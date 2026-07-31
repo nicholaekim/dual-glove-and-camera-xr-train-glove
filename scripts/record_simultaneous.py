@@ -220,6 +220,12 @@ class SyncSession:
                 for rec, folder in ((cam_rec, self.cam_dir), (glove_rec, self.glove_dir)):
                     if rec.count:
                         cam_finalize(folder / name, hands)
+                    else:
+                        # This sensor saw nothing. Drop its empty file rather
+                        # than leave a zero-byte orphan under the un-renamed
+                        # name: pairs are matched by filename, so an orphan can
+                        # never pair and only clutters the folder.
+                        (folder / name).unlink(missing_ok=True)
                 entry["file"] = name.replace("_take", f"_{tag}_take", 1)
                 entry["hands"] = tag
                 print(f"      saved  glove {glove_rec.count} frames | "
