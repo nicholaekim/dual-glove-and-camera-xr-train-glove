@@ -196,6 +196,13 @@ def main() -> None:
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--model", default=str(DEFAULT_MODEL))
+    p.add_argument("--min-det", type=float, default=0.5,
+                   help="detection confidence floor; lower it when a "
+                        "gloved hand is missed (see tune_detection.py)")
+    p.add_argument("--gamma", type=float, default=1.0,
+                   help="brighten before detection (<1 = brighter)")
+    p.add_argument("--clahe", type=float, default=0.0,
+                   help="local contrast boost before detection")
     p.add_argument("--no-mirror", action="store_true")
     p.add_argument("--no-preview", action="store_true",
                    help="no preview window (console + beeps only)")
@@ -217,7 +224,10 @@ def main() -> None:
     print("=" * 62 + "\n")
 
     cap = open_camera(args.camera, args.width, args.height)
-    tracker = HandTracker(model_path=args.model, running_mode="video")
+    tracker = HandTracker(model_path=args.model, running_mode="video",
+                          min_detection_confidence=args.min_det,
+                          min_tracking_confidence=args.min_det,
+                          gamma=args.gamma, clahe=args.clahe)
     session = CamSession(cap, tracker, hz=args.hz or None, out_dir=args.out_dir,
                          mirror=not args.no_mirror, show=not args.no_preview)
     try:

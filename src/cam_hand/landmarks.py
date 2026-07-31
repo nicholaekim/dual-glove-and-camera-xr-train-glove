@@ -71,6 +71,8 @@ class HandTracker:
         swap_handedness: bool = False,
         min_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
+        gamma: float = 1.0,
+        clahe: float = 0.0,
     ):
         import mediapipe as mp
 
@@ -83,6 +85,8 @@ class HandTracker:
         self._mp = mp
         self.swap_handedness = swap_handedness
         self.running_mode = running_mode
+        self.gamma = gamma
+        self.clahe = clahe
 
         vision = mp.tasks.vision
         mode = {"video": vision.RunningMode.VIDEO,
@@ -100,6 +104,12 @@ class HandTracker:
         """Detect hands in a BGR (OpenCV) frame. Returns [] when none found."""
         import cv2
 
+        from .enhance import boost
+
+        # Landmarks come back in pixel coordinates of this image, and boosting
+        # does not move pixels, so results still line up with the original
+        # frame the caller draws on.
+        frame_bgr = boost(frame_bgr, self.gamma, self.clahe)
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=rgb)
         if self.running_mode == "video":

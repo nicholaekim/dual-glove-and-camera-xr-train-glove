@@ -193,12 +193,14 @@ src/cam_hand/
   draw.py         skeleton overlay + HUD (cyan left, red right, as in viz3d)
   recorder.py     JSONL record/load, per-hand rate throttling, pose/take labels
   export21.py     wrist-centring, palm synthesis, professor-format blocks
+  enhance.py      optional gamma / local-contrast boost before detection
   features.py     flexion (5) + spread (6) features, LOO nearest-centroid
   align.py        Umeyama/Kabsch rigid alignment (reflections excluded)
   fusion.py       DOF-split glove+camera fusion, wall-clock frame pairing
   prof_format.py  reader for the tracker's keypoint text files
 scripts/
   live_view.py               live webcam skeleton
+  tune_detection.py          sweep settings to detect a hand being missed
   record_poses_cam.py        guided camera-only pose session
   record_simultaneous.py     guided glove + camera session (shared clock)
   fuse_poses.py              fuse + glove/camera/fused comparison report
@@ -233,6 +235,20 @@ wrist. Frames are never mirrored — the preview window is, the data is not.
 
 ## Known limits
 
+- **MediaPipe often fails to detect a hand wearing the black glove.** It was
+  trained on bare skin, and the glove does not read as a hand to it. This is
+  the sharpest practical obstacle to fusion, because the camera has to see the
+  hand *while* the glove is on it. Note what it is not: darkness. A bare hand
+  darkened all the way to gamma 0.25 is still detected at 0.97 confidence, so
+  brightness and contrast preprocessing do not rescue it.
+
+  Measure your own setup with `python scripts/tune_detection.py`, which sweeps
+  the detection threshold and image boost against the gloved hand and reports
+  the detection rate of each. If a low `--min-det` recovers it, pass the same
+  flag to the recorders. If every configuration reads 0%, no setting will fix
+  it and the options are: better framing and front lighting, accepting camera
+  and glove on different hands, or fine-tuning a pose detector on gloved-hand
+  images (`../xr trainer/vision-experiment` is the start of that).
 - One webcam gives **approximate** millimetres (see the scale spread above).
 - Occluded fingers are estimated, not measured — the glove's advantage.
 - Handedness is unreliable in the egocentric views of the reference dataset,
