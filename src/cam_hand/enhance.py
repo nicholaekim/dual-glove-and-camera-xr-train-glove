@@ -1,15 +1,20 @@
-"""Optional image boosting before hand detection.
+"""Optional image boosting before hand detection. OFF by default, and the
+evidence says leave it off.
 
-Included because it is the obvious first thing to try when a hand is not
-detected, and because trying it is cheap. Be aware of the measured result
-though: MediaPipe still detects a bare hand at 0.97 confidence after the image
-is darkened to gamma 0.25, so underexposure is NOT usually why detection
-fails. If a gloved hand is missed, the cause is almost certainly that the
-model was trained on bare skin and does not recognise the glove as a hand —
-no amount of gamma will change that.
+It is the obvious thing to reach for when a hand is not detected, so it exists
+and can be swept — but measured on this setup it HURT badly. A bare hand
+detected in 100% of frames dropped to 0% under gamma 0.55 + CLAHE 2.5 (68% at
+the loosest threshold). Brightening an already well-exposed frame blows out
+the skin texture the model depends on.
 
-Use scripts/tune_detection.py to find out whether it helps in your setup
-rather than assuming it does.
+Nor is underexposure usually the problem in the first place: MediaPipe still
+detects a bare hand at 0.97 confidence after the image is darkened to gamma
+0.25. When a gloved hand is missed, the cause is that the model was trained on
+bare skin and does not recognise the glove as a hand; no amount of gamma
+changes that.
+
+Only turn this on if scripts/tune_detection.py measures it helping in a
+genuinely dark setup.
 """
 from functools import lru_cache
 

@@ -235,20 +235,30 @@ wrist. Frames are never mirrored — the preview window is, the data is not.
 
 ## Known limits
 
-- **MediaPipe often fails to detect a hand wearing the black glove.** It was
-  trained on bare skin, and the glove does not read as a hand to it. This is
-  the sharpest practical obstacle to fusion, because the camera has to see the
-  hand *while* the glove is on it. Note what it is not: darkness. A bare hand
-  darkened all the way to gamma 0.25 is still detected at 0.97 confidence, so
-  brightness and contrast preprocessing do not rescue it.
+- **MediaPipe cannot see a hand wearing the black StretchSense glove.**
+  Measured, not estimated (`scripts/tune_detection.py`, 40 frames per
+  configuration, same lighting and position for both conditions):
 
-  Measure your own setup with `python scripts/tune_detection.py`, which sweeps
-  the detection threshold and image boost against the gloved hand and reports
-  the detection rate of each. If a low `--min-det` recovers it, pass the same
-  flag to the recorders. If every configuration reads 0%, no setting will fix
-  it and the options are: better framing and front lighting, accepting camera
-  and glove on different hands, or fine-tuning a pose detector on gloved-hand
-  images (`../xr trainer/vision-experiment` is the start of that).
+  | condition | detection rate |
+  |---|---|
+  | gloved hand, all 8 configurations | **0 / 320 frames (0%)** |
+  | bare hand, threshold 0.50 → 0.05 | **320 / 320 frames (100%)** |
+
+  Lowering the confidence floor as far as 0.05 recovers nothing, so the model
+  is not finding the hand weakly — it is not finding it at all. It was trained
+  on bare skin and the glove does not read as a hand. This is the sharpest
+  obstacle to fusion, because the camera has to see the hand *while* the glove
+  is on it. Full table in `results/detection_tuning.csv`.
+
+  What it is **not**: darkness. A bare hand darkened to gamma 0.25 is still
+  detected at 0.97 confidence.
+
+- **The image boost makes detection worse, not better.** Same measurement:
+  a bare hand at 100% detection drops to 0% under `gamma 0.55 + CLAHE 2.5`
+  (68% at the lowest threshold). Brightening an already well-exposed frame
+  blows out the skin texture the model relies on. `--gamma` and `--clahe`
+  therefore default to off and should stay off unless a sweep shows otherwise
+  for a genuinely underexposed setup.
 - One webcam gives **approximate** millimetres (see the scale spread above).
 - Occluded fingers are estimated, not measured — the glove's advantage.
 - Handedness is unreliable in the egocentric views of the reference dataset,
