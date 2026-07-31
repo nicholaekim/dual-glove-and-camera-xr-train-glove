@@ -12,3 +12,8 @@ models/*.task
 # derived from the reference tracker dataset and are not ours to publish.
 recordings/
 results/
+
+# Reference tracker dataset, kept here only so the comparison scripts have it
+# locally. It is the professor's data and contains photographs of people, so it
+# stays out of this public repo.
+reference/
