@@ -77,10 +77,14 @@ def main() -> None:
     model = YOLO(str(args.weights))
 
     if args.source != "cam":
+        # Absolute, because ultralytics resolves a relative project path
+        # against its own configured runs directory — which on this machine
+        # points at an unrelated project, so output silently lands elsewhere.
+        out = args.out.resolve()
         results = model.predict(source=str(args.source), conf=args.conf,
                                 device="cpu", save=args.save,
-                                project=str(args.out.parent),
-                                name=args.out.name, exist_ok=True, verbose=False)
+                                project=str(out.parent),
+                                name=out.name, exist_ok=True, verbose=False)
         found = sum(1 for r in results if r.boxes is not None and len(r.boxes))
         print(f"{found}/{len(results)} images with a detection "
               f"(conf >= {args.conf})")
@@ -89,7 +93,7 @@ def main() -> None:
             best = f"{float(r.boxes.conf.max()):.2f}" if n else "-"
             print(f"  {Path(r.path).name:<32} {n} detection(s)  best conf {best}")
         if args.save:
-            print(f"annotated images -> {args.out}")
+            print(f"annotated images -> {out}")
         return
 
     cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
