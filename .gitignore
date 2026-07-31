@@ -22,3 +22,4 @@ reference/
 # the source images belong to the Ultralytics dataset, not to us.
 datasets/
 runs/
+captures/
