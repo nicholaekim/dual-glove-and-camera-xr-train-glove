@@ -173,22 +173,39 @@ causes. The synthetic glove reproduces the actual failure rather than just
 looking dark.
 
 ```powershell
-python scripts/build_glove_dataset.py --n 2000 --preview
+python scripts/build_glove_dataset.py --n 2500 --extra-dir reference/frames --extra-repeat 4
 ```
 
-Writes a standard YOLO pose dataset to `datasets/glove_synth/` (gitignored)
-plus a `preview.jpg` of bare-vs-gloved pairs. Train with the old project's
-venv, which already has ultralytics and `yolo11n-pose.pt`:
+Writes a standard YOLO pose dataset to `datasets/` (gitignored). `--preview`
+adds a bare-vs-gloved contact sheet.
+
+`--extra-dir` folds in extra bare-hand photos that have no labels of their own
+— the reference tracker frames are the useful case, being the only images from
+the actual lab scene. They are **pseudo-labelled** with MediaPipe (which
+detects them at 100%), so those labels are one model's output rather than
+ground truth and carry its errors; `--extra-repeat` repeats each with fresh
+fabric jitter so a small in-domain set is not drowned by the generic one. Note
+the professor's own `.txt` files cannot serve as labels here: they are 3-D
+millimetres in his tracker's frame, not image coordinates.
+
+Then train and predict. Both scripts import ultralytics and nothing from this
+project, so run them with the **old project's** interpreter, which already has
+ultralytics and `yolo11n-pose.pt`:
 
 ```powershell
-cd "..\xr trainer\vision-experiment"
-& "..\summer-xr-trainer\.venv\Scripts\python.exe" -m ultralytics pose train `
-    model=yolo11n-pose.pt epochs=50 imgsz=640 `
-    data="..\..\non glove xr trainer\datasets\glove_synth\glove_synth.yaml"
+& "..\xr trainer\summer-xr-trainer\.venv\Scripts\python.exe" scripts/train_glove_model.py --smoke
+& "..\xr trainer\summer-xr-trainer\.venv\Scripts\python.exe" scripts/train_glove_model.py --epochs 30 --imgsz 512
+& "..\xr trainer\summer-xr-trainer\.venv\Scripts\python.exe" scripts/predict_glove.py --source cam
 ```
 
-That torch install is **CPU-only**, so expect hours rather than minutes; start
-with a small `--n` and few epochs to confirm the loop runs end to end.
+That torch install is **CPU-only**, so a real run is hours, not minutes —
+`--smoke` (2 epochs at 320 px) proves the loop completes first. Expect pose
+mAP near zero early on: the pretrained head covers 17 body keypoints and is
+reinitialised for 21 hand keypoints, so keypoint accuracy starts from scratch
+while box detection transfers immediately.
+
+`predict_glove.py --source cam` is the test that counts — put the glove on and
+see whether the skeleton tracks, against MediaPipe's measured 0%.
 
 **The honest gap:** a model trained purely on synthetic gloves is validated
 only against synthetic gloves. Before claiming it works, record real gloved
@@ -245,6 +262,8 @@ scripts/
   live_view.py               live webcam skeleton
   tune_detection.py          sweep settings to detect a hand being missed
   build_glove_dataset.py     labelled bare hands -> gloved training set
+  train_glove_model.py       fine-tune YOLO pose on it (old venv)
+  predict_glove.py           run the trained model on the real glove
   record_poses_cam.py        guided camera-only pose session
   record_simultaneous.py     guided glove + camera session (shared clock)
   fuse_poses.py              fuse + glove/camera/fused comparison report

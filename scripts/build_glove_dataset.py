@@ -57,6 +57,40 @@ def parse_label(text: str):
     return out
 
 
+def pseudo_label(img, tracker):
+    """Auto-label a bare-hand photo with MediaPipe -> normalised YOLO pose rows.
+
+    Used to fold in extra bare-hand images that have no keypoint labels of
+    their own, such as the reference tracker photos. These are PSEUDO-labels:
+    they are one model's output, not ground truth, so the trained detector
+    inherits MediaPipe's errors on those frames. Worth it because the images
+    come from the actual target scene, which the generic dataset does not
+    cover, but it is not the same standing as the labelled set.
+    """
+    h, w = img.shape[:2]
+    rows = []
+    for hand in tracker.detect(img):
+        xy = np.asarray(hand.img, dtype=float)[:, :2]
+        nx, ny = xy[:, 0] / w, xy[:, 1] / h
+        if not ((nx > -0.02).all() and (nx < 1.02).all()
+                and (ny > -0.02).all() and (ny < 1.02).all()):
+            continue
+        pad = 0.04
+        x0, x1 = max(nx.min() - pad, 0.0), min(nx.max() + pad, 1.0)
+        y0, y1 = max(ny.min() - pad, 0.0), min(ny.max() + pad, 1.0)
+        kpts = np.stack([np.clip(nx, 0, 1), np.clip(ny, 0, 1),
+                         np.full(N_KPT, 2.0)], axis=1)
+        rows.append((0, [(x0 + x1) / 2, (y0 + y1) / 2, x1 - x0, y1 - y0], kpts))
+    return rows
+
+
+def label_line(cls: int, bbox, kpts: np.ndarray) -> str:
+    vals = [f"{cls}"] + [f"{v:.6f}" for v in bbox]
+    for x, y, v in kpts:
+        vals += [f"{x:.6f}", f"{y:.6f}", f"{int(v)}"]
+    return " ".join(vals)
+
+
 def usable(kpts: np.ndarray) -> bool:
     """Enough visible landmarks, all inside the image, to build a hand mask."""
     vis = kpts[:, 2] > 0
@@ -76,6 +110,12 @@ def main() -> None:
     p.add_argument("--bare-frac", type=float, default=0.0,
                    help="fraction left un-repainted, to keep bare hands working")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--extra-dir", type=Path, default=None,
+                   help="folder of unlabelled bare-hand photos to fold in; "
+                        "they are pseudo-labelled with MediaPipe, then gloved")
+    p.add_argument("--extra-repeat", type=int, default=1,
+                   help="times to repeat each extra image, with different "
+                        "fabric jitter, so a small in-domain set carries weight")
     p.add_argument("--preview", action="store_true",
                    help="also write a side-by-side sheet of the first few")
     args = p.parse_args()
@@ -143,6 +183,42 @@ def main() -> None:
                 previews.append(np.hstack([img, out_img]))
             kept += 1
 
+    n_extra = 0
+    if args.extra_dir is not None:
+        from cam_hand.landmarks import HandTracker
+
+        photos = sorted(p for p in args.extra_dir.rglob("*")
+                        if p.suffix.lower() in (".png", ".jpg", ".jpeg"))
+        if not photos:
+            print(f"  (no images under {args.extra_dir})")
+        tracker = HandTracker(running_mode="image")
+        try:
+            for photo in photos:
+                img = cv2.imread(str(photo))
+                if img is None:
+                    continue
+                rows = pseudo_label(img, tracker)
+                if not rows:
+                    skipped += 1
+                    continue
+                h, w = img.shape[:2]
+                for rep in range(max(1, args.extra_repeat)):
+                    out_img = img
+                    for _cls, _bbox, kpts in rows:
+                        px = np.stack([kpts[:, 0] * w, kpts[:, 1] * h], axis=1)
+                        out_img = apply_glove(out_img, px, rng=rng)
+                    # extras land in train: too few to spare for validation,
+                    # and val should stay comparable to the labelled set
+                    stem = f"{photo.stem}_x{rep}"
+                    cv2.imwrite(str(args.out / "images" / "train" / f"{stem}.jpg"),
+                                out_img)
+                    (args.out / "labels" / "train" / f"{stem}.txt").write_text(
+                        "\n".join(label_line(c, b, k) for c, b, k in rows) + "\n",
+                        encoding="utf-8")
+                    n_extra += 1
+        finally:
+            tracker.close()
+
     yaml_path = args.out / "glove_synth.yaml"
     yaml_path.write_text(
         f"path: {args.out.as_posix()}\n"
@@ -154,9 +230,11 @@ def main() -> None:
         "  0: hand\n", encoding="utf-8")
 
     n_val = min(int(args.n * args.val_frac), kept)
-    print(f"wrote {kept} images to {args.out}")
+    print(f"wrote {kept + n_extra} images to {args.out}")
     print(f"  gloved {gloved} | left bare {bare} | skipped {skipped} unusable")
-    print(f"  train {kept - n_val} | val {n_val}")
+    if n_extra:
+        print(f"  plus {n_extra} MediaPipe-pseudo-labelled from {args.extra_dir}")
+    print(f"  train {kept - n_val + n_extra} | val {n_val}")
     print(f"  dataset config: {yaml_path}")
     if previews:
         sheet = args.out / "preview.jpg"
