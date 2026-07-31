@@ -24,9 +24,46 @@ WHITE = (255, 255, 255)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
+# Outline drawn as eight offset copies at the SAME thickness as the fill.
+# Drawing a thick black pass under a thin coloured pass looks like an outline
+# but is not one: OpenCV's Hershey glyphs get wider as thickness grows, so the
+# two passes start together and drift apart by the end of the string, which
+# reads as doubled text. Same thickness everywhere means identical widths.
+_OUTLINE_OFFSETS = ((-1, -1), (0, -1), (1, -1), (-1, 0),
+                    (1, 0), (-1, 1), (0, 1), (1, 1))
+
 
 def hand_color(side: str):
     return LEFT_BGR if side == "left" else RIGHT_BGR
+
+
+def draw_text(frame, text: str, org, scale: float, color, thickness: int = 1,
+              outline: int = 2) -> None:
+    """Text with a readable dark outline, drift-free."""
+    x, y = int(org[0]), int(org[1])
+    if outline > 0:
+        for dx, dy in _OUTLINE_OFFSETS:
+            cv2.putText(frame, text, (x + dx * outline, y + dy * outline),
+                        FONT, scale, (0, 0, 0), thickness, cv2.LINE_AA)
+    cv2.putText(frame, text, (x, y), FONT, scale, color, thickness, cv2.LINE_AA)
+
+
+def text_size(text: str, scale: float, thickness: int):
+    (w, h), _ = cv2.getTextSize(text, FONT, scale, thickness)
+    return w, h
+
+
+def _fit_scale(frame, text: str, scale: float, thickness: int,
+               margin: int = 24) -> float:
+    """Shrink the scale so a long pose name still fits the frame width."""
+    avail = frame.shape[1] - 2 * margin
+    w, _ = text_size(text, scale, thickness)
+    return scale * avail / w if w > avail > 0 else scale
+
+
+def _centered_x(frame, text: str, scale: float, thickness: int) -> int:
+    w, _ = text_size(text, scale, thickness)
+    return max(6, (frame.shape[1] - w) // 2)
 
 
 def draw_hand(frame, hand) -> None:
@@ -49,34 +86,41 @@ def label_hands(frame, hands, mirrored: bool) -> None:
         if mirrored:
             x = w - x
         text = f"{hand.hand_side} {hand.score:.2f}"
-        org = (int(x) - 40, int(y) + 28)
-        cv2.putText(frame, text, org, FONT, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(frame, text, org, FONT, 0.6, hand_color(hand.hand_side), 1,
-                    cv2.LINE_AA)
+        tw, _th = text_size(text, 0.6, 1)
+        # centre the label under the wrist and keep it inside the frame
+        px = min(max(6, int(x) - tw // 2), frame.shape[1] - tw - 6)
+        py = min(int(y) + 28, frame.shape[0] - 8)
+        draw_text(frame, text, (px, py), 0.6, hand_color(hand.hand_side))
 
 
 def draw_hud(frame, lines) -> None:
     """Small status lines, top-left."""
-    y = 22
+    y = 24
     for line in lines:
-        cv2.putText(frame, line, (10, y), FONT, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(frame, line, (10, y), FONT, 0.55, (80, 255, 80), 1, cv2.LINE_AA)
-        y += 22
+        draw_text(frame, line, (10, y), 0.55, (80, 255, 80))
+        y += 24
 
 
 def draw_banner(frame, text: str, sub: str = "", rec: bool = False) -> None:
-    """Big centred prompt for the guided recorder (pose name, countdown)."""
+    """Big centred prompt for the guided recorder (pose name, countdown).
+
+    Both lines are measured before they are placed, so they stay centred for
+    any pose name, and a long one is scaled down rather than running off the
+    edge of the frame.
+    """
     h, w = frame.shape[:2]
-    cv2.putText(frame, text, (max(10, w // 2 - 10 * len(text)), h // 2 - 20),
-                FONT, 1.2, (0, 0, 0), 6, cv2.LINE_AA)
-    cv2.putText(frame, text, (max(10, w // 2 - 10 * len(text)), h // 2 - 20),
-                FONT, 1.2, WHITE, 2, cv2.LINE_AA)
+
+    scale = _fit_scale(frame, text, 1.2, 2)
+    draw_text(frame, text, (_centered_x(frame, text, scale, 2), h // 2 - 18),
+              scale, WHITE, thickness=2, outline=2)
+
     if sub:
-        cv2.putText(frame, sub, (max(10, w // 2 - 7 * len(sub)), h // 2 + 20),
-                    FONT, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(frame, sub, (max(10, w // 2 - 7 * len(sub)), h // 2 + 20),
-                    FONT, 0.7, (0, 255, 255), 1, cv2.LINE_AA)
+        sub_scale = _fit_scale(frame, sub, 0.7, 1)
+        draw_text(frame, sub, (_centered_x(frame, sub, sub_scale, 1), h // 2 + 22),
+                  sub_scale, (0, 255, 255))
+
     if rec:
-        cv2.circle(frame, (w - 30, 30), 12, (0, 0, 255), -1, cv2.LINE_AA)
-        cv2.putText(frame, "REC", (w - 85, 38), FONT, 0.7, (0, 0, 255), 2,
-                    cv2.LINE_AA)
+        rec_w, _ = text_size("REC", 0.7, 2)
+        cv2.circle(frame, (w - 26, 30), 10, (0, 0, 255), -1, cv2.LINE_AA)
+        draw_text(frame, "REC", (w - 48 - rec_w, 38), 0.7, (0, 0, 255),
+                  thickness=2)
