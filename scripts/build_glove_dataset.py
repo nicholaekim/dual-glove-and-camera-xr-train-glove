@@ -110,9 +110,10 @@ def main() -> None:
     p.add_argument("--bare-frac", type=float, default=0.0,
                    help="fraction left un-repainted, to keep bare hands working")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--extra-dir", type=Path, default=None,
+    p.add_argument("--extra-dir", type=Path, action="append", default=None,
                    help="folder of unlabelled bare-hand photos to fold in; "
-                        "they are pseudo-labelled with MediaPipe, then gloved")
+                        "they are pseudo-labelled with MediaPipe, then gloved. "
+                        "Repeatable for several folders.")
     p.add_argument("--extra-repeat", type=int, default=1,
                    help="times to repeat each extra image, with different "
                         "fabric jitter, so a small in-domain set carries weight")
@@ -184,13 +185,16 @@ def main() -> None:
             kept += 1
 
     n_extra = 0
-    if args.extra_dir is not None:
+    if args.extra_dir:
         from cam_hand.landmarks import HandTracker
 
-        photos = sorted(p for p in args.extra_dir.rglob("*")
-                        if p.suffix.lower() in (".png", ".jpg", ".jpeg"))
-        if not photos:
-            print(f"  (no images under {args.extra_dir})")
+        photos = []
+        for d in args.extra_dir:
+            found = sorted(p for p in d.rglob("*")
+                           if p.suffix.lower() in (".png", ".jpg", ".jpeg"))
+            if not found:
+                print(f"  (no images under {d})")
+            photos += found
         tracker = HandTracker(running_mode="image")
         try:
             for photo in photos:
@@ -233,7 +237,8 @@ def main() -> None:
     print(f"wrote {kept + n_extra} images to {args.out}")
     print(f"  gloved {gloved} | left bare {bare} | skipped {skipped} unusable")
     if n_extra:
-        print(f"  plus {n_extra} MediaPipe-pseudo-labelled from {args.extra_dir}")
+        dirs = ", ".join(str(d) for d in args.extra_dir)
+        print(f"  plus {n_extra} MediaPipe-pseudo-labelled from {dirs}")
     print(f"  train {kept - n_val + n_extra} | val {n_val}")
     print(f"  dataset config: {yaml_path}")
     if previews:
