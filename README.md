@@ -207,11 +207,22 @@ while box detection transfers immediately.
 `predict_glove.py --source cam` is the test that counts — put the glove on and
 see whether the skeleton tracks, against MediaPipe's measured 0%.
 
-**The honest gap:** a model trained purely on synthetic gloves is validated
-only against synthetic gloves. Before claiming it works, record real gloved
-frames and hand-label a small held-out set (30–50 frames is enough to detect a
-sim-to-real gap). If it fails there, the usual fix is mixing real labelled
-frames into training (`--bare-frac` mixes bare hands back in the same way).
+**The sim-to-real gap, measured the hard way.** The first model validated at
+pose mAP50 0.728 on held-out *synthetic* gloves — and scored **0/250 frames on
+the real glove** (`predict_glove.py --source cam`). Real captured frames
+(`scripts/capture_frames.py`) showed why: the v1 repaint drew a closed dark
+mitten with a dot grid, while the real glove is **open-tipped with bare skin
+at the fingertips**, keeps fingers visibly separated, and carries a round
+sensor puck and a wrist strap. The model learned the wrong object.
+
+The v2 repaint is drawn from those real frames (tips bare, fingers separate,
+puck, strap, ribbed knit, near-neutral colour). Lesson worth keeping: fooling
+MediaPipe is a weak validation of a synthetic glove — match the *actual
+artifact*, and test on real frames as early as possible.
+
+Real-frame test sets, captured with `capture_frames.py`: `captures/gloved` for
+detection rate, `captures/bare` as the control (MediaPipe manages only 50%
+even on bare hands in this room's backlight — the scene itself is hard).
 
 ## How fusion works
 
@@ -261,6 +272,7 @@ src/cam_hand/
 scripts/
   live_view.py               live webcam skeleton
   tune_detection.py          sweep settings to detect a hand being missed
+  capture_frames.py          save raw webcam frames (real-glove test sets)
   build_glove_dataset.py     labelled bare hands -> gloved training set
   train_glove_model.py       fine-tune YOLO pose on it (old venv)
   predict_glove.py           run the trained model on the real glove
