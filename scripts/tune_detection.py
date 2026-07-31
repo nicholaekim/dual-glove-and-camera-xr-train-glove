@@ -22,7 +22,10 @@ fine-tuned on gloved hands (see ../xr trainer/vision-experiment).
   python scripts/tune_detection.py --compare        # also measure a bare hand
 """
 import argparse
+import csv
 import time
+
+from pathlib import Path
 
 import cv2
 
@@ -75,7 +78,7 @@ def measure(cap, model, frames: int, min_det: float, gamma: float,
     return rate, (sum(scores) / len(scores) if scores else 0.0)
 
 
-def sweep(cap, model, frames: int, title: str):
+def sweep(cap, model, frames: int, title: str, collected: list):
     print(f"\n=== {title} ===")
     print(f"{'boost':<8}{'min_det':>9}{'detected':>11}{'mean score':>12}")
     rows = []
@@ -84,6 +87,9 @@ def sweep(cap, model, frames: int, title: str):
             label = f"{bname} / thr {thr:g}"
             rate, score = measure(cap, model, frames, thr, gamma, clahe, label)
             rows.append((rate, score, bname, thr))
+            collected.append({"condition": title, "boost": bname,
+                              "min_det": f"{thr:g}", "detected_pct": f"{rate:.0f}",
+                              "mean_score": f"{score:.3f}", "frames": frames})
             print(f"{bname:<8}{thr:>9.2f}{rate:>10.0f}%{score:>12.2f}")
     return rows
 
@@ -99,6 +105,9 @@ def main() -> None:
     p.add_argument("--model", default=str(DEFAULT_MODEL))
     p.add_argument("--prep", type=float, default=5.0,
                    help="seconds to get into position before each sweep")
+    p.add_argument("--out", type=Path,
+                   default=Path("results") / "detection_tuning.csv",
+                   help="where to save the measured table")
     p.add_argument("--compare", action="store_true",
                    help="also sweep a bare hand, as a control")
     args = p.parse_args()
@@ -110,9 +119,10 @@ def main() -> None:
     print("=" * 62)
 
     cap = open_camera(args.camera, args.width, args.height)
+    collected: list = []
     try:
         countdown(cap, args.prep, "GLOVED HAND", "hold it still, fully in frame")
-        rows = sweep(cap, args.model, args.frames, "gloved hand")
+        rows = sweep(cap, args.model, args.frames, "gloved hand", collected)
 
         best = max(rows, key=lambda r: (r[0], r[1]))
         print()
@@ -140,7 +150,8 @@ def main() -> None:
 
         if args.compare:
             countdown(cap, args.prep, "BARE HAND", "same position, glove off")
-            bare = sweep(cap, args.model, args.frames, "bare hand (control)")
+            bare = sweep(cap, args.model, args.frames, "bare hand (control)",
+                         collected)
             b = max(bare, key=lambda r: (r[0], r[1]))
             print(f"\nControl: bare hand best {b[0]:.0f}% vs gloved {best[0]:.0f}%")
             print("  A large gap confirms the glove itself is the problem,")
@@ -150,6 +161,15 @@ def main() -> None:
     finally:
         cap.release()
         cv2.destroyAllWindows()
+        # Always write what was measured, even after an interrupt — the whole
+        # point is to have a record instead of a table that scrolls away.
+        if collected:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            with open(args.out, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=list(collected[0].keys()))
+                w.writeheader()
+                w.writerows(collected)
+            print(f"\nwrote {args.out}  ({len(collected)} configurations)")
 
 
 if __name__ == "__main__":
