@@ -24,6 +24,18 @@ HERE = Path(__file__).resolve().parents[1]
 DEFAULT_WEIGHTS = HERE / "runs" / "glove_pose_v1" / "weights" / "best.pt"
 
 
+def epochs_finished(run_dir: Path) -> int:
+    """Rows in results.csv — one per completed epoch, header excluded."""
+    csv_path = run_dir / "results.csv"
+    if not csv_path.is_file():
+        return 0
+    try:
+        lines = [l for l in csv_path.read_text(encoding="utf-8").splitlines() if l.strip()]
+        return max(0, len(lines) - 1)
+    except OSError:
+        return 0
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Predict gloved-hand keypoints.")
     p.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS)
@@ -40,9 +52,24 @@ def main() -> None:
     args = p.parse_args()
 
     if not args.weights.is_file():
-        raise SystemExit(
-            f"weights not found: {args.weights}\n"
-            "Train first: python scripts/train_glove_model.py")
+        # best.pt is only written when a run finishes, but last.pt is rewritten
+        # after every epoch — so a run still in progress can already be tested.
+        latest = args.weights.with_name("last.pt")
+        if latest.is_file():
+            done = epochs_finished(args.weights.parent.parent)
+            print(f"{args.weights.name} does not exist yet — training has not "
+                  "finished.")
+            print(f"Using {latest.name} instead"
+                  + (f", after {done} epoch(s)" if done else "")
+                  + ". Results improve as training continues; re-run this")
+            print("later to see it get better.\n")
+            args.weights = latest
+        else:
+            raise SystemExit(
+                f"weights not found: {args.weights}\n"
+                "Nothing has finished an epoch yet. Either training is still on "
+                "epoch 1, or it was never started:\n"
+                "  python scripts/train_glove_model.py --smoke   (2 quick epochs)")
 
     import cv2
     from ultralytics import YOLO
