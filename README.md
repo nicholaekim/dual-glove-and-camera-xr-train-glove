@@ -154,6 +154,48 @@ Measured by `compare_to_tracker.py` against the professor's dataset:
   measure of how much. Fine for pose classification and shape comparison, not
   a substitute for calibrated metric ground truth.
 
+## Teaching a detector to see the gloved hand
+
+Since MediaPipe cannot see the glove (above), the fix is a detector trained on
+gloved hands. The obstacle is labels: that needs gloved images with 21
+keypoints marked, and marking them by hand is thousands of clicks.
+
+The way around it is that **repainting a hand does not move its landmarks**.
+The Ultralytics hand-keypoints dataset ships 26,768 bare-hand images with
+ground-truth 21-keypoint labels; painting each hand to look gloved
+(`cam_hand.synth_glove`, using the labels themselves to build the hand mask)
+produces gloved training images whose existing labels are still exactly
+correct.
+
+Checked before relying on it: MediaPipe detects the bare source images at
+**100%** and only **10%** after repainting — the same collapse the real glove
+causes. The synthetic glove reproduces the actual failure rather than just
+looking dark.
+
+```powershell
+python scripts/build_glove_dataset.py --n 2000 --preview
+```
+
+Writes a standard YOLO pose dataset to `datasets/glove_synth/` (gitignored)
+plus a `preview.jpg` of bare-vs-gloved pairs. Train with the old project's
+venv, which already has ultralytics and `yolo11n-pose.pt`:
+
+```powershell
+cd "..\xr trainer\vision-experiment"
+& "..\summer-xr-trainer\.venv\Scripts\python.exe" -m ultralytics pose train `
+    model=yolo11n-pose.pt epochs=50 imgsz=640 `
+    data="..\..\non glove xr trainer\datasets\glove_synth\glove_synth.yaml"
+```
+
+That torch install is **CPU-only**, so expect hours rather than minutes; start
+with a small `--n` and few epochs to confirm the loop runs end to end.
+
+**The honest gap:** a model trained purely on synthetic gloves is validated
+only against synthetic gloves. Before claiming it works, record real gloved
+frames and hand-label a small held-out set (30–50 frames is enough to detect a
+sim-to-real gap). If it fails there, the usual fix is mixing real labelled
+frames into training (`--bare-frac` mixes bare hands back in the same way).
+
 ## How fusion works
 
 `src/cam_hand/fusion.py`. The sensors are not averaged — averaging a
@@ -194,6 +236,7 @@ src/cam_hand/
   recorder.py     JSONL record/load, per-hand rate throttling, pose/take labels
   export21.py     wrist-centring, palm synthesis, professor-format blocks
   enhance.py      optional gamma / local-contrast boost before detection
+  synth_glove.py  repaint a bare hand as gloved, keeping its labels
   features.py     flexion (5) + spread (6) features, LOO nearest-centroid
   align.py        Umeyama/Kabsch rigid alignment (reflections excluded)
   fusion.py       DOF-split glove+camera fusion, wall-clock frame pairing
@@ -201,6 +244,7 @@ src/cam_hand/
 scripts/
   live_view.py               live webcam skeleton
   tune_detection.py          sweep settings to detect a hand being missed
+  build_glove_dataset.py     labelled bare hands -> gloved training set
   record_poses_cam.py        guided camera-only pose session
   record_simultaneous.py     guided glove + camera session (shared clock)
   fuse_poses.py              fuse + glove/camera/fused comparison report

@@ -17,3 +17,8 @@ results/
 # locally. It is the professor's data and contains photographs of people, so it
 # stays out of this public repo.
 reference/
+
+# Generated training sets and model runs — rebuildable from the script, and
+# the source images belong to the Ultralytics dataset, not to us.
+datasets/
+runs/
