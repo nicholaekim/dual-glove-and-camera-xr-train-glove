@@ -1,0 +1,2 @@
+# Keeps models/ in the repo so the README's curl command has somewhere to land.
+# The model file itself (hand_landmarker.task) is gitignored.

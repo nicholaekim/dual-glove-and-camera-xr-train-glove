@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+
+# MediaPipe model: 7.5 MB third-party binary, re-downloadable (see README)
+models/*.task
+
+# Captured and generated data. Recordings are session-specific; results are
+# derived from the reference tracker dataset and are not ours to publish.
+recordings/
+results/
