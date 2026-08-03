@@ -118,30 +118,52 @@ def mean_vector(vectors: Sequence[Sequence[float]]) -> List[float]:
 
 
 def loo_nearest_centroid(samples: Sequence[Tuple[str, Sequence[float]]],
-                         cols: Sequence[int] = None):
+                         cols: Sequence[int] = None,
+                         standardize: bool = False):
     """Leave-one-out nearest-centroid over (label, features) samples.
 
     cols selects a feature subset (e.g. flexion only). Returns
     (n_correct, n_total, [(true, predicted, index), ...]) for the misses.
+
+    standardize z-scores each feature before measuring distance. It matters
+    whenever features live on different scales: raw Euclidean distance weights
+    a dimension by its magnitude, so large-valued features (wrist-to-fingertip
+    distances, ~1-2 palm lengths) drown out smaller ones (thumb offset out of
+    the palm plane, ~0.1-0.6) even when the small ones separate the classes
+    better. Mean and spread are computed from the TRAINING samples only, so
+    the held-out sample never influences its own scaling.
     """
     def pick(v):
         return [v[i] for i in cols] if cols is not None else list(v)
 
     wrong = []
     for i, (label, feats) in enumerate(samples):
+        if standardize:
+            train = [pick(f) for j, (_l, f) in enumerate(samples) if j != i]
+            n_f = len(train[0])
+            mu = [sum(r[k] for r in train) / len(train) for k in range(n_f)]
+            sd = []
+            for k in range(n_f):
+                var = sum((r[k] - mu[k]) ** 2 for r in train) / len(train)
+                sd.append(math.sqrt(var) or 1.0)
+
+            def pick_scaled(v, _mu=mu, _sd=sd, _pick=pick):
+                return [(a - m) / s for a, m, s in zip(_pick(v), _mu, _sd)]
+        else:
+            pick_scaled = pick
         sums: Dict[str, List[float]] = defaultdict(lambda: None)
         counts: Dict[str, int] = defaultdict(int)
         for j, (lab2, f2) in enumerate(samples):
             if j == i:
                 continue
-            v = pick(f2)
+            v = pick_scaled(f2)
             if sums[lab2] is None:
                 sums[lab2] = list(v)
             else:
                 for k in range(len(v)):
                     sums[lab2][k] += v[k]
             counts[lab2] += 1
-        target = pick(feats)
+        target = pick_scaled(feats)
         best, best_d = None, float("inf")
         for lab2, s in sums.items():
             c = [v / counts[lab2] for v in s]
