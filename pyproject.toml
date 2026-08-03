@@ -1,7 +1,7 @@
 [project]
-name = "cam_hand"
-version = "0.1.0"
-description = "Webcam hand-keypoint pipeline (MediaPipe, 21 landmarks): live view -> guided recording -> glove-compatible exports"
+name = "xr_hand_dual"
+version = "0.2.0"
+description = "Dual-sensor hand tracking: StretchSense glove pipeline (xr_hand) + webcam MediaPipe pipeline (cam_hand), shared 21-keypoint formats"
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.26",
@@ -9,6 +9,8 @@ dependencies = [
     # also require opencv-python: two packages providing cv2 shadow each other.
     "mediapipe>=0.10",
     "python-osc>=1.8",
+    "matplotlib>=3.7",
+    "openpyxl>=3.1",
 ]
 
 [build-system]

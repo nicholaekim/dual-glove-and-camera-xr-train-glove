@@ -49,8 +49,7 @@ from cam_hand.features import (
 from cam_hand.recorder import CamRecorder
 
 HERE = Path(__file__).resolve().parents[1]
-DEFAULT_GLOVE = (HERE.parent / "xr trainer" / "summer-xr-trainer"
-                 / "recordings" / "poses")
+DEFAULT_GLOVE = HERE / "recordings" / "poses"
 DEFAULT_CAM = HERE / "recordings" / "poses_cam"
 
 

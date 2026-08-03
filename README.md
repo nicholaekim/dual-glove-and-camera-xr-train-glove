@@ -1,9 +1,18 @@
-# Camera hand tracking + glove/camera fusion
+# Dual-sensor hand tracking: StretchSense glove + webcam
 by Nicholas Kim. All rights reserved.
 
-Webcam counterpart to the StretchSense glove pipeline in
-`..\xr trainer\summer-xr-trainer`, plus the machinery to run both sensors at
-once and fuse them.
+Both halves of the hand-tracking work in one place:
+
+  `src/xr_hand`   the StretchSense glove pipeline (OSC receive -> validate ->
+                  parse -> forward kinematics -> record/export). Started as
+                  the July feasibility project; the copy in
+                  `..\xr trainer\summer-xr-trainer` is the archived version
+                  submitted to the professor and is no longer edited.
+  `src/cam_hand`  the webcam pipeline (MediaPipe 21 landmarks), plus fusion,
+                  alignment, features and the comparison tooling.
+
+Glove-side scripts live in `scripts/glove/`, camera-side scripts in
+`scripts/`. Everything runs from this folder with this venv.
 
 **Why a camera at all.** The glove measures finger *flexion* directly and
 keeps working when fingers hide behind the palm. It has no sensor for finger
@@ -31,13 +40,7 @@ python -m venv .venv
 pip install -e .
 ```
 
-Then make the glove package importable from this venv (needed only by the
-fusion scripts). Write one line — the path to the glove project's `src` — into
-a `.pth` file in site-packages:
-
-```powershell
-"C:\Users\nkim2\OneDrive\Desktop\xr trainer\summer-xr-trainer\src" | Out-File -Encoding ascii .venv\Lib\site-packages\xr_hand_src.pth
-```
+That installs both packages (`xr_hand` and `cam_hand`) editable from `src/`.
 
 Then fetch the hand-landmark model (a 7.5 MB MediaPipe binary, not kept in
 this repo) into `models\`. Note `--ssl-no-revoke`: the same certificate
@@ -47,7 +50,7 @@ workaround the earlier vision experiment needed on this network.
 curl.exe --ssl-no-revoke -o models/hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
 ```
 
-Check the install with `pytest -q` (expect 24 passed).
+Check the install with `pytest -q` (expect 42 passed — camera and glove suites).
 
 ## Try it without any hardware
 
@@ -73,7 +76,31 @@ The glove misses exactly the spread- and opposition-defined poses. That
 proves the code does what it claims on data whose answer is known; it does
 **not** prove a real glove and webcam behave this way. A real session does.
 
-## Daily use
+## Daily use — glove
+
+Needs XR Trainer streaming to `127.0.0.1:9002`, glove connected and calibrated.
+
+```powershell
+python scripts/glove/run_osc.py --dump --no-viz     # confirm the stream
+python scripts/glove/run_osc.py                     # live 3D glove viewer
+python scripts/glove/record_poses.py --poses open_palm,fist,index_point,thumbs_up,peace,three,pinch --takes 3 --duration 5 --prep 8 --out-dir recordings/poses_v2
+python scripts/glove/analyze_poses.py recordings/poses_v2   # separability report
+python scripts/glove/playback.py <file.jsonl>               # scrub a recording
+```
+
+`recordings/poses/` holds the July dataset (copied from the archived project);
+record new sessions into `recordings/poses_v2` etc. so the two never mix. The
+July pinch/three failures trace to take 1 not being held — hence `--prep 8`.
+
+**Glove vs camera on identical features** (pose-level, no simultaneous
+capture needed):
+
+```powershell
+python scripts/compare_sensors.py --write                          # July glove data
+python scripts/compare_sensors.py --glove recordings/poses_v2 --write   # re-recorded
+```
+
+## Daily use — camera
 
 **Live view** (start here — confirms camera, model and handedness):
 ```powershell
@@ -257,6 +284,10 @@ self-test showing `pinch` failing on right hands and `relaxed` on left.
 ## Layout
 
 ```
+src/xr_hand/            glove pipeline (joints, parser, validator, receiver,
+                        recorder, kinematics, keypoints21, mock, viewers)
+scripts/glove/          glove scripts (record_poses, run_osc, analyze_poses,
+                        playback, exports, mock utilities)
 src/cam_hand/
   landmarks.py    MediaPipe HandLandmarker -> CamHand (21 img + 21 world points)
   capture.py      webcam open/read (DirectShow first — MSMF is slow on Windows)
@@ -280,6 +311,7 @@ scripts/
   record_simultaneous.py     guided glove + camera session (shared clock)
   fuse_poses.py              fuse + glove/camera/fused comparison report
   selftest_sync.py           synthetic paired dataset, answer known
+  compare_sensors.py         glove vs camera, same features, same classifier
   compare_to_tracker.py      camera vs the professor's tracker dataset
   export_keypoints21_cam.py  21-keypoint CSVs
   export_prof_format_cam.py  tracker-format text export

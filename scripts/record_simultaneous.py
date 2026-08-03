@@ -36,8 +36,7 @@ from cam_hand.recorder import CamRecorder, pose_filename, slugify
 from cam_hand.recorder import finalize_pose_name as cam_finalize
 from cam_hand.recorder import hand_tag as cam_hand_tag
 
-# The glove side comes from the existing pipeline (see README for the .pth
-# that puts summer-xr-trainer/src on the path).
+# The glove side comes from the xr_hand package in this repo.
 from xr_hand.parser import parse_hand_message
 from xr_hand.receiver import OSCHandReceiver
 from xr_hand.recorder import FrameRecorder
