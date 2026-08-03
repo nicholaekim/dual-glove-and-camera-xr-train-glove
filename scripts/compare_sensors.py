@@ -75,8 +75,14 @@ def glove_samples(root: Path):
     return out
 
 
-def cam_samples(root: Path):
-    """Camera recordings -> the same shape."""
+def cam_samples(root: Path, min_frames: int = 5):
+    """Camera recordings -> the same shape.
+
+    min_frames drops ghost samples: MediaPipe occasionally mislabels the hand
+    for a frame or two, which would otherwise fabricate an extra take x hand
+    sample out of 1-4 stray frames. A real 5 s take at the default 5 Hz has
+    ~23 frames, so a handful is noise, not a sample.
+    """
     out = []
     for path in sorted(root.rglob("*.jsonl")):
         per_hand = defaultdict(list)
@@ -89,7 +95,7 @@ def cam_samples(root: Path):
                 all_features(wrist_centered(d), hand_side=hand))
             poses[hand] = d.get("pose", "")
         for hand, feats in sorted(per_hand.items()):
-            if feats and poses[hand]:
+            if len(feats) >= min_frames and poses[hand]:
                 out.append((poses[hand], hand, path.name, mean_vector(feats)))
     return out
 
