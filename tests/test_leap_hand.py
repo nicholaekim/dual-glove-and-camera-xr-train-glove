@@ -1230,6 +1230,20 @@ def test_leap_backend_keeps_every_camera_frame_by_default(tmp_path: Path,
     assert n_cam > 5 * n_glove, f"{n_cam} camera frames vs {n_glove} glove"
 
 
+def test_the_mediapipe_session_still_owns_cam_and_its_own_recorder():
+    """The refactor that made the camera pluggable must not have moved it."""
+    from cam_hand.recorder import CamRecorder
+
+    sync = _load_repo_script("record_simultaneous")
+    session = sync.SyncSession(cap=None, tracker=None, glove_source=None,
+                               hz=5.0, out_dir=Path("recordings") / "sync")
+    assert session.cam_dir == Path("recordings") / "sync" / "cam"
+    assert session.glove_dir == Path("recordings") / "sync" / "glove"
+    assert isinstance(session.make_cam_recorder("fist", 1), CamRecorder)
+    assert session.dots is True         # it still prints progress dots
+    assert session.show is True         # and still opens its preview window
+
+
 def test_leap_backend_rejects_a_camera_name_that_is_neither(monkeypatch):
     import sys
 
