@@ -243,6 +243,7 @@ def main() -> None:
     skipped = []
     by_source = defaultdict(int)          # camera -> takes read from it
     by_clock = defaultdict(int)           # pairing clock -> takes paired on it
+    palm_residuals = []                   # diagnostic only, never a gate
 
     for gpath in takes:
         try:
@@ -289,6 +290,8 @@ def main() -> None:
                     with_scale=with_scale)
             if info["camera_used"]:
                 n_cam_used += 1
+            if info.get("kabsch_rmse_mm") is not None:
+                palm_residuals.append(info["kabsch_rmse_mm"])
             per_hand_f[hand].append(all_features(fused, hand_side=hand))
             if args.export_csv is not None:
                 fused_rows.append([pose, g["take"], hand, g["wall_time"],
@@ -337,6 +340,19 @@ def main() -> None:
         lines.append(f"  skipped takes           {len(skipped)}")
         for name, why in skipped:
             lines.append(f"    {name}: {why}")
+    if palm_residuals:
+        ordered = sorted(palm_residuals)
+        median = ordered[len(ordered) // 2]
+        lines.append("")
+        lines.append("Palm agreement (diagnostic — nothing is rejected on it)")
+        lines.append(f"  median {median:.1f} mm, worst {ordered[-1]:.1f} mm  "
+                     "RMSE of a rigid 5-point palm fit")
+        lines.append("  This is the glove's TEMPLATE hand against the real "
+                     "one, not a tracking error. It is")
+        lines.append("  reported because it is what Phase 5 would measure; "
+                     "the alignment itself does not use it,")
+        lines.append("  which is why a large value here cannot bend a finger "
+                     "direction.")
     lines.append("")
     lines.append("Leave-one-out nearest-centroid, same test for all three")
     loo_table(glove_samples, FLEXION_COLS, "glove only", lines)
