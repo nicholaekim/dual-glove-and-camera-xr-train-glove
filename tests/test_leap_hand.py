@@ -636,6 +636,26 @@ def test_hand_trail_pairs_an_image_with_the_nearest_tracking_event():
     assert all(len(h["palm_pos"]) == 3 for h in hands)
     assert dt_ms == pytest.approx(-0.1)            # the event is 100 us older
 
+    trail.clear()
+    assert trail.nearest(first_ts) == ([], None)
+
+
+def test_hand_trail_refuses_to_pair_a_still_with_a_stale_hand():
+    """A photo of an untracked glove must not inherit an old hand."""
+    from leap_hand.images import HandTrail
+
+    trail = HandTrail()
+    stream = MockLeapStream(noise_mm=0.0)
+    stream.start()
+    for _side, lh in stream.generate(1):
+        trail.add(lh)
+        last_ts = lh.timestamp_us
+
+    # Ten seconds later the tracker has seen nothing since. The nearest event
+    # is still that one, and it says nothing about this image.
+    assert trail.nearest(last_ts + 10_000_000) == ([], None)
+    assert trail.nearest(last_ts + 10_000)[0]          # 10 ms away: a real pair
+
 
 def test_write_snapshot_writes_two_pngs_and_a_sidecar(tmp_path: Path):
     """A still is only evidence with the tracker's verdict beside it."""
@@ -844,6 +864,7 @@ def test_gate_script_runs_end_to_end_on_the_mock(tmp_path: Path, monkeypatch):
 
     report = report_path.read_text(encoding="utf-8")
     assert "Path A:" in report
+    sidecars = []
     for condition in ("bare", "glove"):
         folder = out_dir / condition
         takes = list(folder.glob("*.jsonl"))
@@ -853,13 +874,19 @@ def test_gate_script_runs_end_to_end_on_the_mock(tmp_path: Path, monkeypatch):
 
         sidecar = json.loads(
             (folder / f"{condition}_000.json").read_text(encoding="utf-8"))
-        assert sidecar["hand_count"] == 2          # the mock tracks both hands
+        assert sidecar["width"] == sidecar["height"] == 384
         assert "--mock" in sidecar["note"]
+        # A still taken inside the mock's injected dropout legitimately sees
+        # nothing; what must never happen is half a hand or a stale one.
+        assert ({h["hand_side"] for h in sidecar["hands"]}
+                in (set(), {"left", "right"}))
+        sidecars.append(sidecar)
 
         rows = analyse_file(takes[0])
         assert {r.hand_side for r in rows} == {"left", "right"}
         for side in ("left", "right"):
             assert f"{condition:<16} {side:<5}" in report
+    assert any(s["hand_count"] == 2 for s in sidecars)
     assert "no hand was seen" not in report
 
 

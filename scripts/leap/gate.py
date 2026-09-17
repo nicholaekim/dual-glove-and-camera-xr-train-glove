@@ -121,6 +121,10 @@ class GateRun:
     def run(self, condition: str, seconds: float, prep: float,
             snapshots: int) -> ConditionResult:
         folder = self.out_dir / condition
+        # Nothing the previous condition saw may be paired with this one's
+        # photographs: a still of an untracked glove must never inherit the
+        # bare hand from ten minutes ago.
+        self.trail.clear()
         print(f"--- Condition: {condition.upper()}  ({seconds:g} s, "
               f"{snapshots} IR still(s)) ---")
         hint = CONDITION_INSTRUCTIONS.get(condition)
@@ -143,8 +147,7 @@ class GateRun:
         raw_path = path.with_suffix(".lmt")
         # Stills spread across the run, the first one a beat after the start
         # so the tracker has settled and the last well before the end.
-        due = [seconds * (k + 0.5) / snapshots for k in range(snapshots)] \
-            if snapshots > 0 else []
+        due = [seconds * (k + 0.5) / snapshots for k in range(snapshots)]
         snaps = []
 
         with self._raw_capture(raw_path):
@@ -181,12 +184,19 @@ class GateRun:
                                                          if s.saw_hand),
                                  folder=str(folder))
         if recorder.count == 0:
+            # Drop the empty JSONL, but KEEP the .lmt: an .lmt full of
+            # hand-less tracking events is the proof that the camera streamed
+            # for the whole run and reported nothing, which in this experiment
+            # is a result rather than a missing file.
             path.unlink(missing_ok=True)
-            raw_path.unlink(missing_ok=True)
+            kept_raw = self.raw and raw_path.exists()
             result.note = ("no frames recorded: the tracker reported no hand "
-                           "for the whole run")
+                           "for the whole run"
+                           + (f"; raw stream kept in {raw_path.name}"
+                              if kept_raw else ""))
             print(f"      no hand tracked in {seconds:g} s "
-                  f"({len(snaps)} IR still(s) kept)\n")
+                  f"({len(snaps)} IR still(s) kept"
+                  f"{', .lmt kept' if kept_raw else ''})\n")
             return result
 
         final = finalize_pose_name(path, recorder.hands_seen)

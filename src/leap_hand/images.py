@@ -392,11 +392,26 @@ class HandTrail:
     clock, so "what did the tracker see in this photo" means "the tracking
     event nearest this image's timestamp". Hands arrive one at a time from
     `LeapStream.drain()`, so they are regrouped by `frame_id` here.
+
+    `PAIR_WINDOW_MS` is what keeps a sidecar honest. Both streams run at about
+    90 Hz and the trail is drained either side of every capture, so a genuine
+    pairing lands within a few milliseconds. Without the window, a still taken
+    while nothing is tracked would be matched to whatever hand was last seen —
+    possibly minutes and a whole condition ago — and the photograph would
+    claim a hand that was not there, which is the one mistake this file exists
+    to prevent.
     """
+
+    # Nearest tracking event further away than this counts as "no hand".
+    PAIR_WINDOW_MS = 100.0
 
     def __init__(self, maxlen: int = 900):
         # [(timestamp_us, frame_id, [hand dicts])], oldest first
         self._frames = deque(maxlen=maxlen)
+
+    def clear(self) -> None:
+        """Forget everything — call between conditions of an experiment."""
+        self._frames.clear()
 
     def add(self, lh) -> None:
         entry = {
@@ -410,18 +425,24 @@ class HandTrail:
             return
         self._frames.append((int(lh.timestamp_us), int(lh.frame_id), [entry]))
 
-    def nearest(self, timestamp_us: int):
+    def nearest(self, timestamp_us: int, window_ms: Optional[float] = None):
         """(hands, dt_ms) for the tracking event nearest `timestamp_us`.
 
         `dt_ms` is the tracking event's time minus the image's, so a positive
         value means the tracker's frame is the later of the two. Returns
-        `([], None)` when no hand has been seen at all.
+        `([], None)` when no hand has been seen, or when the nearest one is
+        further away than `window_ms` (default `PAIR_WINDOW_MS`) — a stale
+        hand is not evidence about this photograph.
         """
         if not self._frames:
             return [], None
+        limit = self.PAIR_WINDOW_MS if window_ms is None else window_ms
         ts, _fid, hands = min(self._frames,
                               key=lambda f: abs(f[0] - timestamp_us))
-        return list(hands), (ts - timestamp_us) / 1000.0
+        dt_ms = (ts - timestamp_us) / 1000.0
+        if abs(dt_ms) > limit:
+            return [], None
+        return list(hands), dt_ms
 
 
 def write_snapshot(out_dir, label: str, index: int, pair: ImagePair,
