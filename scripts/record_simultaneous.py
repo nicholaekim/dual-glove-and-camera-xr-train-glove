@@ -562,11 +562,24 @@ class LeapSyncSession(SyncSession):
         if now - self._hud_at < self.HUD_EVERY:
             return
         glove_0, hands_0 = self._hud_mark
-        seen = ",".join(sorted(self._sides)) or "none"
-        print(f"      {'REC' if rec else '   '} [leap] hands {seen:<11}"
-              f"{self._framerate:5.1f} Hz   "
-              f"{self.hand_total - hands_0:>4} hands/s, "
-              f"{self.glove_total - glove_0:>4} glove/s", flush=True)
+        seen = ",".join(sorted(self._sides))
+        # The stream counts every tracking event, hand or no hand, so the HUD
+        # can tell "camera running, nothing in view" from "camera dead". A
+        # bare "0.0 Hz" read as a dead camera and cost a whole first session.
+        cam_frames = int(getattr(self.leap, "frames", 0) or 0)
+        cam_new = cam_frames - getattr(self, "_cam_frames_mark", 0)
+        self._cam_frames_mark = cam_frames
+        rate = float(getattr(self.leap, "framerate", 0.0) or self._framerate)
+        if seen:
+            cam_text = f"tracking {seen}"
+        elif cam_new > 0 or rate > 0:
+            cam_text = "running, NO HAND IN VIEW"
+        else:
+            cam_text = "NO FRAMES - check the camera"
+        print(f"      {'REC' if rec else '   '} camera: {cam_text:<28}"
+              f"{rate:5.1f} Hz {self.hand_total - hands_0:>4} hands/s"
+              f"  |  glove: {self.glove_total - glove_0:>4} packets/s",
+              flush=True)
         self._hud_at = now
         self._hud_mark = (self.glove_total, self.hand_total)
         self._sides = set()
@@ -575,10 +588,18 @@ class LeapSyncSession(SyncSession):
         print("Waiting for BOTH sensors on the SAME hand "
               "(glove packets + that hand tracked)...")
         print("  Glove on, hand 20 to 50 cm above the module, lenses up.")
+        print("  >>> HOLD THE GLOVED HAND OVER THE CAMERA NOW, palm down. <<<")
+        print("  The session starts by itself the moment the camera tracks it.")
         t0 = time.time()
+        nagged = t0
         self.glove_sides, self.cam_sides = set(), set()
         while time.time() - t0 < timeout:
             self.tick()
+            if not self.cam_sides and time.time() - nagged > 6.0:
+                nagged = time.time()
+                beep(440, 120)
+                print("  ... still no hand tracked: 20 to 30 cm above the "
+                      "lenses, palm facing down, fingers open.", flush=True)
             if (self.glove_total >= 10 and self.hand_total >= 10
                     and (self.glove_sides & self.cam_sides)):
                 shared = hands_text(self.glove_sides & self.cam_sides)
