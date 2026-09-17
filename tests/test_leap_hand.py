@@ -1586,10 +1586,17 @@ def test_an_id_change_during_the_settle_retries_and_leaves_no_file(
     meta = _meta(out_dir)
     assert meta["attempts"] == 2, "the first attempt must have been retried"
     assert meta["hand_id"] == 5002, "the retry re-acquires under the new id"
-    # exactly one take on each side: the abandoned attempt left nothing at all
+    assert meta["accepted"] is True
+    # exactly one take on each side: the session folder holds the take that
+    # stood and nothing else
     assert len(_takes(out_dir, "leap")) == 1
     assert len(_takes(out_dir, "glove")) == 1
     assert {r["hand_id"] for r in _rows(_takes(out_dir, "leap")[0])} == {5002}
+    # Nothing under rejected/ either: this attempt died during the SETTLE,
+    # before either file was opened, so there is no recording to set aside.
+    # (An attempt that fails once recording has started is moved there — see
+    # test_a_take_the_hand_flickered_through_is_not_complete.)
+    assert not (out_dir / "rejected").exists()
 
 
 def test_a_take_the_hand_flickered_through_is_not_complete(tmp_path: Path,
@@ -1598,7 +1605,8 @@ def test_a_take_the_hand_flickered_through_is_not_complete(tmp_path: Path,
 
     Here the id never changes — the hand simply keeps dropping out for a third
     of a second at a time. Coverage is what catches it, and a take under 90 %
-    is discarded rather than written and blamed on the glove later.
+    is set aside under `rejected/` rather than written into the session and
+    blamed on the glove later.
     """
     def plan(t):
         if 1.2 <= t < 1.55 or 1.9 <= t < 2.25 or 2.6 <= t < 2.95:
@@ -1613,6 +1621,13 @@ def test_a_take_the_hand_flickered_through_is_not_complete(tmp_path: Path,
     assert _takes(out_dir, "leap") == [], "an incomplete take is not kept"
     assert _takes(out_dir, "glove") == []
     assert sorted((out_dir / "leap").glob("*.meta.json")) == []
+    # ...and it is still on disk, under rejected/, with the reason attached
+    aside = _takes(out_dir / "rejected", "leap")
+    assert len(aside) == 1
+    import json as _json
+    why = _json.loads(aside[0].with_name(aside[0].stem + ".meta.json")
+                      .read_text(encoding="utf-8"))
+    assert why["accepted"] is False and "covered only" in why["why"]
 
 
 def test_a_clean_take_records_its_coverage_and_how_it_was_got(tmp_path: Path,

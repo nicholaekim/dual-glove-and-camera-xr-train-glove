@@ -94,6 +94,7 @@ from leap_hand.protocol import (
     parse_band,
     parse_schedule,
     read_hand,
+    view_caption,
 )
 from leap_hand.recorder import LeapRecorder
 from leap_hand.stats import analyse_paths
@@ -175,11 +176,14 @@ class GateRun:
         fresh = self._reading if now - self._reading_at < HUD_STALE_S else None
         expected = self.hand or (fresh.hand_side if fresh else "hand")
         if self.view is not None:
-            secs = ("" if seconds_left is None
-                    else f"   {max(0.0, seconds_left):.0f}s")
-            what = "HOLD: " + pose.replace("_", " ").upper() if pose else ""
-            self.view.caption(f"{phase.upper()}  {what}{secs}".strip(),
-                              band=band)
+            # The same caption builder the coached recorder uses, so the two
+            # windows cannot drift apart. `stay=False`: this session runs a
+            # timed schedule where open_palm can follow a fist and really does
+            # mean "open your hand now".
+            self.view.caption(
+                view_caption(phase, pose, seconds_left=seconds_left,
+                             stay=False),
+                band=band)
         self.hud.show(
             hud_line(phase, seconds_left, fresh, expected, band,
                      saw_other_hand=now - self._other_at < HUD_STALE_S,

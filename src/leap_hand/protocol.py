@@ -515,6 +515,174 @@ def hud_line(phase: str, seconds_left: Optional[float],
     return line
 
 
+# --- the window's caption ----------------------------------------------------
+# The operator's eyes are on the camera window, not on the terminal. Until
+# 2026-09-17 the window's caption was `f"{phase}  {extra}{secs}"` and `extra`
+# is empty during SETTLE and REC, so the window said "SETTLE   1s" and never
+# once named the pose — "NOW: FIST" was printed to a terminal nobody was
+# looking at. Nine of that session's 36 takes hold the wrong pose, on both
+# sensors at once. So the caption is a function, with tests, and every phase
+# of it says which pose is wanted.
+#
+# The window is 768 px wide and the caption is drawn at font scale 0.75, which
+# is about 60 characters. Everything here is built to fit that.
+WRONG_POSE = "WRONG POSE"
+
+
+def pose_label(pose: str, stay: bool = True) -> str:
+    """`fist` -> `FIST`; `open_palm` -> `OPEN PALM (stay)`.
+
+    In the coached recorder the hand is ALREADY open when the pose is called
+    — every take is acquired open palm — so "NOW: OPEN PALM" reads as an
+    instruction to change something, and `(stay)` is the whole difference
+    between an operator who moves and one who does not. `stay=False` for a
+    caller whose hand is not coming from an open palm: the gate runs a timed
+    schedule where `open_palm` can follow a fist and really does mean open.
+    """
+    if not pose:
+        return ""
+    text = str(pose).replace("_", " ").upper()
+    return f"{text} (stay)" if (stay and str(pose) == "open_palm") else text
+
+
+def view_caption(phase: str, pose: str, extra: str = "",
+                 seconds_left: Optional[float] = None,
+                 take: Optional[int] = None,
+                 takes: Optional[int] = None,
+                 stay: bool = True) -> str:
+    """The one line on the camera window. Names the pose in EVERY phase.
+
+        ACQUIRE   OPEN PALM first   next: FIST (take 2/3)
+        SETTLE    NOW: FIST   1s
+        REC       HOLD: FIST   REC 4s
+
+    ACQUIRE leads with what the hand has to do NOW (open) and then what is
+    coming, because a hand that is already closed cannot be acquired at all —
+    that is the measured failure the whole protocol is built around. SETTLE
+    and REC lead with the pose, because by then it is the only thing left to
+    get wrong.
+    """
+    ph = str(phase or "").upper()
+    secs = ("" if seconds_left is None
+            else f"{max(0.0, float(seconds_left)):.0f}s")
+    label = pose_label(pose, stay)
+    extra = (extra or "").strip()
+
+    if ph == WRONG_POSE:
+        return f"{WRONG_POSE}: {extra}" if extra else WRONG_POSE
+    if ph == "ACQUIRE":
+        parts = ["OPEN PALM first"]
+        if label:
+            nxt = f"next: {label}"
+            if take and takes:
+                nxt += f" (take {take}/{takes})"
+            parts.append(nxt)
+        if extra:
+            parts.append(extra)
+        if secs:
+            parts.append(secs)
+        return "   ".join(parts)
+    if ph == "SETTLE":
+        parts = [f"NOW: {label}" if label else "NOW"]
+        if secs:
+            parts.append(secs)
+        if extra:
+            parts.append(extra)
+        return "   ".join(parts)
+    if ph == "REC":
+        parts = [f"HOLD: {label}" if label else "HOLD"]
+        parts.append(f"REC {secs}" if secs else "REC")
+        if extra:
+            parts.append(extra)
+        return "   ".join(parts)
+    parts = [ph] if ph else []
+    if label:
+        parts.append(label)
+    if extra:
+        parts.append(extra)
+    if secs:
+        parts.append(secs)
+    return "   ".join(parts)
+
+
+# --- the status file the window is driven through ----------------------------
+# One tiny text file, rewritten only when something changes. Line 1 is the
+# caption; the rest are `key=value` and may be in any order, so a new key can
+# be added without the viewer and the recorder having to agree on line
+# numbers. `__quit__` as the caption closes the window.
+QUIT = "__quit__"
+
+
+def status_text(caption: str, band=None, snap=None) -> str:
+    """The status file's contents, as the viewer parses them back."""
+    body = (caption or "").strip()
+    if band:
+        body += f"\nband={band[0]:g},{band[1]:g}"
+    if snap:
+        body += f"\nsnap={snap}"
+    return body
+
+
+def parse_status(text: str):
+    """`status_text` backwards: (caption, band or None, snap or None).
+
+    Unknown keys and malformed values are ignored rather than raising: the
+    viewer is a child process watching a file that the parent may be halfway
+    through rewriting, and a viewer that dies on a torn read is worse than
+    one that shows the previous caption for another 30 ms.
+    """
+    lines = (text or "").splitlines()
+    caption = lines[0].strip() if lines else ""
+    band = None
+    snap = None
+    for line in lines[1:]:
+        line = line.strip()
+        if line.startswith("band="):
+            try:
+                low, high = (float(v) for v in line[5:].split(","))
+            except ValueError:
+                continue
+            if low < high:
+                band = (low, high)
+        elif line.startswith("snap="):
+            snap = line[5:].strip() or None
+    return caption, band, snap
+
+
+# --- stream health -----------------------------------------------------------
+def stream_health(times: Sequence[float], t0: Optional[float] = None,
+                  t1: Optional[float] = None,
+                  gap_s: float = 0.1) -> dict:
+    """Rate, longest hole and number of holes for one sensor over one take.
+
+    Recorded because a take can be complete by every other measure and still
+    be missing seconds of one sensor: the glove was throttled to 5 Hz by
+    default, which is 24 frames in a five-second take, and 24 frames cannot
+    tell a steady stream from one that stopped for three seconds. The rate is
+    measured between the first and last frame — the cadence the frames
+    actually arrived at — while the holes are measured against the take's own
+    window when one is given, so a stream that starts late is not flattered
+    by its own first frame.
+    """
+    marks = sorted(float(t) for t in times if t is not None)
+    out = {"frames": len(marks), "rate_hz": None, "max_gap_ms": None,
+           "gaps_over_ms": round(gap_s * 1000.0), "gaps_over": 0}
+    if not marks:
+        if t0 is not None and t1 is not None and t1 > t0:
+            out["max_gap_ms"] = round((t1 - t0) * 1000.0, 1)
+            out["gaps_over"] = 1
+        return out
+    span = marks[-1] - marks[0]
+    if len(marks) > 1 and span > 0:
+        out["rate_hz"] = round((len(marks) - 1) / span, 2)
+    edges = ([float(t0)] if t0 is not None else []) + marks + (
+        [float(t1)] if t1 is not None else [])
+    holes = [b - a for a, b in zip(edges, edges[1:])]
+    out["max_gap_ms"] = round(max(holes, default=0.0) * 1000.0, 1)
+    out["gaps_over"] = sum(1 for h in holes if h > gap_s)
+    return out
+
+
 class Hud:
     """Rewrites one terminal line in place, at most `every` seconds apart."""
 
@@ -614,6 +782,12 @@ class CameraView:
         self._proc = None
         self._status = None
         self._last = None
+        # The caption and the snapshot request share one file, so each is
+        # remembered here and the file is rewritten from both. Otherwise
+        # asking for a still would blank the caption for a frame, at the exact
+        # moment the still is taken.
+        self._caption = ""
+        self._snap = None
 
     def start(self):
         if not self.enabled or self._proc is not None:
@@ -640,11 +814,35 @@ class CameraView:
     def caption(self, text, band=None):
         """Set the window's caption (and optionally its height band). Cheap to
         call every HUD refresh: the file is only rewritten when it changes."""
+        self._caption = (text or "").strip()
+        self._write_status(band)
+
+    def snapshot(self, path):
+        """Ask the window to save its next composed frame to `path`, once.
+
+        The take's own evidence: the IR image, the fitted skeleton and the
+        caption that was on screen, as one JPEG, so a verdict about which
+        pose was held can be checked against a picture of the hand instead of
+        against two files of numbers. The viewer writes it and forgets it;
+        asking for the same path twice does nothing.
+
+        A no-op with no window (the mocks, `--no-view`), like every other
+        method here.
+        """
+        if not self.enabled or self._status is None or not path:
+            return None
+        self._snap = str(Path(path))
+        try:
+            Path(self._snap).parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        self._write_status(self.band)
+        return self._snap
+
+    def _write_status(self, band=None):
         if not self.enabled or self._status is None:
             return
-        body = text.strip()
-        if band:
-            body += f"\nband={band[0]:g},{band[1]:g}"
+        body = status_text(self._caption, band, self._snap)
         if body == self._last:
             return
         self._last = body
@@ -656,7 +854,7 @@ class CameraView:
     def close(self):
         if self._status is not None:
             try:
-                self._status.write_text("__quit__", encoding="utf-8")
+                self._status.write_text(QUIT, encoding="utf-8")
             except OSError:
                 pass
         if self._proc is not None:

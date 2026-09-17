@@ -41,6 +41,16 @@ is: acquire the expected hand open and steady, beep, call the pose, let the
 tracker follow it through the transition, and record only if the same hand id
 survived. See `leap_hand.protocol` for the numbers and why they are those.
 
+And then, because a surviving hand id says nothing about what the hand was
+DOING: the take is refused if both sensors say the hand was not in the pose
+that was asked for (`leap_hand.pose_check`). That check exists because the
+session of 2026-09-17 produced 9 takes out of 36 holding the wrong pose, with
+both sensors agreeing — the window never named the pose, so the operator was
+working from memory. A refused attempt is MOVED to `<out-dir>/rejected/`,
+never deleted: the two sensors being evaluated are the ones vetoing the take,
+so the exclusions have to stay countable. `--no-pose-check` turns it off, and
+it is off for mock sensors, whose hand shape does not follow the pose called.
+
 Needs XR Trainer streaming to 127.0.0.1:9002 plus the camera. Rehearse the
 whole thing with no hardware at all:
 
@@ -78,6 +88,7 @@ from leap_hand.protocol import (
     DEFAULT_BAND,
     DEFAULT_RETRIES,
     DEFAULT_SETTLE,
+    WRONG_POSE,
     AsyncBeeper,
     Hud,
     acquire_failures,
@@ -87,7 +98,19 @@ from leap_hand.protocol import (
     hud_line,
     median,
     parse_band,
+    pose_label,
     read_hand,
+    stream_health,
+    view_caption,
+)
+from leap_hand.pose_check import (
+    DEFAULT_PARAMS,
+    MISMATCH,
+    UNCHECKED,
+    PoseCheck,
+    check_pose,
+    read_take,
+    short_summary,
 )
 from leap_hand.recorder import LeapRecorder
 from leap_hand.stream import LeapUnavailable, open_stream
@@ -115,6 +138,17 @@ LOST_S = 0.50
 # sensor that never stops delivering cannot pin us here.
 MAX_DRAIN_ROUNDS = 8
 CAM_BUFFER_FRAMES = 2             # webcam frames to grab and drop
+# How long "WRONG POSE: saw X, want Y" stays on the window before the retry
+# starts. Long enough to read while your hands are still over the module.
+WRONG_POSE_SECONDS = 2.0
+# A glove hole longer than this is called out after the take. 250 ms is 15
+# frames of a 60 Hz stream in a row: a dropout, not jitter.
+GLOVE_GAP_WARN_S = 0.25
+# Where a rejected attempt goes. NOT deleted: the two sensors under
+# evaluation are the ones judging the take, so every exclusion has to stay on
+# disk where it can be counted, looked at and argued with.
+REJECTED = "rejected"
+STILLS = "stills"
 POSE_HINTS = {
     "open_palm": "all five fingers extended and spread",
     "fist": "all fingers curled into a tight fist",
@@ -691,6 +725,15 @@ class Attempt:
     rejected_chirality: int = 0
     second_hand: int = 0
     file: str = ""
+    # Was the hand actually in the pose that was asked for? See
+    # `leap_hand.pose_check`; None until the take has survived everything else.
+    check: Optional[PoseCheck] = None
+    # How the glove stream behaved over the take: rate, longest hole, holes.
+    glove_health: Optional[dict] = None
+    # The one still the camera window saved, and where the attempt's files
+    # ended up if it was rejected. Both relative to the session folder.
+    still: str = ""
+    rejected_to: str = ""
 
 
 @dataclass
@@ -752,7 +795,8 @@ class CoachedLeapSession(LeapSyncSession):
     def __init__(self, leap_source, glove_source, hz, out_dir: Path,
                  leap_hz=None, hand: str = "left", band=DEFAULT_BAND,
                  settle: float = DEFAULT_SETTLE, retries: int = DEFAULT_RETRIES,
-                 acquire_timeout: float = 60.0):
+                 acquire_timeout: float = 60.0, pose_check: bool = True,
+                 pose_check_params=DEFAULT_PARAMS):
         super().__init__(leap_source, glove_source, hz=hz, out_dir=out_dir,
                          leap_hz=leap_hz)
         self.hand = hand
@@ -760,6 +804,17 @@ class CoachedLeapSession(LeapSyncSession):
         self.settle = float(settle)
         self.retries = int(retries)
         self.acquire_timeout = float(acquire_timeout)
+        self.pose_check = bool(pose_check)
+        # Named and passed in rather than reached for, exactly like
+        # `cam_hand.fusion.GateParams`: a threshold nobody can substitute is a
+        # threshold nobody can test against a different hand.
+        self.pose_check_params = pose_check_params
+        self.rejected_dir = out_dir / REJECTED
+        self.stills_dir = out_dir / STILLS
+        # Every attempt the pose check threw out, as (pose, what was seen).
+        # Printed per pose at the end: the sensors are the arbiter here, so
+        # how often they vetoed a take is part of the session's result.
+        self.pose_rejects: List[tuple] = []
 
         # Counted for the whole session and per attempt (see `_mark`).
         self.rejected_chirality = 0      # camera hands of the OTHER side
@@ -773,6 +828,13 @@ class CoachedLeapSession(LeapSyncSession):
         self._phase = "start"
         self._deadline: Optional[float] = None
         self._hud_extra = ""
+        # What the window is currently asking for. Held on the session because
+        # the HUD refreshes four times a second from `tick`, nowhere near the
+        # code that knows which take is running — which is exactly why the
+        # window used to say "SETTLE   1s" and never name the pose at all.
+        self._pose = ""
+        self._take: Optional[int] = None
+        self._takes: Optional[int] = None
         # The latest reading of the expected hand, and when it arrived. Held
         # with its timestamp rather than cleared, so the HUD can tell "the
         # hand is gone" from "no frame has been drained this millisecond".
@@ -869,14 +931,19 @@ class CoachedLeapSession(LeapSyncSession):
             self._rate_at, self._rate_mark = now, self.glove_total
         left = None if self._deadline is None else self._deadline - now
         if self.view is not None:
-            secs = "" if left is None else f"   {max(0.0, left):.0f}s"
             self.view.caption(
-                f"{self._phase.upper()}  {self._hud_extra}{secs}".strip(),
+                view_caption(self._phase, self._pose, self._hud_extra, left,
+                             self._take, self._takes),
                 band=self.band)
+        # The terminal line names the pose too, in the phases where the window
+        # used to be the only thing that could have.
+        extra = self._hud_extra
+        if not extra and self._phase in ("SETTLE", "REC") and self._pose:
+            extra = f"HOLD: {pose_label(self._pose)}"
         self.hud.show(hud_line(self._phase, left, fresh, self.hand, self.band,
                                self._glove_hz,
                                saw_other_hand=now - self._other_at < HUD_STALE_S,
-                               extra=self._hud_extra), now)
+                               extra=extra), now)
 
     def _say(self, *lines: str) -> None:
         """Print above the HUD line, leaving the HUD to reopen underneath."""
@@ -962,14 +1029,27 @@ class CoachedLeapSession(LeapSyncSession):
                     f"{self.acquire_timeout:g} s ({self._hud_extra})")
 
     def _hold(self, phase: str, seconds: float, cam_rec=None,
-              glove_rec=None) -> str:
-        """Tick for `seconds`, watching the pinned hand. "" = it survived."""
+              glove_rec=None, snap=None) -> str:
+        """Tick for `seconds`, watching the pinned hand. "" = it survived.
+
+        `snap` is a path for the camera window to save one composed frame to,
+        taken at the MIDPOINT of the phase: the hand is settled by then and
+        the take is not yet over, so the still shows the pose that the two
+        files claim to contain. It is the only evidence in the session that
+        does not come from the same two sensors that judge it.
+        """
         self._phase = phase
         t_end = time.time() + seconds
         self._deadline = t_end
+        midpoint = t_end - seconds / 2.0
         while time.time() < t_end:
             self.tick(cam_rec, glove_rec)
-            reason = self._lost_reason(time.time())
+            now = time.time()
+            if snap and now >= midpoint:
+                if self.view is not None:
+                    self.view.snapshot(snap)
+                snap = None
+            reason = self._lost_reason(now)
             if reason:
                 return reason
         return ""
@@ -994,6 +1074,8 @@ class CoachedLeapSession(LeapSyncSession):
                            second_hand=self.second_hand - before[1])
 
         name = pose_filename(pose, take)          # one name, two files
+        stem = name[:-len(".jsonl")]
+        still = self.stills_dir / f"{stem}.jpg"
         cam_rec = self.make_cam_recorder(pose, take)
         glove_rec = StampedFrameRecorder(hz=self.hz, pose=pose, take=take)
         self._heights, self._angles, self._times = [], [], []
@@ -1003,16 +1085,18 @@ class CoachedLeapSession(LeapSyncSession):
         self.beeper.beep(1400, 120)
         t0 = time.time()
         try:
-            lost = self._hold("REC", duration, cam_rec, glove_rec)
+            lost = self._hold("REC", duration, cam_rec, glove_rec, snap=still)
         except BaseException:
             # Ctrl+C included. An interrupted take is an unverified take, and
             # the whole point of this session is that unverified takes do not
-            # reach the disk.
+            # reach the disk. Deleted rather than moved to `rejected/`: the
+            # operator stopped mid-recording, so there is no verdict to audit.
             cam_rec.stop()
             glove_rec.stop()
             self._deadline = None
             (self.cam_dir / name).unlink(missing_ok=True)
             (self.glove_dir / name).unlink(missing_ok=True)
+            still.unlink(missing_ok=True)
             raise
         cam_rec.stop()
         glove_rec.stop()
@@ -1028,7 +1112,15 @@ class CoachedLeapSession(LeapSyncSession):
             median_view_deg=median(self._angles),
             rejected_chirality=self.rejected_chirality - before[0],
             second_hand=self.second_hand - before[1],
+            still=still.name if still.is_file() else "",
         )
+        # Read the glove file back rather than counting frames: `glove_frames`
+        # cannot tell a steady stream from one that stopped for three seconds
+        # in the middle, and a take whose glove went quiet is a take whose
+        # fused numbers are an interpolation nobody asked for.
+        glove_read = read_take(self.glove_dir / name, self.hand)
+        got.glove_health = stream_health(glove_read.times, t0,
+                                         min(t1, t0 + duration))
         if lost:
             got.why = f"{lost} during the take"
         elif got.coverage < COMPLETE_COVERAGE:
@@ -1038,23 +1130,110 @@ class CoachedLeapSession(LeapSyncSession):
         else:
             got.complete = True
 
+        # Only now, on a take that survived the tracking checks, is it worth
+        # asking the expensive question: was the hand in the right SHAPE?
+        if got.complete:
+            got.check = self._check_shape(pose, name, glove_read)
+            if got.check.verdict == MISMATCH:
+                got.complete = False
+                got.why = got.check.description
+                self.pose_rejects.append((pose, got.check.seen))
+                self._announce_wrong_pose(got.check)
+
         if not got.complete:
-            # Both files, so a thrown-away attempt leaves nothing on disk that
-            # a later analysis could mistake for a take.
-            (self.cam_dir / name).unlink(missing_ok=True)
-            (self.glove_dir / name).unlink(missing_ok=True)
+            got.rejected_to = self._reject(name, stem, attempt, got)
             return got
 
         final = cam_finalize(self.cam_dir / name, {self.hand})
         cam_finalize(self.glove_dir / name, {self.hand})
         got.file = final.name
+        got.still = self._rename_still(still, final.stem)
+        if (got.glove_health.get("max_gap_ms") or 0) > GLOVE_GAP_WARN_S * 1000:
+            self._say(f"      ! the glove stream stopped for "
+                      f"{got.glove_health['max_gap_ms']:.0f} ms during this "
+                      f"take ({got.glove_health['rate_hz']} Hz overall)")
         return got
+
+    # --- the pose check --------------------------------------------------
+    def _check_shape(self, pose: str, name: str, glove_read) -> PoseCheck:
+        """Is the hand in `pose`? Read both files back and ask `pose_check`.
+
+        The recorders keep nothing in memory — one line is built, written and
+        forgotten — so the take is read back off the disk. That is also the
+        honest thing to check: it verifies the bytes that were actually
+        written, not a parallel copy of them.
+        """
+        if not self.pose_check:
+            return PoseCheck(
+                pose=pose, verdict=UNCHECKED,
+                description="the pose check is off for this session")
+        return check_pose(pose, glove_read,
+                          read_take(self.cam_dir / name, self.hand),
+                          self.pose_check_params)
+
+    def _announce_wrong_pose(self, check: PoseCheck) -> None:
+        """Say it on the window and in the terminal, long enough to read."""
+        self._say(f"      WRONG POSE: {short_summary(check)}",
+                  f"      {check.description}")
+        self._phase, self._hud_extra = WRONG_POSE, short_summary(check)
+        self._deadline = None
+        t_end = time.time() + WRONG_POSE_SECONDS
+        while time.time() < t_end:
+            self.tick()
+        self._hud_extra = ""
+
+    # --- what happens to an attempt that did not stand --------------------
+    def _reject(self, name: str, stem: str, attempt: int, got: Attempt) -> str:
+        """Move both files of a failed attempt under `rejected/`. Never delete.
+
+        The old behaviour was to unlink them, which was right while the only
+        thing that could fail a take was the tracker losing the hand. It is
+        not right now that the two sensors being evaluated also decide which
+        takes survive: an exclusion nobody can look at is an exclusion nobody
+        can check. So the files move, keep their name plus which attempt they
+        were, and get a `meta.json` saying `accepted: false` and why.
+        """
+        target = f"{stem}_attempt{attempt}"
+        moved = []
+        for folder in (self.cam_dir, self.glove_dir):
+            src = folder / name
+            if not src.is_file():
+                continue
+            dst = self.rejected_dir / folder.name / f"{target}.jsonl"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src.replace(dst)
+            moved.append(dst)
+        still = self.stills_dir / f"{stem}.jpg"
+        still_name = ""
+        if still.is_file():
+            dst = self.rejected_dir / STILLS / f"{target}.jpg"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            still.replace(dst)
+            still_name = dst.name
+        if not moved:
+            return ""
+        meta = self.rejected_dir / self.cam_dir.name / f"{target}.meta.json"
+        meta.write_text(json.dumps(
+            self._meta_dict(got, accepted=False, file=f"{target}.jsonl",
+                            still=still_name, attempts=attempt),
+            indent=2) + "\n", encoding="utf-8")
+        return str(Path(REJECTED) / self.cam_dir.name / f"{target}.jsonl")
+
+    @staticmethod
+    def _rename_still(still: Path, final_stem: str) -> str:
+        """Keep the still's name matched to the take's, as the pair is."""
+        if not still.is_file():
+            return ""
+        final = still.with_name(f"{final_stem}.jpg")
+        still.replace(final)
+        return final.name
 
     # --- one take --------------------------------------------------------
     def run_take(self, pose: str, take: int, n_takes: int, pose_idx: int,
                  n_poses: int, duration: float, prep: float) -> None:
         self._warned = set()
         title = pose.replace("_", " ").upper()
+        self._pose, self._take, self._takes = pose, take, n_takes
         self._say("", f"--- Pose {pose_idx}/{n_poses}: {title}  "
                       f"(take {take}/{n_takes}, {self.hand} hand) ---")
         result = TakeResult(pose=pose, take=take)
@@ -1092,26 +1271,26 @@ class CoachedLeapSession(LeapSyncSession):
             self._pinned_id = None
             self.takes.append(result)
             self._write_meta(result)
+            self._pose = ""
 
-    def _write_meta(self, result: TakeResult) -> None:
-        """`<take>.meta.json`: how the take was got, beside the take itself.
+    def _meta_dict(self, got: Attempt, accepted: bool, file: str,
+                   still: str, attempts: int) -> dict:
+        """Everything known about one attempt, accepted or not.
 
-        Only for a take that produced a file — there is nothing for a failed
-        take to sit beside, and the session summary is where those are
-        reported. Everything here is a fact about the capture, which is what
-        the fusion gates and the next session's protocol both read.
+        One builder for both, so a rejected attempt is described in exactly
+        the same terms as a kept one and the two can be counted together.
+        `accepted` is the only field that says which it is.
         """
-        got = result.final
-        if not (result.complete and got and got.file):
-            return
-        path = self.cam_dir / (got.file[:-len(".jsonl")] + ".meta.json")
-        path.write_text(json.dumps({
+        health = got.glove_health or {}
+        return {
+            "accepted": bool(accepted),
             "hand": self.hand,
-            "pose": result.pose,
-            "take": result.take,
+            "pose": self._pose,
+            "take": self._take,
             "hand_id": got.hand_id,
             "coverage": round(got.coverage, 4),
-            "attempts": result.attempts,
+            "attempts": attempts,
+            "why": got.why,
             "median_height_cm": (None if got.median_height_cm is None
                                  else round(got.median_height_cm, 1)),
             "median_view_angle_deg": (None if got.median_view_deg is None
@@ -1122,8 +1301,36 @@ class CoachedLeapSession(LeapSyncSession):
             "settle_s": self.settle,
             "cam_frames": got.cam_frames,
             "glove_frames": got.glove_frames,
-            "file": got.file,
-        }, indent=2) + "\n", encoding="utf-8")
+            # The glove stream's own health over this take: the rate it
+            # actually delivered at, its longest hole, and how many holes.
+            "glove_rate_hz": health.get("rate_hz"),
+            "glove_max_gap_ms": health.get("max_gap_ms"),
+            "glove_gaps_over_100ms": health.get("gaps_over"),
+            "pose_check": (got.check.as_dict() if got.check is not None
+                           else None),
+            # Relative to the session folder, and it never leaves it: a still
+            # of the IR image has the operator in it.
+            "still": (str((Path(STILLS) if accepted
+                           else Path(REJECTED) / STILLS) / still)
+                      if still else None),
+            "file": file,
+        }
+
+    def _write_meta(self, result: TakeResult) -> None:
+        """`<take>.meta.json`: how the take was got, beside the take itself.
+
+        Only for a take that produced a file — a rejected attempt gets its own
+        meta.json under `rejected/` at the moment it is rejected, which is
+        where the ones that did not stand are counted from.
+        """
+        got = result.final
+        if not (result.complete and got and got.file):
+            return
+        path = self.cam_dir / (got.file[:-len(".jsonl")] + ".meta.json")
+        path.write_text(json.dumps(
+            self._meta_dict(got, accepted=True, file=got.file,
+                            still=got.still, attempts=result.attempts),
+            indent=2) + "\n", encoding="utf-8")
 
     # --- the end ---------------------------------------------------------
     def finish(self) -> None:
@@ -1157,6 +1364,19 @@ class CoachedLeapSession(LeapSyncSession):
             attempts = sum(r.attempts for r in rows)
             print(f"  {pose:<12} {len(ok)}/{len(rows)} complete "
                   f"({attempts} attempt(s)){note}")
+        if self.pose_rejects:
+            by_pose: dict = {}
+            for pose, seen in self.pose_rejects:
+                by_pose.setdefault(pose, []).append(seen)
+            print(f"\n  attempts rejected by the pose check: "
+                  f"{len(self.pose_rejects)}  (kept under "
+                  f"{self.rejected_dir.name}\\, never deleted)")
+            for pose, seens in by_pose.items():
+                shapes = ", ".join(sorted(set(seens)))
+                print(f"    {pose:<12} {len(seens):>2}   the hand was "
+                      f"{shapes.lower()}")
+        elif self.pose_check:
+            print("\n  attempts rejected by the pose check: 0")
         print(f"\n  camera hands dropped as the wrong chirality: "
               f"{self.rejected_chirality}")
         print(f"  camera hands dropped as a second hand in view:  "
@@ -1170,8 +1390,16 @@ class CoachedLeapSession(LeapSyncSession):
         if done:
             print(f"\n  glove files: {self.glove_dir}")
             print(f"  cam files:   {self.cam_dir}   (+ <take>.meta.json)")
+            if self.stills_dir.is_dir():
+                print(f"  stills:      {self.stills_dir}   (one per take, "
+                      "what the window saw mid-record)")
             print(f"  fuse + compare:  python scripts/fuse_poses.py "
                   f"{self.out_dir}")
+            print(f"  re-check labels: python scripts/check_take_labels.py "
+                  f"{self.out_dir}")
+        if self.rejected_dir.is_dir():
+            print(f"\n  rejected attempts kept in: {self.rejected_dir}"
+                  "   (fuse_poses and check_take_labels ignore it)")
         failed = [p for p, rows in by_pose.items()
                   if any(not r.complete for r in rows)]
         if failed:
@@ -1188,8 +1416,10 @@ def main() -> None:
     p.add_argument("--takes", type=int, default=3)
     p.add_argument("--duration", type=float, default=5.0)
     p.add_argument("--prep", type=float, default=5.0)
-    p.add_argument("--hz", type=float, default=5.0,
-                   help="frames saved per second per hand, both sensors (0 = all)")
+    p.add_argument("--hz", type=float, default=None,
+                   help="glove frames saved per second per hand (0 = all). "
+                        "Default: every frame with --camera leap, 5 with the "
+                        "webcam backend")
     p.add_argument("--out-dir", type=Path, default=Path("recordings") / "sync")
     p.add_argument("--camera", default="0",
                    help="webcam index (0, 1, ...) for the MediaPipe backend, "
@@ -1242,6 +1472,10 @@ def main() -> None:
     p.add_argument("--no-view", action="store_true",
                    help="do not open the live camera window (--camera leap; it "
                         "is never opened for --mock-leap)")
+    p.add_argument("--no-pose-check", action="store_true",
+                   help="record the take even when the hand is not in the "
+                        "pose that was asked for (the check is off for mock "
+                        "sensors either way — see below)")
     args = p.parse_args()
 
     poses = [slugify(x) for x in args.poses.split(",") if slugify(x)]
@@ -1277,6 +1511,27 @@ def main() -> None:
         raise SystemExit(str(e))
     coached = backend == LEAP and args.hand in ("left", "right")
 
+    # The glove is kept at FULL RATE on the leap backend. It used to be
+    # throttled to 5 Hz like the webcam session, which is 24 frames in a
+    # five-second take — too few to tell a steady stream from one that
+    # stopped for three seconds in the middle, which is a dropout we have
+    # since measured. The camera is the reason the throttle existed (a 90 Hz
+    # camera and a 5 Hz glove pair badly), and `--leap-hz` handles that side.
+    if args.hz is None:
+        glove_hz = None if backend == LEAP else 5.0
+    else:
+        glove_hz = args.hz or None
+
+    # A mock hand's shape does not follow the pose being called: the leap mock
+    # cycles four cartoon poses on its own 4 s timer and the glove mock's curl
+    # is a sine wave. Checking a rehearsal against the pose it was asked for
+    # would fail every take for a reason that has nothing to do with the
+    # operator, so the check is off whenever either sensor is a mock. That is
+    # honest about what a mock is; it is not a loophole, because a mock
+    # session produces no data anyone analyses.
+    mocked = args.mock_leap or args.mock_glove
+    pose_check_on = coached and not args.no_pose_check and not mocked
+
     eta = len(poses) * args.takes * (args.prep + args.duration)
     camera_text = (("MOCK leap" if args.mock_leap else "Ultraleap SIR 170")
                    if backend == LEAP else f"webcam index {camera_index}")
@@ -1294,6 +1549,17 @@ def main() -> None:
         print(f"  Height band {band_text(band)}; up to {args.retries} "
               "retries per take. ONE HAND OVER THE")
         print("  MODULE — keep the other one out of the field.")
+        if pose_check_on:
+            print("  The take is REFUSED and retried if both sensors say the "
+                  "hand was not in the pose;")
+            print("  refused attempts are kept under "
+                  f"{args.out_dir / REJECTED}, never deleted.")
+        elif mocked:
+            print("  Pose check OFF: a mock hand's shape does not follow the "
+                  "pose being called.")
+        else:
+            print("  Pose check OFF (--no-pose-check): the hand's shape is "
+                  "not verified.")
     else:
         print("  Wear the glove AND keep the hand "
               + ("20 to 50 cm above the module." if backend == LEAP
@@ -1314,15 +1580,16 @@ def main() -> None:
                 raise SystemExit(f"\nNo live tracking: {e}\n")
             if coached:
                 session = CoachedLeapSession(
-                    leap, glove, hz=args.hz or None, out_dir=args.out_dir,
+                    leap, glove, hz=glove_hz, out_dir=args.out_dir,
                     leap_hz=args.leap_hz or None, hand=args.hand, band=band,
                     settle=args.settle, retries=args.retries,
-                    acquire_timeout=args.acquire_timeout)
+                    acquire_timeout=args.acquire_timeout,
+                    pose_check=pose_check_on)
                 session.view = CameraView(
                     hand=args.hand, band=band,
                     enabled=not (args.no_view or args.mock_leap)).start()
             else:
-                session = LeapSyncSession(leap, glove, hz=args.hz or None,
+                session = LeapSyncSession(leap, glove, hz=glove_hz,
                                           out_dir=args.out_dir,
                                           leap_hz=args.leap_hz or None)
         else:
@@ -1331,7 +1598,7 @@ def main() -> None:
                                   min_detection_confidence=args.min_det,
                                   min_tracking_confidence=args.min_det,
                                   gamma=args.gamma, clahe=args.clahe)
-            session = SyncSession(cap, tracker, glove, hz=args.hz or None,
+            session = SyncSession(cap, tracker, glove, hz=glove_hz,
                                   out_dir=args.out_dir,
                                   mirror=not args.no_mirror,
                                   show=not args.no_preview)

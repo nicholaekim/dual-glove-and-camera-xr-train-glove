@@ -22,6 +22,8 @@ import leap
 from leap import enums
 from leapc_cffi import ffi, libleapc
 
+from leap_hand.protocol import QUIT, parse_status
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--hand", choices=["left", "right", "both"], default="both")
 ap.add_argument("--band", default="18,28", help="target palm height in cm: LOW,HIGH")
@@ -127,26 +129,29 @@ def parent_alive():
         return True
 
 
-def read_caption():
-    """First line of the status file is the caption; an optional second line
-    `band=LOW,HIGH` (cm) lets the launching script move the height target."""
+def read_status():
+    """The status file: (caption, snapshot path or None), band applied as a side effect.
+
+    Line 1 is the caption; the rest are `key=value` in any order — `band=LOW,HIGH`
+    (cm) moves the height target, `snap=<path>` asks for one still. The format
+    lives in leap_hand.protocol so the recorder that writes it and this viewer
+    cannot drift apart."""
     global LOW, HIGH
     if not args.status_file:
-        return ""
+        return "", None
     try:
         with open(args.status_file, encoding="utf-8") as fh:
-            first = fh.readline().strip()
-            second = fh.readline().strip()
+            text = fh.read()
     except OSError:
-        return ""
-    if second.startswith("band="):
-        try:
-            lo, hi = (float(v) for v in second[5:].split(","))
-            if lo < hi:
-                LOW, HIGH = lo, hi
-        except ValueError:
-            pass
-    return first
+        return "", None
+    caption, band, snap = parse_status(text)
+    if band:
+        LOW, HIGH = band
+    return caption, snap
+
+
+def read_caption():
+    return read_status()[0]
 
 
 def compose():
@@ -186,7 +191,7 @@ def compose():
     seen = {h["side"]: h for h in hands}
     y = 30
     caption = read_caption()
-    if caption and caption != "__quit__":
+    if caption and caption != QUIT:
         put(frame, caption, (14, y), 0.75, (0, 255, 255), 2); y += 34
     ok_all = True
     for side in wanted:
@@ -219,10 +224,22 @@ if not args.no_window:
         cv2.setWindowProperty(WIN, cv2.WND_PROP_TOPMOST, 1)
     except Exception:
         pass
-t0 = time.time(); last = None
+t0 = time.time(); last = None; snapped = None
 try:
     while True:
         last = compose()
+        # One still per take, requested by the recorder through `snap=<path>`:
+        # the independent evidence of what the hand was actually doing, taken
+        # while it was doing it. Written once per path and never overwritten —
+        # a repeated path is a status file that has not changed, not a new ask.
+        caption_now, want_snap = read_status()
+        if want_snap and want_snap != snapped:
+            snapped = want_snap
+            try:
+                os.makedirs(os.path.dirname(want_snap) or ".", exist_ok=True)
+                cv2.imwrite(want_snap, last)
+            except Exception as ex:
+                print("could not write the snapshot:", ex)
         if not args.no_window:
             cv2.imshow(WIN, last)
             k = cv2.waitKey(30) & 0xFF
@@ -234,7 +251,7 @@ try:
             time.sleep(0.03)
         if args.seconds and time.time() - t0 > args.seconds:
             break
-        if read_caption() == "__quit__" or not parent_alive():
+        if caption_now == QUIT or not parent_alive():
             break
 except KeyboardInterrupt:
     pass
