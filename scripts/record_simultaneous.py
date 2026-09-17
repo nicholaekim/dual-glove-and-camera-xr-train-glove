@@ -1,27 +1,46 @@
-"""Record the glove and the camera AT THE SAME TIME, one guided session.
+"""Record the glove and a camera AT THE SAME TIME, one guided session.
 
 This is the data-collection step every fusion result depends on: the same
 physical hand, the same instant, seen by both sensors. Each take writes two
 files with the same name into
 
     recordings/sync/glove/<pose>_<hand>_take<N>_<stamp>.jsonl
-    recordings/sync/cam/<pose>_<hand>_take<N>_<stamp>.jsonl
+    recordings/sync/cam/<pose>_<hand>_take<N>_<stamp>.jsonl     (--camera 0)
+    recordings/sync/leap/<pose>_<hand>_take<N>_<stamp>.jsonl    (--camera leap)
 
 Both recorders stamp time.time() at write, so the two streams share one wall
 clock and scripts/fuse_poses.py can pair frames afterwards (the glove runs at
-~60 Hz, the camera at ~30 Hz; they are matched by nearest timestamp).
+~60 Hz, a webcam at ~30 Hz, the Ultraleap at ~90 Hz; they are matched by
+nearest timestamp).
 
-The protocol is the glove pipeline's: announce the pose, count down with
-beeps, record, move on — no keyboard while wearing the glove.
+Two camera backends, one protocol:
 
-Needs XR Trainer streaming to 127.0.0.1:9002 plus a webcam. Rehearse the whole
-thing with no hardware at all:
+  --camera 0      a webcam through MediaPipe. Normalised landmarks, no
+                  absolute scale, and it did not see the black glove at all
+                  in August — this is the path that motivated the IR camera.
+  --camera leap   the Ultraleap Stereo IR 170. Metric 3D joints in metres,
+                  and the Phase 2 gate says it tracks the gloved hand
+                  (98.6% of frames, 0 re-acquisitions), which is what makes
+                  simultaneous capture — Path A — possible at all.
+
+The leap backend opens no OpenCV window: there is nothing photographic to
+look at and your hands are over the module, so it prints a one-line HUD
+(hands seen, tracking framerate) once a second instead.
+
+The protocol is the glove pipeline's either way: announce the pose, count
+down with beeps, record, move on — no keyboard while wearing the glove.
+
+Needs XR Trainer streaming to 127.0.0.1:9002 plus the camera. Rehearse the
+whole thing with no hardware at all:
 
   python scripts/record_simultaneous.py --mock-glove --takes 1 --duration 3 --prep 2
+  python scripts/record_simultaneous.py --camera leap --mock-glove --mock-leap \
+      --poses fist --takes 1 --duration 3 --prep 1
 
 Usage:
   python scripts/record_simultaneous.py                       # 6 poses x 3 takes
   python scripts/record_simultaneous.py --poses pinch,fist --takes 2
+  python scripts/record_simultaneous.py --camera leap         # Path A
 """
 import argparse
 import time
@@ -36,6 +55,11 @@ from cam_hand.recorder import CamRecorder, pose_filename, slugify
 from cam_hand.recorder import finalize_pose_name as cam_finalize
 from cam_hand.recorder import hand_tag as cam_hand_tag
 
+# The Ultraleap backend (--camera leap). Importing these is free: leap_hand
+# only touches the `leap` bindings inside LeapStream.start().
+from leap_hand.recorder import LeapRecorder
+from leap_hand.stream import LeapUnavailable, open_stream
+
 # The glove side comes from the xr_hand package in this repo.
 from xr_hand.parser import parse_hand_message
 from xr_hand.receiver import OSCHandReceiver
@@ -43,6 +67,8 @@ from xr_hand.recorder import FrameRecorder
 from xr_hand.validator import StreamMonitor, validate_raw_message
 
 DEFAULT_POSES = ["open_palm", "fist", "index_point", "thumbs_up", "peace", "pinch"]
+LEAP = "leap"
+MIN_VISIBLE_TIME_US = 300_000     # plan section 6: a hand counts after 0.3 s
 POSE_HINTS = {
     "open_palm": "all five fingers extended and spread",
     "fist": "all fingers curled into a tight fist",
@@ -92,12 +118,23 @@ class MockGloveSource:
 
 
 class SyncSession:
+    """The webcam + glove session. The protocol lives here; see LeapSyncSession.
+
+    Everything specific to the camera behind it is in four places, and a
+    backend overrides those and nothing else: `cam_dir`, `make_cam_recorder`,
+    `tick` and `wait_for_both`. `dots` is off for a backend that prints its
+    own HUD, so the two do not fight over the same line.
+    """
+
+    dots = True
+
     def __init__(self, cap, tracker, glove_source, hz, out_dir: Path,
                  mirror: bool = True, show: bool = True):
         self.cap = cap
         self.tracker = tracker
         self.glove = glove_source
         self.hz = hz
+        self.out_dir = out_dir
         self.glove_dir = out_dir / "glove"
         self.cam_dir = out_dir / "cam"
         self.mirror = mirror
@@ -105,6 +142,10 @@ class SyncSession:
         self.monitors = {"left": StreamMonitor("left"), "right": StreamMonitor("right")}
         self.results = []
         self._warned = set()
+
+    def make_cam_recorder(self, pose: str, take: int):
+        """The recorder for this session's camera. One per take."""
+        return CamRecorder(hz=self.hz, pose=pose, take=take)
 
     def _pump_glove(self, recorder=None) -> int:
         """Drain and optionally record glove packets. Returns frames seen."""
@@ -186,22 +227,24 @@ class SyncSession:
             self.tick(banner=f"NEXT: {title}", sub=f"{hint}   ({s})")
 
         name = pose_filename(pose, take)      # one name, two files
-        cam_rec = CamRecorder(hz=self.hz, pose=pose, take=take)
+        cam_rec = self.make_cam_recorder(pose, take)
         glove_rec = FrameRecorder(hz=self.hz, pose=pose, take=take)
         cam_rec.start(self.cam_dir / name)
         glove_rec.start(self.glove_dir / name)
         beep(1000, 250)
-        print(f"      REC {duration:g} s - hold it ", end="", flush=True)
+        print(f"      REC {duration:g} s - hold it ",
+              end="" if self.dots else "\n", flush=True)
         try:
             t_end = time.time() + duration
             next_dot = time.time() + 0.5
             while time.time() < t_end:
                 self.tick(cam_rec, glove_rec, banner=title, rec=True)
-                if time.time() >= next_dot:
+                if self.dots and time.time() >= next_dot:
                     print(".", end="", flush=True)
                     next_dot += 0.5
         finally:
-            print(flush=True)
+            if self.dots:
+                print(flush=True)
             cam_rec.stop()
             glove_rec.stop()
             beep(500, 300)
@@ -250,7 +293,118 @@ class SyncSession:
         if ok:
             print(f"\n  glove files: {self.glove_dir}")
             print(f"  cam files:   {self.cam_dir}")
-            print("  fuse + compare:  python scripts/fuse_poses.py")
+            print(f"  fuse + compare:  python scripts/fuse_poses.py "
+                  f"{self.out_dir}")
+
+
+class LeapSyncSession(SyncSession):
+    """The same protocol, with the Ultraleap Stereo IR 170 as the camera.
+
+    Everything the MediaPipe session does around the two files — one name,
+    one clock, one beep protocol, one summary — is inherited unchanged. What
+    differs is what a tick is:
+
+      * hands come from `LeapStream.drain()` (or the mock) rather than from a
+        decoded video frame, and go straight into a `LeapRecorder`, so the
+        camera file is the ordinary Leap JSONL every other tool already
+        reads. `fuse_poses.py` recognises it by `source: "leap"`;
+      * there is no window. An 850 nm brightness image is not something to
+        check a pose against, and on Path A both hands are over the module
+        anyway, so the feedback is a one-line HUD printed once a second;
+      * a hand is skipped until it has been tracked for MIN_VISIBLE_TIME_US,
+        the same settling gate the gate runner and record_poses use. LeapC's
+        `confidence` is a constant 1.0 and is never consulted.
+      * the camera is NOT throttled by default (`leap_hz=None`). Both
+        recorders schedule the next sample from the write that just happened,
+        so two recorders throttled to the same rate drift apart by the
+        difference in how long each waits for its next frame — measured on a
+        mock 3 s take at 5 Hz both sides, that drift reached 48 ms and cost
+        two thirds of the pairs at `fuse_poses --max-dt 0.05`. Keeping every
+        camera frame removes the problem instead of tuning around it: at
+        90 Hz every glove frame has a partner within ~6 ms, and a 5 s take is
+        a couple of megabytes. `--leap-hz` throttles it anyway if disk ever
+        matters more than pairing.
+    """
+
+    dots = False                      # the HUD owns the line instead
+    HUD_EVERY = 1.0
+
+    def __init__(self, leap_source, glove_source, hz, out_dir: Path,
+                 leap_hz=None):
+        super().__init__(cap=None, tracker=None, glove_source=glove_source,
+                         hz=hz, out_dir=out_dir, mirror=False, show=False)
+        self.leap = leap_source
+        self.leap_hz = leap_hz
+        self.cam_dir = out_dir / "leap"
+        self.skipped_young = 0
+        self.glove_total = 0            # cumulative, for wait_for_both
+        self.hand_total = 0
+        # Start the clock now, so the first HUD line reports a real second
+        # rather than the zeros of a session that has not begun.
+        self._hud_at = time.time()
+        self._hud_mark = (0, 0)         # the totals at the last HUD line
+        self._sides: set = set()
+        self._framerate = 0.0
+
+    def make_cam_recorder(self, pose: str, take: int):
+        return LeapRecorder(hz=self.leap_hz, pose=pose, take=take)
+
+    def tick(self, cam_rec=None, glove_rec=None, banner="", sub="", rec=False):
+        """Drain both sensors once and record what each gave. No window."""
+        self.glove_total += self._pump_glove(glove_rec)
+        hands = []
+        for _side, lh in self.leap.drain(64):
+            if lh.framerate:
+                self._framerate = float(lh.framerate)
+            self._sides.add(lh.hand_side)
+            self.hand_total += 1
+            if lh.visible_time_us < MIN_VISIBLE_TIME_US:
+                self.skipped_young += 1      # still settling; not data yet
+                continue
+            hands.append(lh)
+            if cam_rec is not None:
+                cam_rec.record(lh)
+        self._print_hud(rec)
+        # Nothing in this loop blocks (there is no video frame to wait on), so
+        # yield the CPU rather than spin on an empty queue.
+        time.sleep(0.005)
+        return hands
+
+    def _print_hud(self, rec: bool) -> None:
+        """One line a second: which hands, how fast, how much of each sensor."""
+        now = time.time()
+        if now - self._hud_at < self.HUD_EVERY:
+            return
+        glove_0, hands_0 = self._hud_mark
+        seen = ",".join(sorted(self._sides)) or "none"
+        print(f"      {'REC' if rec else '   '} [leap] hands {seen:<11}"
+              f"{self._framerate:5.1f} Hz   "
+              f"{self.hand_total - hands_0:>4} hands/s, "
+              f"{self.glove_total - glove_0:>4} glove/s", flush=True)
+        self._hud_at = now
+        self._hud_mark = (self.glove_total, self.hand_total)
+        self._sides = set()
+
+    def wait_for_both(self, timeout: float = 120.0) -> None:
+        print("Waiting for BOTH sensors (glove packets + a tracked hand)...")
+        print("  Glove on, hand 20 to 50 cm above the module, lenses up.")
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            self.tick()
+            if self.glove_total >= 10 and self.hand_total >= 10:
+                print("  OK - glove packets and Ultraleap tracking both live\n")
+                return
+        raise SystemExit(
+            f"Only got {self.glove_total} glove packets and "
+            f"{self.hand_total} tracked hands. Check XR Trainer is streaming "
+            "(scripts/glove/run_osc.py --dump --no-viz) and the camera "
+            "(python scripts/leap/check_setup.py).")
+
+    def print_summary(self) -> None:
+        super().print_summary()
+        if self.skipped_young:
+            print(f"\n  {self.skipped_young} hands skipped: tracked for less "
+                  f"than {MIN_VISIBLE_TIME_US / 1000:.0f} ms (settling)")
 
 
 def main() -> None:
@@ -263,7 +417,9 @@ def main() -> None:
     p.add_argument("--hz", type=float, default=5.0,
                    help="frames saved per second per hand, both sensors (0 = all)")
     p.add_argument("--out-dir", type=Path, default=Path("recordings") / "sync")
-    p.add_argument("--camera", type=int, default=0)
+    p.add_argument("--camera", default="0",
+                   help="webcam index (0, 1, ...) for the MediaPipe backend, "
+                        "or 'leap' for the Ultraleap Stereo IR 170 (Path A)")
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--model", default=str(DEFAULT_MODEL))
@@ -279,6 +435,15 @@ def main() -> None:
     p.add_argument("--address", default="/v1/animation/kinematic/all")
     p.add_argument("--mock-glove", action="store_true",
                    help="synthetic glove stream (rehearse without hardware)")
+    p.add_argument("--mock-leap", action="store_true",
+                   help="synthetic Ultraleap stream; only with --camera leap")
+    p.add_argument("--leap-hz", type=float, default=0.0,
+                   help="camera frames saved per second with --camera leap "
+                        "(default: 0 = keep every frame, which is what keeps "
+                        "a glove frame's partner within a few ms)")
+    p.add_argument("--mode", default="desktop",
+                   choices=("desktop", "hmd", "screentop"),
+                   help="Ultraleap tracking mode (--camera leap)")
     p.add_argument("--no-mirror", action="store_true")
     p.add_argument("--no-preview", action="store_true")
     args = p.parse_args()
@@ -287,43 +452,75 @@ def main() -> None:
     if not poses:
         raise SystemExit("no poses given")
 
+    backend = str(args.camera).strip().lower()
+    if backend != LEAP:
+        try:
+            camera_index = int(args.camera)
+        except ValueError:
+            raise SystemExit(
+                f"--camera takes a webcam index or 'leap', not {args.camera!r}")
+    if args.mock_leap and backend != LEAP:
+        raise SystemExit("--mock-leap only means anything with --camera leap")
+
     eta = len(poses) * args.takes * (args.prep + args.duration)
+    camera_text = (("MOCK leap" if args.mock_leap else "Ultraleap SIR 170")
+                   if backend == LEAP else f"webcam index {camera_index}")
     print("=" * 62)
     print(f"SIMULTANEOUS session: {len(poses)} poses x {args.takes} takes "
           f"x {args.duration:g} s  (~{eta / 60:.1f} min)")
     print(f"  poses: {', '.join(poses)}")
     print(f"  glove: {'MOCK' if args.mock_glove else f'{args.host}:{args.port}'}"
-          f"   camera: index {args.camera}   output: {args.out_dir}")
-    print("  Wear the glove AND keep the hand in the camera frame.")
+          f"   camera: {camera_text}   output: {args.out_dir}")
+    print("  Wear the glove AND keep the hand "
+          + ("20 to 50 cm above the module." if backend == LEAP
+             else "in the camera frame."))
     print("=" * 62 + "\n")
 
-    cap = open_camera(args.camera, args.width, args.height)
-    tracker = HandTracker(model_path=args.model, running_mode="video",
-                          min_detection_confidence=args.min_det,
-                          min_tracking_confidence=args.min_det,
-                          gamma=args.gamma, clahe=args.clahe)
     glove = (MockGloveSource() if args.mock_glove
              else OSCHandReceiver(host=args.host, port=args.port,
                                   kinematic_addr=args.address))
     glove.start()
 
-    session = SyncSession(cap, tracker, glove, hz=args.hz or None,
-                          out_dir=args.out_dir, mirror=not args.no_mirror,
-                          show=not args.no_preview)
+    cap = tracker = leap = None
     try:
-        session.wait_for_both()
-        for i, pose in enumerate(poses, 1):
-            for take in range(1, args.takes + 1):
-                session.run_take(pose, take, args.takes, i, len(poses),
-                                 args.duration, args.prep)
-    except (KeyboardInterrupt, QuitSession):
-        print("\nInterrupted — keeping the takes recorded so far.")
+        if backend == LEAP:
+            try:
+                leap = open_stream(mock=args.mock_leap, mode=args.mode)
+            except LeapUnavailable as e:
+                raise SystemExit(f"\nNo live tracking: {e}\n")
+            session = LeapSyncSession(leap, glove, hz=args.hz or None,
+                                      out_dir=args.out_dir,
+                                      leap_hz=args.leap_hz or None)
+        else:
+            cap = open_camera(camera_index, args.width, args.height)
+            tracker = HandTracker(model_path=args.model, running_mode="video",
+                                  min_detection_confidence=args.min_det,
+                                  min_tracking_confidence=args.min_det,
+                                  gamma=args.gamma, clahe=args.clahe)
+            session = SyncSession(cap, tracker, glove, hz=args.hz or None,
+                                  out_dir=args.out_dir,
+                                  mirror=not args.no_mirror,
+                                  show=not args.no_preview)
+
+        try:
+            session.wait_for_both()
+            for i, pose in enumerate(poses, 1):
+                for take in range(1, args.takes + 1):
+                    session.run_take(pose, take, args.takes, i, len(poses),
+                                     args.duration, args.prep)
+        except (KeyboardInterrupt, QuitSession):
+            print("\nInterrupted — keeping the takes recorded so far.")
+        finally:
+            session.print_summary()
     finally:
         glove.stop()
-        cap.release()
-        tracker.close()
-        cv2.destroyAllWindows()
-        session.print_summary()
+        if leap is not None:
+            leap.stop()
+        if cap is not None:
+            cap.release()
+        if tracker is not None:
+            tracker.close()
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

@@ -466,6 +466,98 @@ def test_jitter_is_zero_for_a_still_hand():
     assert fingertip_jitter(rows) == pytest.approx(0.0)
 
 
+# --- the detection-rate denominator -----------------------------------------
+# The reviewer's rule, and the bug it exists to stop. A full-rate file's
+# timestamps jitter, so the 10th-percentile gap reads FASTER than the tracker
+# ever ran; dividing by that invents dropouts. See leap_hand.stats.choose_rate.
+def _write_leap_rows(path: Path, n: int, hz: float, framerate: float,
+                     jitter_s: float = 0.0, seed: int = 3,
+                     drop: range = range(0)) -> Path:
+    """A minimal leap-format JSONL: one hand, chosen cadence, chosen jitter."""
+    import json
+    import random
+
+    rng = random.Random(seed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for i in range(n):
+        if i in drop:
+            continue                      # a real dropout: the frame is absent
+        t = i / hz + (rng.uniform(-jitter_s, jitter_s) if jitter_s else 0.0)
+        lines.append(json.dumps({
+            "source": "leap", "timestamp": t, "wall_time": 1.7e9 + t,
+            "hand_side": "left", "hand_id": 11, "framerate": framerate,
+            "pose": "bare", "take": 1,
+        }))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def test_choose_rate_picks_framerate_only_for_a_full_rate_file():
+    from leap_hand.stats import choose_rate
+
+    assert choose_rate(101.0, 90.0) == (90.0, "framerate")   # jittered 90 Hz
+    assert choose_rate(90.0, 90.0) == (90.0, "framerate")
+    assert choose_rate(5.0, 90.0) == (5.0, "cadence")        # --hz 5
+    assert choose_rate(60.0, 90.0) == (60.0, "cadence")      # genuinely slower
+    assert choose_rate(90.0, 0.0) == (90.0, "cadence")       # no framerate key
+
+
+def test_jittered_full_rate_file_is_not_penalised_for_its_own_jitter(tmp_path: Path):
+    """The 2026-09-16 bare-hand bug: 90 Hz file, cadence reads ~101 Hz.
+
+    Every frame the tracker produced is in the file, so detection is 100%.
+    Against the jittered cadence it would score about 89%.
+    """
+    path = _write_leap_rows(tmp_path / "bare_left_take1.jsonl",
+                            n=900, hz=90.0, framerate=90.0, jitter_s=0.0011)
+    s = analyse_file(path)[0]
+
+    assert s.sample_hz > 95.0, "the jitter should make the cadence read fast"
+    assert s.rate_source == "framerate"
+    assert s.rate_hz == pytest.approx(90.0)
+    assert s.detection_rate > 0.99
+    # and the old denominator really would have cost it the plan's threshold
+    assert s.frames / (s.span_s * s.sample_hz + 1) < 0.92
+
+
+def test_a_throttled_file_is_still_measured_against_its_own_cadence(tmp_path: Path):
+    """--hz 5 against a 90 Hz tracker: the rate is 5, or the file scores 6%."""
+    path = _write_leap_rows(tmp_path / "poses_left_take1.jsonl",
+                            n=50, hz=5.0, framerate=90.0)
+    s = analyse_file(path)[0]
+    assert s.rate_source == "cadence"
+    assert s.rate_hz == pytest.approx(5.0, rel=1e-6)
+    assert s.detection_rate > 0.98
+
+
+def test_real_dropouts_still_show_up_at_full_rate(tmp_path: Path):
+    """The rule must not turn every file into 100%: a gap is still a gap."""
+    path = _write_leap_rows(tmp_path / "gappy_left_take1.jsonl",
+                            n=900, hz=90.0, framerate=90.0, jitter_s=0.0011,
+                            drop=range(300, 390))       # 1 s with no hand
+    s = analyse_file(path)[0]
+    assert s.rate_source == "framerate"
+    assert s.detection_rate == pytest.approx(0.90, abs=0.02)
+
+
+def test_the_table_footnote_names_the_denominator_it_used(tmp_path: Path):
+    from leap_hand.stats import analyse_paths, format_table
+
+    full = _write_leap_rows(tmp_path / "full_left_take1.jsonl",
+                            n=200, hz=90.0, framerate=90.0, jitter_s=0.0011)
+    table = format_table(analyse_paths([full]))
+    assert "90.0*" in table                      # the row says which it used
+    assert "tracking framerate" in table
+    assert "no file here was throttled" in table
+
+    slow = _write_leap_rows(tmp_path / "slow_left_take1.jsonl",
+                            n=50, hz=5.0, framerate=90.0)
+    table = format_table(analyse_paths([slow]))
+    assert "5.0 " in table
+    assert "own cadence" in table
+
+
 # --- the no-hardware path ---------------------------------------------------
 def test_missing_bindings_explain_the_next_step(monkeypatch):
     """The first error every new machine hits must name the fix, not traceback.
@@ -712,7 +804,7 @@ def _hand_stats(side: str, detection: float, reacquisitions: int,
         file="gate.jsonl", hand_side=side, frames=frames, span_s=span_s,
         sample_hz=90.0, expected_frames=frames, detection_rate=detection,
         reacquisitions=reacquisitions, mean_framerate=89.9, jitter_mm=jitter_mm,
-        frame_age_ms=9.5, pose="gate",
+        frame_age_ms=9.5, pose="gate", rate_hz=89.9, rate_source="framerate",
     )
 
 
@@ -898,6 +990,131 @@ def test_gate_script_refuses_raw_capture_on_the_mock(monkeypatch):
         gate.main()
 
 
+# --- the gate, recomputed from disk -----------------------------------------
+def _mock_gate_run(tmp_path: Path, monkeypatch, conditions: str,
+                   seconds: str = "1") -> tuple:
+    """Run the mock gate once and return (out_dir, report_path)."""
+    import sys
+
+    gate = _load_script("gate")
+    monkeypatch.setattr(gate, "beep", lambda *a, **k: None)
+    out_dir = tmp_path / "recordings"
+    report = tmp_path / "results" / "REPORT.txt"
+    monkeypatch.setattr(sys, "argv", [
+        "gate.py", "--mock", "--conditions", conditions,
+        "--seconds", seconds, "--prep", "0", "--snapshots", "1",
+        "--out-dir", str(out_dir), "--report", str(report),
+    ])
+    gate.main()
+    return out_dir, report
+
+
+def test_recompute_rebuilds_the_report_from_a_copy_of_a_run(tmp_path: Path,
+                                                            monkeypatch):
+    """No camera, no recording: the same numbers, out of the same files.
+
+    Recomputed on a COPY, so this also proves the report does not depend on
+    anything outside the folder — that is what lets a measurement change be
+    re-applied to a session recorded days ago.
+    """
+    import shutil
+    import sys
+
+    out_dir, report = _mock_gate_run(tmp_path, monkeypatch, "bare,glove")
+    original = report.read_text(encoding="utf-8")
+
+    copy_dir = tmp_path / "copy"
+    shutil.copytree(out_dir, copy_dir)
+    new_report = tmp_path / "copy_results" / "REPORT.txt"
+
+    gate = _load_script("gate")
+    monkeypatch.setattr(sys, "argv", [
+        "gate.py", "--recompute",
+        "--out-dir", str(copy_dir), "--report", str(new_report),
+    ])
+    gate.main()
+    rebuilt = new_report.read_text(encoding="utf-8")
+
+    assert "recomputed:" in rebuilt and "no camera" in rebuilt
+    for condition in ("bare", "glove"):
+        for side in ("left", "right"):
+            row = f"{condition:<16} {side:<5}"
+            assert row in rebuilt
+            # identical numbers to the live run: same files, same maths
+            assert _row_of(rebuilt, row) == _row_of(original, row)
+    assert rebuilt.count("IR still(s), 1 with a tracked hand") >= 1
+    assert "Path A:" in rebuilt
+
+
+def _row_of(report: str, prefix: str) -> str:
+    for line in report.splitlines():
+        if line.startswith(prefix):
+            return line
+    raise AssertionError(f"no row starting {prefix!r} in\n{report}")
+
+
+def test_recompute_measures_the_newest_take_and_names_the_others(tmp_path: Path):
+    from leap_hand.gate import scan_out_dir
+
+    folder = tmp_path / "glove_20cm"
+    old = _write_leap_rows(folder / "glove_20cm_left_take1_20260916_100000.jsonl",
+                           n=100, hz=90.0, framerate=90.0)
+    new = _write_leap_rows(folder / "glove_20cm_left_take1_20260916_223000.jsonl",
+                           n=400, hz=90.0, framerate=90.0)
+    # mtimes deliberately the wrong way round: the filename stamp decides.
+    import os
+    os.utime(old, (2e9, 2e9))
+    os.utime(new, (1e9, 1e9))
+
+    result = scan_out_dir(tmp_path)[0]
+    assert result.condition == "glove_20cm"
+    assert result.recordings == [str(new)]
+    assert result.frames == 400
+    assert new.name in result.note and old.name in result.note
+    assert "not measured" in result.note
+
+
+def test_recompute_takes_any_condition_name_and_judges_it_as_a_glove(
+        tmp_path: Path):
+    """The reviewer's extra runs: custom folders, same thresholds."""
+    from leap_hand.gate import format_report, scan_out_dir, verdict
+
+    for name, n in (("bare", 900), ("glove_right", 900), ("glove_50cm", 300)):
+        _write_leap_rows(tmp_path / name / f"{name}_right_take1_20260916_220000.jsonl",
+                         n=n, hz=90.0, framerate=90.0, jitter_s=0.0011,
+                         drop=range(0) if n == 900 else range(100, 280))
+    results = scan_out_dir(tmp_path)
+
+    assert [r.condition for r in results] == ["bare", "glove_50cm", "glove_right"]
+    v = verdict(results)
+    assert v.path == "A"
+    assert "glove_right" in v.passing        # full detection
+    assert "glove_50cm" not in v.passing     # 40% of its frames missing
+    report = format_report(results, v)
+    assert "glove_right" in report and "glove_50cm" in report
+
+
+def test_recompute_reports_a_condition_folder_with_no_take(tmp_path: Path):
+    from leap_hand.gate import scan_out_dir
+
+    (tmp_path / "glove_day2").mkdir(parents=True)
+    result = scan_out_dir(tmp_path)[0]
+    assert result.stats == [] and not result.saw_hand
+    assert "no JSONL take" in result.note
+
+
+def test_recompute_refuses_an_empty_folder(tmp_path: Path, monkeypatch):
+    import sys
+    gate = _load_script("gate")
+    (tmp_path / "empty").mkdir()
+    monkeypatch.setattr(sys, "argv", [
+        "gate.py", "--recompute", "--out-dir", str(tmp_path / "nope"),
+        "--report", str(tmp_path / "R.txt"),
+    ])
+    with pytest.raises(SystemExit):
+        gate.main()
+
+
 def test_check_setup_warns_about_an_empty_scene_but_still_exits_zero():
     """'Nobody was holding a hand up' is not a broken machine."""
     check_setup = _load_script("check_setup")
@@ -935,6 +1152,206 @@ def test_check_setup_without_the_bindings_skips_the_hand_line(monkeypatch):
     assert checks[0].status == check_setup.FAIL
     assert checks[1].status == check_setup.SKIP
     assert check_setup.report(checks) == 2
+
+
+# --- Path A: the simultaneous recorder with the leap backend ----------------
+def _load_repo_script(name: str):
+    """Import scripts/<name>.py, which is not on a package path."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"repo_script_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _mock_sync_run(tmp_path: Path, monkeypatch, extra=()) -> tuple:
+    """A whole --camera leap session on mock glove + mock leap."""
+    import sys
+
+    sync = _load_repo_script("record_simultaneous")
+    monkeypatch.setattr(sync, "beep", lambda *a, **k: None)
+    out_dir = tmp_path / "sync"
+    monkeypatch.setattr(sys, "argv", [
+        "record_simultaneous.py", "--camera", "leap",
+        "--mock-glove", "--mock-leap", "--poses", "fist", "--takes", "1",
+        "--duration", "2", "--prep", "0", "--out-dir", str(out_dir), *extra,
+    ])
+    sync.main()
+    return sync, out_dir
+
+
+def test_leap_backend_writes_a_pair_of_takes_that_pair_by_time_matches(
+        tmp_path: Path, monkeypatch):
+    """The Path A deliverable: two files, one name, one clock, matched frames."""
+    import json
+
+    from cam_hand.fusion import pair_by_time
+
+    _sync, out_dir = _mock_sync_run(tmp_path, monkeypatch)
+
+    glove_takes = sorted((out_dir / "glove").glob("*.jsonl"))
+    leap_takes = sorted((out_dir / "leap").glob("*.jsonl"))
+    assert len(glove_takes) == len(leap_takes) == 1
+    # the same stem on both sides is what fuse_poses pairs takes on
+    assert glove_takes[0].name == leap_takes[0].name
+    assert not (out_dir / "cam").exists(), "the leap backend owns recordings/sync/leap"
+
+    def rows(path):
+        return [json.loads(line) for line
+                in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    glove, cam = rows(glove_takes[0]), rows(leap_takes[0])
+    assert glove and cam
+    assert {d["source"] for d in cam} == {"leap"}     # how fuse_poses knows
+    assert all("abs26" in d and len(d["abs26"]) == 26 for d in cam)
+    assert all("joints" in d for d in cam)            # still the glove schema
+    assert {d["pose"] for d in cam} == {"fist"}
+
+    pairs = pair_by_time(glove, cam, max_dt=0.05)
+    matched = [(g, c) for g, c in pairs if c is not None]
+    assert len(matched) >= 0.8 * len(pairs), (
+        f"only {len(matched)}/{len(pairs)} glove frames found a camera frame")
+    assert all(g["hand_side"] == c["hand_side"] for g, c in matched)
+    # both files are stamped with time.time() at the write, so the pairs are
+    # tens of milliseconds apart, not hundreds
+    assert max(abs(c["wall_time"] - g["wall_time"]) for g, c in matched) < 0.05
+
+
+def test_leap_backend_keeps_every_camera_frame_by_default(tmp_path: Path,
+                                                          monkeypatch):
+    """--hz throttles the glove; the camera stays dense so pairing holds."""
+    _sync, out_dir = _mock_sync_run(tmp_path, monkeypatch, ["--hz", "5"])
+    glove = sorted((out_dir / "glove").glob("*.jsonl"))[0]
+    cam = sorted((out_dir / "leap").glob("*.jsonl"))[0]
+    n_glove = len(glove.read_text(encoding="utf-8").splitlines())
+    n_cam = len(cam.read_text(encoding="utf-8").splitlines())
+    assert n_cam > 5 * n_glove, f"{n_cam} camera frames vs {n_glove} glove"
+
+
+def test_the_mediapipe_session_still_owns_cam_and_its_own_recorder():
+    """The refactor that made the camera pluggable must not have moved it."""
+    from cam_hand.recorder import CamRecorder
+
+    sync = _load_repo_script("record_simultaneous")
+    session = sync.SyncSession(cap=None, tracker=None, glove_source=None,
+                               hz=5.0, out_dir=Path("recordings") / "sync")
+    assert session.cam_dir == Path("recordings") / "sync" / "cam"
+    assert session.glove_dir == Path("recordings") / "sync" / "glove"
+    assert isinstance(session.make_cam_recorder("fist", 1), CamRecorder)
+    assert session.dots is True         # it still prints progress dots
+    assert session.show is True         # and still opens its preview window
+
+
+def test_leap_backend_rejects_a_camera_name_that_is_neither(monkeypatch):
+    import sys
+
+    sync = _load_repo_script("record_simultaneous")
+    monkeypatch.setattr(sys, "argv",
+                        ["record_simultaneous.py", "--camera", "webcam"])
+    with pytest.raises(SystemExit):
+        sync.main()
+
+    monkeypatch.setattr(sys, "argv",
+                        ["record_simultaneous.py", "--mock-leap"])
+    with pytest.raises(SystemExit):
+        sync.main()
+
+
+# --- the professor-frame replication ----------------------------------------
+def test_record_frame_accepts_every_spelling_of_a_frame_id():
+    record_frame = _load_script("record_frame")
+    for raw in ("128166", "frame_128166", "frame_128166_DONE",
+                "frame_128166_NA", " frame_128166_left "):
+        assert record_frame.frame_name(raw) == "frame_128166"
+    with pytest.raises(SystemExit):
+        record_frame.frame_name("open_palm")
+
+
+def test_record_frame_finds_the_reference_image_or_says_it_is_absent(
+        tmp_path: Path):
+    record_frame = _load_script("record_frame")
+    root = tmp_path / "frames"
+    (root / "frame_99").mkdir(parents=True)
+    png = root / "frame_99" / "frame_99.png"
+    png.write_bytes(b"\x89PNG\r\n")
+    assert record_frame.find_reference("frame_99", root) == png
+    assert record_frame.find_reference("frame_1234", root) is None
+    assert record_frame.find_reference("frame_99", tmp_path / "nope") is None
+
+
+def test_medoid_is_a_real_recorded_frame_not_an_average(tmp_path: Path):
+    """The whole reason it is a medoid: bone lengths must survive."""
+    record_frame = _load_script("record_frame")
+    path = _record_mock(tmp_path, frames=120)
+    frames = [f for f, _w in FrameRecorder.load(path)
+              if f.hand_side == "right"]
+    i = record_frame.medoid_index(frames)
+    assert 0 <= i < len(frames)
+    chosen = frame_to_keypoints21(frames[i])
+    # it IS one of the frames, identical to the one at that index
+    assert chosen == frame_to_keypoints21(frames[i])
+    # and it is closer to the take's mean than the worst frame is
+    def dist(f):
+        pts = [c for p in frame_to_keypoints21(f) for c in p]
+        return sum((a - b) ** 2 for a, b in zip(pts, mean))
+    rows = [[c for p in frame_to_keypoints21(f) for c in p] for f in frames]
+    mean = [sum(r[k] for r in rows) / len(rows) for k in range(len(rows[0]))]
+    assert dist(frames[i]) == min(dist(f) for f in frames)
+
+
+def test_record_frame_writes_the_professor_format_on_the_mock(tmp_path: Path,
+                                                              monkeypatch):
+    """The pipeline end to end: record, pick the medoid, write his format."""
+    import sys
+
+    from cam_hand.prof_format import load_file
+
+    record_frame = _load_script("record_frame")
+    monkeypatch.setattr(record_frame, "beep", lambda *a, **k: None)
+    out_dir = tmp_path / "prof_frames"
+    monkeypatch.setattr(sys, "argv", [
+        "record_frame.py", "128166", "--mock", "--prep", "0",
+        "--seconds", "1", "--out-dir", str(out_dir),
+        "--reference", str(tmp_path / "no_reference_here"),
+    ])
+    record_frame.main()
+
+    out_file = out_dir / "frame_128166_keypoints.txt"
+    assert out_file.is_file()
+    # one block per hand, 21 landmarks each, parsed by the reader that also
+    # reads the professor's own files
+    blocks = load_file(out_file)
+    assert sorted(b.hand for b in blocks) == ["left", "right"]
+    for b in blocks:
+        assert len(b.points) == 21
+        # millimetres in camera space: a hand is tens to hundreds of mm out,
+        # never metres (that would mean the unit conversion was skipped)
+        assert max(abs(c) for p in b.points for c in p) < 2000.0
+
+    # the take it came from is kept beside it
+    takes = list((out_dir / "frame_128166").glob("*.jsonl"))
+    assert len(takes) == 1
+    assert len(analyse_file(takes[0])) == 2       # both hands recorded
+
+
+def test_record_frame_keeps_only_the_hand_you_asked_for(tmp_path: Path,
+                                                        monkeypatch):
+    import sys
+
+    from cam_hand.prof_format import load_file
+
+    record_frame = _load_script("record_frame")
+    monkeypatch.setattr(record_frame, "beep", lambda *a, **k: None)
+    out_dir = tmp_path / "prof_frames"
+    monkeypatch.setattr(sys, "argv", [
+        "record_frame.py", "frame_77", "--mock", "--prep", "0",
+        "--seconds", "1", "--hand", "left", "--out-dir", str(out_dir),
+    ])
+    record_frame.main()
+    blocks = load_file(out_dir / "frame_77_keypoints.txt")
+    assert [b.hand for b in blocks] == ["left"]
 
 
 # --- the installed bindings, if they are here -------------------------------

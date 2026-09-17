@@ -29,6 +29,21 @@ whether the tracker reported a hand at that instant.
   python scripts/leap/gate.py --conditions bare,glove --seconds 30
   python scripts/leap/gate.py --raw                      # also write .lmt
   python scripts/leap/gate.py --mock --seconds 3         # dry run, no camera
+  python scripts/leap/gate.py --recompute                # report from disk
+
+`--recompute` is the one that touches no hardware: it rebuilds the report
+from the recordings and IR stills already under `--out-dir`, discovering the
+conditions from the folder names. Use it when a measurement changes — the
+detection denominator did, see `leap_hand.stats.choose_rate` — so an earlier
+session gets the corrected numbers without anyone re-running the protocol.
+Where a condition folder holds several takes it measures the most recent and
+names the others in the report.
+
+Condition names are free-form. `bare` is the reference; everything else is a
+gloved condition judged against the bare hand of the same side, which is how
+the reviewer's extra runs fit with no code change:
+
+  python scripts/leap/gate.py --conditions bare,glove_right,glove_both
 
 Protocol (plan section 6): module flat on the table, lenses up, hand 20 to 50
 cm above it, palm roughly facing the camera, no sunlight and no other IR
@@ -43,10 +58,11 @@ from datetime import datetime
 from pathlib import Path
 
 from leap_hand.gate import (
-    CONDITION_INSTRUCTIONS,
     DEFAULT_CONDITIONS,
     ConditionResult,
     format_report,
+    instruction_for,
+    scan_out_dir,
     verdict,
 )
 from leap_hand.images import HandTrail, open_sampler, write_snapshot
@@ -127,9 +143,7 @@ class GateRun:
         self.trail.clear()
         print(f"--- Condition: {condition.upper()}  ({seconds:g} s, "
               f"{snapshots} IR still(s)) ---")
-        hint = CONDITION_INSTRUCTIONS.get(condition)
-        if hint:
-            print(f"    {hint}")
+        print(f"    {instruction_for(condition)}")
         print("    Hold the hand 20 to 50 cm above the module, palm toward "
               "the camera, and move it slowly.")
 
@@ -212,10 +226,9 @@ class GateRun:
 
 def wait_for_operator(condition: str, mock: bool) -> None:
     """Print what to change on the hand, then wait — unless this is a dry run."""
-    hint = CONDITION_INSTRUCTIONS.get(condition, f"Set up for: {condition}.")
     print("=" * 62)
     print(f"NEXT: {condition}")
-    print(f"  {hint}")
+    print(f"  {instruction_for(condition)}")
     if mock:
         print("  (--mock: not waiting)")
         print("=" * 62 + "\n")
@@ -228,13 +241,65 @@ def wait_for_operator(condition: str, mock: bool) -> None:
     print()
 
 
+def write_report(results, report_path: Path, title: str,
+                 seconds=None) -> str:
+    """Judge, format, write and print. The one place a report is produced."""
+    v = verdict(results)
+    report = format_report(results, v, title=title, seconds=seconds)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(report + "\n", encoding="utf-8")
+    print()
+    print(report)
+    print(f"\nwrote {report_path}")
+    return report
+
+
+def recompute(out_dir: Path, report_path: Path, conditions=None) -> None:
+    """Rebuild the report from the files already in `out_dir`. No camera.
+
+    The conditions are whatever sub-folders are there, so a run with the
+    reviewer's names (`glove_right`, `glove_20cm`, ...) needs nothing said
+    here; `--conditions` only narrows the set.
+    """
+    print("=" * 62)
+    print("Ultraleap Phase 2 gate — recompute (no camera, no recording)")
+    print(f"  reading: {out_dir}    report: {report_path}")
+    print("=" * 62)
+
+    if not out_dir.is_dir():
+        raise SystemExit(f"no such folder: {out_dir}")
+    results = scan_out_dir(out_dir, conditions)
+    if not results:
+        raise SystemExit(
+            f"no condition folders under {out_dir}. A gate run writes one "
+            "folder per condition; run the gate first, or point --out-dir at "
+            "the folder that holds them.")
+    if conditions:
+        missing = [c for c in conditions
+                   if c not in {r.condition for r in results}]
+        if missing:
+            print(f"  (no folder for: {', '.join(missing)})")
+
+    for r in results:
+        takes = len(r.recordings)
+        print(f"  {r.condition:<16} {r.frames:>6} frames from "
+              f"{takes} take(s), {r.snapshots} IR still(s)")
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    write_report(results, report_path,
+                 title=f"recomputed: {stamp}   from: {out_dir}   "
+                       "(files on disk, no camera)")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Run the Phase 2 gate: does the IR camera see a hand "
                     "inside the StretchSense glove?")
-    p.add_argument("--conditions", default=",".join(DEFAULT_CONDITIONS),
-                   help="comma-separated conditions "
-                        f"(default: {','.join(DEFAULT_CONDITIONS)})")
+    p.add_argument("--conditions", default=None,
+                   help="comma-separated conditions, any names you like "
+                        f"(default: {','.join(DEFAULT_CONDITIONS)}). With "
+                        "--recompute it narrows what is read from --out-dir; "
+                        "left out there, every folder is read.")
     p.add_argument("--seconds", type=float, default=20.0,
                    help="seconds recorded per condition (default: 20)")
     p.add_argument("--prep", type=float, default=5.0,
@@ -253,13 +318,18 @@ def main() -> None:
                    help="also write LeapC's own .lmt beside each take")
     p.add_argument("--mock", action="store_true",
                    help="dry run with synthetic hands and gradient images")
+    p.add_argument("--recompute", action="store_true",
+                   help="rebuild the report from what is already in "
+                        "--out-dir; no camera, no recording")
     p.add_argument("--mode", default="desktop",
                    choices=("desktop", "hmd", "screentop"))
     p.add_argument("--timeout", type=float, default=5.0,
                    help="seconds to wait for a device (default: 5)")
     args = p.parse_args()
 
-    conditions = [slugify(c) for c in args.conditions.split(",") if slugify(c)]
+    given = args.conditions if args.conditions is not None else ",".join(
+        DEFAULT_CONDITIONS)
+    conditions = [slugify(c) for c in given.split(",") if slugify(c)]
     if not conditions:
         raise SystemExit("no conditions given")
     if args.snapshots < 0:
@@ -267,6 +337,14 @@ def main() -> None:
     if args.raw and args.mock:
         raise SystemExit("--raw needs a live camera: there is no LeapC stream "
                          "behind --mock")
+
+    if args.recompute:
+        if args.raw or args.mock:
+            raise SystemExit("--recompute reads files already on disk: "
+                             "--raw and --mock have nothing to do there")
+        wanted = conditions if args.conditions is not None else None
+        recompute(args.out_dir, args.report, wanted)
+        return
 
     eta = len(conditions) * (args.prep + args.seconds)
     print("=" * 62)
@@ -309,15 +387,7 @@ def main() -> None:
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     title = (f"run: {stamp}{'  [MOCK - synthetic data, not evidence]' if args.mock else ''}"
              f"   device: {getattr(source, 'device_serial', None) or 'unknown'}")
-    v = verdict(results)
-    report = format_report(results, v, title=title, seconds=args.seconds)
-
-    args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(report + "\n", encoding="utf-8")
-
-    print()
-    print(report)
-    print(f"\nwrote {args.report}")
+    write_report(results, args.report, title=title, seconds=args.seconds)
     if run.skipped_young:
         print(f"  ({run.skipped_young} hands skipped: tracked for less than "
               f"{MIN_VISIBLE_TIME_US / 1000:.0f} ms — settling)")

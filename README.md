@@ -135,7 +135,10 @@ python scripts/record_simultaneous.py --mock-glove --takes 1 --duration 3 --prep
 ```
 Writes matched pairs into `recordings\sync\glove\` and `recordings\sync\cam\`
 under one filename per take. Both recorders stamp `time.time()`, so the two
-streams share a wall clock.
+streams share a wall clock. `--camera leap` swaps the webcam for the
+Ultraleap Stereo IR 170 and writes to `recordings\sync\leap\` instead — that
+is the Path A recorder, and it has its own section under *Daily use —
+Ultraleap* below.
 
 **Fuse and compare all three:**
 ```powershell
@@ -212,12 +215,16 @@ machine, so `pip install` cannot do it and the `leap` extra in
 python scripts\leap\live_view.py                 # 3D skeleton + tracking HUD
 python scripts\leap\record_poses.py              # 6 poses x 3 takes x 5 s
 python scripts\leap\record_poses.py --raw        # also write LeapC .lmt files
+python scripts\leap\record_frame.py 128166       # one professor reference frame
 python scripts\leap\stats.py recordings\leap\poses --write
 ```
 `live_view.py` is the first thing to run in a session: with an open palm over
 the module it shows whether finger order, chirality and fingertips are right.
 `record_poses.py` is the glove's guided beep protocol, same pose list and
-filenames, writing to `recordings\leap\poses\`.
+filenames, writing to `recordings\leap\poses\`. `record_frame.py` is the
+camera's version of July's `record_frame.ps1`: it shows the professor's
+reference image, records a few seconds, and writes the medoid frame in his
+keypoint format to `recordings\leap\prof_frames\`.
 
 **Gate experiment (Phase 2).** The one experiment that decides the
 architecture: does the IR tracker see a hand inside the black StretchSense
@@ -244,6 +251,56 @@ The verdict applies the plan's thresholds — detection >= 80 %, at most one
 re-acquisition per 10 s, jitter within 2x the bare hand of the same side.
 Path A means simultaneous glove + camera capture; Path B means sequential.
 
+**Result (2026-09-16): Path A, provisionally.** The IR camera tracks the hand
+*inside* the black StretchSense glove in **100 %** of frames, with **0**
+re-acquisitions and **0.20 mm** fingertip jitter against the bare hand's
+0.54 mm. In the 850 nm stills the glove renders almost white with its sensor
+grid visible as dots, so the fabric reflects near IR strongly even though it
+is black to the eye. **Do not read the better-than-bare jitter as a property
+of the fabric**: black textiles vary widely in near-IR reflectance and one
+session cannot separate that from run-to-run variation — which is what the
+extra runs below are for. The bare left hand scored 89.2 %. Every number is
+from that one session and lives in `results\leap_gate\REPORT.txt`; the
+detection rates are the corrected ones, recomputed from the same recordings
+— see the next paragraph. Plan section 9 has the full entry.
+
+**Recompute a report without the camera.**
+
+```powershell
+python scripts\leap\gate.py --recompute
+```
+
+Rebuilds `results\leap_gate\REPORT.txt` from the recordings and IR sidecars
+already under `--out-dir`, discovering the conditions from the folder names
+and measuring the most recent take in each (older takes are named in the
+report, never averaged in). Use it whenever a measurement changes, so an
+earlier session gets the corrected numbers without anyone re-running the
+protocol. It has been used once already: the detection denominator is now the
+LeapC tracking framerate for a file that kept every frame, because the
+10th-percentile gap of a full-rate file measures the timestamp jitter rather
+than the cadence (it read 101 Hz on a 90 Hz file). That moved bare left from
+79.2 % to 89.2 % and the glove from 98.6 % to 100 %, and left the verdict
+where it was. `leap_hand.stats.choose_rate` is the rule; the report's
+footnote names the denominator every row used.
+
+**Extra gate runs the reviewer asked for** (plan section 9). A centred
+right-hand glove run and one with both hands up at once, then the gloved hand
+held at 20, 35 and 50 cm above the module, working through **fist, pinch and
+open/spread** in each distance run — then the whole set repeated on a second
+day, so the result is not one session's lighting:
+
+```powershell
+python scripts\leap\gate.py --conditions bare,glove_right,glove_both,glove_20cm,glove_35cm,glove_50cm
+```
+
+Condition names are free-form: `bare` is the reference, everything else is a
+gloved condition judged against the bare hand **of the same side**, so these
+need no code change — show the bare hand on both sides in the `bare` run and
+each side's glove row is compared against its own baseline. Repeat the next
+day into a separate `--out-dir` (add `glove_day2` if you want the second
+day's plain-glove run in the same table), then `--recompute` either folder
+for its table.
+
 **The IR stills are the evidence.** A `.lmt` and our JSONL both hold *solved
 skeletons*, so when the tracker sees nothing they are empty and prove
 nothing. The stills are the raw 850 nm images of the glove, and each PNG has
@@ -266,6 +323,52 @@ fingertips farthest from the wrist). Exit 0 all good, 2 no hand appeared,
 `to_openxr.py` is corrected. It came back all zeros on this unit; see plan
 section 9.
 
+### Path A: recording glove and camera together
+
+The gate said Path A, which means one hand, one instant, both sensors — the
+glove supplying flexion, the camera supplying spread, thumb opposition, palm
+pose and wrist. Two commands, in order. Wear the glove, keep the hand 20 to
+50 cm above the module, and have XR Trainer streaming to `127.0.0.1:9002`.
+
+```powershell
+python scripts\record_simultaneous.py --camera leap
+python scripts\fuse_poses.py recordings\sync --write
+```
+
+The first is the glove pipeline's guided beep protocol with the Ultraleap as
+the camera: announce the pose, count down, record, move on, nothing to type.
+Each take writes two files under **one name**, `recordings\sync\glove\...`
+and `recordings\sync\leap\...`, both stamped with `time.time()` at the write
+— the one clock the sensors share. There is no preview window: your hands are
+over the module and an 850 nm brightness image is not something to check a
+pose against, so it prints a one-line HUD (hands seen, tracking framerate)
+once a second instead. The camera is **not** throttled by `--hz` (which stays
+the glove's rate): keeping every frame at 90 Hz is what guarantees each glove
+frame a partner within a few milliseconds, and `--leap-hz` overrides that if
+disk ever matters more than pairing.
+
+The second matches the frames by wall clock, fuses each pair and prints the
+three-row table — glove only, camera only, fused — plus how many frames found
+a partner and how often the camera actually contributed. It recognises a leap
+take by the `source: "leap"` key in the file itself, not by the folder, and
+aligns it onto the glove **rigidly, without scale**, because Leap joints are
+real millimetres and a scale factor would quietly absorb the difference
+between the hand and the glove's template skeleton (plan section 3). A
+MediaPipe take in `recordings\sync\cam\` keeps its Umeyama-with-scale fit, and
+both kinds can sit in one session folder.
+
+Rehearse the whole thing with no hardware at all:
+
+```powershell
+python scripts\record_simultaneous.py --camera leap --mock-glove --mock-leap --poses fist --takes 1 --duration 3 --prep 1
+python scripts\fuse_poses.py recordings\sync
+```
+
+Single reference frames — the 21 poses the glove could not do — go through
+`scripts\leap\record_frame.py 128166`, which shows the professor's image,
+records `--seconds` (default 3), picks the medoid frame and writes
+`<frame>_keypoints.txt` in his format into `recordings\leap\prof_frames\`.
+
 **No camera to hand?** Every script here takes `--mock`, which drives the same
 code with synthetic hands at 90 Hz:
 ```powershell
@@ -274,6 +377,8 @@ python scripts\leap\live_view.py --mock --no-window --duration 5
 python scripts\leap\record_poses.py --mock --takes 1 --duration 2 --prep 1 --poses open_palm,fist
 python scripts\leap\ir_snapshot.py --mock --label demo --count 2
 python scripts\leap\gate.py --mock --conditions bare,glove --seconds 3 --prep 0
+python scripts\leap\record_frame.py 128166 --mock --prep 0 --seconds 1
+python scripts\record_simultaneous.py --camera leap --mock-glove --mock-leap --poses fist --takes 1 --duration 3 --prep 1
 python scripts\leap\stats.py --mock
 ```
 `--mock` images are obviously synthetic gradients and their sidecars say so;
