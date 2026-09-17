@@ -10,9 +10,14 @@ Both halves of the hand-tracking work in one place:
                   dataset, technical PDF) and is frozen there.
   `src/cam_hand`  the webcam pipeline (MediaPipe 21 landmarks), plus fusion,
                   alignment, features and the comparison tooling.
+  `src/leap_hand` the Ultraleap Stereo IR 170 pipeline (LeapC -> the same 26
+                  OpenXR joints the glove uses). Metric 3D hand position and
+                  orientation, which neither of the other two measures.
+                  Plan and phases: `docs/ultraleap_ir170_plan.md`.
 
-Glove-side scripts live in `scripts/glove/`, camera-side scripts in
-`scripts/`. Everything runs from this folder with this venv.
+Glove-side scripts live in `scripts/glove/`, Ultraleap scripts in
+`scripts/leap/`, webcam scripts in `scripts/`. Everything runs from this
+folder with this venv.
 
 **Why a camera at all.** The glove measures finger *flexion* directly and
 keeps working when fingers hide behind the palm. It has no sensor for finger
@@ -26,6 +31,7 @@ a replacement for the glove; it is the other half of the hand.
 | Finger spread (abduction) | **camera** | glove has no sensor for it |
 | Thumb opposition | **camera** | the motion that makes `pinch` invisible to the glove |
 | Hand position in space | **camera** | the glove reports nothing outside the wrist |
+| Metric 3D position, wrist angle, bone lengths | **Ultraleap** | a webcam cannot recover absolute scale; the IR camera measures millimetres |
 
 Landmarks are the 21-point MediaPipe layout — the same order
 `xr_hand.keypoints21` already uses — so camera files, glove files and fused
@@ -40,7 +46,9 @@ python -m venv .venv
 pip install -e .
 ```
 
-That installs both packages (`xr_hand` and `cam_hand`) editable from `src/`.
+That installs all three packages (`xr_hand`, `cam_hand` and `leap_hand`)
+editable from `src/`. The Ultraleap bindings are **not** installed by that
+line and cannot be — see "Daily use — Ultraleap" below.
 
 Then fetch the hand-landmark model (a 7.5 MB MediaPipe binary, not kept in
 this repo) into `models\`. Note `--ssl-no-revoke`: the same certificate
@@ -50,7 +58,9 @@ workaround the earlier vision experiment needed on this network.
 curl.exe --ssl-no-revoke -o models/hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
 ```
 
-Check the install with `pytest -q` (expect 42 passed — camera and glove suites).
+Check the install with `pytest -q` (expect 77 passed — camera, glove and
+Ultraleap suites; a handful of the Ultraleap tests check the installed
+bindings and skip when they are absent).
 
 ## Try it without any hardware
 
@@ -147,6 +157,87 @@ the photo and his device's keypoints for the same instant:
 ```powershell
 python scripts/compare_to_tracker.py "..\xr trainer\xr trainer poses" --csv results/tracker_comparison.csv
 ```
+
+## Daily use — Ultraleap (Stereo IR 170)
+
+Full plan, phases and acceptance: `docs/ultraleap_ir170_plan.md`. This section
+is the operating procedure.
+
+**Phase 0 — once per machine.** The `leap` Python bindings are not on PyPI:
+they wrap `leapc_cffi`, which has to be compiled against the LeapSDK on this
+machine, so `pip install` cannot do it and the `leap` extra in
+`pyproject.toml` is deliberately empty.
+
+1. Download **Ultraleap Hyperion 6.2.0**, Operating System = **Windows**,
+   from https://www.ultraleap.com/downloads/sir170/ and install it. It brings
+   the tracking service, the Control Panel/visualiser and the LeapSDK at
+   `C:\Program Files\Ultraleap\LeapSDK`.
+2. Plug the camera into a **direct USB port** — not a hub. It needs 0.5 A and
+   browns out on unpowered hubs.
+3. Open the **Ultraleap Control Panel**, confirm the device is listed, the
+   visualiser shows hands, and the tracking mode is **Desktop**. If the panel
+   does not list the SIR170, uninstall and use Gemini 5.x from the same page
+   (plan section 1); the code is identical either way.
+4. Build and install the bindings, then verify:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File scripts\leap\setup_bindings.ps1
+   python scripts\leap\check_setup.py
+   ```
+   `setup_bindings.ps1` clones the bindings into `%TEMP%`, compiles
+   `leapc_cffi` against the SDK, installs both packages into `.venv` and ends
+   by running the checker. `check_setup.py` prints PASS/FAIL for the SDK
+   folder, `LeapC.h`, `LeapC.dll`/`.lib`, the tracking service, `import leap`
+   and a 3 s live tracking test, with the fix on every FAIL, and exits 2 if
+   anything failed. Set `LEAPSDK_INSTALL_LOCATION` first if the SDK is not at
+   the default path.
+5. Archive the installer and the `LeapSDK` folder into
+   `reference\ultraleap\` the day they are downloaded (Ultraleap releases
+   have disappeared before). The bindings clone lives in `%TEMP%` and is
+   disposable — re-run the script to recreate it, or copy it there too.
+
+**Daily.**
+```powershell
+python scripts\leap\live_view.py                 # 3D skeleton + tracking HUD
+python scripts\leap\record_poses.py              # 6 poses x 3 takes x 5 s
+python scripts\leap\record_poses.py --raw        # also write LeapC .lmt files
+python scripts\leap\stats.py recordings\leap\poses --write
+```
+`live_view.py` is the first thing to run in a session: with an open palm over
+the module it shows whether finger order, chirality and fingertips are right.
+`record_poses.py` is the glove's guided beep protocol, same pose list and
+filenames, writing to `recordings\leap\poses\`.
+
+**No camera to hand?** Every script here takes `--mock`, which drives the same
+code with synthetic hands at 90 Hz:
+```powershell
+python scripts\leap\check_setup.py --mock
+python scripts\leap\live_view.py --mock --no-window --duration 5
+python scripts\leap\record_poses.py --mock --takes 1 --duration 2 --prep 1 --poses open_palm,fist
+python scripts\leap\stats.py --mock
+```
+
+**Exports — the existing tools, unchanged.** Leap recordings are JSONL with
+exactly the glove's keys plus camera-only extras, and `FrameRecorder.load`
+ignores keys it does not know, so:
+```powershell
+python scripts\glove\playback.py recordings\leap\poses\<file>.jsonl
+python scripts\glove\export_keypoints21.py recordings\leap\poses
+python scripts\glove\export_prof_format.py recordings\leap\poses
+```
+One caveat in `playback.py`: Leap frames carry the hand's **real position** in
+camera space (a wrist 25 cm above the module), while that viewer's box is
+fixed at ±0.22 m around the origin, so the hand can sit outside the view.
+`scripts\leap\live_view.py` re-anchors the wrist and does not have this
+problem, and every export is wrist-centred, so only that one viewer is
+affected.
+
+**Units and frame.** Positions are metres, the same unit as glove
+`HandFrame`s (LeapC's millimetres are converted once, in
+`leap_hand.to_openxr.from_leap_mm`). The frame is LeapC desktop-mode camera
+space: right-handed, origin at the module, +x along the baseline, +y up, +z
+toward the user. `hand.confidence` is never used anywhere — LeapC documents
+it as a constant 1.0; recordings are gated on presence and `visible_time`
+instead.
 
 ## Results so far (102 reference frames)
 
