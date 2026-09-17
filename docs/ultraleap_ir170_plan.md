@@ -138,7 +138,10 @@ Evidence to keep from every gate run
 - The JSONL and `.lmt` recordings, and the `stats.py` table.
 - IR stills of the hand in each condition, saved with
   `scripts/leap/ir_snapshot.py` (to be written on hardware day): it calls
-  `connection.set_policy_flags(flags_to_set=[leap.PolicyFlag.Images])`,
+  `connection.set_policy_flags(flags_to_set=[leap.enums.PolicyFlag.Images])`
+  — the flag lives in `leap.enums`, **not** on the package root:
+  `leap.PolicyFlag` is an AttributeError (checked against the installed
+  bindings, 2026-09-16) —
   receives `on_image_event(event)` with `event.image[0]` (left) and
   `event.image[1]` (right), reads `image.c_data.properties.width/.height/
   .bpp`, `.data` and `.offset`, copies the buffer inside the callback (LeapC
