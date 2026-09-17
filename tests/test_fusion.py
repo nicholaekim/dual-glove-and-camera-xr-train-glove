@@ -8,11 +8,26 @@ import pytest
 from cam_hand.align import umeyama
 from cam_hand.features import all_features, flexion_features, spread_features
 from cam_hand.fusion import (
+    CAMERA_DOFS,
+    DEFAULT_GATES,
     FINGER_CHAINS,
+    GateParams,
+    R_CURLED,
+    R_DISAGREE,
+    R_FIELD,
+    R_HAND_ID,
+    R_NO_FRAME,
+    R_VIEW,
+    R_VISIBLE,
+    flag_hand_id_stability,
+    frame_trust,
     fuse_skeletons,
     pair_by_time,
+    palm_field_angle_deg,
     palm_frame,
+    proximal_direction,
     rotation_between,
+    viewing_angle_deg,
 )
 
 
@@ -623,3 +638,330 @@ def test_the_kabsch_residual_is_reported_and_never_gates_a_frame():
     # the MediaPipe path has no metric residual to report
     _f, mp = fuse_skeletons(glove, cam, with_scale=True)
     assert mp["kabsch_rmse_mm"] is None and mp["alignment"] == "similarity"
+
+
+# --- gating: when the camera may and may not supply a DOF ---------------
+# The first real simultaneous session is the source of every number here.
+# The two cases that matter are pinch (the camera is right, the glove is
+# blind) and thumbs_up (the glove is right, the camera is confidently wrong),
+# and a gate that cannot tell them apart is not a gate.
+
+def facing_meta(view_deg=0.0, **over):
+    """Camera metadata for a hand held above the module, palm turned by view_deg.
+
+    The module is the origin, so a palm at (0, h, 0) is seen along -y; tilting
+    the normal away from that ray by `view_deg` is exactly what the gate
+    measures.
+    """
+    meta = {"visible_time_us": 5_000_000, "hand_id_stable": True,
+            "palm_abs": [0.0, 0.25, 0.0],
+            "palm_normal_abs": [math.sin(math.radians(view_deg)),
+                                -math.cos(math.radians(view_deg)), 0.0]}
+    meta.update(over)
+    return meta
+
+
+def hand_with_curls(curls, spread_deg=0.0):
+    """A synthetic hand whose five flexion features are exactly `curls`.
+
+    `make_hand`'s `curl` is a bend ANGLE; the gate reads the FEATURE
+    (tip-to-wrist over palm length). Each finger is therefore bent as far as
+    the angle can take it toward its target and its bones are then scaled
+    about the knuckle to land on it — a real hand is both longer and more
+    foldable than this toy one, reaching 2.07 palm lengths open and 0.62
+    curled where the toy spans 0.97 to 1.83. Knuckles never move, so palm
+    length, and with it every other finger's feature, is unaffected.
+    """
+    pts = make_hand(spread_deg=spread_deg, curl=0.0)
+    wrist = pts[0].copy()
+    palm = float(np.linalg.norm(pts[9] - wrist))
+    for k, chain in enumerate(FINGER_CHAINS.values()):
+        target = curls[k] * palm
+        lo, hi = 0.0, 3.0          # past 90 degrees: a real fist folds under
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            trial = make_hand(spread_deg=spread_deg, curl=mid)
+            if float(np.linalg.norm(trial[chain[-1]] - wrist)) > target:
+                lo = mid
+            else:
+                hi = mid
+        seg = make_hand(spread_deg=spread_deg, curl=0.5 * (lo + hi))[chain]
+        knuckle = seg[0].copy()
+        # |knuckle - wrist + s*v| = target, solved rather than searched: with
+        # the tip folded back past the wrist the distance is not monotonic in
+        # s and a bisection would find the wrong side of the turn.
+        v = seg[-1] - knuckle
+        w = knuckle - wrist
+        qa = float(v @ v)
+        qb = 2.0 * float(w @ v)
+        qc = float(w @ w) - target * target
+        disc = qb * qb - 4.0 * qa * qc
+        s = (-qb + math.sqrt(disc)) / (2.0 * qa) if disc >= 0 else 1.0
+        pts[chain] = knuckle + s * (seg - knuckle)
+    assert np.allclose(flexion_features(pts), curls, atol=1e-6), (
+        flexion_features(pts), curls)
+    return pts
+
+
+# Medians measured in recordings/sync, take 1, over the 5 s each pose was held.
+OPEN_GLOVE_CURLS = [1.43, 1.97, 2.07, 1.97, 1.71]
+FIST_GLOVE_CURLS = [0.95, 0.73, 0.72, 0.71, 0.73]
+PINCH_GLOVE_CURLS = OPEN_GLOVE_CURLS          # identical, to the last digit
+PINCH_CAM_CURLS = [1.28, 1.31, 1.79, 1.69, 1.49]
+THUMBSUP_GLOVE_CURLS = [1.43, 0.66, 0.62, 0.70, 1.02]
+THUMBSUP_CAM_CURLS = [1.18, 1.68, 1.82, 1.44, 1.22]
+
+
+def test_viewing_angle_is_zero_when_the_palm_faces_the_module():
+    # palm 25 cm above the module, normal pointing straight back down at it
+    assert viewing_angle_deg([0.0, 0.25, 0.0], [0.0, -1.0, 0.0]) == pytest.approx(0.0, abs=1e-9)
+    # edge-on: the normal is perpendicular to the ray
+    assert viewing_angle_deg([0.0, 0.25, 0.0], [1.0, 0.0, 0.0]) == pytest.approx(90.0, abs=1e-9)
+    # back of the hand
+    assert viewing_angle_deg([0.0, 0.25, 0.0], [0.0, 1.0, 0.0]) == pytest.approx(180.0, abs=1e-9)
+    # and it is the RAY, not the y axis: an off-axis palm is measured from
+    # where it actually is
+    assert viewing_angle_deg([0.25, 0.25, 0.0], [0.0, -1.0, 0.0]) == pytest.approx(45.0, abs=1e-6)
+
+
+def test_the_central_field_gate_is_lateral_offset_against_height():
+    assert palm_field_angle_deg([0.0, 0.3, 0.0]) == pytest.approx(0.0, abs=1e-9)
+    assert palm_field_angle_deg([0.3, 0.3, 0.0]) == pytest.approx(45.0, abs=1e-6)
+    ok, reasons, _m = frame_trust(facing_meta(palm_abs=[0.10, 0.30, 0.0]))
+    assert ok and reasons == []
+    ok, reasons, _m = frame_trust(facing_meta(palm_abs=[0.40, 0.30, 0.0]))
+    assert not ok and R_FIELD in reasons
+    # a palm level with or below the module is outside it by construction
+    assert palm_field_angle_deg([0.1, 0.0, 0.0]) >= 90.0
+
+
+def test_frame_trust_rejects_a_fresh_or_unsettled_track():
+    ok, reasons, metrics = frame_trust(facing_meta(visible_time_us=299_999))
+    assert not ok and R_VISIBLE in reasons
+    assert frame_trust(facing_meta(visible_time_us=300_000))[0]
+    ok, reasons, _m = frame_trust(facing_meta(hand_id_stable=False))
+    assert not ok and R_HAND_ID in reasons
+    # the numbers it measured are reported whether or not it passed
+    assert metrics["view_angle_deg"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_hand_id_stability_is_flagged_per_hand_over_time():
+    rows = [{"hand_side": "right", "capture_time": t, "hand_id": hid}
+            for t, hid in [(0.0, 7), (0.1, 7), (0.2, 9), (0.3, 9),
+                           (0.5, 9), (0.6, 9)]]
+    # a left hand interleaved, whose own id never changes
+    rows += [{"hand_side": "left", "capture_time": t, "hand_id": 3}
+             for t in (0.05, 0.25, 0.55)]
+    flag_hand_id_stability(rows, DEFAULT_GATES, clock="capture_time")
+    right = [r["hand_id_stable"] for r in rows if r["hand_side"] == "right"]
+    assert right == [True, True, False, False, True, True], (
+        "the change at 0.2 s must blank 0.25 s of frames and no more")
+    assert all(r["hand_id_stable"] for r in rows if r["hand_side"] == "left"), (
+        "the other hand's re-acquisition is not this hand's problem")
+
+
+# --- the spread gate ---------------------------------------------------
+
+def test_a_curled_finger_keeps_the_gloves_spread_and_an_open_one_does_not():
+    """The glove decides whether the camera is allowed to bend the finger.
+
+    A finger curled into the palm has no abduction left to see and its
+    proximal bone points at the camera end-on, so its azimuth there is noise.
+    """
+    open_glove = hand_with_curls(OPEN_GLOVE_CURLS)
+    cam = make_hand(spread_deg=25.0, curl=0.0)
+    fused, info = fuse_skeletons(open_glove, cam, with_scale=False,
+                                 cam_meta=facing_meta())
+    assert all(info["dof_source"][f"spread {f}"] == "camera"
+               for f in ("index", "middle", "ring", "pinky"))
+    assert not np.allclose(fused, open_glove - open_glove[0], atol=1e-6)
+
+    curled = hand_with_curls(FIST_GLOVE_CURLS)
+    fused, info = fuse_skeletons(curled, cam, with_scale=False,
+                                 cam_meta=facing_meta())
+    for f in ("index", "middle", "ring", "pinky"):
+        assert info["dof_source"][f"spread {f}"] == "glove"
+        assert info["rejected"][f"spread {f}"] == R_CURLED
+
+
+def test_an_edge_on_view_rejects_every_camera_dof():
+    """thumbs_up in the real session: 70-78 degrees, and wrong about everything."""
+    glove = make_hand(spread_deg=0.0, curl=0.0)
+    cam = make_hand(spread_deg=25.0, curl=0.0)
+    fused, info = fuse_skeletons(glove, cam, with_scale=False,
+                                 cam_meta=facing_meta(view_deg=75.0))
+    assert info["view_angle_deg"] == pytest.approx(75.0, abs=1e-6)
+    assert set(info["rejected"]) == set(CAMERA_DOFS)
+    assert all(v == R_VIEW for v in info["rejected"].values())
+    assert np.allclose(fused, glove - glove[0], atol=1e-12)
+    # ...and moving the gate past it lets the same frame straight back in
+    loose = GateParams(view_gate_deg=80.0)
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, gates=loose,
+                              cam_meta=facing_meta(view_deg=75.0))
+    assert info["rejected"] == {}
+
+
+# --- the thumb gate: the pinch / thumbs_up pair -------------------------
+# Both hands are built from the real session's curl numbers, which is the
+# whole argument for the rule: the same camera, the same tracker, one frame
+# worth taking and one not, told apart without asking the tracker.
+
+def test_pinch_passes_the_thumb_gate_and_thumbs_up_is_rejected():
+    """One rule, both real cases, and it has to get both right.
+
+    pinch      the glove is numerically its own open palm, and the camera
+               agrees with it about index..little to within 0.28 — it is
+               looking at the same hand, so its thumb is worth having.
+    thumbs_up  the camera has the four curled fingers nearly straight. A
+               camera that wrong about the fingers has the hand's orientation
+               wrong, and orientation error moves the thumb most of all.
+    """
+    pinch_g = hand_with_curls(PINCH_GLOVE_CURLS)
+    pinch_c = hand_with_curls(PINCH_CAM_CURLS)
+    _f, info = fuse_skeletons(pinch_g, pinch_c, with_scale=False,
+                              cam_meta=facing_meta(view_deg=40.0))
+    assert info["curl_disagreement"] < DEFAULT_GATES.curl_agree_tol
+    assert info["dof_source"]["thumb"] == "camera", info["rejected"]
+
+    up_g = hand_with_curls(THUMBSUP_GLOVE_CURLS)
+    up_c = hand_with_curls(THUMBSUP_CAM_CURLS)
+    _f, info = fuse_skeletons(up_g, up_c, with_scale=False,
+                              cam_meta=facing_meta(view_deg=40.0))
+    assert info["curl_disagreement"] > DEFAULT_GATES.curl_agree_tol
+    assert info["dof_source"]["thumb"] == "glove"
+    assert info["rejected"]["thumb"] == R_DISAGREE
+
+    # the real thumbs_up frames were ALSO edge-on, so the frame is refused
+    # twice over — either rule alone is enough
+    _f, info = fuse_skeletons(up_g, up_c, with_scale=False,
+                              cam_meta=facing_meta(view_deg=75.0))
+    assert info["rejected"]["thumb"] == R_VIEW
+
+
+def test_the_thumb_gate_ignores_the_thumb_it_is_deciding_about():
+    """Only index..little vote. A disagreeing thumb is the reason to look."""
+    glove = hand_with_curls([1.43, 1.97, 2.07, 1.97, 1.71])
+    cam = hand_with_curls([0.70, 1.95, 2.05, 1.95, 1.70])   # thumb miles off
+    _f, info = fuse_skeletons(glove, cam, with_scale=False,
+                              cam_meta=facing_meta(view_deg=10.0))
+    assert info["curl_disagreement"] < 0.05
+    assert info["dof_source"]["thumb"] == "camera"
+
+
+# --- azimuth is read off the proximal bone ------------------------------
+
+def test_azimuth_comes_from_the_proximal_bone_not_the_curled_tip():
+    """A finger whose TIP is bent sideways must not look abducted.
+
+    The index is left straight out of its knuckle and only its last two bones
+    are swung 40 degrees across the palm. Knuckle -> tip then reports a large
+    azimuth that the knuckle never produced; knuckle -> PIP reports the truth.
+    """
+    from cam_hand.features import proximal_azimuth_deg
+
+    pts = make_hand(spread_deg=0.0, curl=0.0)
+    chain = FINGER_CHAINS["index"]
+    pivot = pts[chain[1]].copy()                  # bend at the PIP
+    th = math.radians(40.0)
+    R = np.array([[math.cos(th), -math.sin(th), 0.0],
+                  [math.sin(th), math.cos(th), 0.0],
+                  [0.0, 0.0, 1.0]])
+    pts[chain[2:]] = (R @ (pts[chain[2:]] - pivot).T).T + pivot
+
+    straight = make_hand(spread_deg=0.0, curl=0.0)
+    n, x, y = palm_frame(pts)
+
+    def tip_az(p):
+        d = np.asarray(p)[chain[-1]] - np.asarray(p)[chain[0]]
+        d = d / np.linalg.norm(d)
+        return math.degrees(math.atan2(float(np.dot(d, y)), float(np.dot(d, x))))
+
+    # the tip moved a long way; the proximal bone did not move at all
+    assert abs(tip_az(pts) - tip_az(straight)) > 15.0
+    assert proximal_azimuth_deg(pts, "index") == pytest.approx(
+        proximal_azimuth_deg(straight, "index"), abs=1e-9)
+    assert np.allclose(proximal_direction(pts, "index"),
+                       proximal_direction(straight, "index"), atol=1e-9)
+
+    # and fusing against this camera hand must not swing the glove's index:
+    # there is no abduction here, only flexion, which is the glove's already
+    fused, _info = fuse_skeletons(straight, pts, with_scale=False)
+    d = fused[chain[1]] - fused[chain[0]]
+    got = math.degrees(math.atan2(float(np.dot(d / np.linalg.norm(d), y)),
+                                  float(np.dot(d / np.linalg.norm(d), x))))
+    assert got == pytest.approx(
+        proximal_azimuth_deg(straight, "index"), abs=1e-6)
+
+
+def test_adopting_a_camera_azimuth_leaves_every_curl_untouched():
+    """The chain turns about the palm normal, so curl survives exactly."""
+    glove = make_hand(spread_deg=0.0, curl=0.7)
+    cam = make_hand(spread_deg=25.0, curl=0.0)
+    fused, _info = fuse_skeletons(glove, cam, thumb_from_camera=False,
+                                  with_scale=False)
+    n, _x, _y = palm_frame(glove)
+    for chain in FINGER_CHAINS.values():
+        for a, b in zip(chain, chain[1:]):
+            def out(p):
+                d = np.asarray(p)[b] - np.asarray(p)[a]
+                return float(np.dot(d / np.linalg.norm(d), n))
+            assert out(fused) == pytest.approx(out(glove), abs=1e-12)
+
+
+# --- bookkeeping -------------------------------------------------------
+
+def test_every_frame_reports_where_each_dof_came_from_and_why():
+    glove = make_hand(spread_deg=0.0, curl=0.0)
+    cam = make_hand(spread_deg=25.0, curl=0.0)
+
+    _f, info = fuse_skeletons(glove, cam, with_scale=False,
+                              cam_meta=facing_meta())
+    assert info["gated"] is True
+    assert set(info["dof_source"]) == set(CAMERA_DOFS)
+    assert set(info["dof_source"].values()) == {"camera"}
+    assert info["rejected"] == {}
+    # every DOF is either sourced from the camera or carries a reason it is not
+    for dof in CAMERA_DOFS:
+        assert (info["dof_source"][dof] == "camera") != (dof in info["rejected"])
+
+    # a frame-level failure names itself on every DOF, and nothing is dropped
+    fused, info = fuse_skeletons(glove, cam, with_scale=False,
+                                 cam_meta=facing_meta(visible_time_us=1000))
+    assert info["frame_reasons"] == [R_VISIBLE]
+    assert set(info["rejected"].values()) == {R_VISIBLE}
+    assert np.allclose(fused, glove, atol=1e-12), "a rejected frame is the glove"
+
+    # so does having no camera frame at all
+    _f, info = fuse_skeletons(glove, None)
+    assert set(info["rejected"].values()) == {R_NO_FRAME}
+
+
+def test_an_ungated_mediapipe_frame_is_fused_exactly_as_before():
+    """No capture facts to read is not a reason to reject a whole sensor.
+
+    A MediaPipe take has no absolute palm, no hand id and no visibility
+    clock. It passes cam_meta=None, every camera DOF is taken, and `gated`
+    says so rather than the report inventing a 0% camera-use rate for it.
+    """
+    glove = make_hand(spread_deg=0.0, curl=0.9)     # a fist: would be gated out
+    cam = make_hand(spread_deg=25.0, curl=0.9)
+    fused, info = fuse_skeletons(glove, cam, with_scale=True)
+    assert info["gated"] is False
+    assert info["rejected"] == {}
+    assert set(info["dof_source"].values()) == {"camera"}
+    assert info["fingers_adjusted"] == list(FINGER_CHAINS)
+    assert not np.allclose(fused, glove - glove[0], atol=1e-6)
+
+
+def test_gate_thresholds_are_named_parameters_and_are_reported():
+    described = DEFAULT_GATES.described()
+    assert described == {"curl_gate": 1.2, "view_gate_deg": 50.0,
+                         "curl_agree_tol": 0.35, "min_visible_time_us": 300_000,
+                         "hand_id_settle_s": 0.25, "field_half_angle_deg": 45.0}
+    # and they are honoured, not just stored
+    glove = make_hand(spread_deg=0.0, curl=0.0)
+    cam = make_hand(spread_deg=25.0, curl=0.0)
+    strict = GateParams(curl_gate=9.9)
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, gates=strict,
+                              cam_meta=facing_meta())
+    assert info["rejected"]["spread index"] == R_CURLED
