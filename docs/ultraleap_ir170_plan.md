@@ -497,6 +497,22 @@ Gate result (2026-09-16, 22:47 to 22:52, one operator, left hand)
   say otherwise.
 - Raw `.lmt` capture ran with a device for the first time (empty scene,
   322 events, reads back through `leap.Recording`).
+- Recomputed with the tracker-rate denominator (`gate.py --recompute`):
+  bare left 89.2 %, glove left 100.0 %, verdict unchanged.
+
+Path A tooling (merged 2026-09-16, 130 tests)
+- `scripts/record_simultaneous.py --camera leap`: one guided session records
+  the glove over OSC and the camera together on a shared wall clock. The
+  camera keeps every frame (two independently throttled recorders drift
+  apart and lose two thirds of the pairs); the glove keeps its `--hz`.
+- `scripts/fuse_poses.py` and `cam_hand/fusion.py`: leap files are detected
+  by `source: "leap"` and aligned rigidly, no scale, because they are
+  already metric. The MediaPipe path is unchanged. On the known-answer
+  self-test expressed as leap files: glove 24/36, camera 36/36, fused
+  36/36.
+- `scripts/leap/record_frame.py`: camera version of the professor-frame
+  replication (medoid of a short take, professor txt format in mm).
+- Not yet run with a real hand or with XR Trainer streaming.
 
 Phase 2 tooling (2026-09-16, still the same evening, camera attached, no
 second person available to hold a hand)
