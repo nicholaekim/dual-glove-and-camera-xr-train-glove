@@ -188,11 +188,14 @@ machine, so `pip install` cannot do it and the `leap` extra in
    `leapc_cffi` against the SDK, installs both packages into `.venv` and ends
    by running the checker. It reuses an archived wheel built for the running
    interpreter when there is one, so a repeat setup takes seconds instead of
-   a compile; `-Fresh` forces a rebuild. `check_setup.py` prints PASS/FAIL for
+   a compile; `-Fresh` forces a rebuild. `check_setup.py` prints a line for
    the SDK folder, `LeapC.h`, `LeapC.dll`/`.lib`, the tracking service,
-   `import leap` and a 3 s live tracking test, with the fix on every FAIL, and
-   exits 2 if anything failed. Set `LEAPSDK_INSTALL_LOCATION` first if the SDK
-   is not at the default path.
+   `import leap`, then **device streaming** and **hand seen** over a 6 s
+   window, with the fix on every FAIL. `hand seen` is a **WARN**, not a FAIL,
+   when the device streams but nobody is holding a hand over it — an empty
+   room is not a broken machine, so that still exits 0; anything else failing
+   exits 2. Set `LEAPSDK_INSTALL_LOCATION` first if the SDK is not at the
+   default path.
 5. Archive the installer and the `LeapSDK` folder into
    `..\xr trainer\reference\ultraleap\` the day they are downloaded —
    Ultraleap releases have disappeared before. The bindings clone already
@@ -216,14 +219,66 @@ the module it shows whether finger order, chirality and fingertips are right.
 `record_poses.py` is the glove's guided beep protocol, same pose list and
 filenames, writing to `recordings\leap\poses\`.
 
+**Gate experiment (Phase 2).** The one experiment that decides the
+architecture: does the IR tracker see a hand inside the black StretchSense
+glove? One command runs the whole of plan section 2 —
+
+```powershell
+python scripts\leap\gate.py
+```
+
+— four conditions in order (`bare`, `glove`, `glove_liner`, `glove_tape`),
+20 s each. Per condition it counts you in with beeps, records, takes IR
+stills spread across the run, then prints what to change on your hand and
+waits for Enter. Add `--raw` for LeapC `.lmt` files, or narrow it with
+`--conditions bare,glove --seconds 30`. It writes:
+
+```
+recordings\leap\gate\<condition>\   the JSONL take, the IR stills (PNG + JSON
+                                    sidecar each), and .lmt with --raw
+results\leap_gate\REPORT.txt        one table row per condition and hand, then
+                                    "Path A: yes/no because ..."
+```
+
+The verdict applies the plan's thresholds — detection >= 80 %, at most one
+re-acquisition per 10 s, jitter within 2x the bare hand of the same side.
+Path A means simultaneous glove + camera capture; Path B means sequential.
+
+**The IR stills are the evidence.** A `.lmt` and our JSONL both hold *solved
+skeletons*, so when the tracker sees nothing they are empty and prove
+nothing. The stills are the raw 850 nm images of the glove, and each PNG has
+a sidecar naming the hands the tracker reported at that instant — a photo of
+a clearly visible glove next to `"no hand tracked"` is itself the finding.
+Take them on their own with:
+
+```powershell
+python scripts\leap\ir_snapshot.py --label glove --count 10 --interval 0.5
+```
+
+Measured on this unit: 384 x 384, 8-bit, one plane per eye.
+
+**Convention checker.** `python scripts\leap\convention_check.py` holds a
+real hand in front of the device and verifies every LeapC convention the
+26-joint mapping is built on (bone `rotation * (0,0,-1)` along
+`prev_joint -> next_joint`, the zero-length thumb metacarpal, the palm basis,
+fingertips farthest from the wrist). Exit 0 all good, 2 no hand appeared,
+3 a convention failed — in which case do not collect data until
+`to_openxr.py` is corrected. It came back all zeros on this unit; see plan
+section 9.
+
 **No camera to hand?** Every script here takes `--mock`, which drives the same
 code with synthetic hands at 90 Hz:
 ```powershell
 python scripts\leap\check_setup.py --mock
 python scripts\leap\live_view.py --mock --no-window --duration 5
 python scripts\leap\record_poses.py --mock --takes 1 --duration 2 --prep 1 --poses open_palm,fist
+python scripts\leap\ir_snapshot.py --mock --label demo --count 2
+python scripts\leap\gate.py --mock --conditions bare,glove --seconds 3 --prep 0
 python scripts\leap\stats.py --mock
 ```
+`--mock` images are obviously synthetic gradients and their sidecars say so;
+`convention_check.py` has no mock, because a convention can only be checked
+against a real device.
 
 **Exports — the existing tools, unchanged.** Leap recordings are JSONL with
 exactly the glove's keys plus camera-only extras, and `FrameRecorder.load`
