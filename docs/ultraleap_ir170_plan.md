@@ -138,7 +138,8 @@ live viewer):
 Evidence to keep from every gate run
 - The JSONL and `.lmt` recordings, and the `stats.py` table.
 - IR stills of the hand in each condition, saved with
-  `scripts/leap/ir_snapshot.py` (to be written on hardware day): it calls
+  `scripts/leap/ir_snapshot.py` (written 2026-09-16; `scripts/leap/gate.py`
+  takes them automatically during each condition): it calls
   `connection.set_policy_flags(flags_to_set=[leap.enums.PolicyFlag.Images])`
   — the flag lives in `leap.enums`, **not** on the package root:
   `leap.PolicyFlag` is an AttributeError (checked against the installed
@@ -293,10 +294,11 @@ Phase 1. Backend (2 to 3 days).
   through `export_keypoints21` and `export_prof_format` with no code changes
   to those tools.
 
-Phase 2. Gate experiment (half a day). Run Section 2. Write
-`results/leap_glove_visibility.txt` with per-condition detection rate,
-re-acquisitions, tracking framerate and jitter. Choose Path A or B and
-record the choice in the README.
+Phase 2. Gate experiment (half a day). Run Section 2 with
+`scripts/leap/gate.py`, which writes `results/leap_gate/REPORT.txt`:
+per-condition detection rate, re-acquisitions, tracking framerate and jitter,
+then the Path A / Path B verdict in the report's own words. Record the choice
+in the README.
 
 Phase 3. Data collection (1 to 2 days of recording).
 - Bare hand, both hands, 7 poses x 3 takes: `recordings/leap/poses/`.
@@ -470,6 +472,30 @@ Hardware day (2026-09-16, later the same evening, camera attached)
 - Closed: device enumeration, bindings against the Hyperion SDK, the
   convention checks. Still open: the glove gate (Section 2) and the raw
   `.lmt` capture, which has not yet run with a device.
+
+Phase 2 tooling (2026-09-16, still the same evening, camera attached, no
+second person available to hold a hand)
+- Written: `src/leap_hand/images.py` (image policy, LeapC buffer -> numpy,
+  `ImageSampler`, `HandTrail`, snapshot writing), `src/leap_hand/gate.py`
+  (the thresholds, the verdict and the report text),
+  `scripts/leap/{ir_snapshot.py, gate.py, convention_check.py}`, the
+  `check_setup.py` split, and 26 tests. 107 pass.
+- IR images confirmed on hardware, empty scene: 384 x 384, `bpp` 1, one
+  plane per eye, mean pixel 5.3 (left) / 5.6 (right) in a dark room, and the
+  PNGs show the room, so the policy, the pointer arithmetic and the copy are
+  all right. `PolicyFlag.Images` comes back active from
+  `set_policy_flags`.
+- Raw `.lmt` capture confirmed on hardware for the first time: a 3 s gate run
+  with an empty scene wrote 322 tracking events, 0 hands, and the file reads
+  back through `leap.Recording`. That closes the last Phase 0 item.
+- `check_setup.py` now splits the old "live tracking" line into "device
+  streaming" (FAIL if no tracking events) and "hand seen" (WARN, exit 0),
+  because an empty room is not a broken machine and this machine is usually
+  empty.
+- Still open, and it needs a second person: every number in the gate itself.
+  Nothing has been measured with a hand — bare or gloved — so Path A vs B is
+  undecided. The tooling was exercised with `--mock` end to end and with the
+  device on an empty scene.
 
 ## 10. Handoff block for the executing session
 

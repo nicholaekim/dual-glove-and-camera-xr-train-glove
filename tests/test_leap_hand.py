@@ -498,6 +498,445 @@ def test_hand_side_falls_back_to_the_string_form(monkeypatch):
     assert hand_side(FakeHand("right")) == "right"
 
 
+# --- IR images --------------------------------------------------------------
+# The gate's evidence path: LeapC's raw buffer -> numpy -> PNG + sidecar. The
+# fakes below are shaped like `leap.Image` / `leap.ImageEvent`: a thin wrapper
+# with everything real behind `c_data`.
+class FakeImageProperties:
+    def __init__(self, width, height, bpp):
+        self.width, self.height, self.bpp = width, height, bpp
+
+
+class FakeImageCData:
+    def __init__(self, properties, data, offset=0):
+        self.properties = properties
+        self.data = data
+        self.offset = offset
+
+
+class FakeImage:
+    """Like leap.Image: only `c_data` reaches the pixels."""
+    def __init__(self, c_data):
+        self.c_data = c_data
+        self.matrix_version = 1
+
+
+class FakeImageEvent:
+    def __init__(self, images, frame_id=11, timestamp=987_654):
+        self.image = images
+
+        class _Info:
+            pass
+
+        class _CData:
+            pass
+
+        info = _Info()
+        info.frame_id = frame_id
+        info.timestamp = timestamp
+        self.c_data = _CData()
+        self.c_data.info = info
+
+
+def _fake_image(width, height, bpp=1, offset=0, fill=None, cffi=False):
+    """One FakeImage over `width*height*bpp` bytes, optionally real cffi data."""
+    payload = bytes(fill if fill is not None
+                    else [(i * 7) % 256 for i in range(width * height * bpp)])
+    raw = bytes(offset) + payload
+    if cffi:
+        ffi = pytest.importorskip("leapc_cffi").ffi
+        raw = ffi.new("uint8_t[]", raw)
+    return FakeImage(FakeImageCData(FakeImageProperties(width, height, bpp),
+                                    raw, offset))
+
+
+def test_image_to_numpy_reads_the_leapc_buffer_through_cffi():
+    """The hardware path: a real ffi buffer, an offset, and a copy."""
+    ffi = pytest.importorskip("leapc_cffi").ffi
+    from leap_hand.images import image_to_numpy
+
+    width, height, offset = 4, 3, 5
+    image = _fake_image(width, height, offset=offset, cffi=True)
+    array = image_to_numpy(image)
+
+    assert array.shape == (height, width)          # (rows, columns)
+    assert array.dtype.name == "uint8"
+    assert array.ravel().tolist() == [(i * 7) % 256 for i in range(width * height)]
+
+    # The copy is the point: LeapC reuses this buffer for the next frame, so
+    # overwriting it must not reach an array we already handed out.
+    before = array.copy()
+    for i in range(offset, offset + width * height):
+        image.c_data.data[i] = 0
+    assert array.tolist() == before.tolist()
+    assert ffi.buffer(image.c_data.data)[offset] == b"\x00"   # really cleared
+
+
+def test_image_to_numpy_without_the_bindings():
+    """Plain bytes work too, so the conversion is testable on any machine."""
+    from leap_hand.images import image_to_numpy
+    array = image_to_numpy(_fake_image(5, 2))
+    assert array.shape == (2, 5)
+    assert array[0, 0] == 0 and array[0, 1] == 7
+
+
+def test_image_to_numpy_keeps_the_planes_of_a_wider_pixel():
+    from leap_hand.images import image_to_numpy
+    assert image_to_numpy(_fake_image(4, 3, bpp=3)).shape == (3, 4, 3)
+
+
+def test_image_to_numpy_rejects_an_empty_frame():
+    from leap_hand.images import image_to_numpy
+    with pytest.raises(ValueError):
+        image_to_numpy(_fake_image(0, 0))
+
+
+def test_image_sampler_keeps_only_the_newest_pair():
+    from leap_hand.images import ImageSampler
+
+    sampler = ImageSampler()
+    for frame_id in (1, 2, 3):
+        sampler.on_image_event(FakeImageEvent(
+            [_fake_image(4, 3), _fake_image(4, 3)], frame_id=frame_id,
+            timestamp=1000 * frame_id))
+
+    pair = sampler.latest()
+    assert pair.frame_id == 3 and pair.timestamp_us == 3000
+    assert pair.width == 4 and pair.height == 3 and pair.bpp == 1
+    assert [side for side, _ in pair.sides()] == ["L", "R"]
+    assert sampler.received == 3 and sampler.skipped == 2 and sampler.errors == 0
+    assert sampler.latest() is None          # taken once, gone
+
+
+def test_image_sampler_survives_a_bad_event():
+    """A frame we cannot read is counted, not raised: the run keeps going."""
+    from leap_hand.images import ImageSampler
+
+    sampler = ImageSampler()
+    sampler.on_image_event(FakeImageEvent([_fake_image(0, 0),
+                                           _fake_image(0, 0)]))
+    assert sampler.errors == 1 and sampler.latest() is None
+
+
+def test_hand_trail_pairs_an_image_with_the_nearest_tracking_event():
+    from leap_hand.images import HandTrail
+
+    trail = HandTrail()
+    assert trail.nearest(0) == ([], None)
+
+    stream = MockLeapStream(noise_mm=0.0)
+    stream.start()
+    items = stream.generate(3)
+    for _side, lh in items:
+        trail.add(lh)
+
+    first_ts = items[0][1].timestamp_us
+    hands, dt_ms = trail.nearest(first_ts + 100)
+    assert {h["hand_side"] for h in hands} == {"left", "right"}   # one event
+    assert all(len(h["palm_pos"]) == 3 for h in hands)
+    assert dt_ms == pytest.approx(-0.1)            # the event is 100 us older
+
+    trail.clear()
+    assert trail.nearest(first_ts) == ([], None)
+
+
+def test_hand_trail_refuses_to_pair_a_still_with_a_stale_hand():
+    """A photo of an untracked glove must not inherit an old hand."""
+    from leap_hand.images import HandTrail
+
+    trail = HandTrail()
+    stream = MockLeapStream(noise_mm=0.0)
+    stream.start()
+    for _side, lh in stream.generate(1):
+        trail.add(lh)
+        last_ts = lh.timestamp_us
+
+    # Ten seconds later the tracker has seen nothing since. The nearest event
+    # is still that one, and it says nothing about this image.
+    assert trail.nearest(last_ts + 10_000_000) == ([], None)
+    assert trail.nearest(last_ts + 10_000)[0]          # 10 ms away: a real pair
+
+
+def test_write_snapshot_writes_two_pngs_and_a_sidecar(tmp_path: Path):
+    """A still is only evidence with the tracker's verdict beside it."""
+    import json
+
+    import cv2
+
+    from leap_hand.images import MockImageSampler, write_snapshot
+
+    pair = MockImageSampler(size=(32, 24)).latest()
+    hands = [{"hand_side": "right", "hand_id": 7, "palm_pos": [0.0, 0.25, 0.0],
+              "visible_time_us": 1_000_000}]
+    snap = write_snapshot(tmp_path, "glove", 2, pair, hands=hands,
+                          tracking_dt_ms=1.5)
+
+    left = tmp_path / "glove_002_L.png"
+    assert left.is_file() and (tmp_path / "glove_002_R.png").is_file()
+    assert cv2.imread(str(left), cv2.IMREAD_UNCHANGED).shape == (24, 32)
+
+    side = json.loads((tmp_path / "glove_002.json").read_text(encoding="utf-8"))
+    assert side["width"] == 32 and side["height"] == 24 and side["bpp"] == 1
+    assert side["frame_id"] == pair.frame_id
+    assert side["timestamp_us"] == pair.timestamp_us
+    assert side["wall_time"] > 0
+    assert side["hand_count"] == 1 and side["hands"][0]["hand_id"] == 7
+    assert "right" in side["tracking"]
+    assert snap.saw_hand and snap.png_paths and snap.json_path
+
+
+def test_write_snapshot_says_so_when_nothing_was_tracked(tmp_path: Path):
+    from leap_hand.images import MockImageSampler, write_snapshot
+    snap = write_snapshot(tmp_path, "glove", 0,
+                          MockImageSampler(size=(16, 16)).latest())
+    assert not snap.saw_hand
+    assert snap.tracking_text == "no hand tracked"
+
+
+def test_open_sampler_refuses_a_mock_stream_without_mock():
+    from leap_hand.images import open_sampler
+    stream = MockLeapStream()
+    stream.start()
+    with pytest.raises(LeapUnavailable):
+        open_sampler(stream, mock=False)        # no connection behind a mock
+
+
+# --- the gate verdict -------------------------------------------------------
+# Synthetic stats, so the plan's thresholds are checked against numbers chosen
+# to sit either side of them. A threshold that is wrong by a factor of ten is
+# invisible in a live run and obvious here.
+def _hand_stats(side: str, detection: float, reacquisitions: int,
+                jitter_mm: float, span_s: float = 20.0, frames: int = 1800):
+    from leap_hand.stats import HandStats
+    return HandStats(
+        file="gate.jsonl", hand_side=side, frames=frames, span_s=span_s,
+        sample_hz=90.0, expected_frames=frames, detection_rate=detection,
+        reacquisitions=reacquisitions, mean_framerate=89.9, jitter_mm=jitter_mm,
+        frame_age_ms=9.5, pose="gate",
+    )
+
+
+def _condition(name: str, rows, snapshots: int = 3):
+    from leap_hand.gate import ConditionResult
+    return ConditionResult(condition=name, stats=list(rows),
+                           snapshots=snapshots,
+                           snapshots_with_hand=snapshots if rows else 0,
+                           folder=f"recordings/leap/gate/{name}")
+
+
+def test_verdict_path_a_when_the_gloved_hand_tracks():
+    from leap_hand.gate import format_report, verdict
+
+    results = [
+        _condition("bare", [_hand_stats("left", 1.00, 0, 0.50),
+                            _hand_stats("right", 1.00, 0, 0.60)]),
+        # 95% detected, one loss in 20 s (0.5 per 10 s), jitter 1.6x bare.
+        _condition("glove", [_hand_stats("left", 0.95, 1, 0.80),
+                             _hand_stats("right", 0.93, 1, 0.90)]),
+    ]
+    v = verdict(results)
+    assert v.path == "A" and v.path_a
+    assert v.passing == ["glove"]
+    assert v.lines[0].startswith("Path A: yes because")
+    assert "glove" in v.lines[0]
+    report = format_report(results, v, title="test")
+    assert "Path A: yes because" in report
+    assert "bare" in report and "glove" in report
+
+
+def test_verdict_path_b_when_the_glove_defeats_the_tracker():
+    from leap_hand.gate import format_report, verdict
+
+    results = [
+        _condition("bare", [_hand_stats("left", 1.00, 0, 0.50),
+                            _hand_stats("right", 1.00, 0, 0.50)]),
+        # Every threshold missed: 21% of frames, 4.5 losses per 10 s, 6x jitter.
+        _condition("glove", [_hand_stats("left", 0.21, 9, 3.00),
+                             _hand_stats("right", 0.18, 11, 3.40)]),
+    ]
+    v = verdict(results)
+    assert v.path == "B" and not v.path_a and v.passing == []
+    assert v.lines[0].startswith("Path A: no because")
+    assert "detection" in v.lines[0]
+    assert "re-acquisitions" in v.lines[0]
+    assert "jitter" in v.lines[0]
+    assert any(line.startswith("Path B:") for line in v.lines)
+    assert "Path A: no because" in format_report(results, v)
+
+
+def test_verdict_each_threshold_alone_is_enough_to_fail():
+    from leap_hand.gate import verdict
+
+    bare = _condition("bare", [_hand_stats("right", 1.00, 0, 0.50)])
+    only_detection = _condition("glove", [_hand_stats("right", 0.79, 0, 0.50)])
+    only_reacq = _condition("glove", [_hand_stats("right", 1.00, 3, 0.50)])
+    only_jitter = _condition("glove", [_hand_stats("right", 1.00, 0, 1.01)])
+    for bad in (only_detection, only_reacq, only_jitter):
+        assert verdict([bare, bad]).path == "B"
+    # ...and the same numbers just inside every threshold pass.
+    good = _condition("glove", [_hand_stats("right", 0.80, 2, 1.00)])
+    assert verdict([bare, good]).path == "A"
+
+
+def test_verdict_credits_a_mitigation_and_names_it():
+    """If the liner is what works, the protocol keeps the liner — and says so."""
+    from leap_hand.gate import verdict
+
+    results = [
+        _condition("bare", [_hand_stats("right", 1.00, 0, 0.50)]),
+        _condition("glove", [_hand_stats("right", 0.10, 8, 4.00)]),
+        _condition("glove_liner", [_hand_stats("right", 0.97, 0, 0.70)]),
+    ]
+    v = verdict(results)
+    assert v.path == "A" and v.passing == ["glove_liner"]
+    assert "glove_liner" in v.lines[0] and "plain glove did not" in v.lines[0]
+
+
+def test_verdict_uses_the_bare_hand_of_the_same_side_as_the_baseline():
+    """A left hand jitters differently; comparing across sides blames the glove."""
+    from leap_hand.gate import jitter_baselines, verdict
+
+    results = [
+        _condition("bare", [_hand_stats("left", 1.0, 0, 2.00),
+                            _hand_stats("right", 1.0, 0, 0.50)]),
+        # 1.6 mm is 0.8x the left bare hand, but 3.2x the right one.
+        _condition("glove", [_hand_stats("left", 1.0, 0, 1.60)]),
+    ]
+    assert jitter_baselines(results)["left"] == pytest.approx(2.0)
+    assert verdict(results).path == "A"
+
+
+def test_verdict_says_so_when_no_hand_was_tracked_at_all():
+    """The smoke-test case: the run is not a result about the glove."""
+    from leap_hand.gate import format_report, verdict
+
+    results = [_condition("bare", [], snapshots=1)]
+    v = verdict(results)
+    assert v.path == "B"
+    assert v.lines[0].startswith("Path A: no because no hand was tracked")
+    report = format_report(results, v)
+    assert "no hand was seen" in report
+
+
+def test_verdict_refuses_to_judge_a_bare_only_run_that_did_see_a_hand():
+    from leap_hand.gate import verdict
+    v = verdict([_condition("bare", [_hand_stats("right", 1.0, 0, 0.5)])])
+    assert v.path == "B"
+    assert "no gloved condition was recorded" in v.lines[0]
+
+
+def test_verdict_skips_the_jitter_threshold_without_a_bare_run():
+    from leap_hand.gate import verdict
+    v = verdict([_condition("glove", [_hand_stats("right", 0.99, 0, 9.9)])])
+    assert v.path == "A"                       # detection and losses both pass
+    assert any("jitter threshold could not be applied" in line
+               for line in v.lines)
+
+
+# --- the scripts ------------------------------------------------------------
+def _load_script(name: str):
+    """Import scripts/leap/<name>.py, which is not on a package path."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "leap" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"leap_script_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_gate_script_runs_end_to_end_on_the_mock(tmp_path: Path, monkeypatch):
+    """The whole Phase 2 protocol, minus the camera and the human."""
+    import json
+    import sys
+
+    gate = _load_script("gate")
+    monkeypatch.setattr(gate, "beep", lambda *a, **k: None)   # quiet, and fast
+
+    out_dir = tmp_path / "recordings"
+    report_path = tmp_path / "results" / "REPORT.txt"
+    monkeypatch.setattr(sys, "argv", [
+        "gate.py", "--mock", "--conditions", "bare,glove",
+        "--seconds", "1", "--prep", "0", "--snapshots", "1",
+        "--out-dir", str(out_dir), "--report", str(report_path),
+    ])
+    gate.main()
+
+    report = report_path.read_text(encoding="utf-8")
+    assert "Path A:" in report
+    sidecars = []
+    for condition in ("bare", "glove"):
+        folder = out_dir / condition
+        takes = list(folder.glob("*.jsonl"))
+        assert len(takes) == 1, f"{condition} recorded no take"
+        assert (folder / f"{condition}_000_L.png").is_file()
+        assert (folder / f"{condition}_000_R.png").is_file()
+
+        sidecar = json.loads(
+            (folder / f"{condition}_000.json").read_text(encoding="utf-8"))
+        assert sidecar["width"] == sidecar["height"] == 384
+        assert "--mock" in sidecar["note"]
+        # A still taken inside the mock's injected dropout legitimately sees
+        # nothing; what must never happen is half a hand or a stale one.
+        assert ({h["hand_side"] for h in sidecar["hands"]}
+                in (set(), {"left", "right"}))
+        sidecars.append(sidecar)
+
+        rows = analyse_file(takes[0])
+        assert {r.hand_side for r in rows} == {"left", "right"}
+        for side in ("left", "right"):
+            assert f"{condition:<16} {side:<5}" in report
+    assert any(s["hand_count"] == 2 for s in sidecars)
+    assert "no hand was seen" not in report
+
+
+def test_gate_script_refuses_raw_capture_on_the_mock(monkeypatch):
+    import sys
+    gate = _load_script("gate")
+    monkeypatch.setattr(sys, "argv", ["gate.py", "--mock", "--raw"])
+    with pytest.raises(SystemExit):
+        gate.main()
+
+
+def test_check_setup_warns_about_an_empty_scene_but_still_exits_zero():
+    """'Nobody was holding a hand up' is not a broken machine."""
+    check_setup = _load_script("check_setup")
+    ready = [
+        check_setup.Check("import leap", check_setup.PASS, "here"),
+        check_setup.Check(check_setup.STREAMING, check_setup.PASS,
+                          "540 events, tracking 89.8 Hz"),
+        check_setup.Check(check_setup.HAND_SEEN, check_setup.WARN,
+                          "0 hands (none)", "hold a hand above the module"),
+    ]
+    assert check_setup.report(ready) == 0
+
+    broken = list(ready)
+    broken[1] = check_setup.Check(check_setup.STREAMING, check_setup.FAIL,
+                                  "no tracking events", "check the panel")
+    assert check_setup.report(broken) == 2
+
+
+def test_check_setup_watches_for_six_seconds_by_default():
+    """A device plugged in seconds ago sends nothing for the first few."""
+    check_setup = _load_script("check_setup")
+    assert check_setup.build_parser().parse_args([]).seconds == 6.0
+
+
+def test_check_setup_without_the_bindings_skips_the_hand_line(monkeypatch):
+    """No bindings: 'device streaming' fails, 'hand seen' has nothing to say."""
+    import sys
+
+    check_setup = _load_script("check_setup")
+    monkeypatch.setitem(sys.modules, "leap", None)   # make `import leap` fail
+
+    checks = check_setup.check_live(0.1)
+    assert [c.name for c in checks] == [check_setup.STREAMING,
+                                        check_setup.HAND_SEEN]
+    assert checks[0].status == check_setup.FAIL
+    assert checks[1].status == check_setup.SKIP
+    assert check_setup.report(checks) == 2
+
+
 # --- the installed bindings, if they are here -------------------------------
 # These check the assumptions the hardware path is written against. They are
 # skipped on a machine without the bindings, and they never touch a device.
@@ -553,3 +992,20 @@ class TestAgainstTheRealBindings:
         import leap
         assert hasattr(leap, "Recording") and hasattr(leap, "Recorder")
         assert issubclass(leap.Recorder, leap.Listener)
+
+    def test_the_images_policy_flag_is_in_leap_enums_only(self):
+        """images.py depends on this: leap.PolicyFlag is an AttributeError."""
+        import leap
+        assert hasattr(leap.enums.PolicyFlag, "Images")
+        assert not hasattr(leap, "PolicyFlag")
+        assert hasattr(leap.Connection, "set_policy_flags")
+        assert hasattr(leap.Listener, "on_image_event")
+
+    def test_an_image_only_exposes_its_pixels_through_c_data(self):
+        """Why image_to_numpy goes through c_data instead of the wrapper."""
+        from leap.datatypes import Image
+        assert hasattr(Image, "matrix_version")
+        for name in ("properties", "data", "offset"):
+            assert not hasattr(Image, name), f"Image.{name} exists now"
+        from leap.events import ImageEvent
+        assert hasattr(ImageEvent, "image")
