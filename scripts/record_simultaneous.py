@@ -710,6 +710,9 @@ class Quit(Exception):
     """The operator asked to stop (Ctrl+C), mid-acquire."""
 
 
+from leap_hand.protocol import CameraView  # noqa: E402  (the live camera window)
+
+
 class CoachedLeapSession(LeapSyncSession):
     """One hand at a time: acquire it OPEN, call the pose, verify the track.
 
@@ -766,6 +769,7 @@ class CoachedLeapSession(LeapSyncSession):
 
         self.beeper = AsyncBeeper(beep)
         self.hud = Hud(self._write)
+        self.view = None                 # CameraView, set by main() for a real camera
         self._phase = "start"
         self._deadline: Optional[float] = None
         self._hud_extra = ""
@@ -864,6 +868,11 @@ class CoachedLeapSession(LeapSyncSession):
                               / (now - self._rate_at))
             self._rate_at, self._rate_mark = now, self.glove_total
         left = None if self._deadline is None else self._deadline - now
+        if self.view is not None:
+            secs = "" if left is None else f"   {max(0.0, left):.0f}s"
+            self.view.caption(
+                f"{self._phase.upper()}  {self._hud_extra}{secs}".strip(),
+                band=self.band)
         self.hud.show(hud_line(self._phase, left, fresh, self.hand, self.band,
                                self._glove_hz,
                                saw_other_hand=now - self._other_at < HUD_STALE_S,
@@ -1230,6 +1239,9 @@ def main() -> None:
                         "take is marked failed (default: 60)")
     p.add_argument("--no-mirror", action="store_true")
     p.add_argument("--no-preview", action="store_true")
+    p.add_argument("--no-view", action="store_true",
+                   help="do not open the live camera window (--camera leap; it "
+                        "is never opened for --mock-leap)")
     args = p.parse_args()
 
     poses = [slugify(x) for x in args.poses.split(",") if slugify(x)]
@@ -1306,6 +1318,9 @@ def main() -> None:
                     leap_hz=args.leap_hz or None, hand=args.hand, band=band,
                     settle=args.settle, retries=args.retries,
                     acquire_timeout=args.acquire_timeout)
+                session.view = CameraView(
+                    hand=args.hand, band=band,
+                    enabled=not (args.no_view or args.mock_leap)).start()
             else:
                 session = LeapSyncSession(leap, glove, hz=args.hz or None,
                                           out_dir=args.out_dir,

@@ -43,6 +43,7 @@ months later.
 """
 import math
 import re
+from pathlib import Path
 import threading
 from dataclasses import dataclass
 from queue import Queue
@@ -589,3 +590,84 @@ class AsyncBeeper:
         self._queue.put(None)
         self._thread.join(timeout=timeout)
         self._thread = None
+
+
+class CameraView:
+    """The live camera window (`scripts/leap/camera_view.py`) as a child process.
+
+    The operator cannot position a hand they cannot see: the first coached
+    sessions failed on hands held 13 cm above the lens and on a camera that
+    had silently locked onto the wrong hand. The window shows the IR image,
+    the fitted skeleton, height against the band and palm facing, plus a
+    caption this process controls through a tiny status file. It is a second,
+    read-only LeapC client, so it never touches the recording connection.
+
+    Disabled (`enabled=False`, the mocks) it is a no-op with the same API.
+    """
+
+    SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "leap" / "camera_view.py"
+
+    def __init__(self, hand=None, band=None, enabled=True):
+        self.hand = hand if hand in ("left", "right") else "both"
+        self.band = band
+        self.enabled = bool(enabled) and self.SCRIPT.exists()
+        self._proc = None
+        self._status = None
+        self._last = None
+
+    def start(self):
+        if not self.enabled or self._proc is not None:
+            return self
+        import atexit
+        import os
+        import subprocess
+        import sys
+        import tempfile
+        self._status = Path(tempfile.gettempdir()) / f"leap_view_status_{os.getpid()}.txt"
+        self.caption("starting")
+        cmd = [sys.executable, str(self.SCRIPT), "--hand", self.hand,
+               "--status-file", str(self._status), "--parent-pid", str(os.getpid())]
+        if self.band:
+            cmd += ["--band", f"{self.band[0]:g},{self.band[1]:g}"]
+        try:
+            self._proc = subprocess.Popen(cmd)
+        except OSError:
+            self.enabled = False
+            return self
+        atexit.register(self.close)
+        return self
+
+    def caption(self, text, band=None):
+        """Set the window's caption (and optionally its height band). Cheap to
+        call every HUD refresh: the file is only rewritten when it changes."""
+        if not self.enabled or self._status is None:
+            return
+        body = text.strip()
+        if band:
+            body += f"\nband={band[0]:g},{band[1]:g}"
+        if body == self._last:
+            return
+        self._last = body
+        try:
+            self._status.write_text(body, encoding="utf-8")
+        except OSError:
+            pass
+
+    def close(self):
+        if self._status is not None:
+            try:
+                self._status.write_text("__quit__", encoding="utf-8")
+            except OSError:
+                pass
+        if self._proc is not None:
+            try:
+                self._proc.wait(timeout=2)
+            except Exception:
+                self._proc.terminate()
+            self._proc = None
+        if self._status is not None:
+            try:
+                self._status.unlink()
+            except OSError:
+                pass
+            self._status = None
