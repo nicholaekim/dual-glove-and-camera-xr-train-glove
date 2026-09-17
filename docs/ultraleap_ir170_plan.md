@@ -473,6 +473,31 @@ Hardware day (2026-09-16, later the same evening, camera attached)
   convention checks. Still open: the glove gate (Section 2) and the raw
   `.lmt` capture, which has not yet run with a device.
 
+Gate result (2026-09-16, 22:47 to 22:52, one operator, left hand)
+- The IR camera tracks the hand inside the black StretchSense glove. Glove
+  run: 1672 frames in 18.6 s, 98.6 % detection, 0 re-acquisitions, 0.20 mm
+  fingertip jitter at 90 Hz. Bare run, same hand: 79.2 % detection as
+  reported (about 89 % against the 90 Hz tracker rate; the report's
+  denominator used the file's own cadence, which timestamp jitter inflated
+  to 101 Hz, a bias fixed in the next tooling pass), 1 re-acquisition,
+  0.54 mm jitter. The right hand only drifted into view briefly.
+- Why it works: in the 850 nm IR stills the glove renders bright, close to
+  white, with the sensor grid visible as dots, so the fabric reflects near
+  IR strongly even though it is black to the eye. Every glove still has a
+  sidecar confirming the tracker reported the hand at that instant. The
+  stills contain the operator's face and stay in the ignored `recordings/`
+  tree.
+- Verdict: Path A, simultaneous glove + camera capture, provisionally.
+  Second opinion (ChatGPT, browsing): supported but not yet demonstrated;
+  before it goes to the professor, add a centred right-hand glove run, both
+  hands at once, fist and pinch and open/spread at about 20, 35 and 50 cm,
+  and a repeat on a second day. Do not attribute the better-than-bare
+  numbers to the fabric; black textiles vary widely in near-IR reflectance
+  and the difference is within run-to-run variation until paired repeats
+  say otherwise.
+- Raw `.lmt` capture ran with a device for the first time (empty scene,
+  322 events, reads back through `leap.Recording`).
+
 Phase 2 tooling (2026-09-16, still the same evening, camera attached, no
 second person available to hold a hand)
 - Written: `src/leap_hand/images.py` (image policy, LeapC buffer -> numpy,
