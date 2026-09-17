@@ -1072,6 +1072,11 @@ class CoachedLeapSession(LeapSyncSession):
         except TimeoutError as e:
             result.why = str(e)
             self._say(f"      FAILED: {e}")
+        except (KeyboardInterrupt, QuitSession):
+            # The take still goes in the summary, with the reason it has —
+            # a blank "last failure" reads as a bug in the recorder.
+            result.why = "interrupted before the take finished"
+            raise
         finally:
             self.hud.close()
             self._phase, self._deadline, self._hud_extra = "idle", None, ""
