@@ -303,19 +303,22 @@ def format_table(rows: Sequence[HandStats]) -> str:
     return "\n".join(lines)
 
 
-def rate_footnote(rows: Sequence[HandStats]) -> List[str]:
-    """The two lines that say which denominator each row's det% used.
+def rate_footnote(rows: Sequence[HandStats],
+                  has_cadence_column: bool = True) -> List[str]:
+    """The lines that say which denominator each row's det% used.
 
     Shared by this table and the gate report, because a detection rate is
-    only readable next to the rate it was divided by.
+    only readable next to the rate it was divided by. `has_cadence_column`
+    is False for the gate table, which has no `cad` column to explain.
     """
     used = {s.rate_source for s in rows}
+    tail = ("cad = that cadence (10th-percentile gap); "
+            if has_cadence_column else "")
     lines = [
         "rate = the denominator of det%, marked * when it is the LeapC "
         "tracking framerate (the file kept every frame) and unmarked when it",
         "is the file's own cadence (a --hz throttled file); "
-        "cad = that cadence (10th-percentile gap); "
-        "fps = framerate LeapC reported.",
+        f"{tail}fps = framerate LeapC reported.",
     ]
     if used == {RATE_FRAMERATE}:
         lines.append("Every row above used the tracking framerate: no file "

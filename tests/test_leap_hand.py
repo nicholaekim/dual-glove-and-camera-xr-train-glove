@@ -990,6 +990,131 @@ def test_gate_script_refuses_raw_capture_on_the_mock(monkeypatch):
         gate.main()
 
 
+# --- the gate, recomputed from disk -----------------------------------------
+def _mock_gate_run(tmp_path: Path, monkeypatch, conditions: str,
+                   seconds: str = "1") -> tuple:
+    """Run the mock gate once and return (out_dir, report_path)."""
+    import sys
+
+    gate = _load_script("gate")
+    monkeypatch.setattr(gate, "beep", lambda *a, **k: None)
+    out_dir = tmp_path / "recordings"
+    report = tmp_path / "results" / "REPORT.txt"
+    monkeypatch.setattr(sys, "argv", [
+        "gate.py", "--mock", "--conditions", conditions,
+        "--seconds", seconds, "--prep", "0", "--snapshots", "1",
+        "--out-dir", str(out_dir), "--report", str(report),
+    ])
+    gate.main()
+    return out_dir, report
+
+
+def test_recompute_rebuilds_the_report_from_a_copy_of_a_run(tmp_path: Path,
+                                                            monkeypatch):
+    """No camera, no recording: the same numbers, out of the same files.
+
+    Recomputed on a COPY, so this also proves the report does not depend on
+    anything outside the folder — that is what lets a measurement change be
+    re-applied to a session recorded days ago.
+    """
+    import shutil
+    import sys
+
+    out_dir, report = _mock_gate_run(tmp_path, monkeypatch, "bare,glove")
+    original = report.read_text(encoding="utf-8")
+
+    copy_dir = tmp_path / "copy"
+    shutil.copytree(out_dir, copy_dir)
+    new_report = tmp_path / "copy_results" / "REPORT.txt"
+
+    gate = _load_script("gate")
+    monkeypatch.setattr(sys, "argv", [
+        "gate.py", "--recompute",
+        "--out-dir", str(copy_dir), "--report", str(new_report),
+    ])
+    gate.main()
+    rebuilt = new_report.read_text(encoding="utf-8")
+
+    assert "recomputed:" in rebuilt and "no camera" in rebuilt
+    for condition in ("bare", "glove"):
+        for side in ("left", "right"):
+            row = f"{condition:<16} {side:<5}"
+            assert row in rebuilt
+            # identical numbers to the live run: same files, same maths
+            assert _row_of(rebuilt, row) == _row_of(original, row)
+    assert rebuilt.count("IR still(s), 1 with a tracked hand") >= 1
+    assert "Path A:" in rebuilt
+
+
+def _row_of(report: str, prefix: str) -> str:
+    for line in report.splitlines():
+        if line.startswith(prefix):
+            return line
+    raise AssertionError(f"no row starting {prefix!r} in\n{report}")
+
+
+def test_recompute_measures_the_newest_take_and_names_the_others(tmp_path: Path):
+    from leap_hand.gate import scan_out_dir
+
+    folder = tmp_path / "glove_20cm"
+    old = _write_leap_rows(folder / "glove_20cm_left_take1_20260916_100000.jsonl",
+                           n=100, hz=90.0, framerate=90.0)
+    new = _write_leap_rows(folder / "glove_20cm_left_take1_20260916_223000.jsonl",
+                           n=400, hz=90.0, framerate=90.0)
+    # mtimes deliberately the wrong way round: the filename stamp decides.
+    import os
+    os.utime(old, (2e9, 2e9))
+    os.utime(new, (1e9, 1e9))
+
+    result = scan_out_dir(tmp_path)[0]
+    assert result.condition == "glove_20cm"
+    assert result.recordings == [str(new)]
+    assert result.frames == 400
+    assert new.name in result.note and old.name in result.note
+    assert "not measured" in result.note
+
+
+def test_recompute_takes_any_condition_name_and_judges_it_as_a_glove(
+        tmp_path: Path):
+    """The reviewer's extra runs: custom folders, same thresholds."""
+    from leap_hand.gate import format_report, scan_out_dir, verdict
+
+    for name, n in (("bare", 900), ("glove_right", 900), ("glove_50cm", 300)):
+        _write_leap_rows(tmp_path / name / f"{name}_right_take1_20260916_220000.jsonl",
+                         n=n, hz=90.0, framerate=90.0, jitter_s=0.0011,
+                         drop=range(0) if n == 900 else range(100, 280))
+    results = scan_out_dir(tmp_path)
+
+    assert [r.condition for r in results] == ["bare", "glove_50cm", "glove_right"]
+    v = verdict(results)
+    assert v.path == "A"
+    assert "glove_right" in v.passing        # full detection
+    assert "glove_50cm" not in v.passing     # 40% of its frames missing
+    report = format_report(results, v)
+    assert "glove_right" in report and "glove_50cm" in report
+
+
+def test_recompute_reports_a_condition_folder_with_no_take(tmp_path: Path):
+    from leap_hand.gate import scan_out_dir
+
+    (tmp_path / "glove_day2").mkdir(parents=True)
+    result = scan_out_dir(tmp_path)[0]
+    assert result.stats == [] and not result.saw_hand
+    assert "no JSONL take" in result.note
+
+
+def test_recompute_refuses_an_empty_folder(tmp_path: Path, monkeypatch):
+    import sys
+    gate = _load_script("gate")
+    (tmp_path / "empty").mkdir()
+    monkeypatch.setattr(sys, "argv", [
+        "gate.py", "--recompute", "--out-dir", str(tmp_path / "nope"),
+        "--report", str(tmp_path / "R.txt"),
+    ])
+    with pytest.raises(SystemExit):
+        gate.main()
+
+
 def test_check_setup_warns_about_an_empty_scene_but_still_exits_zero():
     """'Nobody was holding a hand up' is not a broken machine."""
     check_setup = _load_script("check_setup")

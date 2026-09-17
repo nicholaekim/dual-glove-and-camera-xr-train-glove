@@ -28,11 +28,31 @@ Two deliberate choices in the reading of the thresholds:
   * The mitigations (a liner glove, white tape) count. If the plain glove
     fails but `glove_liner` passes, that is still Path A — with the liner in
     the protocol, and the report says so rather than burying it.
+
+Condition names are open. `bare` is the one reserved name — the reference
+every other row is measured against — and **everything else is a gloved
+condition**, judged against the bare hand of the same side. That is what lets
+the reviewer's extra runs (`glove_right`, `glove_both`, `glove_20cm`,
+`glove_35cm`, `glove_50cm`, `glove_day2`) go through the same table, the same
+thresholds and the same verdict as the four the plan names, with no code
+change: the side comes from the frames, not from the folder name.
+
+`scan_out_dir` rebuilds these results from recordings already on disk, which
+is what `scripts/leap/gate.py --recompute` runs on. A report is then a pure
+function of the files in the folder, so a fix to a measurement (see
+`stats.choose_rate`) can be re-applied to last night's data without asking
+anyone to hold a hand over the camera again.
 """
+import json
+import logging
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-from .stats import HandStats, rate_footnote
+from .stats import HandStats, analyse_paths, rate_footnote
+
+log = logging.getLogger(__name__)
 
 # The conditions of the plan's protocol, in the order they are run: each one
 # adds something to the hand, so the operator never has to take anything off.
@@ -54,6 +74,31 @@ CONDITION_INSTRUCTIONS: Dict[str, str] = {
                              "tape. Last, because it can saturate the IR "
                              "image.",
 }
+
+# Conditions that are the plain glove plus something. Only these get the "the
+# plain glove did not, so keep the X on" sentence in the verdict; a custom
+# name like `glove_20cm` is a different setup, not a mitigation, and saying
+# "keep the 20cm on" would be nonsense.
+MITIGATIONS: Dict[str, str] = {
+    "glove_liner": "liner",
+    "glove_tape": "white tape",
+    "glove_retroreflective": "retro-reflective tape",
+}
+
+
+def is_glove(condition: str) -> bool:
+    """Everything that is not `bare` is a gloved condition. See the docstring."""
+    return condition != BARE
+
+
+def instruction_for(condition: str) -> str:
+    """What the operator does before this condition, custom names included."""
+    hint = CONDITION_INSTRUCTIONS.get(condition)
+    if hint:
+        return hint
+    return (f"Glove condition '{condition}': the StretchSense glove on. The "
+            "name says the rest — which hand, how far above the module, "
+            "which day.")
 
 # Plan section 2, decision table.
 DETECTION_MIN = 0.80
@@ -174,7 +219,7 @@ def verdict(results: Sequence[ConditionResult]) -> Verdict:
     grep, or by whoever opens the report six months from now.
     """
     baselines = jitter_baselines(results)
-    gloved = [r for r in results if r.condition != BARE]
+    gloved = [r for r in results if is_glove(r.condition)]
     any_hand = any(r.saw_hand for r in results)
 
     if not any_hand:
@@ -210,9 +255,12 @@ def verdict(results: Sequence[ConditionResult]) -> Verdict:
         best = "glove" if "glove" in passing else passing[0]
         why = (f"the {best} condition met all three thresholds "
                f"({THRESHOLD_TEXT})")
-        if best != "glove":
+        mitigation = MITIGATIONS.get(best)
+        if mitigation and any(r.condition == "glove" for r in gloved):
             why += (" — the plain glove did not, so the protocol has to keep "
-                    f"the {best.replace('glove_', '')} on")
+                    f"the {mitigation} on")
+        if len(passing) > 1:
+            why += f"; also passing: {', '.join(c for c in passing if c != best)}"
         lines.append(f"Path A: yes because {why}.")
         lines.append("Simultaneous capture: the glove supplies flexion, the "
                      "camera supplies palm pose, spread, thumb and wrist "
@@ -234,6 +282,100 @@ def verdict(results: Sequence[ConditionResult]) -> Verdict:
                      "re-acquisitions were checked.")
     return Verdict(path="A" if passing else "B", passing=passing, lines=lines,
                    baselines=baselines)
+
+
+# --- rebuilding a run from the files it left behind --------------------------
+# Every take this pipeline writes carries a `_YYYYmmdd_HHMMSS` stamp, so the
+# name is the recording time and survives copying, syncing and restoring —
+# none of which mtime does. mtime is only the tiebreak.
+_STAMP_RE = re.compile(r"_(\d{8}_\d{6})")
+
+
+def take_recency(path: Path) -> tuple:
+    """Sort key over takes of one condition: newest last."""
+    m = _STAMP_RE.search(path.name)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:                              # pragma: no cover - race
+        mtime = 0.0
+    return (m.group(1) if m else "", mtime, path.name)
+
+
+def read_snapshots(folder: Path) -> tuple:
+    """(stills, stills with a tracked hand) from the sidecars in a folder.
+
+    A sidecar is a JSON dict with an `images` list — `write_snapshot` writes
+    one beside every PNG pair. Anything else in the folder is ignored rather
+    than guessed at, and an unreadable sidecar is skipped with a warning: a
+    miscounted still would end up in the report as evidence.
+    """
+    total = with_hand = 0
+    for path in sorted(folder.glob("*.json")):
+        try:
+            d = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            log.warning("unreadable snapshot sidecar %s (%s); not counted",
+                        path.name, e)
+            continue
+        if not isinstance(d, dict) or "images" not in d:
+            continue
+        total += 1
+        if d.get("hand_count", 0) > 0:
+            with_hand += 1
+    return total, with_hand
+
+
+def scan_condition(folder: Path) -> ConditionResult:
+    """One condition folder -> the `ConditionResult` the report wants.
+
+    The newest take is the one measured. Older takes in the same folder are
+    named in the note instead of being merged in: they are usually aborted
+    runs, and averaging an aborted run into a good one hides both.
+    """
+    condition = folder.name
+    snapshots, with_hand = read_snapshots(folder)
+    result = ConditionResult(condition=condition, snapshots=snapshots,
+                             snapshots_with_hand=with_hand,
+                             folder=str(folder))
+
+    takes = sorted(folder.glob("*.jsonl"), key=take_recency)
+    if not takes:
+        result.note = ("no JSONL take in this folder"
+                       + (f"; {snapshots} IR still(s) kept" if snapshots else ""))
+        return result
+
+    newest = takes[-1]
+    result.recordings = [str(newest)]
+    result.stats = analyse_paths([newest])
+    notes = [f"measured from the most recent take, {newest.name}"]
+    if len(takes) > 1:
+        notes.append("older takes in this folder, not measured: "
+                     + ", ".join(t.name for t in takes[:-1]))
+    if not result.stats:
+        notes.append("that take holds no frames: the tracker reported no hand")
+    result.note = "; ".join(notes)
+    return result
+
+
+def scan_out_dir(out_dir: Path, conditions: Optional[Sequence[str]] = None
+                 ) -> List[ConditionResult]:
+    """Rebuild every condition of a gate run from `out_dir`, bare first.
+
+    Conditions are the sub-folder names — whatever they were called, so the
+    reviewer's extra runs need no list here. `conditions`, when given, keeps
+    only those (and keeps the caller's order).
+    """
+    out_dir = Path(out_dir)
+    if not out_dir.is_dir():
+        return []
+    folders = {p.name: p for p in sorted(out_dir.iterdir()) if p.is_dir()}
+    if conditions is not None:
+        names = [c for c in conditions if c in folders]
+    else:
+        # bare first: it is the reference, and the table reads top-down.
+        names = ([BARE] if BARE in folders else []) + sorted(
+            n for n in folders if n != BARE)
+    return [scan_condition(folders[n]) for n in names]
 
 
 # --- the report -------------------------------------------------------------
@@ -281,7 +423,8 @@ def format_report(results: Sequence[ConditionResult], v: Verdict,
                  "jit_mm = fingertip spread over the steadiest 2 s;")
     lines.append("jit_x = that jitter divided by the bare hand's "
                  "(same side where the bare run has it).")
-    lines += rate_footnote([s for r in results for s in r.stats])
+    lines += rate_footnote([s for r in results for s in r.stats],
+                           has_cadence_column=False)
 
     lines += ["", "What the camera saw"]
     for result in results:
