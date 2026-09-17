@@ -263,10 +263,20 @@ class MockLeapStream:
         since_reacquire = i - generation * self.reacquire_every if self.reacquire_every else i
         base_id = 1001 if side == "right" else 2001
 
+        # This generator's LeapC clock IS the wall clock: `_t0_us` is
+        # `time.time()` at start(), and frame i sits one interval after it. So
+        # `capture_time` is that same instant in seconds, and the mock behaves
+        # like the device in the way that matters here — drain a backlog in
+        # one pass and those hands carry capture times spread across the
+        # period they were "captured" while sharing one `wall_time`. Anything
+        # that pairs on the writer's clock fails against this mock for the
+        # same reason it would fail against the camera.
+        timestamp_us = self._t0_us + int(round(i * 1e6 / self.hz))
+
         return LeapHand(
             hand_side=side,
             hand_id=base_id + generation,
-            timestamp_us=self._t0_us + int(round(i * 1e6 / self.hz)),
+            timestamp_us=timestamp_us,
             frame_id=i,
             framerate=self.hz + self._rng.gauss(0.0, 0.4),
             visible_time_us=int(since_reacquire * 1e6 / self.hz),
@@ -277,4 +287,5 @@ class MockLeapStream:
             abs26=positions,
             quat26=[list(q) for q in quat26],
             frame_age_us=None,   # no LeapC clock behind a mock
+            capture_time=timestamp_us / 1e6,
         )

@@ -336,7 +336,7 @@ def test_a_leap_take_fuses_with_a_glove_take_of_the_same_hand(tmp_path):
 
     g, c = matched[0]
     fused, info = fuse_skeletons(g["pts"], c["pts"], with_scale=False)
-    assert info["camera_used"] and info["alignment"] == "rigid"
+    assert info["camera_used"] and info["alignment"] == "palm_frame"
 
     G, C = np.asarray(g["pts"], float), np.asarray(c["pts"], float)
 
@@ -436,6 +436,190 @@ def test_the_same_hand_fuses_the_same_through_either_camera_loader(tmp_path):
     G = glove[0]["pts"]
     through_leap, info_leap = fuse_skeletons(G, leap_pts, with_scale=False)
     through_cam, info_cam = fuse_skeletons(G, cam_pts, with_scale=True)
-    assert info_leap["alignment"] == "rigid"
+    assert info_leap["alignment"] == "palm_frame"
     assert info_cam["alignment"] == "similarity"
     assert np.allclose(through_leap, through_cam, atol=1e-9)
+
+
+# --- which clock pairs the two streams ---------------------------------
+# `wall_time` is a WRITER stamp. Both recorders drain a queue and write the
+# burst it held, so frames captured hundreds of ms apart can share a
+# wall_time. `capture_time` is when the sensor had the frame. These pin that
+# the right one is chosen, and that choosing it actually changes the answer.
+
+def test_pairing_clock_needs_capture_time_on_every_frame():
+    from cam_hand.fusion import pairing_clock
+
+    full = [{"wall_time": 1.0, "capture_time": 0.9},
+            {"wall_time": 1.1, "capture_time": 1.0}]
+    assert pairing_clock(full, full) == "capture_time"
+    # one stream without it: a mixture would compare two different clocks
+    old = [{"wall_time": 1.0}, {"wall_time": 1.1}]
+    assert pairing_clock(full, old) == "wall_time"
+    assert pairing_clock(old, full) == "wall_time"
+    # one FRAME without it is enough, and so is an explicit null
+    partial = [{"wall_time": 1.0, "capture_time": 0.9}, {"wall_time": 1.1}]
+    assert pairing_clock(full, partial) == "wall_time"
+    nulled = [{"wall_time": 1.0, "capture_time": None}]
+    assert pairing_clock(full, nulled) == "wall_time"
+    assert pairing_clock([], []) == "wall_time"
+
+
+def test_a_written_burst_pairs_wrong_on_wall_time_and_right_on_capture_time():
+    """The bug, in eight frames.
+
+    The camera queued four frames 30 ms apart and they were all written in
+    one pass, a millisecond apart. On the writer's clock every one of them
+    looks equally close to the glove frame, so the FIRST wins by scan order;
+    on the capture clock the one actually taken at that moment wins.
+    """
+    glove = [{"wall_time": 100.000, "capture_time": 100.000,
+              "hand_side": "right"}]
+    cam = [{"wall_time": 100.050 + i * 0.001, "capture_time": 99.940 + i * 0.030,
+            "hand_side": "right", "tag": i} for i in range(4)]
+    #        capture times: 99.940, 99.970, 100.000, 100.030
+    #        the glove frame was captured at 100.000, so tag 2 is the partner
+
+    on_wall = pair_by_time(glove, cam, max_dt=0.05, clock="wall_time")[0][1]
+    on_capture = pair_by_time(glove, cam, max_dt=0.05, clock="capture_time")[0][1]
+    assert on_capture["tag"] == 2, "capture_time must pick the frame of that instant"
+    assert on_wall["tag"] != 2, "wall_time cannot tell these four apart"
+    # auto picks the right one, because every frame here has a capture_time
+    assert pair_by_time(glove, cam, max_dt=0.05)[0][1]["tag"] == 2
+
+
+def test_wall_time_pairing_can_exceed_the_window_it_reports():
+    """Worse than picking wrong: it picks a frame outside --max-dt and says ok."""
+    glove = [{"wall_time": 100.0, "capture_time": 100.0, "hand_side": "left"}]
+    cam = [{"wall_time": 100.001, "capture_time": 99.80, "hand_side": "left"}]
+
+    paired = pair_by_time(glove, cam, max_dt=0.05, clock="wall_time")[0][1]
+    assert paired is not None                       # "matched within 50 ms"
+    assert abs(paired["capture_time"] - glove[0]["capture_time"]) > 0.05
+    # on the real clock it is correctly refused
+    assert pair_by_time(glove, cam, max_dt=0.05)[0][1] is None
+
+
+def test_old_recordings_without_capture_time_still_pair():
+    """Files recorded before capture_time existed must keep working."""
+    glove = [{"wall_time": 10.00, "hand_side": "right"},
+             {"wall_time": 10.10, "hand_side": "right"}]
+    cam = [{"wall_time": 9.99, "hand_side": "right", "tag": "a"},
+           {"wall_time": 10.12, "hand_side": "right", "tag": "b"}]
+    assert [c["tag"] for _g, c in pair_by_time(glove, cam, max_dt=0.05)] == ["a", "b"]
+
+
+def test_one_take_name_under_two_cameras_is_an_error_not_a_coin_flip(tmp_path):
+    """Two sensors, two alignments: picking by folder order picks by accident."""
+    fuse = _fuse_module()
+    name = "fist_right_take1_20260916_230000.jsonl"
+    _write_leap_take(tmp_path / "leap" / name, spread_deg=10.0, curl=0.2)
+    (tmp_path / "cam").mkdir()
+    (tmp_path / "cam" / name).write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(fuse.AmbiguousTake) as e:
+        fuse.find_camera_take(tmp_path, name)
+    assert "cam" in str(e.value) and "leap" in str(e.value)
+    assert "--camera" in str(e.value)            # and it says how to resolve it
+
+    # naming a camera resolves it, and only looks where it was told
+    assert fuse.find_camera_take(tmp_path, name, "leap") == tmp_path / "leap" / name
+    assert fuse.find_camera_take(tmp_path, name, "cam") == tmp_path / "cam" / name
+    assert fuse.find_camera_take(tmp_path, "absent.jsonl", "leap") is None
+
+
+# --- the metric path does not let palm SIZE become rotation -------------
+# The glove reports the XR Trainer template hand; the camera measures the
+# real one. Kabsch over five palm points trades rotation against that size
+# difference, and the tilt it invents lands in the spread the camera is
+# supposed to be supplying.
+
+def test_a_camera_hand_10_percent_larger_still_gives_its_spread(tmp_path):
+    """The stated case: the real hand is bigger than the template."""
+    from cam_hand.features import spread_features
+
+    glove = make_hand(spread_deg=0.0, curl=0.5)
+    cam = make_hand(spread_deg=24.0, curl=0.5) * 1.10      # same pose, bigger
+
+    fused, info = fuse_skeletons(glove, cam, with_scale=False)
+    assert info["alignment"] == "palm_frame"
+
+    def gaps(p):
+        # normalised by palm length, so a bigger hand is comparable at all
+        return np.asarray(spread_features(p, hand_side="right")[:4])
+
+    assert np.abs(gaps(fused) - gaps(cam)).max() < np.abs(
+        gaps(glove) - gaps(cam)).max() / 5
+    # bones stay the glove's: fusion rotates chains, it never rescales them
+    assert bone_lengths(fused) == pytest.approx(bone_lengths(glove), abs=1e-9)
+    # and the size disagreement is reported rather than absorbed
+    assert info["kabsch_rmse_mm"] > 1.0
+
+
+def _tilt_deg(R) -> float:
+    """The rotation angle of R, in degrees."""
+    return math.degrees(math.acos(
+        min(1.0, max(-1.0, (np.trace(np.asarray(R)) - 1.0) / 2.0))))
+
+
+def test_palm_size_mismatch_does_not_tilt_the_camera_hand():
+    """The mechanism, isolated: a reshaped palm must not rotate the hand.
+
+    Every camera hand here holds the SAME orientation as the glove hand and
+    differs only in palm proportions — a template-vs-real difference, not a
+    pose difference. The transfer must therefore be a pure placement, and on
+    the palm-basis path it is: exactly zero degrees, because the basis is
+    built from unit vectors and dimensions cannot reach it.
+
+    The 5-point rigid fit this replaced tilts by a few tenths of a degree,
+    in a fixed direction for a given mismatch. Not large — the point is that
+    it is systematic, it is entirely an artefact of the glove's template
+    hand, and it lands in the one quantity the camera is there to supply.
+    Note the last case: a hand that is evenly BIGGER does not fool Kabsch at
+    all. Only a change of PROPORTIONS does, which is exactly what a template
+    hand on a real hand is.
+    """
+    from cam_hand.align import umeyama
+    from cam_hand.fusion import PALM_IDX, palm_basis, palm_frame_transfer
+
+    glove = make_hand(spread_deg=0.0, curl=0.3)
+    reshapes = {"wider palm": (1.20, 1.00), "longer palm": (1.00, 1.20),
+                "wider and shorter": (1.20, 0.90),
+                "narrower palm": (0.85, 1.00)}
+    worst_kabsch = 0.0
+    for label, (sx, sy) in reshapes.items():
+        cam = make_hand(spread_deg=0.0, curl=0.3)
+        cam[:, 0] *= sx
+        cam[:, 1] *= sy
+
+        moved = palm_frame_transfer(glove, cam)
+        # placed, not turned: the shape that arrives is the shape that leaves
+        assert np.allclose(moved - moved[0], cam - cam[0], atol=1e-9), label
+        assert np.allclose(moved[0], glove[0], atol=1e-12), label   # wrist on wrist
+        assert _tilt_deg(palm_basis(glove) @ palm_basis(cam).T) < 1e-9, label
+
+        R, _s, _t = umeyama(cam[PALM_IDX], glove[PALM_IDX], with_scale=False)
+        worst_kabsch = max(worst_kabsch, _tilt_deg(R))
+
+    assert worst_kabsch > 0.25, (
+        "if the 5-point fit no longer tilts on a reshaped palm, this test has "
+        "stopped testing anything")
+
+    # ...and a hand that is simply bigger, same proportions, fools neither.
+    even = make_hand(spread_deg=0.0, curl=0.3) * 1.10
+    R, _s, _t = umeyama(even[PALM_IDX], glove[PALM_IDX], with_scale=False)
+    assert _tilt_deg(R) < 1e-6
+
+
+def test_the_kabsch_residual_is_reported_and_never_gates_a_frame():
+    """A palm that does not match the template is a fact, not a rejection."""
+    glove = make_hand(spread_deg=0.0, curl=0.4)
+    cam = make_hand(spread_deg=20.0, curl=0.4) * 1.5      # wildly wrong size
+
+    fused, info = fuse_skeletons(glove, cam, with_scale=False)
+    assert info["kabsch_rmse_mm"] > 10.0     # tens of mm out
+    assert info["camera_used"] is True       # ...and still used, by design
+    assert info["fingers_adjusted"]
+    # the MediaPipe path has no metric residual to report
+    _f, mp = fuse_skeletons(glove, cam, with_scale=True)
+    assert mp["kabsch_rmse_mm"] is None and mp["alignment"] == "similarity"

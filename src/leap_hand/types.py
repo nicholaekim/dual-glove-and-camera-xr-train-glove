@@ -44,6 +44,20 @@ class LeapHand:
     # not end-to-end latency (it excludes exposure, and our own processing
     # after this point). None when the clock was unavailable (mock, replay).
     frame_age_us: float | None = None
+    # When the CAMERA saw this hand, on the wall clock the three sensors
+    # share: `time.time()` in the tracking callback minus the frame's age.
+    #
+    # It exists because `wall_time` in a recording is a WRITER timestamp,
+    # taken as the line is written. Hands arrive from LeapC's polling thread
+    # in bursts — a whole queue drains in one pass — so frames captured
+    # 200 ms apart can carry `wall_time`s a millisecond apart, and pairing a
+    # glove take against that matches on write order rather than on when the
+    # hand was actually in the pose. `fuse_poses.py` pairs on `capture_time`
+    # whenever both sides have it.
+    #
+    # None when there was no LeapC clock to read, the same condition that
+    # leaves `frame_age_us` None.
+    capture_time: float | None = None
 
     def tips(self) -> List[List[float]]:
         """The five fingertip positions, thumb to little, in metres."""

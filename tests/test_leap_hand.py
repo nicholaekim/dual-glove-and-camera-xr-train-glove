@@ -1230,6 +1230,181 @@ def test_leap_backend_keeps_every_camera_frame_by_default(tmp_path: Path,
     assert n_cam > 5 * n_glove, f"{n_cam} camera frames vs {n_glove} glove"
 
 
+def test_the_start_beep_cannot_backdate_the_head_of_a_take(tmp_path: Path,
+                                                           monkeypatch):
+    """A blocking beep must not leave a quarter second of stale frames.
+
+    Both sensor threads keep queueing while `winsound.Beep` blocks, and both
+    recorders stamp a frame with the time of the WRITE — so a beep that runs
+    after the files are open puts backdated frames at the head of every take.
+    The fix is an ordering, and this is what holds it: with a beep that
+    really does block, nothing written may predate the end of that beep.
+    """
+    import json
+    import sys
+    import time as _time
+
+    sync = _load_repo_script("record_simultaneous")
+    beeps = []
+
+    def slow_beep(freq=880, ms=180):
+        end = _time.time() + ms / 1000.0
+        while _time.time() < end:            # a real beep blocks; so does this
+            _time.sleep(0.005)
+        beeps.append(_time.time())
+
+    monkeypatch.setattr(sync, "beep", slow_beep)
+    out_dir = tmp_path / "sync"
+    monkeypatch.setattr(sys, "argv", [
+        "record_simultaneous.py", "--camera", "leap", "--mock-glove",
+        "--mock-leap", "--poses", "fist", "--takes", "1", "--duration", "1",
+        "--prep", "0", "--out-dir", str(out_dir),
+    ])
+    sync.main()
+
+    assert len(beeps) >= 2                   # start beep, then the stop beep
+    path = sorted((out_dir / "leap").glob("*.jsonl"))[0]
+    rows = [json.loads(line) for line
+            in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert rows
+
+    # The backlog is visible as a burst: every frame the beep queued is
+    # drained in one pass and written within a millisecond of the next, all
+    # stamped with the same instant, although the camera captured them over a
+    # quarter of a second. A 250 ms beep at 90 Hz x 2 hands is about 45 of
+    # them; after the fix the first drain finds what one tick's worth is.
+    t0 = min(r["wall_time"] for r in rows)
+    in_first_20ms = sum(1 for r in rows if r["wall_time"] - t0 < 0.020)
+    assert in_first_20ms < 10, (
+        f"{in_first_20ms} frames share the first 20 ms of the take — that is "
+        "the beep's backlog, written as if it had just been captured")
+
+
+def test_both_sides_record_a_capture_time_and_it_is_used(tmp_path: Path,
+                                                         monkeypatch):
+    """The clock the two files are actually paired on, end to end."""
+    import json
+
+    from cam_hand.fusion import pairing_clock
+    from xr_hand.recorder import FrameRecorder as PlainFrameRecorder
+
+    _sync, out_dir = _mock_sync_run(tmp_path, monkeypatch)
+    glove_path = sorted((out_dir / "glove").glob("*.jsonl"))[0]
+    cam_path = sorted((out_dir / "leap").glob("*.jsonl"))[0]
+
+    def rows(path):
+        return [json.loads(line) for line
+                in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    glove, cam = rows(glove_path), rows(cam_path)
+    for name, side in (("glove", glove), ("leap", cam)):
+        assert all(r.get("capture_time") is not None for r in side), name
+        # it is a real wall-clock instant, at or before the write
+        for r in side:
+            assert 0.0 <= r["wall_time"] - r["capture_time"] < 5.0, name
+    # the camera keeps the keys a later latency question is answered from
+    assert all(r.get("timestamp_us") is not None for r in cam)
+    assert all("frame_age_us" in r for r in cam)
+    assert pairing_clock(glove, cam) == "capture_time"
+
+    # the added key must not stop any existing reader: this is the loader
+    # every glove tool in the repo uses
+    frames = list(PlainFrameRecorder.load(glove_path))
+    assert len(frames) == len(glove)
+    assert frames[0][0].hand_side in ("left", "right")
+
+
+def test_the_glove_recorder_adds_capture_time_without_changing_the_default():
+    """StampedFrameRecorder adds one key; FrameRecorder's output is untouched."""
+    import json
+    import tempfile
+
+    from xr_hand.mock import MockHandGenerator
+    from xr_hand.parser import parse_hand_message
+    from xr_hand.recorder import FrameRecorder as PlainFrameRecorder
+
+    sync = _load_repo_script("record_simultaneous")
+    frame = parse_hand_message(MockHandGenerator(hand="right").next_frame(),
+                               hand_side_hint="right")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stamped = Path(tmp) / "stamped.jsonl"
+        plain = Path(tmp) / "plain.jsonl"
+
+        rec = sync.StampedFrameRecorder(pose="fist", take=1)
+        rec.start(stamped)
+        rec.record(frame, capture_time=1234.5)
+        rec.record(frame)                      # no stamp given -> no key
+        rec.stop()
+
+        ref = PlainFrameRecorder(pose="fist", take=1)
+        ref.start(plain)
+        ref.record(frame)
+        ref.stop()
+
+        lines = [json.loads(x) for x
+                 in stamped.read_text(encoding="utf-8").splitlines() if x.strip()]
+        base = json.loads(plain.read_text(encoding="utf-8").splitlines()[0])
+
+    assert lines[0]["capture_time"] == pytest.approx(1234.5)
+    assert "capture_time" not in lines[1]
+    assert "capture_time" not in base, "the plain recorder must be unchanged"
+    # everything else is identical, key for key
+    assert set(lines[0]) - {"capture_time"} == set(base)
+
+
+def test_the_osc_queue_item_carries_arrival_time_and_still_unpacks():
+    """Frozen scripts do `for hand, raw in drain(64)`; that must keep working."""
+    import time as _time
+
+    from xr_hand.receiver import OSCHandReceiver, QueueItem
+
+    item = QueueItem("left", [1.0, 2.0], recv_time=99.5)
+    hand, raw = item                            # the two-value unpack
+    assert hand == "left" and raw == [1.0, 2.0]
+    assert item.recv_time == 99.5
+    assert item == ("left", [1.0, 2.0])         # still equal to a plain tuple
+    assert QueueItem("left", [1.0]).recv_time == 0.0   # default
+
+    # and the receiver really stamps it, on the thread that took the packet
+    rx = OSCHandReceiver()
+    before = _time.time()
+    rx._enqueue("right", "/addr", [0.0] * 187)
+    after = _time.time()
+    queued = rx.drain(4)[0]
+    assert before <= queued.recv_time <= after
+    assert queued[0] == "right"
+
+
+def test_a_take_needs_one_hand_on_BOTH_sensors_not_frames_on_each():
+    """camera=left + glove=right is plenty of frames and exactly zero pairs."""
+    sync = _load_repo_script("record_simultaneous")
+
+    class FakeRec:
+        def __init__(self, count, hands):
+            self.count, self.hands_seen = count, set(hands)
+
+    msg = sync.describe_mismatch(FakeRec(300, {"left"}), FakeRec(60, {"right"}))
+    assert "left" in msg and "right" in msg and "no hand in common" in msg
+    # the two silences need different fixes, so they get different words
+    assert "camera captured nothing" in sync.describe_mismatch(
+        FakeRec(0, set()), FakeRec(60, {"right"}))
+    assert "glove captured nothing" in sync.describe_mismatch(
+        FakeRec(300, {"left"}), FakeRec(0, set()))
+
+
+def test_readiness_needs_a_shared_hand_and_names_the_disagreement():
+    sync = _load_repo_script("record_simultaneous")
+    session = sync.SyncSession(cap=None, tracker=None, glove_source=None,
+                               hz=5.0, out_dir=Path("recordings") / "sync")
+    session.glove_sides, session.cam_sides = {"right"}, {"left"}
+    msg = session.not_ready_message(glove_ok=400, cam_ok=200)
+    assert "no hand in common" in msg and "right" in msg and "left" in msg
+    # a genuinely silent sensor still gets the old, correct advice
+    session.glove_sides, session.cam_sides = set(), set()
+    assert "Check XR Trainer" in session.not_ready_message(0, 200)
+
+
 def test_the_mediapipe_session_still_owns_cam_and_its_own_recorder():
     """The refactor that made the camera pluggable must not have moved it."""
     from cam_hand.recorder import CamRecorder
@@ -1287,18 +1462,29 @@ def test_medoid_is_a_real_recorded_frame_not_an_average(tmp_path: Path):
     path = _record_mock(tmp_path, frames=120)
     frames = [f for f, _w in FrameRecorder.load(path)
               if f.hand_side == "right"]
+    import numpy as np
+
+    from cam_hand.align import align_points
+    from cam_hand.fusion import PALM_IDX
+
     i = record_frame.medoid_index(frames)
     assert 0 <= i < len(frames)
-    chosen = frame_to_keypoints21(frames[i])
-    # it IS one of the frames, identical to the one at that index
-    assert chosen == frame_to_keypoints21(frames[i])
-    # and it is closer to the take's mean than the worst frame is
-    def dist(f):
-        pts = [c for p in frame_to_keypoints21(f) for c in p]
-        return sum((a - b) ** 2 for a, b in zip(pts, mean))
-    rows = [[c for p in frame_to_keypoints21(f) for c in p] for f in frames]
-    mean = [sum(r[k] for r in rows) / len(rows) for k in range(len(rows[0]))]
-    assert dist(frames[i]) == min(dist(f) for f in frames)
+    # it IS one of the recorded frames — a real hand with real bone lengths,
+    # never the mean, whose bones are shorter than any frame's
+    assert frame_to_keypoints21(frames[i]) == frame_to_keypoints21(frames[i])
+
+    # and it is the one closest to the take's mean once orientation is taken
+    # out of the comparison, which is the criterion medoid_index applies
+    pts = [np.asarray(frame_to_keypoints21(f), float) for f in frames]
+    mean = np.mean(np.stack(pts), axis=0)
+
+    def aligned_dist(p):
+        moved, _r, _e, _s = align_points(p, mean, with_scale=False,
+                                         subset=PALM_IDX)
+        return float(((moved - mean) ** 2).sum())
+
+    assert aligned_dist(pts[i]) == pytest.approx(
+        min(aligned_dist(p) for p in pts))
 
 
 def test_record_frame_writes_the_professor_format_on_the_mock(tmp_path: Path,
@@ -1426,3 +1612,113 @@ class TestAgainstTheRealBindings:
             assert not hasattr(Image, name), f"Image.{name} exists now"
         from leap.events import ImageEvent
         assert hasattr(ImageEvent, "image")
+
+
+# --- the medoid must rank POSE, not orientation -----------------------------
+def _rotated_take(angles, pose=(15.0, 0.30), outlier=None, outlier_at=None):
+    """Frames of one hand: a slow rotation about +z, optionally one bad pose.
+
+    Built from test_fusion's 26-joint synthetic hand so the geometry is the
+    one the fusion tests already reason about.
+    """
+    import math
+
+    import numpy as np
+    from test_fusion import _hand26
+
+    from xr_hand.joints import HandFrame
+    from xr_hand.kinematics import absolute_to_relative
+
+    identity = [[0.0, 0.0, 0.0, 1.0]] * 26
+    frames = []
+    for i, deg in enumerate(angles):
+        spread, curl = outlier if (outlier and i == outlier_at) else pose
+        pts = np.asarray(_hand26(spread, curl), dtype=float)
+        wrist = pts[JOINT_NAMES.index("WRIST")].copy()
+        a = math.radians(deg)
+        rot = np.array([[math.cos(a), -math.sin(a), 0.0],
+                        [math.sin(a), math.cos(a), 0.0],
+                        [0.0, 0.0, 1.0]])
+        pts = (rot @ (pts - wrist).T).T + wrist
+        frames.append(HandFrame(
+            timestamp=float(i), packet_counter=i, hand_side="right",
+            frame_id=i, status=0,
+            joints=absolute_to_relative([list(p) for p in pts], identity)))
+    return frames
+
+
+def test_the_medoid_ignores_slow_rotation_and_rejects_the_bad_pose():
+    """A hand held still still turns; that must not decide which frame wins.
+
+    Twenty frames of one pose over a 10-degree drift, plus one frame in a
+    plainly wrong pose at the middle of the sweep. Scored on raw
+    wrist-centred coordinates, identical poses span a 48x range of "distance
+    from the mean" purely because of the drift — at 100 mm from the wrist
+    5 degrees is 8.7 mm, against the 0.20 mm jitter the gate measured. After
+    a rigid palm alignment they are all equal, and only the pose is left to
+    rank.
+    """
+    import numpy as np
+
+    from cam_hand.align import align_points
+    from cam_hand.fusion import PALM_IDX
+
+    record_frame = _load_script("record_frame")
+    angles = list(np.linspace(0.0, 10.0, 20))
+    bad = 10
+    frames = _rotated_take(angles, outlier=(0.0, 0.75), outlier_at=bad)
+
+    chosen = record_frame.medoid_index(frames)
+    assert chosen != bad, "the medoid picked the frame in the wrong pose"
+
+    pts = [np.asarray(frame_to_keypoints21(f), float) for f in frames]
+    mean = np.mean(np.stack(pts), axis=0)
+    good = [i for i in range(len(frames)) if i != bad]
+
+    def naive(i):
+        return float(((pts[i] - mean) ** 2).sum())
+
+    def aligned(i):
+        moved, _r, _e, _s = align_points(pts[i], mean, with_scale=False,
+                                         subset=PALM_IDX)
+        return float(((moved - mean) ** 2).sum())
+
+    # identical poses, scored purely on where they sit in the drift
+    assert max(naive(i) for i in good) / min(naive(i) for i in good) > 10.0
+    # ...and scored on pose alone, they are the same frame as far as this cares
+    assert max(aligned(i) for i in good) / min(aligned(i) for i in good) < 1.01
+    # the outlier is the worst of the take, by a wide margin
+    assert aligned(bad) > 10.0 * max(aligned(i) for i in good)
+
+
+def test_the_medoid_exports_the_original_frame_not_an_aligned_copy(tmp_path: Path):
+    """Alignment picks the winner. What gets written is the measurement."""
+    import numpy as np
+
+    from cam_hand.prof_format import load_file
+
+    record_frame = _load_script("record_frame")
+    frames = _rotated_take(list(np.linspace(0.0, 10.0, 8)))
+
+    take = tmp_path / "frame_99_right_take1.jsonl"
+    rec = FrameRecorder(pose="frame_99", take=1)
+    rec.start(take)
+    for f in frames:
+        rec.record(f)
+    rec.stop()
+
+    out = tmp_path / "frame_99_keypoints.txt"
+    chosen = record_frame.write_prof_file(take, out)
+    assert set(chosen) == {"right"}
+    index, total = chosen["right"]
+    assert total == len(frames)
+
+    # the file holds exactly the frame that won, unrotated: its coordinates
+    # are the ones the recorder stored, not a copy turned to face the mean
+    winner, wall = list(FrameRecorder.load(take))[index]
+    exporter = record_frame.glove_exporter()
+    expected = exporter.frame_block(winner, wall)
+    assert out.read_text(encoding="utf-8").strip() == expected
+
+    block = load_file(out)[0]
+    assert block.frame == winner.packet_counter and len(block.points) == 21

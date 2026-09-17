@@ -8,11 +8,20 @@ glove frame — `wall_time`, `timestamp`, `packet_counter`, `hand_side`,
 changes at all. That is the whole point: the camera is a new sensor, not a
 new format.
 
-Two clocks, and the difference matters:
+Three clocks, and the differences matter:
 
   wall_time     `time.time()` as the line is written, exactly as the glove
-                and camera recorders stamp it. It is the only clock the three
-                sensors share, and it is what `fuse_poses.py` pairs takes on.
+                and camera recorders stamp it. A WRITER timestamp: hands
+                arrive from LeapC's polling thread in bursts, so frames
+                captured hundreds of milliseconds apart can share a
+                `wall_time` to the millisecond. Kept because every recording
+                in this repo has it and because it bounds when a line was
+                written, but it is not the clock to pair on.
+  capture_time  when the camera saw the hand, on that same wall clock:
+                `time.time()` in the tracking callback minus the frame's age
+                (see `stream._on_tracking`, the only place both clocks are in
+                hand at once). This is what `fuse_poses.py` pairs takes on.
+                Null in replayed recordings, which have no LeapC clock.
   timestamp     `event.timestamp` in seconds - the **LeapC clock**, whose
                 epoch is arbitrary. Right for intervals inside one recording
                 (free of the jitter our writer adds, so `stats.py` prefers
@@ -35,6 +44,7 @@ The extras, none of which the glove can produce:
   grab_strength     0..1
   frame_age_us      leap.get_now() - event.timestamp at receipt: frame age,
                     not end-to-end latency. null for mock and replayed data
+  capture_time      wall-clock instant the camera saw this hand (above)
   palm_abs          palm position in camera space, metres
   abs26             all 26 joint positions in camera space, metres — the real
                     geometry, before it was folded into parent-relative form
@@ -110,7 +120,10 @@ class LeapRecorder:
 
         frame = to_hand_frame(lh)
         # wall_time is time.time() at the write, the same stamp the glove and
-        # camera recorders use; frame.timestamp is the LeapC clock.
+        # camera recorders use; frame.timestamp is the LeapC clock; and
+        # capture_time (below) is when the camera actually saw this hand, on
+        # the wall clock. All three are kept, because they answer different
+        # questions and only the third one can be paired across sensors.
         d = _frame_to_dict(frame, wall_time=now)
         if self.pose is not None:
             d["pose"] = self.pose
@@ -128,6 +141,8 @@ class LeapRecorder:
             "grab_strength": lh.grab_strength,
             "frame_age_us": (None if lh.frame_age_us is None
                              else round(lh.frame_age_us, 1)),
+            "capture_time": (None if lh.capture_time is None
+                             else round(lh.capture_time, 6)),
             "palm_abs": _round(lh.palm_pos),
             "abs26": [_round(p) for p in lh.abs26],
         })

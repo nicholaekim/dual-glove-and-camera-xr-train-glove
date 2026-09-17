@@ -173,23 +173,38 @@ class LeapStream:
                         "'unavailable' in recordings", why)
 
     def _on_tracking(self, event) -> None:
-        # Frame age at receipt (not end-to-end latency): how old the tracking
-        # data already was when this callback ran, on the LeapC clock.
-        age_us = None
+        # Two clocks, read in one place because they have to agree.
+        #
+        #   age_us        frame age at receipt (not end-to-end latency): how
+        #                 old the tracking data already was when this callback
+        #                 ran, on the LeapC clock, whose epoch is arbitrary.
+        #   capture_time  the same instant on the WALL clock, by subtracting
+        #                 that age from time.time() here.
+        #
+        # This callback is the only place the two clocks can be related,
+        # because it is the only moment we hold both. Doing it here is what
+        # lets every consumer downstream have a camera timestamp comparable
+        # with the glove's, rather than the time we happened to drain the
+        # queue — hands arrive from the polling thread in bursts, so drain
+        # time says nothing about when a hand was in a pose.
+        now = time.time()
+        age_us = capture_time = None
         try:
             age_us = float(self._leap.get_now() - event.timestamp)
+            capture_time = now - age_us / 1e6
         except Exception:                        # pragma: no cover - hardware path
             pass
 
         self.frames += 1
-        self.last_event_time = time.time()
+        self.last_event_time = now
         rate = getattr(event, "framerate", None)
         if rate:
             self.framerate = float(rate)
 
         for hand in event.hands:
             try:
-                lh = leap_hand_from_api(hand, event, frame_age_us=age_us)
+                lh = leap_hand_from_api(hand, event, frame_age_us=age_us,
+                                        capture_time=capture_time)
             except Exception as e:               # pragma: no cover - hardware path
                 log.warning("could not convert a hand from frame %s: %s",
                             getattr(event, "tracking_frame_id", "?"), e)

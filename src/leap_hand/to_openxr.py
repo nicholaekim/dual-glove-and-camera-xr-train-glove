@@ -155,7 +155,8 @@ def joint_pose_from_api(hand, source: JointSource):
     return pos, b.rotation
 
 
-def leap_hand_from_api(hand, event, frame_age_us: Optional[float] = None) -> LeapHand:
+def leap_hand_from_api(hand, event, frame_age_us: Optional[float] = None,
+                       capture_time: Optional[float] = None) -> LeapHand:
     """A LeapC `hand` from a tracking `event` -> a `LeapHand` in metres.
 
     Args:
@@ -164,6 +165,9 @@ def leap_hand_from_api(hand, event, frame_age_us: Optional[float] = None) -> Lea
         frame_age_us: `leap.get_now() - event.timestamp`, sampled by the
             caller at the top of the callback. Frame age at receipt, not
             end-to-end latency.
+        capture_time: when the camera saw this hand, on the shared wall clock
+            — `time.time()` in the callback minus `frame_age_us`. The caller
+            computes it because only the caller knows when the callback ran.
 
     `hand.confidence` is not read: LeapC documents it as a constant 1.0.
     """
@@ -188,6 +192,7 @@ def leap_hand_from_api(hand, event, frame_age_us: Optional[float] = None) -> Lea
         abs26=abs26,
         quat26=quat26,
         frame_age_us=None if frame_age_us is None else float(frame_age_us),
+        capture_time=None if capture_time is None else float(capture_time),
     )
 
 

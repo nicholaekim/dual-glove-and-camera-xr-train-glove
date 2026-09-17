@@ -16,6 +16,13 @@ a take that wobbles shortens every bone, so the "average" hand is a hand
 nobody has. A medoid is a real frame, with real bone lengths, and the take it
 came from is kept beside it.
 
+Candidates are compared after a RIGID alignment onto the take's mean (see
+`medoid_index`), because a hand held still for three seconds still turns
+slowly and a 5-degree drift moves a fingertip 8.7 mm — far above the tracker's
+0.20 mm jitter. Without that, "most typical" quietly means "held at the
+average angle" rather than "in the right pose". The frame written out is the
+original, untouched one: the alignment decides the winner and nothing else.
+
 Why this matters for Phase 3. Of the professor's 102 frames the glove
 replicated 81 and could not do 21 at all (`reference/frames/_folder_status.csv`
 lists them NA): they need spread, thumb opposition or wrist angles the glove
@@ -42,6 +49,10 @@ import re
 import time
 from pathlib import Path
 
+import numpy as np
+
+from cam_hand.align import align_points
+from cam_hand.fusion import PALM_IDX
 from leap_hand.recorder import LeapRecorder
 from leap_hand.stream import LeapUnavailable, open_stream
 from xr_hand.keypoints21 import frame_to_keypoints21
@@ -51,6 +62,7 @@ REPO = Path(__file__).resolve().parents[2]
 DEFAULT_OUT = Path("recordings") / "leap" / "prof_frames"
 DEFAULT_REFERENCE = Path("reference") / "frames"
 MIN_VISIBLE_TIME_US = 300_000     # plan section 6: a hand counts after 0.3 s
+MAX_DRAIN_ROUNDS = 8              # bound on the post-beep flush
 STREAM_WAIT_TIMEOUT = 60.0
 STREAM_WAIT_HANDS = 10
 
@@ -114,19 +126,42 @@ def glove_exporter():
 
 
 def medoid_index(frames) -> int:
-    """The frame closest to the mean of the take, over 21 keypoints.
+    """Which frame of the take is the most typical POSE. Returns its index.
 
-    Exactly what `scripts/glove/export_keypoints21.py` does for its summary
-    row: flatten each frame to wrist-centred coordinates, take the mean of
-    the take, and return the REAL frame with the smallest squared distance to
-    it. Never the mean itself — that hand has shortened bones.
+    Same idea as `scripts/glove/export_keypoints21.py`: take the mean of the
+    take and pick the REAL frame nearest it, never the mean itself — averaged
+    joint positions have shortened bones, so the "average" hand is a hand
+    nobody has.
+
+    What differs, and why. Wrist-centring alone removes translation but not
+    ORIENTATION. A hand held still for three seconds still rotates slowly,
+    and at 100 mm from the wrist a 5-degree drift moves a fingertip 8.7 mm —
+    an order of magnitude above the 0.20 mm jitter the gate measured. Judged
+    on raw wrist-centred coordinates, "closest to the mean" therefore means
+    "held at the average ANGLE", and a frame in a plainly wrong pose taken
+    mid-sweep can win over a correct one recorded early.
+
+    So each candidate is first aligned RIGIDLY — rotation and translation,
+    scale 1 — onto the take's mean using the palm landmarks, which are the
+    near-rigid part of a hand. What is left after that alignment is the only
+    thing this is supposed to be ranking: how the FINGERS are posed.
+
+    The alignment is used for scoring only. The caller exports the original,
+    untouched frame, because the deliverable is a measurement of the hand in
+    camera space, not a re-oriented copy of it.
     """
-    rows = [[c for pt in frame_to_keypoints21(f) for c in pt] for f in frames]
-    n = len(rows)
-    mean = [sum(r[i] for r in rows) / n for i in range(len(rows[0]))]
+    pts = [np.asarray(frame_to_keypoints21(f), dtype=float) for f in frames]
+    if len(pts) == 1:
+        return 0
+
+    # The mean is only a reference to align against, so a plain elementwise
+    # mean is fine here: nothing is exported from it.
+    mean = np.mean(np.stack(pts), axis=0)
     best, best_d = 0, None
-    for i, r in enumerate(rows):
-        d = sum((a - b) ** 2 for a, b in zip(r, mean))
+    for i, p in enumerate(pts):
+        aligned, _rmse, _err, _s = align_points(p, mean, with_scale=False,
+                                                subset=PALM_IDX)
+        d = float(((aligned - mean) ** 2).sum())
         if best_d is None or d < best_d:
             best, best_d = i, d
     return best
@@ -138,9 +173,11 @@ def record_take(source, path: Path, name: str, seconds: float,
     recorder = LeapRecorder(pose=name, take=1)      # every frame: 3 s is small
     skipped = 0
 
-    def consume(rec=None):
+    def consume(rec=None) -> int:
         nonlocal skipped
+        seen = 0
         for _side, lh in source.drain(64):
+            seen += 1
             # Presence and settling time, never confidence: LeapC documents
             # confidence as a constant 1.0 (plan section 6).
             if lh.visible_time_us < MIN_VISIBLE_TIME_US:
@@ -148,6 +185,25 @@ def record_take(source, path: Path, name: str, seconds: float,
                 continue
             if rec is not None:
                 rec.record(lh)
+        return seen
+
+    def discard_backlog() -> int:
+        """Drop what queued while the start beep blocked.
+
+        `winsound.Beep` blocks for its whole duration while LeapC's polling
+        thread keeps filling the queue, so hands drained straight after a
+        250 ms beep are up to 250 ms old and get written with the current
+        time. Here they are also hands from BEFORE the go signal, while the
+        operator is still moving into the pose — and the medoid is computed
+        over whatever ends up in the file.
+        """
+        dropped = 0
+        for _ in range(MAX_DRAIN_ROUNDS):
+            n = consume()
+            dropped += n
+            if not n:
+                break
+        return dropped
 
     for s in range(int(round(prep)), 0, -1):
         print(f"      {s}...")
@@ -157,8 +213,10 @@ def record_take(source, path: Path, name: str, seconds: float,
             consume()
             time.sleep(0.02)
 
-    recorder.start(path)
+    # Beep, drop what queued behind the beep, and only then open the file.
     beep(1000, 250)
+    discard_backlog()
+    recorder.start(path)
     print(f"      REC {seconds:g} s - hold it ", end="", flush=True)
     try:
         t_end = time.time() + seconds
