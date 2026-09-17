@@ -58,6 +58,7 @@ POSE_HINTS = {
 STREAM_WAIT_TIMEOUT = 120.0   # s to wait for the first hands
 STREAM_WAIT_HANDS = 10        # hands seen before the first take starts
 MIN_VISIBLE_TIME_US = 300_000  # plan section 6: a hand counts after 0.3 s
+MAX_DRAIN_ROUNDS = 8           # bound on the post-beep flush
 
 
 def beep(freq: int = 880, ms: int = 180) -> None:
@@ -81,13 +82,16 @@ class Session:
         self._skipped_young = 0
 
     # --- stream plumbing ------------------------------------------------
-    def _consume(self, recorder=None) -> None:
+    def _consume(self, recorder=None) -> int:
         """Drain pending hands: count everything, record if asked.
 
         Runs during the countdowns too (recorder=None) so the queue stays
         fresh and a stale hand from the previous pose never leaks into a take.
+        Returns how many hands were drained.
         """
+        seen = 0
         for _side, lh in self.source.drain(64):
+            seen += 1
             previous = self._ids.get(lh.hand_side)
             if previous is not None and previous != lh.hand_id:
                 self._reacquired += 1
@@ -99,6 +103,25 @@ class Session:
                 continue
             if recorder is not None:
                 recorder.record(lh)
+        return seen
+
+    def _discard_backlog(self) -> int:
+        """Drop everything the tracker queued while the start beep blocked.
+
+        `winsound.Beep` blocks for its whole duration and LeapC's polling
+        thread keeps filling the queue behind it, so the first hands drained
+        after a 250 ms beep are up to 250 ms old — and the recorder stamps
+        each one with the time of the WRITE. Recording through that backdates
+        the head of every take. Counters and hand ids still go through
+        `_consume`, so the re-acquisition count stays honest.
+        """
+        dropped = 0
+        for _ in range(MAX_DRAIN_ROUNDS):
+            n = self._consume()
+            dropped += n
+            if not n:
+                break
+        return dropped
 
     def wait_for_stream(self) -> None:
         print(f"Waiting for hands (need {STREAM_WAIT_HANDS}, timeout "
@@ -148,8 +171,11 @@ class Session:
         before = self._reacquired
 
         with self._raw_capture(raw_path):
-            recorder.start(path)
+            # Beep, throw away what queued behind the beep, and only then open
+            # the file — see `_discard_backlog`.
             beep(1000, 250)
+            self._discard_backlog()
+            recorder.start(path)
             print(f"      REC {duration:g} s - hold it ", end="", flush=True)
             try:
                 t_end = time.time() + duration

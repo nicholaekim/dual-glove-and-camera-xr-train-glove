@@ -51,6 +51,7 @@ REPO = Path(__file__).resolve().parents[2]
 DEFAULT_OUT = Path("recordings") / "leap" / "prof_frames"
 DEFAULT_REFERENCE = Path("reference") / "frames"
 MIN_VISIBLE_TIME_US = 300_000     # plan section 6: a hand counts after 0.3 s
+MAX_DRAIN_ROUNDS = 8              # bound on the post-beep flush
 STREAM_WAIT_TIMEOUT = 60.0
 STREAM_WAIT_HANDS = 10
 
@@ -138,9 +139,11 @@ def record_take(source, path: Path, name: str, seconds: float,
     recorder = LeapRecorder(pose=name, take=1)      # every frame: 3 s is small
     skipped = 0
 
-    def consume(rec=None):
+    def consume(rec=None) -> int:
         nonlocal skipped
+        seen = 0
         for _side, lh in source.drain(64):
+            seen += 1
             # Presence and settling time, never confidence: LeapC documents
             # confidence as a constant 1.0 (plan section 6).
             if lh.visible_time_us < MIN_VISIBLE_TIME_US:
@@ -148,6 +151,25 @@ def record_take(source, path: Path, name: str, seconds: float,
                 continue
             if rec is not None:
                 rec.record(lh)
+        return seen
+
+    def discard_backlog() -> int:
+        """Drop what queued while the start beep blocked.
+
+        `winsound.Beep` blocks for its whole duration while LeapC's polling
+        thread keeps filling the queue, so hands drained straight after a
+        250 ms beep are up to 250 ms old and get written with the current
+        time. Here they are also hands from BEFORE the go signal, while the
+        operator is still moving into the pose — and the medoid is computed
+        over whatever ends up in the file.
+        """
+        dropped = 0
+        for _ in range(MAX_DRAIN_ROUNDS):
+            n = consume()
+            dropped += n
+            if not n:
+                break
+        return dropped
 
     for s in range(int(round(prep)), 0, -1):
         print(f"      {s}...")
@@ -157,8 +179,10 @@ def record_take(source, path: Path, name: str, seconds: float,
             consume()
             time.sleep(0.02)
 
-    recorder.start(path)
+    # Beep, drop what queued behind the beep, and only then open the file.
     beep(1000, 250)
+    discard_backlog()
+    recorder.start(path)
     print(f"      REC {seconds:g} s - hold it ", end="", flush=True)
     try:
         t_end = time.time() + seconds

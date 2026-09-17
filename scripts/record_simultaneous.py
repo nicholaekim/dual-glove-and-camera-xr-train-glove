@@ -69,6 +69,12 @@ from xr_hand.validator import StreamMonitor, validate_raw_message
 DEFAULT_POSES = ["open_palm", "fist", "index_point", "thumbs_up", "peace", "pinch"]
 LEAP = "leap"
 MIN_VISIBLE_TIME_US = 300_000     # plan section 6: a hand counts after 0.3 s
+# Bounds on the post-beep flush (see SyncSession.discard_backlog). A 250 ms
+# beep leaves at most ~45 Leap hands and ~30 glove packets behind it, so a
+# handful of drain(64) rounds always clears it; the bound is only there so a
+# sensor that never stops delivering cannot pin us here.
+MAX_DRAIN_ROUNDS = 8
+CAM_BUFFER_FRAMES = 2             # webcam frames to grab and drop
 POSE_HINTS = {
     "open_palm": "all five fingers extended and spread",
     "fist": "all fingers curled into a tight fist",
@@ -90,6 +96,27 @@ def beep(freq: int = 880, ms: int = 180) -> None:
 
 class QuitSession(Exception):
     pass
+
+
+def hands_text(sides) -> str:
+    """{'left'} -> 'left'; set() -> 'nothing'."""
+    return ", ".join(sorted(sides)) if sides else "nothing"
+
+
+def describe_mismatch(cam_rec, glove_rec) -> str:
+    """Why a take with frames on both sides still cannot be fused.
+
+    Named rather than counted, because the two failures need different
+    fixes: a silent sensor is a cable or a service, two different hands is
+    the operator wearing the glove on one hand and holding the other up.
+    """
+    if cam_rec.count == 0:
+        return "the camera captured nothing"
+    if glove_rec.count == 0:
+        return "the glove captured nothing"
+    return (f"the camera saw {hands_text(cam_rec.hands_seen)} but the glove "
+            f"streamed {hands_text(glove_rec.hands_seen)} — no hand in common, "
+            "so no frame can pair")
 
 
 class MockGloveSource:
@@ -142,10 +169,48 @@ class SyncSession:
         self.monitors = {"left": StreamMonitor("left"), "right": StreamMonitor("right")}
         self.results = []
         self._warned = set()
+        # Which hand sides each sensor has actually delivered. Readiness is
+        # about the INTERSECTION, not the totals: a camera watching the left
+        # hand while the glove streams the right one has plenty of both and
+        # can never produce a pair.
+        self.glove_sides: set = set()
+        self.cam_sides: set = set()
 
     def make_cam_recorder(self, pose: str, take: int):
         """The recorder for this session's camera. One per take."""
         return CamRecorder(hz=self.hz, pose=pose, take=take)
+
+    def discard_backlog(self) -> int:
+        """Empty both sensors' backlogs. Returns how many frames were dropped.
+
+        Called after the start beep and before the recorders open their
+        files: see the comment in `run_take` for why that ordering is the
+        whole point.
+        """
+        dropped = self._discard_camera_backlog()
+        # The glove queue reports emptiness honestly, so drain it until it
+        # says so rather than guessing a number of rounds. `_pump_glove(None)`
+        # and not a raw queue drain: the StreamMonitor has to see these packet
+        # counters go by, or it reports the gap we just made as a dropout.
+        for _ in range(MAX_DRAIN_ROUNDS):
+            n = self._pump_glove(None)
+            dropped += n
+            if not n:
+                break
+        return dropped
+
+    def _discard_camera_backlog(self) -> int:
+        """Flush the webcam's buffer without decoding or tracking anything.
+
+        `grab()` pulls a frame off the driver's queue without decoding it,
+        which is what is wanted here: the next `read_frame` should return
+        what the camera sees now, not what it saw during the beep. A fixed
+        small count, because `grab()` blocks for the next frame once the
+        buffer is empty and so cannot tell us when to stop.
+        """
+        if self.cap is None:
+            return 0
+        return sum(1 for _ in range(CAM_BUFFER_FRAMES) if self.cap.grab())
 
     def _pump_glove(self, recorder=None) -> int:
         """Drain and optionally record glove packets. Returns frames seen."""
@@ -159,6 +224,7 @@ class SyncSession:
             for w in self.monitors[hand].update(frame.packet_counter):
                 self._warn(f"[{hand}] {w}")
             seen += 1
+            self.glove_sides.add(frame.hand_side)
             if recorder is not None:
                 recorder.record(frame)
         return seen
@@ -176,6 +242,7 @@ class SyncSession:
         if frame is None:
             raise RuntimeError("camera stopped delivering frames")
         hands = self.tracker.detect(frame, ts_ms)
+        self.cam_sides.update(h.hand_side for h in hands)
         if cam_rec is not None:
             size = (frame.shape[1], frame.shape[0])
             for h in hands:
@@ -195,22 +262,36 @@ class SyncSession:
         return hands
 
     def wait_for_both(self, timeout: float = 120.0) -> None:
-        print("Waiting for BOTH sensors (glove packets + a hand in view)...")
+        print("Waiting for BOTH sensors on the SAME hand "
+              "(glove packets + that hand in view)...")
         t0 = time.time()
         glove_ok = cam_ok = 0
+        self.glove_sides, self.cam_sides = set(), set()
         while time.time() - t0 < timeout:
             glove_ok += self._pump_glove()
             hands = self.tick(banner="SHOW YOUR HAND",
                               sub="glove on, hand inside the frame")
             if hands:
                 cam_ok += 1
-            if glove_ok >= 10 and cam_ok >= 10:
-                print(f"  OK - glove packets and camera tracking both live\n")
+            if (glove_ok >= 10 and cam_ok >= 10
+                    and (self.glove_sides & self.cam_sides)):
+                shared = hands_text(self.glove_sides & self.cam_sides)
+                print(f"  OK - glove and camera both on: {shared}\n")
                 return
-        raise SystemExit(
-            f"Only got {glove_ok} glove packets and {cam_ok} camera detections. "
-            "Check XR Trainer is streaming (scripts/run_osc.py --dump --no-viz in "
-            "the glove project) and the webcam (scripts/live_view.py).")
+        raise SystemExit(self.not_ready_message(glove_ok, cam_ok))
+
+    def not_ready_message(self, glove_ok: int, cam_ok: int) -> str:
+        """Why the session will not start, naming the actual disagreement."""
+        if glove_ok and cam_ok and not (self.glove_sides & self.cam_sides):
+            return (f"The glove is streaming {hands_text(self.glove_sides)} "
+                    f"and the camera is seeing {hands_text(self.cam_sides)} — "
+                    "no hand in common, so nothing could ever pair. Put the "
+                    "glove on the hand you are showing the camera (or show "
+                    "the camera the gloved hand).")
+        return (f"Only got {glove_ok} glove packets and {cam_ok} camera "
+                "detections. Check XR Trainer is streaming "
+                "(scripts/glove/run_osc.py --dump --no-viz) and the webcam "
+                "(scripts/live_view.py).")
 
     def run_take(self, pose: str, take: int, n_takes: int, pose_idx: int,
                  n_poses: int, duration: float, prep: float) -> None:
@@ -229,9 +310,20 @@ class SyncSession:
         name = pose_filename(pose, take)      # one name, two files
         cam_rec = self.make_cam_recorder(pose, take)
         glove_rec = FrameRecorder(hz=self.hz, pose=pose, take=take)
+        # Order matters, and it is not the obvious one. `winsound.Beep`
+        # BLOCKS for its whole duration while the OSC thread and the LeapC
+        # polling thread keep filling their queues behind it, so whatever is
+        # drained straight after the beep is up to a quarter of a second old
+        # — and both recorders stamp a frame with the time of the WRITE.
+        # Recording through that would put 250 ms of backdated frames at the
+        # head of every take. So: beep, throw the backlog away, and only then
+        # open the files, immediately before the timed loop.
+        beep(1000, 250)
+        dropped = self.discard_backlog()
         cam_rec.start(self.cam_dir / name)
         glove_rec.start(self.glove_dir / name)
-        beep(1000, 250)
+        if dropped:
+            self._warn(f"dropped {dropped} frame(s) queued during the beep")
         print(f"      REC {duration:g} s - hold it ",
               end="" if self.dots else "\n", flush=True)
         try:
@@ -248,9 +340,18 @@ class SyncSession:
             cam_rec.stop()
             glove_rec.stop()
             beep(500, 300)
+            # A take is usable only if ONE HAND was seen by BOTH sensors.
+            # Counting frames per sensor is not enough: a camera that saw the
+            # left hand and a glove that streamed the right one both report
+            # plenty of frames, and `pair_by_time` never crosses hands, so the
+            # take fuses into nothing. Say which hands each side had.
+            shared = cam_rec.hands_seen & glove_rec.hands_seen
             entry = {"pose": pose, "take": take,
                      "cam_frames": cam_rec.count, "glove_frames": glove_rec.count,
-                     "ok": cam_rec.count > 0 and glove_rec.count > 0}
+                     "cam_hands": sorted(cam_rec.hands_seen),
+                     "glove_hands": sorted(glove_rec.hands_seen),
+                     "shared_hands": sorted(shared),
+                     "ok": bool(shared)}
             hands = cam_rec.hands_seen | glove_rec.hands_seen
             if cam_rec.count == 0 and glove_rec.count == 0:
                 (self.cam_dir / name).unlink(missing_ok=True)
@@ -273,9 +374,8 @@ class SyncSession:
                 print(f"      saved  glove {glove_rec.count} frames | "
                       f"camera {cam_rec.count} frames  ({tag})")
                 if not entry["ok"]:
-                    which = "camera" if cam_rec.count == 0 else "glove"
-                    print(f"      WARNING: {which} captured nothing — "
-                          "this take cannot be fused")
+                    print(f"      WARNING: {describe_mismatch(cam_rec, glove_rec)}"
+                          " — this take cannot be fused")
                 print()
             self.results.append(entry)
 
@@ -285,10 +385,19 @@ class SyncSession:
             return
         ok = [r for r in self.results if r["ok"]]
         print("=" * 62)
-        print(f"Session summary: {len(ok)}/{len(self.results)} takes have BOTH sensors")
+        print(f"Session summary: {len(ok)}/{len(self.results)} takes have BOTH "
+              "sensors on one hand")
         for r in self.results:
-            status = (f"glove {r['glove_frames']:>4}f | cam {r['cam_frames']:>4}f"
-                      if r["ok"] else "INCOMPLETE")
+            if r["ok"]:
+                status = (f"glove {r['glove_frames']:>4}f | "
+                          f"cam {r['cam_frames']:>4}f  "
+                          f"({hands_text(r.get('shared_hands', []))})")
+            elif r["glove_frames"] and r["cam_frames"]:
+                status = (f"NO SHARED HAND: glove "
+                          f"{hands_text(r.get('glove_hands', []))} vs cam "
+                          f"{hands_text(r.get('cam_hands', []))}")
+            else:
+                status = "INCOMPLETE"
             print(f"  {r['pose']:<12} take{r['take']}  {status}")
         if ok:
             print(f"\n  glove files: {self.glove_dir}")
@@ -349,6 +458,16 @@ class LeapSyncSession(SyncSession):
     def make_cam_recorder(self, pose: str, take: int):
         return LeapRecorder(hz=self.leap_hz, pose=pose, take=take)
 
+    def _discard_camera_backlog(self) -> int:
+        """Empty the LeapC queue. At 90 Hz a blocking beep fills a lot of it."""
+        dropped = 0
+        for _ in range(MAX_DRAIN_ROUNDS):
+            n = len(self.leap.drain(64))
+            dropped += n
+            if not n:
+                break
+        return dropped
+
     def tick(self, cam_rec=None, glove_rec=None, banner="", sub="", rec=False):
         """Drain both sensors once and record what each gave. No window."""
         self.glove_total += self._pump_glove(glove_rec)
@@ -361,6 +480,7 @@ class LeapSyncSession(SyncSession):
             if lh.visible_time_us < MIN_VISIBLE_TIME_US:
                 self.skipped_young += 1      # still settling; not data yet
                 continue
+            self.cam_sides.add(lh.hand_side)
             hands.append(lh)
             if cam_rec is not None:
                 cam_rec.record(lh)
@@ -386,19 +506,31 @@ class LeapSyncSession(SyncSession):
         self._sides = set()
 
     def wait_for_both(self, timeout: float = 120.0) -> None:
-        print("Waiting for BOTH sensors (glove packets + a tracked hand)...")
+        print("Waiting for BOTH sensors on the SAME hand "
+              "(glove packets + that hand tracked)...")
         print("  Glove on, hand 20 to 50 cm above the module, lenses up.")
         t0 = time.time()
+        self.glove_sides, self.cam_sides = set(), set()
         while time.time() - t0 < timeout:
             self.tick()
-            if self.glove_total >= 10 and self.hand_total >= 10:
-                print("  OK - glove packets and Ultraleap tracking both live\n")
+            if (self.glove_total >= 10 and self.hand_total >= 10
+                    and (self.glove_sides & self.cam_sides)):
+                shared = hands_text(self.glove_sides & self.cam_sides)
+                print(f"  OK - glove and Ultraleap both on: {shared}\n")
                 return
-        raise SystemExit(
-            f"Only got {self.glove_total} glove packets and "
-            f"{self.hand_total} tracked hands. Check XR Trainer is streaming "
-            "(scripts/glove/run_osc.py --dump --no-viz) and the camera "
-            "(python scripts/leap/check_setup.py).")
+        raise SystemExit(self.not_ready_message(self.glove_total,
+                                                self.hand_total))
+
+    def not_ready_message(self, glove_ok: int, cam_ok: int) -> str:
+        if glove_ok and cam_ok and not (self.glove_sides & self.cam_sides):
+            return (f"The glove is streaming {hands_text(self.glove_sides)} "
+                    f"and the camera is tracking {hands_text(self.cam_sides)} "
+                    "— no hand in common, so nothing could ever pair. Hold "
+                    "the GLOVED hand over the module.")
+        return (f"Only got {glove_ok} glove packets and {cam_ok} tracked "
+                "hands. Check XR Trainer is streaming "
+                "(scripts/glove/run_osc.py --dump --no-viz) and the camera "
+                "(python scripts/leap/check_setup.py).")
 
     def print_summary(self) -> None:
         super().print_summary()

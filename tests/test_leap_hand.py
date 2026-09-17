@@ -1230,6 +1230,85 @@ def test_leap_backend_keeps_every_camera_frame_by_default(tmp_path: Path,
     assert n_cam > 5 * n_glove, f"{n_cam} camera frames vs {n_glove} glove"
 
 
+def test_the_start_beep_cannot_backdate_the_head_of_a_take(tmp_path: Path,
+                                                           monkeypatch):
+    """A blocking beep must not leave a quarter second of stale frames.
+
+    Both sensor threads keep queueing while `winsound.Beep` blocks, and both
+    recorders stamp a frame with the time of the WRITE — so a beep that runs
+    after the files are open puts backdated frames at the head of every take.
+    The fix is an ordering, and this is what holds it: with a beep that
+    really does block, nothing written may predate the end of that beep.
+    """
+    import json
+    import sys
+    import time as _time
+
+    sync = _load_repo_script("record_simultaneous")
+    beeps = []
+
+    def slow_beep(freq=880, ms=180):
+        end = _time.time() + ms / 1000.0
+        while _time.time() < end:            # a real beep blocks; so does this
+            _time.sleep(0.005)
+        beeps.append(_time.time())
+
+    monkeypatch.setattr(sync, "beep", slow_beep)
+    out_dir = tmp_path / "sync"
+    monkeypatch.setattr(sys, "argv", [
+        "record_simultaneous.py", "--camera", "leap", "--mock-glove",
+        "--mock-leap", "--poses", "fist", "--takes", "1", "--duration", "1",
+        "--prep", "0", "--out-dir", str(out_dir),
+    ])
+    sync.main()
+
+    assert len(beeps) >= 2                   # start beep, then the stop beep
+    path = sorted((out_dir / "leap").glob("*.jsonl"))[0]
+    rows = [json.loads(line) for line
+            in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert rows
+
+    # The backlog is visible as a burst: every frame the beep queued is
+    # drained in one pass and written within a millisecond of the next, all
+    # stamped with the same instant, although the camera captured them over a
+    # quarter of a second. A 250 ms beep at 90 Hz x 2 hands is about 45 of
+    # them; after the fix the first drain finds what one tick's worth is.
+    t0 = min(r["wall_time"] for r in rows)
+    in_first_20ms = sum(1 for r in rows if r["wall_time"] - t0 < 0.020)
+    assert in_first_20ms < 10, (
+        f"{in_first_20ms} frames share the first 20 ms of the take — that is "
+        "the beep's backlog, written as if it had just been captured")
+
+
+def test_a_take_needs_one_hand_on_BOTH_sensors_not_frames_on_each():
+    """camera=left + glove=right is plenty of frames and exactly zero pairs."""
+    sync = _load_repo_script("record_simultaneous")
+
+    class FakeRec:
+        def __init__(self, count, hands):
+            self.count, self.hands_seen = count, set(hands)
+
+    msg = sync.describe_mismatch(FakeRec(300, {"left"}), FakeRec(60, {"right"}))
+    assert "left" in msg and "right" in msg and "no hand in common" in msg
+    # the two silences need different fixes, so they get different words
+    assert "camera captured nothing" in sync.describe_mismatch(
+        FakeRec(0, set()), FakeRec(60, {"right"}))
+    assert "glove captured nothing" in sync.describe_mismatch(
+        FakeRec(300, {"left"}), FakeRec(0, set()))
+
+
+def test_readiness_needs_a_shared_hand_and_names_the_disagreement():
+    sync = _load_repo_script("record_simultaneous")
+    session = sync.SyncSession(cap=None, tracker=None, glove_source=None,
+                               hz=5.0, out_dir=Path("recordings") / "sync")
+    session.glove_sides, session.cam_sides = {"right"}, {"left"}
+    msg = session.not_ready_message(glove_ok=400, cam_ok=200)
+    assert "no hand in common" in msg and "right" in msg and "left" in msg
+    # a genuinely silent sensor still gets the old, correct advice
+    session.glove_sides, session.cam_sides = set(), set()
+    assert "Check XR Trainer" in session.not_ready_message(0, 200)
+
+
 def test_the_mediapipe_session_still_owns_cam_and_its_own_recorder():
     """The refactor that made the camera pluggable must not have moved it."""
     from cam_hand.recorder import CamRecorder

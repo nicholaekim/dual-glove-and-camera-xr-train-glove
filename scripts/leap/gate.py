@@ -75,6 +75,7 @@ DEFAULT_OUT = Path("recordings") / "leap" / "gate"
 DEFAULT_REPORT = Path("results") / "leap_gate" / "REPORT.txt"
 MOCK_NOTE = "synthetic: --mock run, not camera data"
 MIN_VISIBLE_TIME_US = 300_000     # plan section 6: a hand counts after 0.3 s
+MAX_DRAIN_ROUNDS = 8              # bound on the post-beep flush
 
 
 def beep(freq: int = 880, ms: int = 180) -> None:
@@ -101,9 +102,11 @@ class GateRun:
         self.skipped_young = 0
 
     # --- plumbing --------------------------------------------------------
-    def _consume(self, recorder=None) -> None:
+    def _consume(self, recorder=None) -> int:
         """Drain pending hands into the trail, and into the recorder if any."""
+        seen = 0
         for _side, lh in self.source.drain(64):
+            seen += 1
             self.trail.add(lh)
             # Gate on presence and settling time, never on confidence: LeapC
             # documents confidence as a constant 1.0 (plan section 6).
@@ -112,6 +115,26 @@ class GateRun:
                 continue
             if recorder is not None:
                 recorder.record(lh)
+        return seen
+
+    def _discard_backlog(self) -> int:
+        """Drop what queued while the start beep blocked.
+
+        `winsound.Beep` blocks for its whole duration while LeapC's polling
+        thread keeps filling the queue, so hands drained straight after a
+        250 ms beep are up to 250 ms old and would be written with the
+        current time. Here that matters twice over: those frames inflate the
+        count at the head of the take without lengthening its span, and the
+        count over the span IS the detection rate this experiment turns on.
+        The trail still sees every hand, so the IR stills keep pairing.
+        """
+        dropped = 0
+        for _ in range(MAX_DRAIN_ROUNDS):
+            n = self._consume()
+            dropped += n
+            if not n:
+                break
+        return dropped
 
     def _raw_capture(self, path: Path):
         if not self.raw:
@@ -165,8 +188,11 @@ class GateRun:
         snaps = []
 
         with self._raw_capture(raw_path):
-            recorder.start(path)
+            # Beep, throw away what queued behind the beep, and only then open
+            # the file — see `_discard_backlog`.
             beep(1000, 250)
+            self._discard_backlog()
+            recorder.start(path)
             print(f"      REC {seconds:g} s - hold it ", end="", flush=True)
             t0 = time.time()
             try:
