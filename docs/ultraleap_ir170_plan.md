@@ -134,6 +134,26 @@ live viewer):
    white cotton glove), so treat them as experiments and record the result
    either way. Also record the tracking `framerate` in every run.
 
+Evidence to keep from every gate run
+- The JSONL and `.lmt` recordings, and the `stats.py` table.
+- IR stills of the hand in each condition, saved with
+  `scripts/leap/ir_snapshot.py` (to be written on hardware day): it calls
+  `connection.set_policy_flags(flags_to_set=[leap.PolicyFlag.Images])`,
+  receives `on_image_event(event)` with `event.image[0]` (left) and
+  `event.image[1]` (right), reads `image.c_data.properties.width/.height/
+  .bpp`, `.data` and `.offset`, copies the buffer inside the callback (LeapC
+  reuses it) and writes PNGs. These photos are the professor-facing evidence
+  of what the camera actually sees through the glove.
+
+Control Panel settings for the gate (leave everything else at default)
+- Tracking mode: Desktop, set explicitly.
+- Allow images: on, and confirm `PolicyFlag.Images` comes back active.
+- Performance mode: Balanced (default). Do not enable Low Resource.
+- Robust / light-robustness and auto-orientation: default; note whether the
+  device reports a robust status during the runs (IR interference).
+- Interpolation: off for gate metrics. Hyperion's alternate hand models
+  (Hand On Object, Microgestures) are HMD-only; do not use them here.
+
 Decision table
 - Path A (gloved hand reported in 80 %+ of frames, no more than one
   re-acquisition per 10 s, jitter within 2x the bare-hand value):
@@ -382,6 +402,30 @@ official pages directly. Outcome:
   this particular unit, whether the 2023 Python bindings build against the
   Hyperion SDK, and whether `leapc_cffi` builds on Python 3.14. All five
   are covered by Phase 0 and the Phase 2 gate, and each has a fallback.
+
+Phase 0 outcome, same day (evening of 2026-09-16)
+- Hyperion installed: build string `6.2.0+2025.07.11.824112c4.CI1622376`,
+  service key `UltraleapTracking`, display name "Ultraleap Tracking
+  Service", running. SDK at the default path with `LeapC.h`, `LeapC.dll`,
+  `LeapC.lib`. Installer, SDK copy, the bindings clone and the built wheel
+  are archived in `..\xr trainer\reference\ultraleap\`.
+- `leapc_cffi` builds on Python 3.14 with the VS 2022 Build Tools
+  (`leapc_cffi-0.0.1-cp314-cp314-win_amd64.whl`). The 3.11 fallback is not
+  needed. Two of the five open items are therefore closed.
+- Lesson: the bindings' `requirements.txt` pulls `opencv-python`, which
+  shares the `cv2` folder with mediapipe's `opencv-contrib-python`;
+  installing it, or uninstalling it afterwards, breaks `cv2`. The setup
+  script now filters it out; the repair is
+  `pip install --force-reinstall --no-deps opencv-contrib-python==5.0.0.93`.
+- Design review before coding (ChatGPT, browsing the bindings source):
+  compare `hand.type` with `leap.HandType` by isinstance then enum, use
+  `connect()`/`disconnect()` for a long-lived stream, `leap.get_now() -
+  event.timestamp` is frame age at receipt, `leap.Recording`/`leap.Recorder`
+  give raw `.lmt` capture and replay, detect the service by display name.
+  All applied in `src/leap_hand`.
+- Still open for hardware day: device enumeration (no camera was attached
+  when the checker ran), the visual and numeric convention checks, and the
+  glove gate itself.
 
 ## 10. Handoff block for the executing session
 
