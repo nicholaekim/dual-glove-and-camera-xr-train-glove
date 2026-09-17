@@ -451,6 +451,26 @@ Phase 1 outcome (same evening)
   (the glove's is a device tick counter); `wall_time` in the JSONL is the
   shared clock used for pairing, and `timestamp_us` is kept alongside.
 
+Hardware day (2026-09-16, later the same evening, camera attached)
+- Hyperion 6.2.0 enumerates this unit: serial
+  `LE3100040000001DD2-3610-2217501E20`, reported as `DevicePID.SIR170`,
+  Windows shows it as a USB composite device (VID 2936, PID 1202) with a
+  camera interface. Streams at 89 to 90 Hz tracking rate with the mode
+  confirmed as Desktop. The first checker run right after plug-in saw zero
+  events in its 3 s window; the device needs a few seconds to start.
+- Numeric convention check on a bare hand (587 hand samples, both hands):
+  `rotation * (0,0,-1)` matches prev_joint to next_joint to 0.00 degrees on
+  every bone; thumb `bones[0]` length 0.000 mm; palm basis matches
+  {normal x direction, -normal, -direction} to 0.00 degrees; palm to wrist
+  72 mm; fingertips farther from the wrist than the knuckles on all five
+  fingers (wrist to tip: thumb 117, index 141, middle 140, ring 131, pinky
+  117 mm). Frame age at receipt median 9.5 ms, p95 10.4 ms. Every
+  documented convention in Section 1 is therefore confirmed on hardware;
+  the mapping needs no change.
+- Closed: device enumeration, bindings against the Hyperion SDK, the
+  convention checks. Still open: the glove gate (Section 2) and the raw
+  `.lmt` capture, which has not yet run with a device.
+
 ## 10. Handoff block for the executing session
 
 Context: repo `C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer`
