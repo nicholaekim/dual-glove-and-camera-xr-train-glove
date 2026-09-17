@@ -108,7 +108,8 @@ This machine (checked today)
 - Python 3.14.6 is the only interpreter (`py -0`). The repo venv is 3.14.
 - Visual Studio 2022 Build Tools with the C++ toolset are installed
   (vswhere finds them), so compiling `leapc_cffi` is possible.
-- No Ultraleap software installed yet.
+- Hyperion 6.2.0 installed the same evening (see the Phase 0 outcome in
+  Section 9); the notes above describe the machine before that.
 
 ## 2. The gate: does the camera see the gloved hand?
 
@@ -429,6 +430,26 @@ Phase 0 outcome, same day (evening of 2026-09-16)
 - Still open for hardware day: device enumeration (no camera was attached
   when the checker ran), the visual and numeric convention checks, and the
   glove gate itself.
+
+Phase 1 outcome (same evening)
+- `src/leap_hand` (types, to_openxr, stream, recorder, mock, replay, stats),
+  `scripts/leap/{check_setup.py, setup_bindings.ps1, live_view.py,
+  record_poses.py, stats.py}` and `tests/test_leap_hand.py` written by an
+  Opus session from Section 3, then code-reviewed by ChatGPT against the
+  bindings source. Review found four real bugs (tracking-mode failure
+  swallowed, frames accepted before Desktop mode was set, a failed connect
+  left the LeapC connection open, an invalid device-info fallback) plus
+  wording and robustness items; all eleven were fixed. 81 tests pass; the
+  mock recording plays back and exports through the unchanged glove tools.
+  Merged to main on 2026-09-16.
+- Measured with the service running and no camera: `get_tracking_mode()`
+  times out because the TrackingMode event only arrives once a device is
+  present. The stream therefore sets Desktop mode right after connect
+  (fatal on failure), clears its queue, waits for the device and first
+  frame, then confirms the mode and refuses to run if it is not Desktop.
+- `HandFrame.timestamp` for camera frames is the Leap clock in seconds
+  (the glove's is a device tick counter); `wall_time` in the JSONL is the
+  shared clock used for pairing, and `timestamp_us` is kept alongside.
 
 ## 10. Handoff block for the executing session
 

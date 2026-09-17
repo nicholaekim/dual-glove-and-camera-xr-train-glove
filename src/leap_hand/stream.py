@@ -252,6 +252,9 @@ class LeapStream:
             self._discard_pending()
             self._wait_for_device()
             self._verify_tracking_mode()
+            # Frames that arrived between the set and its confirmation were
+            # queued in an unconfirmed mode; only what follows counts.
+            self._discard_pending()
         except BaseException:
             self._safe_disconnect()
             raise
