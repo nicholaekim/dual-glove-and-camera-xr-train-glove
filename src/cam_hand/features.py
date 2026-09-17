@@ -178,3 +178,161 @@ def loo_nearest_centroid(samples: Sequence[Tuple[str, Sequence[float]]],
 FLEXION_COLS = list(range(len(FLEXION_NAMES)))
 SPREAD_COLS = list(range(len(FLEXION_NAMES), len(ALL_NAMES)))
 ALL_COLS = list(range(len(ALL_NAMES)))
+
+
+# --- proximal-bone geometry -------------------------------------------
+# Everything below is ADDITIVE: no existing feature, column index or
+# classifier result changes. It exists because a fingertip is the wrong place
+# to read abduction from.
+#
+# A finger's in-plane direction (its azimuth in the palm plane) is what the
+# camera is there to supply. Reading it from knuckle -> TIP mixes it with
+# curl: once the PIP and DIP are bent, the tip swings far off the bone's own
+# line and a few degrees of flexion error becomes tens of degrees of apparent
+# abduction. The PROXIMAL bone — knuckle (MCP) to the next joint (PIP) — moves
+# only with the joint that actually abducts, so its azimuth is the abduction
+# and nothing else. The thumb has no PIP, so its proximal bone is CMC -> MCP,
+# the same "first bone out of the chain" rule.
+
+PROXIMAL_BONE: Dict[str, Tuple[int, int]] = {
+    "thumb":  (1, 2),      # THUMB_CMC -> THUMB_MCP
+    "index":  (5, 6),
+    "middle": (9, 10),
+    "ring":   (13, 14),
+    "pinky":  (17, 18),
+}
+
+FINGER_ORDER = ["thumb", "index", "middle", "ring", "pinky"]
+
+# Adjacent pairs whose in-plane angle is the spread a camera can see.
+ADJACENT_PAIRS = [("thumb", "index"), ("index", "middle"),
+                  ("middle", "ring"), ("ring", "pinky")]
+ADJACENT_SPREAD_NAMES = [f"{a}-{b}" for a, b in ADJACENT_PAIRS]
+
+
+def _unit3(v):
+    n = _norm(v)
+    return [v[0] / n, v[1] / n, v[2] / n] if n > 1e-12 else list(v)
+
+
+def palm_axes(pts, hand_side: str = "right"):
+    """Orthonormal (normal, in-plane x, in-plane y) for measuring azimuths.
+
+    x runs wrist -> middle knuckle. The normal is `palm_normal`, so it is
+    already flipped for a left hand; y is then flipped back for the left hand
+    too, which makes an azimuth measured here mean the SAME physical abduction
+    on both hands instead of changing sign with chirality.
+    """
+    wrist = pts[WRIST]
+    x = _unit3(_sub(pts[MIDDLE_MCP], wrist))
+    n = _unit3(palm_normal(pts, hand_side))
+    # re-orthogonalise: the knuckle triangle is not exactly perpendicular to x
+    n = _unit3([n[i] - _dot(n, x) * x[i] for i in range(3)])
+    y = _cross(n, x)
+    if str(hand_side).lower().startswith("l"):
+        y = [-y[0], -y[1], -y[2]]
+    return n, x, y
+
+
+def proximal_azimuth_deg(pts, finger: str, hand_side: str = "right") -> float:
+    """In-plane angle of a finger's PROXIMAL bone, degrees, 0 = down the palm.
+
+    Positive is toward the thumb side on both hands (see `palm_axes`).
+    """
+    a, b = PROXIMAL_BONE[finger]
+    d = _sub(pts[b], pts[a])
+    _n, x, y = palm_axes(pts, hand_side)
+    return math.degrees(math.atan2(_dot(d, y), _dot(d, x)))
+
+
+def adjacent_spreads_deg(pts, hand_side: str = "right") -> List[float]:
+    """The 4 adjacent in-plane finger gaps in degrees, unsigned.
+
+    Unsigned because it is the OPENING between two fingers, which is the same
+    physical quantity whichever hand it is on.
+    """
+    az = {f: proximal_azimuth_deg(pts, f, hand_side) for f in FINGER_ORDER}
+    out = []
+    for a, b in ADJACENT_PAIRS:
+        d = (az[a] - az[b] + 180.0) % 360.0 - 180.0
+        out.append(abs(d))
+    return out
+
+
+def thumb_index_gap(pts, normalize: bool = True) -> float:
+    """Thumb tip to index tip over palm length — the pinch measurement."""
+    scale = palm_length(pts) if normalize else 1.0
+    scale = scale if scale > 1e-9 else 1.0
+    return _norm(_sub(pts[TIP_IDX[1]], pts[TIP_IDX[0]])) / scale
+
+
+# Rows of the per-DOF report: (label, kind, index-within-kind).
+DOF_ROWS = ([(f"curl {n}", "curl", i) for i, n in enumerate(FLEXION_NAMES)]
+            + [(f"spread {n}", "spread_deg", i)
+               for i, n in enumerate(ADJACENT_SPREAD_NAMES)]
+            + [("thumb-index gap", "ti_gap", 0)])
+
+
+def dof_values(pts, hand_side: str = "right") -> List[float]:
+    """The per-DOF report row values for one hand, in DOF_ROWS order."""
+    curls = flexion_features(pts)
+    spreads = adjacent_spreads_deg(pts, hand_side)
+    gap = thumb_index_gap(pts)
+    picked = {"curl": curls, "spread_deg": spreads, "ti_gap": [gap]}
+    return [picked[kind][i] for _label, kind, i in DOF_ROWS]
+
+
+def median(values: Sequence[float]) -> float:
+    v = sorted(values)
+    n = len(v)
+    if not n:
+        return float("nan")
+    return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+def loo_take_nearest_centroid(samples: Sequence[Tuple[str, str, Sequence[float]]],
+                              cols: Sequence[int] = None):
+    """Leave-one-TAKE-out nearest centroid over (label, take, features).
+
+    The difference from `loo_nearest_centroid` is what "held out" means. There,
+    one SAMPLE is held out, so the other hand of the very same take — the same
+    five seconds, the same hand pose, the same tracking state — is still in the
+    training set and the test mostly measures whether the two hands of one take
+    look alike. Here every sample sharing the held-out sample's take is removed,
+    so nothing recorded at that moment can vote on it.
+
+    Consequence worth stating: with a single take per pose, holding out that
+    take removes the pose's only training samples, there is no centroid for the
+    true label to be nearest to, and every held-out sample is necessarily wrong.
+    That is not a fusion result — it is a statement about the recording, and it
+    stays 0% until a second take of each pose exists.
+
+    Returns (n_correct, n_total, [(true, predicted, index), ...]).
+    """
+    def pick(v):
+        return [v[i] for i in cols] if cols is not None else list(v)
+
+    wrong = []
+    for i, (label, take, feats) in enumerate(samples):
+        sums: Dict[str, List[float]] = {}
+        counts: Dict[str, int] = defaultdict(int)
+        for j, (lab2, take2, f2) in enumerate(samples):
+            if take2 == take:
+                continue                      # the whole held-out take, not one row
+            v = pick(f2)
+            if lab2 not in sums:
+                sums[lab2] = list(v)
+            else:
+                for k in range(len(v)):
+                    sums[lab2][k] += v[k]
+            counts[lab2] += 1
+        target = pick(feats)
+        best, best_d = None, float("inf")
+        for lab2, s in sums.items():
+            c = [v / counts[lab2] for v in s]
+            d = sum((a - b) ** 2 for a, b in zip(target, c))
+            if d < best_d:
+                best, best_d = lab2, d
+        if best != label:
+            wrong.append((label, best, i))
+    return len(samples) - len(wrong), len(samples), wrong
