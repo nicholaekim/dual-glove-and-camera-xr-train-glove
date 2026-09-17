@@ -251,14 +251,18 @@ The verdict applies the plan's thresholds — detection >= 80 %, at most one
 re-acquisition per 10 s, jitter within 2x the bare hand of the same side.
 Path A means simultaneous glove + camera capture; Path B means sequential.
 
-**Result (2026-09-16): Path A.** The IR camera tracks the hand *inside* the
-black StretchSense glove in **100 %** of frames, with **0** re-acquisitions
-and **0.20 mm** fingertip jitter — 0.37x the bare hand's 0.54 mm, i.e. the
-gloved hand is *steadier* than the bare one. The bare left hand scored
-89.2 %. Every number here is from that one session and lives in
-`results\leap_gate\REPORT.txt`; the detection rates are the corrected ones,
-recomputed from the same recordings — see the next paragraph for what
-changed.
+**Result (2026-09-16): Path A, provisionally.** The IR camera tracks the hand
+*inside* the black StretchSense glove in **100 %** of frames, with **0**
+re-acquisitions and **0.20 mm** fingertip jitter against the bare hand's
+0.54 mm. In the 850 nm stills the glove renders almost white with its sensor
+grid visible as dots, so the fabric reflects near IR strongly even though it
+is black to the eye. **Do not read the better-than-bare jitter as a property
+of the fabric**: black textiles vary widely in near-IR reflectance and one
+session cannot separate that from run-to-run variation — which is what the
+extra runs below are for. The bare left hand scored 89.2 %. Every number is
+from that one session and lives in `results\leap_gate\REPORT.txt`; the
+detection rates are the corrected ones, recomputed from the same recordings
+— see the next paragraph. Plan section 9 has the full entry.
 
 **Recompute a report without the camera.**
 
@@ -279,11 +283,11 @@ than the cadence (it read 101 Hz on a 90 Hz file). That moved bare left from
 where it was. `leap_hand.stats.choose_rate` is the rule; the report's
 footnote names the denominator every row used.
 
-**Extra gate runs the reviewer asked for.** One session on the right hand and
-one with both hands up at once, then the gloved hand held at 20, 35 and 50 cm
-above the module, holding a **fist and a pinch** through each distance run —
-then the whole set repeated on a second day, so the result is not one
-session's lighting:
+**Extra gate runs the reviewer asked for** (plan section 9). A centred
+right-hand glove run and one with both hands up at once, then the gloved hand
+held at 20, 35 and 50 cm above the module, working through **fist, pinch and
+open/spread** in each distance run — then the whole set repeated on a second
+day, so the result is not one session's lighting:
 
 ```powershell
 python scripts\leap\gate.py --conditions bare,glove_right,glove_both,glove_20cm,glove_35cm,glove_50cm
