@@ -420,9 +420,82 @@ REC       3.4s left YES      23.8 cm OK       view  11 deg  glove 59.8/s
   1.5) for the hand to change shape while the tracker follows it.
 * **REC** records `--duration` seconds — but only if the hand id pinned at
   acquire is still on the hand. If it changed, or the hand was lost, the
-  attempt says so, **both files are deleted**, and the take is retried from
-  ACQUIRE up to `--retries` times (default 3). A take is complete when the
-  expected hand, on that one id, covers >= 90 % of it.
+  attempt says so, **both files are set aside** (see below), and the take is
+  retried from ACQUIRE up to `--retries` times (default 3). A take is complete
+  when the expected hand, on that one id, covers >= 90 % of it — **and** the
+  hand was in the pose that was asked for.
+
+**The window names the pose, and a take whose hand is not in it is refused.**
+On 2026-09-17 the window's caption was phase + extras + seconds, and the
+extras are empty during SETTLE and REC, so the window the operator was
+actually watching said `SETTLE   1s` and never once named the pose — `NOW:
+FIST` went to a terminal nobody was looking at. Nine of that session's 36
+takes hold the wrong pose, **with both sensors agreeing on the wrong one**
+(three fists that are open palms, three index points that are fists, two
+thumbs ups that are fists, one peace that is a thumbs up). So the caption is
+now a tested function and says the pose in every phase:
+
+```
+ACQUIRE   OPEN PALM first   next: FIST (take 2/3)
+SETTLE    NOW: FIST   1s
+REC       HOLD: FIST   REC 4s
+refused   WRONG POSE: saw OPEN HAND, want FIST
+```
+
+and after the take `leap_hand.pose_check` compares each finger's curl
+(tip-to-wrist over palm length — the same number `fuse_poses.py` reports)
+against the shape the pose is supposed to be. **A finger is only wrong when
+BOTH sensors are decisive and BOTH contradict the pose**; one sensor
+disagreeing is a warning and never a failure. That rule is not caution for
+its own sake, it is what the same session measured: the glove reports an
+exact open palm for every real pinch (it cannot see thumb opposition at all),
+and the camera reads the ring finger extended on the right-hand peace takes
+where the glove reads it curled. So `pinch` is judged on the camera's
+thumb-index gap alone, reported as `pinch_camera_gap` and **never rejected
+on** — the camera may not select the pinch takes it is later going to be
+scored on — and a camera looking at the hand edge-on (median viewing angle
+over 65 degrees) casts no vote at all, so nothing can fail on it.
+`--no-pose-check` turns the whole thing off; it is off automatically for
+`--mock-glove`/`--mock-leap`, whose cartoon hands do not follow the pose
+being called.
+
+**A refused attempt is never deleted.** Both files move to
+`recordings\sync\rejected\glove\` and `...\rejected\leap\` under the same name
+plus `_attemptN`, with a `meta.json` saying `accepted: false` and why — the
+two sensors under evaluation are the ones vetoing the take, so every
+exclusion has to stay countable. `fuse_poses.py` and `check_take_labels.py`
+both ignore `rejected/`. The session summary ends with how many attempts the
+pose check refused, per pose.
+
+**One still per take, as independent evidence.** At the midpoint of REC the
+camera window saves the frame it is composing — IR image, fitted skeleton,
+caption — to `recordings\sync\stills\<take>.jpg` (and to `rejected\stills\`
+with a refused attempt), through a `snap=<path>` line in the status file it
+is already driven by. It is the only record of a take that does not come from
+the two sensors that judge it. `recordings\` is git-ignored and the stills
+have the operator in them, so they never go anywhere else.
+
+**The glove is recorded at full rate** with `--camera leap` (`--hz` still
+throttles it explicitly, and the webcam backend still defaults to 5 Hz). At
+5 Hz a five-second take is 24 glove frames, which cannot tell a steady stream
+from one that stopped for three seconds; the meta files now carry
+`glove_rate_hz`, `glove_max_gap_ms` and `glove_gaps_over_100ms`, and a take
+whose glove went quiet for more than 250 ms says so as it finishes. Pairing
+is unaffected — every glove frame is matched to the nearest camera frame, and
+a mock session at full rate pairs 94 % of them within 50 ms.
+
+Audit a folder that was recorded before any of this existed:
+
+```powershell
+python scripts\check_take_labels.py recordings\sync_coached_20260917
+```
+
+It prints every take's verdict, both sensors' median curls, the glove's
+stream health and one line of English (`both sensors saw an OPEN HAND,
+expected FIST`), then the exact command to re-record the poses that were
+wrong — whole poses, because take numbering is per pose. On that session it
+reproduces the nine wrong takes exactly, warns on the four the two sensors
+disagree about, and flags no pinch.
 
 A camera hand of the other chirality is dropped before it can reach the
 recorder, so `--hand left` cannot produce a right-handed line; the wrong-hand
@@ -430,9 +503,10 @@ and second-hand-in-view counts are printed per session and stored per take.
 Each take writes two files under **one name**, `recordings\sync\glove\...` and
 `recordings\sync\leap\...`, both stamped with `time.time()` at the write — the
 one clock the sensors share — plus `<take>.meta.json` beside the camera file
-with the hand, pose, hand id, coverage, attempts, median height, median
-viewing angle and the rejection counts. The session summary ends with the
-exact command to redo only the poses that failed:
+with `accepted`, the hand, pose, hand id, coverage, attempts, median height,
+median viewing angle, the rejection counts, the glove's stream health, the
+still's path and the whole `pose_check` verdict. The session summary ends with
+the exact command to redo only the poses that failed:
 
 ```
   open_palm    3/3 complete (3 attempt(s))

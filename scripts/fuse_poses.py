@@ -34,6 +34,16 @@ Two kinds of camera take, told apart by the file itself and never by a flag:
 A session folder may hold both; each take is read the way its own first line
 says, and the report names which camera every take came from.
 
+  recordings/sync/rejected/  attempts the recorder threw out — the hand was
+                             lost, the coverage was short, or both sensors
+                             said the hand was not in the pose that was asked
+                             for. They are kept (never deleted) so that every
+                             exclusion can be counted and looked at, and they
+                             are NOT fused: takes are found under `glove/`,
+                             which is a sibling of `rejected/`, so a rejected
+                             attempt cannot reach this report by accident.
+                             `scripts/check_take_labels.py` skips it too.
+
 Also reports the plumbing that has to be right for any of it to mean anything:
 how many frames found a partner within the time window, and how often the
 camera was confident enough to contribute.
