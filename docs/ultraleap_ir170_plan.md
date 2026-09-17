@@ -514,6 +514,28 @@ Path A tooling (merged 2026-09-16, 130 tests)
   replication (medoid of a short take, professor txt format in mm).
 - Not yet run with a real hand or with XR Trainer streaming.
 
+Second gate session (2026-09-17, 13:19 to 13:23, daytime)
+- Report: bare right 62 %, glove_right 60 %, glove_both 75 / 80 %,
+  glove_20cm 94 / 100 %, glove_35cm 92 / 87 %, glove_50cm 51 %. Verdict
+  still Path A (glove_20cm and glove_35cm meet all three thresholds, with
+  both hands in view at once).
+- Reading the losses from the recordings: they are single long blocks of
+  1 to 8 s, not flicker. Bare hand: lost for 5 s when the hand turned
+  edge-on to the camera (29 % of its frames were edge-on). glove_right: the
+  hand sank to 99 mm above the lens, the bottom of the 10 to 75 cm range,
+  and was lost for 8 s. In four gloved runs the loss began while the hand
+  was a fist (`grab_strength` 1.0 at the last tracked frame). No bare-hand
+  fist was recorded in this session, and the first session's gloved fist
+  tracked at 100 %, so whether fists are harder with the glove is open.
+- The distance labels were not achieved: median palm height was 196 to
+  207 mm for "20cm", 198 to 240 mm for "35cm" and 267 mm for "50cm". There
+  is no evidence yet about tracking beyond about 30 cm.
+- Conclusion: the glove did not track worse than bare skin in the same
+  session; the session's protocol was too loose to say more. The gate
+  runner needs timed pose prompts, a live height readout against a target
+  band, and per-pose detection rates with a paired bare run, so that a
+  fist with the glove is compared with a fist without it.
+
 Path A review round (ChatGPT, 2026-09-17; all fixed, 146 tests)
 - Pairing clock. Frames were stamped when written, not when captured, so a
   drained burst of camera frames shared one time. Both sensors now carry
