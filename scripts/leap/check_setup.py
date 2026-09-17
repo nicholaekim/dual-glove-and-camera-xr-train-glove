@@ -326,7 +326,7 @@ def report(checks: List[Check]) -> int:
     return 0
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Check that this machine can record with the Stereo IR 170.")
     p.add_argument("--mock", action="store_true",
@@ -334,7 +334,11 @@ def main() -> None:
     p.add_argument("--seconds", type=float, default=6.0,
                    help="how long to watch for hands (default: 6 — a device "
                         "plugged in seconds ago needs a few to start)")
-    args = p.parse_args()
+    return p
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     print("=" * 72)
     print("Ultraleap Stereo IR 170 — setup check" + ("  [mock]" if args.mock else ""))
