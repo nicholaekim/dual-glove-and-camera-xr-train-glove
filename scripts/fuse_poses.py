@@ -1,18 +1,23 @@
-"""Fuse simultaneous glove + camera takes and score all three against each other.
+"""Fuse simultaneous glove + camera takes and report what each sensor supplied.
 
 Reads the paired recordings written by scripts/record_simultaneous.py, matches
-frames by wall-clock, fuses each pair (glove curl + camera spread — see
-cam_hand/fusion.py), and then runs the SAME leave-one-out nearest-centroid
-test on three datasets:
+frames on the capture clock, fuses each pair through cam_hand/fusion.py, and
+prints a PER-DEGREE-OF-FREEDOM table: for every pose and hand, the glove's
+value, the camera's value and the fused value for the five curls, the four
+adjacent spreads and the thumb-index gap, followed by how often the camera
+actually supplied each gated DOF and why it was refused the rest of the time.
 
-    glove only     what the current pipeline can do
-    camera only    what the camera alone can do
-    fused          curl from the glove, spread and thumb from the camera
+That table is the headline because it is the thing that can be checked against
+the hand that was in front of the sensors. A single accuracy number cannot say
+WHICH degree of freedom fusion got right, and on the first real session it said
+the opposite of the truth: fused scored below glove-only, because the fusion
+was importing the camera's confidently wrong thumbs_up.
 
-That three-row table is the point: it says whether fusion actually buys
-accuracy, per pose, instead of asserting that it should. Watch pinch in
-particular — it is the pose the glove misses because thumb opposition is
-invisible to stretch sensors.
+The leave-one-out nearest-centroid comparison is still printed, below, as a
+secondary metric, and it is now leave-one-TAKE-out: no frame recorded in the
+held-out take may train on it. With one take per pose that means the held-out
+pose has no centroid at all, so the number is not meaningful and the report
+says so rather than quoting it.
 
 Two kinds of camera take, told apart by the file itself and never by a flag:
 
@@ -51,16 +56,29 @@ from cam_hand.export21 import wrist_centered
 from cam_hand.features import (
     ALL_COLS,
     ALL_NAMES,
+    DOF_ROWS,
     FLEXION_COLS,
     all_features,
-    loo_nearest_centroid,
+    dof_values,
+    loo_take_nearest_centroid,
     mean_vector,
+    median,
+    palm_normal,
 )
-from cam_hand.fusion import AUTO, fuse_skeletons, pair_by_time, pairing_clock
+from cam_hand.fusion import (
+    AUTO,
+    CAMERA_DOFS,
+    DEFAULT_GATES,
+    GateParams,
+    flag_hand_id_stability,
+    fuse_skeletons,
+    pair_by_time,
+    pairing_clock,
+)
 from cam_hand.landmarks import MP21_NAMES
 from cam_hand.recorder import CamRecorder
 
-from xr_hand.keypoints21 import frame_to_keypoints21
+from xr_hand.keypoints21 import MP21_TO_OPENXR_IDX, frame_to_keypoints21
 from xr_hand.recorder import FrameRecorder
 
 COORD_COLS = [f"{n}_{a}" for n in MP21_NAMES for a in ("x", "y", "z")]
@@ -123,11 +141,25 @@ def load_leap_cam(path: Path):
     `pair_by_time` pairs on it, `timestamp_us` and `frame_age_us` because
     they are what any later question about latency or cadence is answered
     from, and dropping them here would mean re-reading the file to ask.
+
+    The CAPTURE FACTS the gates read ride along too, and they are facts about
+    the capture rather than the tracker's opinion of it: how long LeapC has
+    held this hand (`visible_time_us`), which track it is (`hand_id`, turned
+    into `hand_id_stable` once the whole take is in hand), and where the palm
+    sat in the module's field. `palm_normal_abs` is computed here, in ABSOLUTE
+    leap space, because the wrist-centred `pts` have thrown away where the
+    module is — and the module is the origin of that space, so the palm's
+    absolute position is also the direction it was seen from.
     """
     with open(path, "r", encoding="utf-8") as f:
         labels = [json.loads(line) for line in f if line.strip()]
     out = []
     for d, (frame, wall) in zip(labels, FrameRecorder.load(path)):
+        abs26 = d.get("abs26")
+        normal = None
+        if abs26 is not None:
+            normal = palm_normal([abs26[i] for i in MP21_TO_OPENXR_IDX],
+                                 frame.hand_side)
         out.append({
             "wall_time": wall,
             "capture_time": d.get("capture_time"),
@@ -137,6 +169,10 @@ def load_leap_cam(path: Path):
             "pose": d.get("pose", ""),
             "take": d.get("take", ""),
             "score": 1.0,
+            "hand_id": d.get("hand_id"),
+            "visible_time_us": d.get("visible_time_us"),
+            "palm_abs": d.get("palm_abs"),
+            "palm_normal_abs": normal,
             "pts": frame_to_keypoints21(frame),
         })
     return out
@@ -193,16 +229,113 @@ def find_camera_take(input_dir: Path, name: str, camera: str = AUTO):
 
 
 def loo_table(samples, cols, label, lines):
-    """samples: [(pose, hand, file, features)] -> print a scored row."""
+    """samples: [(pose, hand, take, features)] -> print a scored row.
+
+    Leave-one-TAKE-out: the held-out sample's whole take leaves the training
+    set, so the other hand of the same five seconds cannot vote for it.
+    """
     if not samples:
         lines.append(f"  {label:<14} (no samples)")
         return None
-    ok, n, wrong = loo_nearest_centroid([(s[0], s[3]) for s in samples], cols)
+    ok, n, wrong = loo_take_nearest_centroid(
+        [(s[0], s[2], s[3]) for s in samples], cols)
     lines.append(f"  {label:<14} {ok:>3}/{n} correct ({100.0 * ok / n:3.0f}%)")
-    for true_lab, got, i in wrong:
-        _p, hand, fname, _f = samples[i]
-        lines.append(f"       miss: {true_lab:<12} ({hand}, {fname}) -> {got}")
     return {p for p, *_ in (samples[i] for _, _, i in wrong)}
+
+
+def cam_meta_of(row, source):
+    """The capture facts fusion gates on, or None if this camera has none.
+
+    A MediaPipe frame has no absolute palm, no hand id and no visibility
+    clock, so it returns None and is fused ungated, exactly as before. That is
+    not a loophole: a gate needs evidence, and there is none to read.
+    """
+    if source != LEAP or row.get("palm_abs") is None:
+        return None
+    return {"visible_time_us": row.get("visible_time_us"),
+            "hand_id_stable": row.get("hand_id_stable"),
+            "palm_abs": row.get("palm_abs"),
+            "palm_normal_abs": row.get("palm_normal_abs")}
+
+
+# Which gated DOFs move each row of the per-DOF table. A curl of the four
+# fingers is the glove's by construction and appears with no owner at all —
+# the table shows it precisely because it is what the camera must NOT change.
+ROW_OWNERS = {
+    "curl thumb": ("thumb",),
+    "spread thumb-index": ("thumb", "spread index"),
+    "spread index-middle": ("spread index", "spread middle"),
+    "spread middle-ring": ("spread middle", "spread ring"),
+    "spread ring-pinky": ("spread ring", "spread pinky"),
+    "thumb-index gap": ("thumb", "spread index"),
+}
+
+
+def row_owner(label, sources, n_paired):
+    """The 'from' column: how much of this row the camera actually supplied."""
+    owners = ROW_OWNERS.get(label, ())
+    if not owners:
+        return "glove (by design)"
+    if not n_paired:
+        return "glove (no camera)"
+    hits = sum(1 for frame in sources
+               if any(frame.get(d) == "camera" for d in owners))
+    if hits == 0:
+        return "glove"
+    return f"camera {100.0 * hits / n_paired:.0f}%"
+
+
+def dof_table(per_pose, lines):
+    """The headline: glove / camera / fused, per DOF, per pose and hand."""
+    lines.append("Per-DOF values — median over the paired frames of each take")
+    lines.append("  curls are tip-to-wrist over palm length; spreads are the "
+                 "in-plane angle between")
+    lines.append("  adjacent PROXIMAL bones, in degrees; the thumb-index gap "
+                 "is tip-to-tip over palm length.")
+    lines.append("  The camera column is blank where no camera frame paired "
+                 "with that take at all.")
+    lines.append("  'spread thumb-index' is the angle of the thumb's BASE "
+                 "bone: the camera supplies the")
+    lines.append("  thumb's whole direction, not its base angle, so that row "
+                 "moves only incidentally —")
+    lines.append("  'thumb-index gap' is where the thumb's contribution "
+                 "actually shows.")
+    lines.append("")
+    lines.append(f"  {'pose':<12} {'hand':<6} {'tk':<3} {'DOF':<20} "
+                 f"{'glove':>8} {'camera':>8} {'fused':>8}   from")
+    for (pose, hand, take) in sorted(per_pose):
+        rows = per_pose[(pose, hand, take)]
+        for k, (label, _kind, _i) in enumerate(DOF_ROWS):
+            g = median([v[k] for v in rows["glove"]])
+            f = median([v[k] for v in rows["fused"]])
+            c = (median([v[k] for v in rows["camera"]])
+                 if rows["camera"] else None)
+            c_txt = f"{c:8.2f}" if c is not None else "       -"
+            lines.append(f"  {pose:<12} {hand:<6} {take:<3} {label:<20} "
+                         f"{g:8.2f} {c_txt} {f:8.2f}   "
+                         f"{row_owner(label, rows['sources'], rows['paired'])}")
+        lines.append("")
+
+
+def gate_tables(dof_used, dof_total, reasons, gates, lines):
+    lines.append("Camera-use rate per gated DOF "
+                 "(share of paired frames the camera actually supplied)")
+    for dof in CAMERA_DOFS:
+        n = dof_total.get(dof, 0)
+        pct = 100.0 * dof_used.get(dof, 0) / n if n else 0.0
+        lines.append(f"  {dof:<16} {dof_used.get(dof, 0):>5}/{n:<5} {pct:5.1f}%")
+    lines.append("")
+    lines.append("Why the glove kept a DOF (counted over DOF x paired frame)")
+    if not reasons:
+        lines.append("  (nothing was rejected)")
+    for why, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+        lines.append(f"  {n:>6}  {why}")
+    lines.append("")
+    lines.append("Gate thresholds in force (empirical starting points from the "
+                 "first real session,")
+    lines.append("  not calibrated constants — every one is a named parameter)")
+    for k, v in gates.described().items():
+        lines.append(f"  {k:<22} {v}")
 
 
 def main() -> None:
@@ -216,6 +349,18 @@ def main() -> None:
                    help="camera confidence below which the glove is kept as-is")
     p.add_argument("--no-thumb-camera", action="store_true",
                    help="do not take the thumb direction from the camera")
+    p.add_argument("--curl-gate", type=float, default=DEFAULT_GATES.curl_gate,
+                   help="glove curl above which a finger's spread may come "
+                        f"from the camera (default {DEFAULT_GATES.curl_gate})")
+    p.add_argument("--view-gate-deg", type=float,
+                   default=DEFAULT_GATES.view_gate_deg,
+                   help="max angle between palm normal and the ray to the "
+                        f"module (default {DEFAULT_GATES.view_gate_deg})")
+    p.add_argument("--curl-agree-tol", type=float,
+                   default=DEFAULT_GATES.curl_agree_tol,
+                   help="max median curl disagreement over index..little for "
+                        f"the camera to own the thumb "
+                        f"(default {DEFAULT_GATES.curl_agree_tol})")
     p.add_argument("--camera", choices=(AUTO,) + CAM_DIRS, default=AUTO,
                    help="which camera folder to read (default: auto — both, "
                         "and a take name in both is an error)")
@@ -238,6 +383,10 @@ def main() -> None:
     if not takes:
         raise SystemExit(f"no glove recordings in {glove_dir}")
 
+    gates = GateParams(curl_gate=args.curl_gate,
+                       view_gate_deg=args.view_gate_deg,
+                       curl_agree_tol=args.curl_agree_tol)
+
     glove_samples, cam_samples, fused_samples = [], [], []
     fused_rows = []
     n_pairs = n_matched = n_cam_used = 0
@@ -245,6 +394,10 @@ def main() -> None:
     by_source = defaultdict(int)          # camera -> takes read from it
     by_clock = defaultdict(int)           # pairing clock -> takes paired on it
     palm_residuals = []                   # diagnostic only, never a gate
+    per_pose = {}                         # (pose, hand) -> the DOF table rows
+    dof_used = defaultdict(int)           # gated DOF -> frames the camera won
+    dof_total = defaultdict(int)          # gated DOF -> paired frames
+    reasons = defaultdict(int)            # rejection reason -> count
 
     for gpath in takes:
         try:
@@ -266,6 +419,9 @@ def main() -> None:
         # capture_time existed alongside takes recorded after.
         clock = pairing_clock(glove, cam)
         by_clock[clock] += 1
+        # Needs the whole take at once: "did the id change 0.25 s ago" is a
+        # question about the frames around this one, not about this one.
+        flag_hand_id_stability(cam, gates, clock=clock)
 
         per_hand_g = defaultdict(list)
         per_hand_c = defaultdict(list)
@@ -277,23 +433,39 @@ def main() -> None:
             hand = g["hand_side"]
             G = np.asarray(g["pts"], dtype=float)
             per_hand_g[hand].append(all_features(G, hand_side=hand))
+            slot = per_pose.setdefault(
+                (pose, hand, str(g["take"])),
+                {"glove": [], "camera": [], "fused": [], "sources": [],
+                 "paired": 0})
+            slot["glove"].append(dof_values(G, hand_side=hand))
             if c is None:
                 fused, info = fuse_skeletons(G, None, min_score=args.min_score,
-                                             with_scale=with_scale)
+                                             with_scale=with_scale, gates=gates)
             else:
                 n_matched += 1
-                per_hand_c[hand].append(
-                    all_features(np.asarray(c["pts"], float), hand_side=hand))
+                slot["paired"] += 1
+                C = np.asarray(c["pts"], float)
+                per_hand_c[hand].append(all_features(C, hand_side=hand))
+                slot["camera"].append(dof_values(C, hand_side=hand))
                 fused, info = fuse_skeletons(
                     G, c["pts"], cam_score=c.get("score", 1.0),
                     min_score=args.min_score,
                     thumb_from_camera=not args.no_thumb_camera,
-                    with_scale=with_scale)
+                    with_scale=with_scale,
+                    cam_meta=cam_meta_of(c, source), gates=gates)
+                for dof in CAMERA_DOFS:
+                    dof_total[dof] += 1
+                    if info["dof_source"][dof] == "camera":
+                        dof_used[dof] += 1
+                for why in info["rejected"].values():
+                    reasons[why] += 1
+                slot["sources"].append(dict(info["dof_source"]))
             if info["camera_used"]:
                 n_cam_used += 1
             if info.get("kabsch_rmse_mm") is not None:
                 palm_residuals.append(info["kabsch_rmse_mm"])
             per_hand_f[hand].append(all_features(fused, hand_side=hand))
+            slot["fused"].append(dof_values(fused, hand_side=hand))
             if args.export_csv is not None:
                 fused_rows.append([pose, g["take"], hand, g["wall_time"],
                                    int(info["camera_used"])]
@@ -355,14 +527,45 @@ def main() -> None:
         lines.append("  which is why a large value here cannot bend a finger "
                      "direction.")
     lines.append("")
-    lines.append("Leave-one-out nearest-centroid, same test for all three")
+    lines.append("=" * 66)
+    dof_table(per_pose, lines)
+    gate_tables(dof_used, dof_total, reasons, gates, lines)
+
+    lines.append("")
+    lines.append("=" * 66)
+    lines.append("Secondary metric: leave-one-TAKE-out nearest centroid")
     loo_table(glove_samples, FLEXION_COLS, "glove only", lines)
     loo_table(cam_samples, ALL_COLS, "camera only", lines)
     loo_table(fused_samples, ALL_COLS, "fused", lines)
     lines.append("")
-    lines.append("  glove only uses the 5 flexion features (all it can measure);")
-    lines.append("  camera only and fused use flexion + spread.")
-    lines.append(f"  feature order: {', '.join(ALL_NAMES)}")
+    n_takes = len({s[2] for s in glove_samples})
+    per_pose_takes = defaultdict(set)
+    for pose, _hand, take, _f in glove_samples:
+        per_pose_takes[pose].add(take)
+    if max((len(v) for v in per_pose_takes.values()), default=0) < 2:
+        lines.append("  THIS NUMBER IS NOT MEANINGFUL on this session. Every "
+                     "pose has exactly one take,")
+        lines.append("  so holding that take out removes the pose's only "
+                     "training samples and the true")
+        lines.append("  label has no centroid left to be nearest to — every "
+                     "held-out sample must be")
+        lines.append("  wrong, whatever fusion did. It reads 0% for all three "
+                     "rows and will keep")
+        lines.append("  reading 0% until a second take of each pose is "
+                     "recorded. Read the per-DOF")
+        lines.append("  table above instead; it is measured per frame and "
+                     "needs no held-out set.")
+        lines.append("")
+        lines.append(f"  (it was leave-one-SAMPLE-out before, which scored the "
+                     f"{n_takes} takes against")
+        lines.append("  the other hand of the same five seconds — a number "
+                     "that looked meaningful and")
+        lines.append("  was not.)")
+    else:
+        lines.append("  glove only uses the 5 flexion features (all it can "
+                     "measure);")
+        lines.append("  camera only and fused use flexion + spread.")
+        lines.append(f"  feature order: {', '.join(ALL_NAMES)}")
 
     report = "\n".join(lines)
     print(report)
