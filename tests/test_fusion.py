@@ -410,3 +410,32 @@ def test_a_mediapipe_take_is_still_read_as_before(tmp_path):
     assert source == "mediapipe" and len(rows) == 4
     assert rows[0]["score"] == pytest.approx(0.97)
     assert np.allclose(rows[0]["pts"][0], 0.0, atol=1e-12)   # wrist-centred
+
+
+def test_the_same_hand_fuses_the_same_through_either_camera_loader(tmp_path):
+    """One geometry, written twice: as a webcam take and as a leap take.
+
+    The leap path must be the same pipeline with a different reader and a
+    rigid fit, not a second implementation that happens to run. If these two
+    ever disagree, one of the loaders is bending the data.
+    """
+    fuse = _fuse_module()
+    name = "spread_right_take1_20260916_230000.jsonl"
+    cam_pts = make_hand(spread_deg=22.0, curl=0.1)
+
+    _write_glove_take(tmp_path / "glove" / name, spread_deg=0.0, curl=0.6)
+    _write_leap_take(tmp_path / "leap" / name, spread_deg=22.0, curl=0.1)
+    glove = fuse.load_glove(tmp_path / "glove" / name)
+    leap_rows, _ = fuse.load_cam(tmp_path / "leap" / name)
+
+    # the same 21 points the leap file holds, read as a MediaPipe take would be
+    leap_pts = np.asarray(leap_rows[0]["pts"], float)
+    assert np.allclose(leap_pts, cam_pts, atol=1e-6), (
+        "the leap loader must return the geometry that was recorded")
+
+    G = glove[0]["pts"]
+    through_leap, info_leap = fuse_skeletons(G, leap_pts, with_scale=False)
+    through_cam, info_cam = fuse_skeletons(G, cam_pts, with_scale=True)
+    assert info_leap["alignment"] == "rigid"
+    assert info_cam["alignment"] == "similarity"
+    assert np.allclose(through_leap, through_cam, atol=1e-9)
