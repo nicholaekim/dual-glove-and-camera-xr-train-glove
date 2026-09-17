@@ -565,6 +565,57 @@ streaming, 6 poses x 1 take x 5 s, both hands over the camera at once)
   exists, even when the hand is edge-on or the glove says the finger is
   fully curled, which is when the camera is guessing.
 
+Third Path A session, coached recorder (2026-09-17, 15:34 to 15:41, both
+hands one at a time, 6 poses x 3 takes each; copy in
+`recordings/sync_coached_20260917`)
+- Capture worked: 36/36 takes, coverage 100 % on 35 and 93 % on one, one
+  hand id per take, heights 18.7 to 27.6 cm, 868/869 glove frames paired
+  within 50 ms, palm fit 3.2 mm median.
+- Labels did not: in 9 takes BOTH sensors show a different pose than the
+  label (fist_left_1, fist_right_1/2 = open palm; index_point_left_1/2/3 and
+  thumbs_up_left_1/2 = fist; peace_left_1 = thumbs up). Cause: the camera
+  window showed the phase but never the pose name, and the operator was
+  told to watch the window. The classifier numbers from this session
+  (61 / 69 / 72 %) are on polluted labels and are not to be quoted.
+- Pinch: the camera sees a pinch in 6/6 takes (index curl 1.20 to 1.30,
+  thumb-index gap 0.10 to 0.35); the glove reports a bit-exact open palm in
+  5/6, on both hands.
+- Single-finger sweep (left index): only two fast bends, so sparse, but the
+  glove left its open value as soon as the camera saw flexion, read about
+  1.38 at 50 to 60 % bend and 0.66 at full bend. So there is NO general
+  near-extension dead zone; the loss is specific to the pinch shape. The
+  glove also returned slowly (1.87 to 1.90 for about 5 s, then snapped to
+  1.9737). The left glove's stream stopped for 3.1 s during the sweep,
+  which matches the on-screen lag complaint.
+- XR Trainer's OSC output (sniffed): `/v1/animation/kinematic/all`,
+  `/v1/orientation/all`, `/v1/controller_input/all` (12 button/axis fields,
+  all zero at rest), `/v1/calibration/gesture/state`,
+  `/v1/calibration/articulation/state` = `'Basic', 4, 100.0` on both hands,
+  plus tracker config. Device label "Reality Glove". No raw stretch-sensor
+  channel is exposed. Open lead: the articulation calibration level is
+  "Basic"; a higher level, if XR Trainer has one, may represent the pinch.
+  `..\xr trainer\probe_pinch_inputs.py --hand left` logs skeleton and
+  controller values through open / pinch / open / fist to see whether
+  anything XR Trainer sends carries the pinch.
+
+ChatGPT review of the third session (2026-09-17), all adopted
+- The pose check uses the two sensors under evaluation as the arbiter, so
+  it is QC, not ground truth: rejected attempts are kept on disk under
+  `rejected/` with the reason, the count is reported, and each take gets an
+  independent IR still from the camera window for visual confirmation.
+- Pinch acceptance by the camera's thumb-index gap would bias any camera
+  pinch result, so for pinch the check only warns, never rejects.
+- Change B renamed from "censored rail" to "rail-disagreement override":
+  glove on its open-palm rail AND trusted camera shows sustained flexion
+  for N frames, hysteresis, index finger in pinch-like shapes only until
+  there is evidence for other fingers. No claim about a dead-zone width.
+- Glove recorded at full rate in paired takes (was 5 Hz, 24 frames per
+  take), downsampled offline if rates must be equal; stream gaps go in the
+  take's meta.json.
+- Sample size: 3 takes is pilot evidence. Minimum for a within-operator
+  conclusion: 5 clean takes x 6 poses x 2 hands on 2 separate days; the
+  take, not the frame, is the independent sample.
+
 Second Path A session and what it changed (2026-09-17, 13:52, left hand
 only, 6 poses x 3 takes)
 - Glove side complete. Camera side: open_palm 3/3 with one continuous hand
