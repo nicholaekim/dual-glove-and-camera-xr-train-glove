@@ -17,10 +17,10 @@ hand hovering about 250 mm above the module:
 
 `pose=None` cycles through all four. Two artefacts are injected on purpose so
 the analysis tooling has something to measure: a short dropout where no hand
-is reported at all (`dropout_every` / `dropout_frames`), and a hand-id change
-every `reacquire_every` frames, which is what a real re-acquisition looks
-like — new id, `visible_time` back to zero. `scripts/leap/stats.py` counts
-both.
+is reported at all (20 frames in every 300, about 7% of frames), and a
+hand-id change every `reacquire_every` frames — 5 s by default, which is what
+a real re-acquisition looks like: new id, `visible_time` back to zero.
+`scripts/leap/stats.py` counts both.
 
 Geometry is a plausible cartoon of a hand, not a calibrated one: segment
 lengths are typical adult values and the joint angles come from two
@@ -98,7 +98,7 @@ class MockLeapStream:
         noise_mm: float = 0.35,
         dropout_every: int = 300,
         dropout_frames: int = 20,
-        reacquire_every: int = 180,
+        reacquire_every: int = 450,
         cycle_seconds: float = 4.0,
     ):
         self.hz = float(hz)

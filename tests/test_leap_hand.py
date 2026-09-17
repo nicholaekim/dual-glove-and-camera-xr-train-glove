@@ -383,8 +383,8 @@ def test_stats_on_a_mock_recording(tmp_path: Path):
         assert math.isfinite(s.jitter_mm) and s.jitter_mm >= 0.0
         assert math.isfinite(s.span_s) and s.span_s > 0
         assert s.frame_age_ms is None            # no LeapC clock behind a mock
-        # 600 frames at 90 Hz with a re-acquisition every 180: 3 id changes.
-        assert s.reacquisitions == 3
+        # 600 frames at 90 Hz, re-acquisition every 450: one id change.
+        assert s.reacquisitions == 1
         # 20 dropped frames in every 300 -> about 93% of frames present.
         assert 0.85 < s.detection_rate < 1.0
 
