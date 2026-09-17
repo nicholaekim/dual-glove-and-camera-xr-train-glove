@@ -1245,6 +1245,101 @@ def test_leap_backend_rejects_a_camera_name_that_is_neither(monkeypatch):
         sync.main()
 
 
+# --- the professor-frame replication ----------------------------------------
+def test_record_frame_accepts_every_spelling_of_a_frame_id():
+    record_frame = _load_script("record_frame")
+    for raw in ("128166", "frame_128166", "frame_128166_DONE",
+                "frame_128166_NA", " frame_128166_left "):
+        assert record_frame.frame_name(raw) == "frame_128166"
+    with pytest.raises(SystemExit):
+        record_frame.frame_name("open_palm")
+
+
+def test_record_frame_finds_the_reference_image_or_says_it_is_absent(
+        tmp_path: Path):
+    record_frame = _load_script("record_frame")
+    root = tmp_path / "frames"
+    (root / "frame_99").mkdir(parents=True)
+    png = root / "frame_99" / "frame_99.png"
+    png.write_bytes(b"\x89PNG\r\n")
+    assert record_frame.find_reference("frame_99", root) == png
+    assert record_frame.find_reference("frame_1234", root) is None
+    assert record_frame.find_reference("frame_99", tmp_path / "nope") is None
+
+
+def test_medoid_is_a_real_recorded_frame_not_an_average(tmp_path: Path):
+    """The whole reason it is a medoid: bone lengths must survive."""
+    record_frame = _load_script("record_frame")
+    path = _record_mock(tmp_path, frames=120)
+    frames = [f for f, _w in FrameRecorder.load(path)
+              if f.hand_side == "right"]
+    i = record_frame.medoid_index(frames)
+    assert 0 <= i < len(frames)
+    chosen = frame_to_keypoints21(frames[i])
+    # it IS one of the frames, identical to the one at that index
+    assert chosen == frame_to_keypoints21(frames[i])
+    # and it is closer to the take's mean than the worst frame is
+    def dist(f):
+        pts = [c for p in frame_to_keypoints21(f) for c in p]
+        return sum((a - b) ** 2 for a, b in zip(pts, mean))
+    rows = [[c for p in frame_to_keypoints21(f) for c in p] for f in frames]
+    mean = [sum(r[k] for r in rows) / len(rows) for k in range(len(rows[0]))]
+    assert dist(frames[i]) == min(dist(f) for f in frames)
+
+
+def test_record_frame_writes_the_professor_format_on_the_mock(tmp_path: Path,
+                                                              monkeypatch):
+    """The pipeline end to end: record, pick the medoid, write his format."""
+    import sys
+
+    from cam_hand.prof_format import load_file
+
+    record_frame = _load_script("record_frame")
+    monkeypatch.setattr(record_frame, "beep", lambda *a, **k: None)
+    out_dir = tmp_path / "prof_frames"
+    monkeypatch.setattr(sys, "argv", [
+        "record_frame.py", "128166", "--mock", "--prep", "0",
+        "--seconds", "1", "--out-dir", str(out_dir),
+        "--reference", str(tmp_path / "no_reference_here"),
+    ])
+    record_frame.main()
+
+    out_file = out_dir / "frame_128166_keypoints.txt"
+    assert out_file.is_file()
+    # one block per hand, 21 landmarks each, parsed by the reader that also
+    # reads the professor's own files
+    blocks = load_file(out_file)
+    assert sorted(b.hand for b in blocks) == ["left", "right"]
+    for b in blocks:
+        assert len(b.points) == 21
+        # millimetres in camera space: a hand is tens to hundreds of mm out,
+        # never metres (that would mean the unit conversion was skipped)
+        assert max(abs(c) for p in b.points for c in p) < 2000.0
+
+    # the take it came from is kept beside it
+    takes = list((out_dir / "frame_128166").glob("*.jsonl"))
+    assert len(takes) == 1
+    assert len(analyse_file(takes[0])) == 2       # both hands recorded
+
+
+def test_record_frame_keeps_only_the_hand_you_asked_for(tmp_path: Path,
+                                                        monkeypatch):
+    import sys
+
+    from cam_hand.prof_format import load_file
+
+    record_frame = _load_script("record_frame")
+    monkeypatch.setattr(record_frame, "beep", lambda *a, **k: None)
+    out_dir = tmp_path / "prof_frames"
+    monkeypatch.setattr(sys, "argv", [
+        "record_frame.py", "frame_77", "--mock", "--prep", "0",
+        "--seconds", "1", "--hand", "left", "--out-dir", str(out_dir),
+    ])
+    record_frame.main()
+    blocks = load_file(out_dir / "frame_77_keypoints.txt")
+    assert [b.hand for b in blocks] == ["left"]
+
+
 # --- the installed bindings, if they are here -------------------------------
 # These check the assumptions the hardware path is written against. They are
 # skipped on a machine without the bindings, and they never touch a device.
