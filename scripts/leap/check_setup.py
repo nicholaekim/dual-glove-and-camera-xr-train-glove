@@ -1,8 +1,9 @@
 """Phase 0 checker: is this machine ready to record with the Stereo IR 170?
 
 Runs the whole chain from the SDK on disk to hands arriving in this process,
-prints PASS or FAIL for each link with the fix for every failure, and exits
-0 only if everything passed (2 otherwise, so a script can gate on it).
+prints PASS, WARN or FAIL for each link with the fix for every failure, and
+exits 0 unless something actually failed (2 otherwise, so a script can gate
+on it).
 
   1  LeapSDK folder          C:\\Program Files\\Ultraleap\\LeapSDK, or wherever
                              LEAPSDK_INSTALL_LOCATION points
@@ -10,8 +11,15 @@ prints PASS or FAIL for each link with the fix for every failure, and exits
   3  LeapC.dll / LeapC.lib   lib\\x64\\ — the bindings link against these
   4  tracking service        the Ultraleap service, running
   5  import leap             the Python bindings, in THIS interpreter
-  6  live tracking           a device, hands, and the tracking framerate,
-                             over a 3 s connection
+  6  device streaming        a device, tracking events and the framerate
+  7  hand seen               a hand actually tracked in the window
+
+The last two are separate because they fail for opposite reasons. A device
+that sends no tracking events is broken setup. A device that streams happily
+while nobody is holding a hand over it is a **working** machine with nobody
+in front of the camera, which is the normal state of this repo's hardware
+most of the time — so that is a WARN, and the exit code stays 0. Only line 6
+gates.
 
 Until the hardware and Hyperion are installed this is expected to fail from
 line 1 and exit 2; that is the point of running it first. To check that the
@@ -41,7 +49,11 @@ DEFAULT_SDK = Path(r"C:\Program Files\Ultraleap\LeapSDK")
 DOWNLOAD_PAGE = "https://www.ultraleap.com/downloads/sir170/"
 SETUP_SCRIPT = r"powershell -ExecutionPolicy Bypass -File scripts\leap\setup_bindings.ps1"
 
-PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
+PASS, FAIL, WARN, SKIP = "PASS", "FAIL", "WARN", "SKIP"
+
+# Everything the camera needs except a human being in the room.
+STREAMING = "device streaming"
+HAND_SEEN = "hand seen"
 
 
 @dataclass
@@ -173,9 +185,21 @@ def check_bindings() -> Check:
     return Check("import leap", PASS, f"{where} (python {sys.executable})")
 
 
-def check_live(seconds: float) -> Check:
-    """Connect for `seconds` and report device, hands and tracking rate."""
+def check_live(seconds: float) -> List[Check]:
+    """Connect for `seconds`; report streaming and hands as separate lines.
+
+    Two checks, because they mean different things. "device streaming" is
+    about the machine: SDK, service, USB, tracking mode. "hand seen" is about
+    whether anybody was holding a hand over the module while this ran, which
+    is not a setup problem and must not fail the script.
+    """
     from leap_hand.stream import LeapStream, LeapUnavailable
+
+    def no_stream(detail: str, fix: str) -> List[Check]:
+        return [
+            Check(STREAMING, FAIL, detail, fix),
+            Check(HAND_SEEN, SKIP, "no stream to watch"),
+        ]
 
     try:
         stream = LeapStream(mode="desktop", device_timeout=max(seconds, 3.0))
@@ -186,11 +210,12 @@ def check_live(seconds: float) -> Check:
         first, _, rest = str(e).partition("\n")
         fix = " ".join(line.strip() for line in rest.splitlines() if line.strip())
         fix = fix.removeprefix("Next step:").strip()
-        return Check("live tracking", FAIL, first, fix or "see the message above")
+        return no_stream(first, fix or "see the message above")
     except Exception as e:      # pragma: no cover - hardware path
-        return Check("live tracking", FAIL, f"{type(e).__name__}: {e}",
-                     "unexpected SDK error — re-run with the Control Panel open "
-                     "and check that no other app is holding the camera")
+        return no_stream(
+            f"{type(e).__name__}: {e}",
+            "unexpected SDK error — re-run with the Control Panel open and "
+            "check that no other app is holding the camera")
 
     try:
         sides = set()
@@ -203,21 +228,26 @@ def check_live(seconds: float) -> Check:
             time.sleep(0.01)
         rate = stream.framerate
         detail = (f"device {stream.device_serial}, {stream.frames} events, "
-                  f"{hands} hands ({', '.join(sorted(sides)) or 'none'}), "
-                  f"tracking {rate:.1f} Hz")
+                  f"tracking {rate:.1f} Hz over {seconds:g} s")
+        hand_detail = (f"{hands} hands ({', '.join(sorted(sides)) or 'none'})")
     finally:
         stream.stop()
 
     if not stream.frames:
-        return Check("live tracking", FAIL, detail,
-                     "the device is connected but sent no tracking events — "
-                     "check the Control Panel visualiser and the tracking mode")
+        return no_stream(
+            detail,
+            "the device is connected but sent no tracking events — check the "
+            "Control Panel visualiser and the tracking mode. A device plugged "
+            "in seconds ago needs a moment; try --seconds 10")
     if not hands:
-        return Check("live tracking", FAIL, detail,
-                     "tracking runs but saw no hand — hold a hand 20 to 50 cm "
-                     "above the module, lenses up, away from sunlight and other "
-                     "IR sources")
-    return Check("live tracking", PASS, detail)
+        return [
+            Check(STREAMING, PASS, detail),
+            Check(HAND_SEEN, WARN, hand_detail,
+                  "nothing was over the module — hold a hand 20 to 50 cm "
+                  "above it, lenses up, away from sunlight and other IR "
+                  "sources, and re-run. The machine is ready either way."),
+        ]
+    return [Check(STREAMING, PASS, detail), Check(HAND_SEEN, PASS, hand_detail)]
 
 
 def check_mock(seconds: float) -> List[Check]:
@@ -261,6 +291,11 @@ def check_mock(seconds: float) -> List[Check]:
 
 
 def report(checks: List[Check]) -> int:
+    """Print every line and return the exit code: 2 if anything FAILed, else 0.
+
+    A WARN is printed with its hint and never changes the exit code — see the
+    module docstring on why "nobody was holding a hand up" is not a failure.
+    """
     import textwrap
 
     width = max(len(c.name) for c in checks)
@@ -268,18 +303,25 @@ def report(checks: List[Check]) -> int:
     print()
     for c in checks:
         print(f"{c.status}  {c.name:<{width}}  {c.detail}")
-        if c.status == FAIL and c.fix:
-            wrapped = textwrap.wrap(f"fix: {c.fix}", width=100 - len(indent),
+        if c.status in (FAIL, WARN) and c.fix:
+            label = "fix: " if c.status == FAIL else "note: "
+            wrapped = textwrap.wrap(label + c.fix, width=100 - len(indent),
                                     subsequent_indent="     ")
             for line in wrapped:
                 print(indent + line)
     counted = [c for c in checks if c.counts]
     failed = [c for c in counted if c.status == FAIL]
+    warned = [c for c in counted if c.status == WARN]
     print()
     if failed:
         print(f"{len(counted) - len(failed)}/{len(counted)} checks passed — "
               f"not ready. Fix the FAIL lines above, top to bottom.")
         return 2
+    if warned:
+        print(f"{len(counted) - len(warned)}/{len(counted)} checks passed, "
+              f"{len(warned)} warning: {', '.join(c.name for c in warned)}. "
+              "The machine is ready.")
+        return 0
     print(f"{len(counted)}/{len(counted)} checks passed.")
     return 0
 
@@ -289,8 +331,9 @@ def main() -> None:
         description="Check that this machine can record with the Stereo IR 170.")
     p.add_argument("--mock", action="store_true",
                    help="skip the environment; exercise the mock pipeline instead")
-    p.add_argument("--seconds", type=float, default=3.0,
-                   help="how long to watch for hands (default: 3)")
+    p.add_argument("--seconds", type=float, default=6.0,
+                   help="how long to watch for hands (default: 6 — a device "
+                        "plugged in seconds ago needs a few to start)")
     args = p.parse_args()
 
     print("=" * 72)
@@ -307,11 +350,12 @@ def main() -> None:
     checks.append(check_service())
     checks.append(check_bindings())
     if checks[-1].status == PASS:
-        checks.append(check_live(args.seconds))
+        checks.extend(check_live(args.seconds))
     else:
         checks.append(Check(
-            "live tracking", FAIL, "skipped: the bindings did not import",
+            STREAMING, FAIL, "skipped: the bindings did not import",
             "fix the import leap line first; everything below depends on it"))
+        checks.append(Check(HAND_SEEN, SKIP, "no stream to watch"))
     sys.exit(report(checks))
 
 
