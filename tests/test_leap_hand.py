@@ -1219,9 +1219,15 @@ def test_leap_backend_writes_a_pair_of_takes_that_pair_by_time_matches(
     assert len(matched) >= 0.8 * len(pairs), (
         f"only {len(matched)}/{len(pairs)} glove frames found a camera frame")
     assert all(g["hand_side"] == c["hand_side"] for g, c in matched)
-    # both files are stamped with time.time() at the write, so the pairs are
-    # tens of milliseconds apart, not hundreds
-    assert max(abs(c["wall_time"] - g["wall_time"]) for g, c in matched) < 0.05
+    # pairs are matched on capture_time, so that is the clock the 50 ms bound
+    # holds on. wall_time is when a line was WRITTEN: on a loaded machine one
+    # late write out of hundreds is normal, so it only has to be near, and the
+    # typical pair close.
+    def at(d):
+        return d.get("capture_time", d["wall_time"])
+    assert max(abs(at(c) - at(g)) for g, c in matched) <= 0.05
+    wall = sorted(abs(c["wall_time"] - g["wall_time"]) for g, c in matched)
+    assert wall[len(wall) // 2] < 0.05 and wall[-1] < 0.5
 
 
 def test_leap_backend_keeps_every_camera_frame_by_default(tmp_path: Path,
