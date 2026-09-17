@@ -1154,6 +1154,97 @@ def test_check_setup_without_the_bindings_skips_the_hand_line(monkeypatch):
     assert check_setup.report(checks) == 2
 
 
+# --- Path A: the simultaneous recorder with the leap backend ----------------
+def _load_repo_script(name: str):
+    """Import scripts/<name>.py, which is not on a package path."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"repo_script_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _mock_sync_run(tmp_path: Path, monkeypatch, extra=()) -> tuple:
+    """A whole --camera leap session on mock glove + mock leap."""
+    import sys
+
+    sync = _load_repo_script("record_simultaneous")
+    monkeypatch.setattr(sync, "beep", lambda *a, **k: None)
+    out_dir = tmp_path / "sync"
+    monkeypatch.setattr(sys, "argv", [
+        "record_simultaneous.py", "--camera", "leap",
+        "--mock-glove", "--mock-leap", "--poses", "fist", "--takes", "1",
+        "--duration", "2", "--prep", "0", "--out-dir", str(out_dir), *extra,
+    ])
+    sync.main()
+    return sync, out_dir
+
+
+def test_leap_backend_writes_a_pair_of_takes_that_pair_by_time_matches(
+        tmp_path: Path, monkeypatch):
+    """The Path A deliverable: two files, one name, one clock, matched frames."""
+    import json
+
+    from cam_hand.fusion import pair_by_time
+
+    _sync, out_dir = _mock_sync_run(tmp_path, monkeypatch)
+
+    glove_takes = sorted((out_dir / "glove").glob("*.jsonl"))
+    leap_takes = sorted((out_dir / "leap").glob("*.jsonl"))
+    assert len(glove_takes) == len(leap_takes) == 1
+    # the same stem on both sides is what fuse_poses pairs takes on
+    assert glove_takes[0].name == leap_takes[0].name
+    assert not (out_dir / "cam").exists(), "the leap backend owns recordings/sync/leap"
+
+    def rows(path):
+        return [json.loads(line) for line
+                in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    glove, cam = rows(glove_takes[0]), rows(leap_takes[0])
+    assert glove and cam
+    assert {d["source"] for d in cam} == {"leap"}     # how fuse_poses knows
+    assert all("abs26" in d and len(d["abs26"]) == 26 for d in cam)
+    assert all("joints" in d for d in cam)            # still the glove schema
+    assert {d["pose"] for d in cam} == {"fist"}
+
+    pairs = pair_by_time(glove, cam, max_dt=0.05)
+    matched = [(g, c) for g, c in pairs if c is not None]
+    assert len(matched) >= 0.8 * len(pairs), (
+        f"only {len(matched)}/{len(pairs)} glove frames found a camera frame")
+    assert all(g["hand_side"] == c["hand_side"] for g, c in matched)
+    # both files are stamped with time.time() at the write, so the pairs are
+    # tens of milliseconds apart, not hundreds
+    assert max(abs(c["wall_time"] - g["wall_time"]) for g, c in matched) < 0.05
+
+
+def test_leap_backend_keeps_every_camera_frame_by_default(tmp_path: Path,
+                                                          monkeypatch):
+    """--hz throttles the glove; the camera stays dense so pairing holds."""
+    _sync, out_dir = _mock_sync_run(tmp_path, monkeypatch, ["--hz", "5"])
+    glove = sorted((out_dir / "glove").glob("*.jsonl"))[0]
+    cam = sorted((out_dir / "leap").glob("*.jsonl"))[0]
+    n_glove = len(glove.read_text(encoding="utf-8").splitlines())
+    n_cam = len(cam.read_text(encoding="utf-8").splitlines())
+    assert n_cam > 5 * n_glove, f"{n_cam} camera frames vs {n_glove} glove"
+
+
+def test_leap_backend_rejects_a_camera_name_that_is_neither(monkeypatch):
+    import sys
+
+    sync = _load_repo_script("record_simultaneous")
+    monkeypatch.setattr(sys, "argv",
+                        ["record_simultaneous.py", "--camera", "webcam"])
+    with pytest.raises(SystemExit):
+        sync.main()
+
+    monkeypatch.setattr(sys, "argv",
+                        ["record_simultaneous.py", "--mock-leap"])
+    with pytest.raises(SystemExit):
+        sync.main()
+
+
 # --- the installed bindings, if they are here -------------------------------
 # These check the assumptions the hardware path is written against. They are
 # skipped on a machine without the bindings, and they never touch a device.
