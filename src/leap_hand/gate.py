@@ -32,7 +32,7 @@ Two deliberate choices in the reading of the thresholds:
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
-from .stats import HandStats
+from .stats import HandStats, rate_footnote
 
 # The conditions of the plan's protocol, in the order they are run: each one
 # adds something to the hand, so the operator never has to take anything off.
@@ -238,8 +238,8 @@ def verdict(results: Sequence[ConditionResult]) -> Verdict:
 
 # --- the report -------------------------------------------------------------
 _HEADER = (f"{'condition':<16} {'hand':<5} {'n':>5} {'span':>6} {'fps':>6} "
-           f"{'det%':>6} {'reacq':>6} {'/10s':>6} {'jit_mm':>7} {'jit_x':>6} "
-           f"{'snaps':>6} {'pass':>5}")
+           f"{'rate':>7} {'det%':>6} {'reacq':>6} {'/10s':>6} {'jit_mm':>7} "
+           f"{'jit_x':>6} {'snaps':>6} {'pass':>5}")
 
 
 def _row(result: ConditionResult, s: HandStats,
@@ -247,6 +247,7 @@ def _row(result: ConditionResult, s: HandStats,
     ratio = jitter_ratio(s, baselines)
     return (f"{result.condition[:16]:<16} {s.hand_side:<5} {s.frames:>5} "
             f"{s.span_s:>6.1f} {s.mean_framerate:>6.1f} "
+            f"{s.rate_hz:>6.1f}{s.rate_flag} "
             f"{s.detection_rate * 100:>6.1f} {s.reacquisitions:>6} "
             f"{reacq_per_10s(s):>6.2f} {s.jitter_mm:>7.2f} "
             f"{'     -' if ratio is None else f'{ratio:>6.2f}'} "
@@ -271,15 +272,16 @@ def format_report(results: Sequence[ConditionResult], v: Verdict,
                 lines.append(_row(result, s, v.baselines))
         else:
             lines.append(f"{result.condition[:16]:<16} {'-':<5} {0:>5} "
-                         f"{0.0:>6.1f} {0.0:>6.1f} {0.0:>6.1f} {0:>6} "
-                         f"{0.0:>6.2f} {0.0:>7.2f} {'     -':>6} "
+                         f"{0.0:>6.1f} {0.0:>6.1f} {0.0:>6.1f}  {0.0:>6.1f} "
+                         f"{0:>6} {0.0:>6.2f} {0.0:>7.2f} {'     -':>6} "
                          f"{result.snapshots:>6} {'NO':>5}")
     lines.append("-" * len(_HEADER))
     lines.append(f"thresholds: {THRESHOLD_TEXT}")
-    lines.append("det% = frames present / span x the file's own cadence; "
+    lines.append("det% = frames present / span x rate; "
                  "jit_mm = fingertip spread over the steadiest 2 s;")
     lines.append("jit_x = that jitter divided by the bare hand's "
                  "(same side where the bare run has it).")
+    lines += rate_footnote([s for r in results for s in r.stats])
 
     lines += ["", "What the camera saw"]
     for result in results:

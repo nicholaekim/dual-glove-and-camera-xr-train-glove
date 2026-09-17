@@ -466,6 +466,98 @@ def test_jitter_is_zero_for_a_still_hand():
     assert fingertip_jitter(rows) == pytest.approx(0.0)
 
 
+# --- the detection-rate denominator -----------------------------------------
+# The reviewer's rule, and the bug it exists to stop. A full-rate file's
+# timestamps jitter, so the 10th-percentile gap reads FASTER than the tracker
+# ever ran; dividing by that invents dropouts. See leap_hand.stats.choose_rate.
+def _write_leap_rows(path: Path, n: int, hz: float, framerate: float,
+                     jitter_s: float = 0.0, seed: int = 3,
+                     drop: range = range(0)) -> Path:
+    """A minimal leap-format JSONL: one hand, chosen cadence, chosen jitter."""
+    import json
+    import random
+
+    rng = random.Random(seed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for i in range(n):
+        if i in drop:
+            continue                      # a real dropout: the frame is absent
+        t = i / hz + (rng.uniform(-jitter_s, jitter_s) if jitter_s else 0.0)
+        lines.append(json.dumps({
+            "source": "leap", "timestamp": t, "wall_time": 1.7e9 + t,
+            "hand_side": "left", "hand_id": 11, "framerate": framerate,
+            "pose": "bare", "take": 1,
+        }))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def test_choose_rate_picks_framerate_only_for_a_full_rate_file():
+    from leap_hand.stats import choose_rate
+
+    assert choose_rate(101.0, 90.0) == (90.0, "framerate")   # jittered 90 Hz
+    assert choose_rate(90.0, 90.0) == (90.0, "framerate")
+    assert choose_rate(5.0, 90.0) == (5.0, "cadence")        # --hz 5
+    assert choose_rate(60.0, 90.0) == (60.0, "cadence")      # genuinely slower
+    assert choose_rate(90.0, 0.0) == (90.0, "cadence")       # no framerate key
+
+
+def test_jittered_full_rate_file_is_not_penalised_for_its_own_jitter(tmp_path: Path):
+    """The 2026-09-16 bare-hand bug: 90 Hz file, cadence reads ~101 Hz.
+
+    Every frame the tracker produced is in the file, so detection is 100%.
+    Against the jittered cadence it would score about 89%.
+    """
+    path = _write_leap_rows(tmp_path / "bare_left_take1.jsonl",
+                            n=900, hz=90.0, framerate=90.0, jitter_s=0.0011)
+    s = analyse_file(path)[0]
+
+    assert s.sample_hz > 95.0, "the jitter should make the cadence read fast"
+    assert s.rate_source == "framerate"
+    assert s.rate_hz == pytest.approx(90.0)
+    assert s.detection_rate > 0.99
+    # and the old denominator really would have cost it the plan's threshold
+    assert s.frames / (s.span_s * s.sample_hz + 1) < 0.92
+
+
+def test_a_throttled_file_is_still_measured_against_its_own_cadence(tmp_path: Path):
+    """--hz 5 against a 90 Hz tracker: the rate is 5, or the file scores 6%."""
+    path = _write_leap_rows(tmp_path / "poses_left_take1.jsonl",
+                            n=50, hz=5.0, framerate=90.0)
+    s = analyse_file(path)[0]
+    assert s.rate_source == "cadence"
+    assert s.rate_hz == pytest.approx(5.0, rel=1e-6)
+    assert s.detection_rate > 0.98
+
+
+def test_real_dropouts_still_show_up_at_full_rate(tmp_path: Path):
+    """The rule must not turn every file into 100%: a gap is still a gap."""
+    path = _write_leap_rows(tmp_path / "gappy_left_take1.jsonl",
+                            n=900, hz=90.0, framerate=90.0, jitter_s=0.0011,
+                            drop=range(300, 390))       # 1 s with no hand
+    s = analyse_file(path)[0]
+    assert s.rate_source == "framerate"
+    assert s.detection_rate == pytest.approx(0.90, abs=0.02)
+
+
+def test_the_table_footnote_names_the_denominator_it_used(tmp_path: Path):
+    from leap_hand.stats import analyse_paths, format_table
+
+    full = _write_leap_rows(tmp_path / "full_left_take1.jsonl",
+                            n=200, hz=90.0, framerate=90.0, jitter_s=0.0011)
+    table = format_table(analyse_paths([full]))
+    assert "90.0*" in table                      # the row says which it used
+    assert "tracking framerate" in table
+    assert "no file here was throttled" in table
+
+    slow = _write_leap_rows(tmp_path / "slow_left_take1.jsonl",
+                            n=50, hz=5.0, framerate=90.0)
+    table = format_table(analyse_paths([slow]))
+    assert "5.0 " in table
+    assert "own cadence" in table
+
+
 # --- the no-hardware path ---------------------------------------------------
 def test_missing_bindings_explain_the_next_step(monkeypatch):
     """The first error every new machine hits must name the fix, not traceback.
@@ -712,7 +804,7 @@ def _hand_stats(side: str, detection: float, reacquisitions: int,
         file="gate.jsonl", hand_side=side, frames=frames, span_s=span_s,
         sample_hz=90.0, expected_frames=frames, detection_rate=detection,
         reacquisitions=reacquisitions, mean_framerate=89.9, jitter_mm=jitter_mm,
-        frame_age_ms=9.5, pose="gate",
+        frame_age_ms=9.5, pose="gate", rate_hz=89.9, rate_source="framerate",
     )
 
 
