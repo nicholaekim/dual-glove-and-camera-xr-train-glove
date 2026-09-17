@@ -53,9 +53,20 @@ def drain_into(trail: HandTrail, source) -> int:
     return len(hands)
 
 
+SETTLE_S = 0.4      # let tracking events flow before the first still
+
+
 def capture(source, sampler, trail: HandTrail, out_dir: Path, label: str,
             count: int, interval: float, mock: bool) -> list:
     """Take `count` snapshots `interval` seconds apart. Returns the records."""
+    # `open_stream` clears its queue on the way out, so without this the first
+    # snapshot would be paired against an empty trail and report "no hand"
+    # even with a hand over the module.
+    t_end = time.time() + SETTLE_S
+    while time.time() < t_end:
+        drain_into(trail, source)
+        time.sleep(0.005)
+
     snaps = []
     for k in range(count):
         if k:
