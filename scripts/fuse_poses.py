@@ -22,8 +22,9 @@ Two kinds of camera take, told apart by the file itself and never by a flag:
   recordings/sync/leap/    Ultraleap. `source: "leap"`, the glove's own
                            26-joint schema plus camera extras, read back with
                            FrameRecorder.load + frame_to_keypoints21 — real
-                           metres. Aligned RIGIDLY, no scale, because both
-                           sides are already metric (plan section 3).
+                           metres. Aligned by PALM BASIS — rotation and
+                           wrist translation, scale 1 — because both sides are
+                           already metric (plan section 3, fusion.py).
 
 A session folder may hold both; each take is read the way its own first line
 says, and the report names which camera every take came from.
@@ -316,7 +317,7 @@ def main() -> None:
     for source, n in sorted(by_source.items()):
         if source == LEAP:
             what = ("Ultraleap Stereo IR 170 — metric 3D joints in metres, "
-                    "aligned rigidly (no scale)")
+                    "aligned by palm basis (rotation + wrist, no scale)")
         else:
             what = ("MediaPipe webcam — normalised landmarks, aligned with "
                     "rotation + scale")
