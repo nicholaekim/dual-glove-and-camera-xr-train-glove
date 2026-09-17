@@ -404,13 +404,15 @@ def test_jitter_is_zero_for_a_still_hand():
 
 
 # --- the no-hardware path ---------------------------------------------------
-def test_live_stream_without_the_bindings_explains_the_next_step():
-    try:
-        import leap  # noqa: F401
-    except ImportError:
-        pass
-    else:
-        pytest.skip("the leap bindings are installed: this is the hardware path")
+def test_missing_bindings_explain_the_next_step(monkeypatch):
+    """The first error every new machine hits must name the fix, not traceback.
+
+    `sys.modules['leap'] = None` makes `import leap` raise ImportError even
+    where the bindings are installed, so this covers the empty-machine path
+    on any machine.
+    """
+    import sys
+    monkeypatch.setitem(sys.modules, "leap", None)
 
     with pytest.raises(LeapUnavailable) as e:
         LeapStream().start()
@@ -423,3 +425,68 @@ def test_live_stream_without_the_bindings_explains_the_next_step():
 def test_stream_rejects_an_unknown_tracking_mode():
     with pytest.raises(ValueError):
         LeapStream(mode="sideways")
+
+
+def test_hand_side_falls_back_to_the_string_form(monkeypatch):
+    """Without the bindings, `str(hand.type)` is all there is to go on."""
+    import sys
+    monkeypatch.setitem(sys.modules, "leap", None)
+    assert hand_side(FakeHand("left")) == "left"
+    assert hand_side(FakeHand("right")) == "right"
+
+
+# --- the installed bindings, if they are here -------------------------------
+# These check the assumptions the hardware path is written against. They are
+# skipped on a machine without the bindings, and they never touch a device.
+class TestAgainstTheRealBindings:
+    @pytest.fixture(autouse=True)
+    def leap(self):
+        return pytest.importorskip("leap", reason="the leap bindings are not installed")
+
+    def test_hand_type_is_an_enum(self):
+        import leap
+        assert isinstance(leap.HandType.Left, leap.HandType)
+        # ...and a foreign enum must not read as a left hand.
+        assert hand_side(FakeHand("right")) == "right"
+
+    def test_tracking_modes_exist(self):
+        import leap
+        for name in ("Desktop", "HMD", "ScreenTop"):
+            assert hasattr(leap.TrackingMode, name)
+
+    def test_connection_lifecycle_methods_exist(self):
+        import leap
+        for name in ("add_listener", "remove_listener", "connect", "disconnect",
+                     "set_tracking_mode"):
+            assert hasattr(leap.Connection, name), name
+
+    def test_listener_callbacks_exist(self):
+        import leap
+        for name in ("on_connection_event", "on_connection_lost_event",
+                     "on_device_event", "on_tracking_event"):
+            assert hasattr(leap.Listener, name), name
+
+    def test_get_now_is_available_for_frame_age(self):
+        import leap
+        assert isinstance(leap.get_now(), int)
+
+    def test_cannot_open_device_error_is_where_the_stream_looks_for_it(self):
+        import leap
+        assert hasattr(leap.exceptions, "LeapCannotOpenDeviceError")
+
+    def test_the_mapping_reads_attributes_that_actually_exist(self):
+        """Every attribute to_openxr touches is a real property of the SDK type."""
+        from leap.datatypes import Bone, Digit, Hand, Palm
+        for name in ("id", "type", "visible_time", "pinch_strength",
+                     "grab_strength", "palm", "digits", "arm"):
+            assert hasattr(Hand, name), f"Hand.{name}"
+        for name in ("prev_joint", "next_joint", "rotation"):
+            assert hasattr(Bone, name), f"Bone.{name}"
+        assert hasattr(Digit, "bones")
+        for name in ("position", "orientation"):
+            assert hasattr(Palm, name), f"Palm.{name}"
+
+    def test_raw_recording_types_exist(self):
+        import leap
+        assert hasattr(leap, "Recording") and hasattr(leap, "Recorder")
+        assert issubclass(leap.Recorder, leap.Listener)

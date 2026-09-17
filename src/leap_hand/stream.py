@@ -115,6 +115,10 @@ class LeapStream:
         """Subclass `leap.Listener` now that the module is actually imported."""
         leap = self._leap
         stream = self
+        # LeapCannotOpenDeviceError lives in leap.exceptions, not on the
+        # package root; fall back to the base LeapError if that ever moves.
+        cannot_open = getattr(leap.exceptions, "LeapCannotOpenDeviceError",
+                              leap.LeapError)
 
         class _StreamListener(leap.Listener):
             def on_connection_event(self, event):
@@ -132,7 +136,7 @@ class LeapStream:
                 try:
                     with event.device.open():
                         info = event.device.get_info()
-                except leap.LeapCannotOpenDeviceError:
+                except cannot_open:
                     try:
                         info = event.device.get_info()
                     except Exception as e:      # pragma: no cover - hardware path

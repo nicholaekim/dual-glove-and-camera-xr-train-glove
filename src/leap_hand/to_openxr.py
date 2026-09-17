@@ -72,16 +72,22 @@ def quat_xyzw(q) -> List[float]:
 def is_left(hand) -> bool:
     """True when this is a left hand.
 
-    Compares against `leap.HandType.Left` when the bindings are importable,
-    which is the correct test. Falls back to the string form for replayed,
-    mocked or duck-typed hands on a machine without the SDK.
+    `hand.type` is a `leap.HandType` (verified against the bindings:
+    `Hand.type` returns `HandType(self._data.type)`), so the correct test is
+    an enum comparison. The string form is the fallback, and only for objects
+    that are not a `leap.HandType` at all — a duck-typed test hand, or a
+    machine without the bindings. Comparing a foreign enum against
+    `leap.HandType.Left` is always False, so the isinstance check has to come
+    first or every fake left hand silently reads as a right hand.
     """
     hand_type = getattr(hand, "type", None)
     try:
         import leap  # noqa: PLC0415 — optional dependency, imported lazily
-        return hand_type == leap.HandType.Left
+        if isinstance(hand_type, leap.HandType):
+            return hand_type == leap.HandType.Left
     except Exception:
-        return str(hand_type).endswith("Left")
+        pass
+    return str(hand_type).endswith("Left")
 
 
 def hand_side(hand) -> str:
