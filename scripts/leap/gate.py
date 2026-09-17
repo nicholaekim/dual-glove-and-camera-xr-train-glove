@@ -138,6 +138,7 @@ class GateRun:
         self.skipped_young = 0
         self.beeper = AsyncBeeper(beep)
         self.hud = Hud(self._write)
+        self.view = None                 # CameraView, set by main() for a real camera
         self._reading = None
         self._reading_at = 0.0
         self._other_at = 0.0
@@ -173,6 +174,12 @@ class GateRun:
         now = time.time()
         fresh = self._reading if now - self._reading_at < HUD_STALE_S else None
         expected = self.hand or (fresh.hand_side if fresh else "hand")
+        if self.view is not None:
+            secs = ("" if seconds_left is None
+                    else f"   {max(0.0, seconds_left):.0f}s")
+            what = "HOLD: " + pose.replace("_", " ").upper() if pose else ""
+            self.view.caption(f"{phase.upper()}  {what}{secs}".strip(),
+                              band=band)
         self.hud.show(
             hud_line(phase, seconds_left, fresh, expected, band,
                      saw_other_hand=now - self._other_at < HUD_STALE_S,
@@ -467,6 +474,9 @@ def main() -> None:
                    choices=("desktop", "hmd", "screentop"))
     p.add_argument("--timeout", type=float, default=5.0,
                    help="seconds to wait for a device (default: 5)")
+    p.add_argument("--no-view", action="store_true",
+                   help="do not open the live camera window (never opened "
+                        "with --mock)")
     args = p.parse_args()
 
     given = args.conditions if args.conditions is not None else ",".join(
@@ -521,6 +531,9 @@ def main() -> None:
 
     run = GateRun(source, sampler, args.out_dir, args.hz or None, args.raw,
                   args.mock, schedule=schedule, band=band, hand=args.hand)
+    from leap_hand.protocol import CameraView
+    run.view = CameraView(hand=args.hand, band=band,
+                          enabled=not (args.no_view or args.mock)).start()
     results = []
     try:
         for condition in conditions:
