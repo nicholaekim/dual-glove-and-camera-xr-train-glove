@@ -514,6 +514,31 @@ Path A tooling (merged 2026-09-16, 130 tests)
   replication (medoid of a short take, professor txt format in mm).
 - Not yet run with a real hand or with XR Trainer streaming.
 
+Path A review round (ChatGPT, 2026-09-17; all fixed, 146 tests)
+- Pairing clock. Frames were stamped when written, not when captured, so a
+  drained burst of camera frames shared one time. Both sensors now carry
+  `capture_time`: the camera's is computed in the LeapC callback as
+  `time.time()` minus the frame's age on the Leap clock, the glove's is
+  stamped when the OSC packet is enqueued. `fuse_poses.py` pairs on it when
+  every frame has it and says which clock it used. Measured on a mock take:
+  partners chosen on `wall_time` were 10.7 ms apart on average and 50.7 ms
+  at worst in real capture time; on `capture_time`, 2.8 ms and 4.9 ms.
+- The countdown beep blocked for 250 ms after the recorders had started, so
+  every take opened with stale frames. Order is now beep, drop the backlog,
+  open the files, in all four guided scripts.
+- A take now needs the same hand on both sensors, not just frames on both.
+- Alignment for metric camera data is palm-basis rotation plus wrist
+  translation, scale 1, instead of a 5-point rigid fit. With only the palm
+  proportions changed (the XR Trainer template versus a real hand), the
+  palm basis tilts exactly 0 degrees while the point fit tilts 0.35 to 0.70
+  degrees, straight into the spread the camera is there to supply. The
+  point-fit RMSE is still reported, as a diagnostic, never a threshold.
+- Professor-frame medoid is chosen after rigid palm alignment to the take's
+  mean, and the original frame is exported. Over a 10 degree drift the raw
+  wrist-centred distances of one pose spanned 48x; after alignment, 1.0x.
+- A take name present under both `cam/` and `leap/` is now an error unless
+  `--camera cam` or `--camera leap` says which.
+
 Phase 2 tooling (2026-09-16, still the same evening, camera attached, no
 second person available to hold a hand)
 - Written: `src/leap_hand/images.py` (image policy, LeapC buffer -> numpy,
