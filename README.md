@@ -235,21 +235,53 @@ python scripts\leap\gate.py
 ```
 
 — four conditions in order (`bare`, `glove`, `glove_liner`, `glove_tape`),
-20 s each. Per condition it counts you in with beeps, records, takes IR
-stills spread across the run, then prints what to change on your hand and
-waits for Enter. Add `--raw` for LeapC `.lmt` files, or narrow it with
-`--conditions bare,glove --seconds 30`. It writes:
+each running the same **timed pose schedule** (`--schedule`, default
+`open_palm:5,fist:5,pinch:5,spread:5`). Per condition it counts you in with
+beeps, calls each pose as its window starts, records, takes IR stills spread
+across the run, then prints what to change on your hand and waits for Enter.
+The same one-line HUD as the Path A recorder runs throughout — pose being
+called for, hand tracked, palm height against `--band`, viewing angle — and
+out of band is flagged and counted, never blocked. Add `--raw` for LeapC
+`.lmt` files, or narrow it with `--conditions bare,glove`. It writes:
 
 ```
 recordings\leap\gate\<condition>\   the JSONL take, the IR stills (PNG + JSON
                                     sidecar each), and .lmt with --raw
-results\leap_gate\REPORT.txt        one table row per condition and hand, then
-                                    "Path A: yes/no because ..."
+results\leap_gate\REPORT.txt        one table row per condition and hand, a
+                                    per-pose block, the paired per-pose
+                                    verdict, then "Path A: yes/no because ..."
 ```
 
-The verdict applies the plan's thresholds — detection >= 80 %, at most one
-re-acquisition per 10 s, jitter within 2x the bare hand of the same side.
-Path A means simultaneous glove + camera capture; Path B means sequential.
+The condition verdict applies the plan's thresholds — detection >= 80 %, at
+most one re-acquisition per 10 s, jitter within 2x the bare hand of the same
+side. Path A means simultaneous glove + camera capture; Path B means
+sequential.
+
+**Why the schedule.** On 2026-09-17 the operator chose poses and heights
+freely, and every number came out uninterpretable: the bare baseline scored
+62 % because the hand turned edge-on for five seconds, one gloved run sat
+99 mm above the lens (below the device's range), the runs labelled "35cm" and
+"50cm" were actually at 198-240 mm and 267 mm, and four gloved runs lost
+tracking while the hand was a fist — with **no bare-hand fist anywhere to
+compare against**. Now each frame carries the plan it was recorded under and
+its own offset into it, so the report measures each pose separately and pairs
+each gloved pose against the bare hand doing **the same pose on the same
+hand**:
+
+```
+Paired verdict per pose (glove vs bare, same hand)
+  glove   left  open_palm  PASS     detection 96.1% (bare 98.4%), longest loss 0.08 s
+  glove   left  fist       FAIL     detection 41.0% is below 80% and 57.0 points below bare
+  glove   left  pinch      NO BARE  ... there is no bare pinch for the left hand to pair
+```
+
+A pose passes when glove detection is >= 80 % **or** within 10 points of bare,
+**and** its longest loss is <= 1 s **or** no longer than bare's — absolute or
+relative on both clauses, because a pose the camera cannot see bare is not
+evidence about the glove. A pose with no bare partner is reported as missing
+and left unjudged. A condition named `<name>_<N>cm` sets its own band to
+N +/- 5 cm and is paired against `bare_<N>cm` where that run exists, so a
+distance sweep measures the glove rather than the height.
 
 **Result (2026-09-16): Path A, provisionally.** The IR camera tracks the hand
 *inside* the black StretchSense glove in **100 %** of frames, with **0**
@@ -282,6 +314,12 @@ than the cadence (it read 101 Hz on a 90 Hz file). That moved bare left from
 79.2 % to 89.2 % and the glove from 98.6 % to 100 %, and left the verdict
 where it was. `leap_hand.stats.choose_rate` is the rule; the report's
 footnote names the denominator every row used.
+
+Takes recorded before schedules existed have no pose boundaries in them, so
+`--recompute` reads them exactly as it always did — the per-condition table,
+unchanged — and says why there is no per-pose block rather than attributing
+frames to a pose by where they sit in the file. Re-run the gate to get the
+per-pose comparison.
 
 **Extra gate runs the reviewer asked for** (plan section 9). A centred
 right-hand glove run and one with both hands up at once, then the gloved hand

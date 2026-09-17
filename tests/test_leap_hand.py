@@ -1793,6 +1793,279 @@ def test_the_presentation_hints_reach_the_acquire_prompt():
     assert len(acquire_prompt("peace", "left")) == 1
 
 
+# --- the coached gate: per scheduled pose -----------------------------------
+def _write_scheduled_take(path: Path, plan: str = "open_palm:1,fist:1",
+                          present=None, side: str = "left", hand_id: int = 1,
+                          hz: float = 90.0, condition: str = "glove",
+                          ids=None):
+    """A take recorded under `plan`, with `present(t)` deciding each frame.
+
+    `pose_t` is the capture clock offset into the schedule, so a test can put
+    a hole exactly inside one pose window and nowhere else.
+    """
+    from leap_hand.protocol import parse_schedule
+
+    rec = LeapRecorder(pose=condition, take=1, pose_plan=plan)
+    rec.start(path)
+    rec.schedule_t0 = 0.0
+    shape = MockLeapStream(noise_mm=0.0, dropout_every=0, reacquire_every=0,
+                           pose="open_palm")
+    for i in range(int(parse_schedule(plan).total * hz)):
+        t = i / hz
+        hands = dict(shape.generate(1))
+        if present is not None and not present(t):
+            continue
+        lh = hands[side]
+        lh.hand_id = ids(t) if ids else hand_id
+        lh.visible_time_us = 5_000_000
+        lh.framerate = hz
+        lh.capture_time = t                    # schedule_t0 is 0, so pose_t = t
+        rec.record(lh)
+    rec.stop()
+    return path
+
+
+def _pose(**kw):
+    """A `PoseStats` row with plausible defaults, for judging in isolation."""
+    from leap_hand.stats import PoseStats
+
+    d = dict(file="f.jsonl", condition="glove", hand_side="left",
+             pose="fist", frames=450, scheduled_s=5.0, detection_rate=0.95,
+             longest_loss_s=0.05, reacquisitions=0)
+    d.update(kw)
+    return PoseStats(**d)
+
+
+def test_a_pose_passes_on_its_own_merit_or_level_with_the_bare_hand():
+    """Absolute OR relative, on both clauses, and nothing without a bare row."""
+    from leap_hand.gate import judge_pose
+
+    bare = _pose(condition="bare", detection_rate=0.98, longest_loss_s=0.04)
+
+    passed, why = judge_pose(_pose(detection_rate=0.93), bare)
+    assert passed is True and "93.0%" in why[0]
+
+    # well under 80 %, but the bare hand was no better: that is not about the
+    # glove, and the pose passes
+    poor_bare = _pose(condition="bare", detection_rate=0.55,
+                      longest_loss_s=3.0)
+    assert judge_pose(_pose(detection_rate=0.50, longest_loss_s=2.5),
+                      poor_bare)[0] is True
+
+    # the fist case: far below 80 % and far below a bare hand that managed it
+    passed, why = judge_pose(_pose(detection_rate=0.41, longest_loss_s=2.3),
+                             bare)
+    assert passed is False
+    assert any("41.0%" in r and "below bare" in r for r in why)
+    assert any("2.30 s" in r for r in why)
+
+    # a long loss alone fails it, even with the detection rate up
+    assert judge_pose(_pose(detection_rate=0.99, longest_loss_s=1.6),
+                      bare)[0] is False
+    # ...unless the bare hand lost it for just as long
+    assert judge_pose(_pose(detection_rate=0.99, longest_loss_s=1.6),
+                      _pose(condition="bare", longest_loss_s=2.0))[0] is True
+
+
+def test_a_pose_with_no_bare_partner_is_reported_missing_never_guessed():
+    """The 2026-09-17 failure: four gloved fists, no bare fist anywhere."""
+    from leap_hand.gate import NO_BARE, judge_pose
+
+    passed, why = judge_pose(_pose(pose="fist", detection_rate=0.94), None)
+    assert passed is None, "an unpaired pose must not be scored either way"
+    assert "no bare fist" in why[0] and "left hand" in why[0]
+    assert "94.0%" in why[0], "its own numbers are still reported"
+
+    from leap_hand.gate import PoseVerdict
+
+    assert PoseVerdict(condition="glove", hand_side="left", pose="fist",
+                       glove=_pose(), passed=None).status == NO_BARE
+
+
+def test_the_paired_verdict_pairs_by_pose_and_by_hand():
+    """Fist against fist, left against left — and 20 cm against 20 cm."""
+    from leap_hand.gate import ConditionResult, pose_verdicts
+
+    bare = ConditionResult(condition="bare", pose_stats=[
+        _pose(condition="bare", pose="open_palm", detection_rate=0.98),
+        _pose(condition="bare", pose="fist", detection_rate=0.96),
+        _pose(condition="bare", pose="fist", hand_side="right",
+              detection_rate=0.30, longest_loss_s=4.0),
+    ])
+    glove = ConditionResult(condition="glove", pose_stats=[
+        _pose(pose="open_palm", detection_rate=0.97),
+        _pose(pose="fist", detection_rate=0.35, longest_loss_s=2.2),
+        _pose(pose="fist", hand_side="right", detection_rate=0.31,
+              longest_loss_s=3.5),
+        _pose(pose="pinch", detection_rate=0.88),
+    ])
+    got = {(v.pose, v.hand_side): v for v in pose_verdicts([bare, glove])}
+    assert got[("open_palm", "left")].passed is True
+    assert got[("fist", "left")].passed is False
+    # the right hand's bare fist was just as bad, so the glove is not blamed
+    assert got[("fist", "right")].passed is True
+    # no bare pinch at all: reported, not guessed
+    assert got[("pinch", "left")].passed is None
+    assert got[("pinch", "left")].bare is None
+    # bare rows are not judged against themselves
+    assert all(v.condition == "glove" for v in pose_verdicts([bare, glove]))
+
+
+def test_a_distance_run_is_paired_against_the_bare_run_at_that_distance():
+    """Detection falls off with height; 20 cm vs 35 cm measures the height."""
+    from leap_hand.gate import ConditionResult, pose_verdicts
+
+    results = [
+        ConditionResult(condition="bare", pose_stats=[
+            _pose(condition="bare", detection_rate=0.99)]),
+        ConditionResult(condition="bare_50cm", pose_stats=[
+            _pose(condition="bare_50cm", detection_rate=0.45)]),
+        ConditionResult(condition="glove_50cm", pose_stats=[
+            _pose(condition="glove_50cm", detection_rate=0.44)]),
+    ]
+    v = pose_verdicts(results)[0]
+    assert v.baseline_condition == "bare_50cm"
+    assert v.passed is True, "44 % against a bare 45 % is not a glove failure"
+
+
+def test_the_height_band_comes_from_the_condition_name():
+    """`glove_20cm` says its own band; that is the point of a distance sweep."""
+    from leap_hand.protocol import DEFAULT_BAND, band_for_condition, parse_band
+
+    assert band_for_condition("glove") == DEFAULT_BAND
+    assert band_for_condition("glove_20cm") == (15.0, 25.0)
+    assert band_for_condition("bare_50cm") == (45.0, 55.0)
+    # an explicit --band wins over the name
+    assert band_for_condition("glove_20cm", (10.0, 40.0)) == (10.0, 40.0)
+    assert parse_band("18,28") == (18.0, 28.0)
+    with pytest.raises(ValueError):
+        parse_band("28,18")
+
+
+def test_per_pose_stats_measure_each_window_against_its_own_seconds(
+        tmp_path: Path):
+    """A pose the tracker saw for half a second must not score 100 %."""
+    from leap_hand.stats import analyse_poses
+
+    # open_palm 0-2 s fully tracked; fist 2-4 s lost for a second in the middle
+    path = _write_scheduled_take(
+        tmp_path / "glove_left_take1.jsonl", plan="open_palm:2,fist:2",
+        present=lambda t: not (2.5 <= t < 3.5))
+    rows = {s.pose: s for s in analyse_poses(path)}
+    assert set(rows) == {"open_palm", "fist"}
+    assert rows["open_palm"].detection_rate == pytest.approx(1.0, abs=0.02)
+    assert rows["open_palm"].longest_loss_s < 0.05
+    assert rows["fist"].detection_rate == pytest.approx(0.5, abs=0.03)
+    assert rows["fist"].longest_loss_s == pytest.approx(1.0, abs=0.05)
+    assert rows["fist"].scheduled_s == 2.0
+    # the mock hand hovers 25 cm up with the palm toward the module
+    assert rows["fist"].median_height_cm == pytest.approx(25.0, abs=0.5)
+    assert rows["fist"].facing_pct == pytest.approx(100.0, abs=0.1)
+    assert rows["fist"].in_band_pct == pytest.approx(100.0, abs=0.1)
+
+
+def test_a_pose_the_tracker_never_saw_reports_the_whole_window_as_lost(
+        tmp_path: Path):
+    from leap_hand.stats import analyse_poses
+
+    path = _write_scheduled_take(
+        tmp_path / "glove_left_take1.jsonl", plan="open_palm:2,fist:2",
+        present=lambda t: t < 2.0)
+    rows = {s.pose: s for s in analyse_poses(path)}
+    assert rows["fist"].frames == 0
+    assert rows["fist"].detection_rate == 0.0
+    assert rows["fist"].longest_loss_s == pytest.approx(2.0, abs=0.05)
+
+
+def test_a_reacquisition_is_counted_inside_the_pose_it_happened_in(
+        tmp_path: Path):
+    from leap_hand.stats import analyse_poses
+
+    path = _write_scheduled_take(
+        tmp_path / "glove_left_take1.jsonl", plan="open_palm:2,fist:2",
+        ids=lambda t: 11 if t < 3.0 else 12)
+    rows = {s.pose: s for s in analyse_poses(path)}
+    assert rows["open_palm"].reacquisitions == 0
+    assert rows["fist"].reacquisitions == 1
+
+
+def test_an_unscheduled_take_has_no_per_pose_rows_and_says_so(tmp_path: Path):
+    """--recompute on last week's data: the old table, and why it is the old
+    table."""
+    import sys
+
+    from leap_hand.stats import analyse_poses
+
+    gate = _load_script("gate")
+    for condition in ("bare", "glove"):
+        folder = tmp_path / "gate" / condition
+        folder.mkdir(parents=True)
+        rec = LeapRecorder(pose=condition, take=1)      # no pose_plan
+        rec.start(folder / f"{condition}_left_take1_20260916_120000.jsonl")
+        shape = MockLeapStream(noise_mm=0.0, dropout_every=0,
+                               reacquire_every=0, pose="open_palm")
+        for _ in range(200):
+            lh = dict(shape.generate(1))["left"]
+            lh.visible_time_us = 5_000_000
+            rec.record(lh)
+        rec.stop()
+        assert analyse_poses(rec.path) == [], "no plan, no per-pose rows"
+
+    report = tmp_path / "R.txt"
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(sys, "argv", [
+        "gate.py", "--recompute", "--out-dir", str(tmp_path / "gate"),
+        "--report", str(report)])
+    try:
+        gate.main()
+    finally:
+        monkey.undo()
+
+    text = report.read_text(encoding="utf-8")
+    assert "Per pose" in text
+    assert "was recorded under a --schedule" in text
+    assert "Paired verdict per pose" not in text
+    # the per-condition table is still the whole report it always was
+    assert "thresholds: detection >= 80%" in text
+    assert "bare" in text and "glove" in text
+
+
+def test_the_gate_records_the_schedule_on_every_frame(tmp_path: Path,
+                                                      monkeypatch):
+    """A scheduled mock run, end to end: plan and offset on each line."""
+    import json
+    import sys
+
+    gate = _load_script("gate")
+    monkeypatch.setattr(gate, "beep", lambda *a, **k: None)
+    out_dir = tmp_path / "gate"
+    monkeypatch.setattr(sys, "argv", [
+        "gate.py", "--mock", "--conditions", "bare,glove", "--prep", "0",
+        "--schedule", "open_palm:1,fist:1", "--snapshots", "0",
+        "--out-dir", str(out_dir), "--report", str(tmp_path / "R.txt"),
+    ])
+    gate.main()
+
+    take = sorted((out_dir / "glove").glob("*.jsonl"))[0]
+    rows = [json.loads(line) for line
+            in take.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert rows
+    assert {r["pose_plan"] for r in rows} == {"open_palm:1,fist:1"}
+    # `pose_t` is on the CAPTURE clock, so the first frames drained after the
+    # file opened can be a few milliseconds older than the schedule's start.
+    # Those belong to no window and are simply outside every pose's rows.
+    assert all(-0.1 <= r["pose_t"] < 2.1 for r in rows)
+    assert any(r["pose_t"] >= 1.0 for r in rows), "the fist window was recorded"
+    # the condition label is untouched: it is what the folder and the
+    # per-condition table are keyed on
+    assert {r["pose"] for r in rows} == {"glove"}
+
+    text = (tmp_path / "R.txt").read_text(encoding="utf-8")
+    assert "Per pose (schedule: open_palm:1,fist:1" in text
+    assert "Paired verdict per pose" in text
+    assert "open_palm" in text and "fist" in text
+
+
 # --- the professor-frame replication ----------------------------------------
 def test_record_frame_accepts_every_spelling_of_a_frame_id():
     record_frame = _load_script("record_frame")

@@ -54,12 +54,35 @@ than the code:
 Reading a stat line: a gloved-hand run with a detection rate near 1.0, few
 re-acquisitions and jitter close to the bare-hand run is Path A in the plan;
 anything much worse is Path B.
+
+**Per pose.** A take recorded under a `--schedule` carries `pose_plan` and
+`pose_t` on every frame, and `analyse_poses` then measures each of the above
+inside each scheduled pose window instead of over the whole take. That is the
+difference between "the glove scored 62 %" and "the glove scored 96 % open and
+11 % in a fist", and it is the only form in which the gloved and bare runs can
+honestly be compared — the 2026-09-17 session lost tracking four times while
+the hand was a fist and had no bare-hand fist anywhere to compare against.
+A take with no `pose_plan` has no per-pose analysis and says so; nothing is
+inferred from the condition name.
 """
 import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
+
+from .protocol import (
+    DEFAULT_BAND,
+    IN_BAND,
+    VIEW_ANGLE_MAX_DEG,
+    Schedule,
+    band_flag,
+    longest_gap,
+    parse_schedule,
+    row_height_cm,
+    row_view_angle_deg,
+)
+from .protocol import median as _median
 
 # abs26 indices of the five fingertips (thumb, index, middle, ring, little).
 TIP_IDX = (5, 10, 15, 20, 25)
@@ -259,6 +282,129 @@ def analyse_paths(paths: Sequence[str | Path]) -> List[HandStats]:
     out: List[HandStats] = []
     for f in files:
         out.extend(analyse_file(f))
+    return out
+
+
+# --- per scheduled pose ------------------------------------------------------
+@dataclass
+class PoseStats:
+    """One row of the per-pose table: one pose, one hand, one recording."""
+
+    file: str
+    condition: str
+    hand_side: str
+    pose: str
+    frames: int
+    scheduled_s: float
+    detection_rate: float
+    longest_loss_s: float
+    reacquisitions: int
+    median_height_cm: Optional[float] = None
+    in_band_pct: Optional[float] = None
+    facing_pct: Optional[float] = None
+    median_view_deg: Optional[float] = None
+    rate_hz: float = 0.0
+    rate_source: str = RATE_CADENCE
+
+    @property
+    def rate_flag(self) -> str:
+        return "*" if self.rate_source == RATE_FRAMERATE else " "
+
+
+def schedule_of(rows: Sequence[dict]) -> Optional[Schedule]:
+    """The schedule these rows were recorded under, or None.
+
+    None means "this take cannot be read per pose", which is a fact about the
+    file, not a reason to guess: a take recorded before schedules existed has
+    no pose boundaries in it, and inventing them from the condition name would
+    manufacture exactly the comparison this module exists to make honest.
+    """
+    plans = {r.get("pose_plan") for r in rows if r.get("pose_plan")}
+    if len(plans) != 1:
+        return None
+    try:
+        return parse_schedule(plans.pop())
+    except ValueError:                           # pragma: no cover - bad file
+        return None
+
+
+def _in_window(t, window) -> bool:
+    return t is not None and window.start <= float(t) < window.end
+
+
+def _pose_stats(path: Path, condition: str, side: str, rows: List[dict],
+                schedule: Schedule, pose: str, rate_hz: float,
+                rate_source: str, band: Tuple[float, float]) -> PoseStats:
+    windows = schedule.windows_for(pose)
+    frames: List[dict] = []
+    worst_loss = 0.0
+    reacquisitions = 0
+    for w in windows:
+        here = sorted((r for r in rows if _in_window(r.get("pose_t"), w)),
+                      key=lambda r: float(r["pose_t"]))
+        frames.extend(here)
+        # The window's own edges bound the gap, so a pose the tracker never
+        # saw at all reports the whole window as one loss rather than zero.
+        worst_loss = max(worst_loss,
+                         longest_gap([float(r["pose_t"]) for r in here],
+                                     w.start, w.end))
+        ids = [r.get("hand_id") for r in here]
+        # Only inside a window: the id may legitimately differ across two
+        # windows of the same pose, with another pose held in between.
+        reacquisitions += sum(1 for a, b in zip(ids, ids[1:])
+                              if a != b and b is not None)
+
+    scheduled = schedule.seconds_of(pose)
+    expected = scheduled * rate_hz
+    heights = [h for h in (row_height_cm(r) for r in frames) if h is not None]
+    angles = [a for a in (row_view_angle_deg(r) for r in frames)
+              if a is not None]
+    return PoseStats(
+        file=path.name,
+        condition=condition,
+        hand_side=side,
+        pose=pose,
+        frames=len(frames),
+        scheduled_s=scheduled,
+        detection_rate=min(len(frames) / expected, 1.0) if expected else 0.0,
+        longest_loss_s=worst_loss,
+        reacquisitions=reacquisitions,
+        median_height_cm=_median(heights),
+        in_band_pct=(100.0 * sum(1 for h in heights
+                                 if band_flag(h, band) == IN_BAND) / len(heights)
+                     if heights else None),
+        facing_pct=(100.0 * sum(1 for a in angles if a < VIEW_ANGLE_MAX_DEG)
+                    / len(angles) if angles else None),
+        median_view_deg=_median(angles),
+        rate_hz=rate_hz,
+        rate_source=rate_source,
+    )
+
+
+def analyse_poses(path: str | Path, band: Tuple[float, float] = DEFAULT_BAND,
+                  condition: str = "") -> List[PoseStats]:
+    """One `PoseStats` per (hand, scheduled pose). Empty if unscheduled.
+
+    The detection denominator is the one the whole-take row already chose
+    (`choose_rate`), applied to the seconds the SCHEDULE allotted the pose —
+    not to the span of the frames that happen to be there, which would score a
+    pose the tracker saw for half a second at 100 %.
+    """
+    path = Path(path)
+    rows = read_rows(path)
+    schedule = schedule_of(rows)
+    if schedule is None:
+        return []
+    by_hand: Dict[str, List[dict]] = {}
+    for r in rows:
+        by_hand.setdefault(r.get("hand_side", "?"), []).append(r)
+    out: List[PoseStats] = []
+    for side, hand_rows in sorted(by_hand.items()):
+        base = _hand_stats(path, side, hand_rows)
+        for pose in schedule.poses:
+            out.append(_pose_stats(path, condition or path.parent.name, side,
+                                   hand_rows, schedule, pose, base.rate_hz,
+                                   base.rate_source, band))
     return out
 
 

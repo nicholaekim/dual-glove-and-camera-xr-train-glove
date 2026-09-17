@@ -337,6 +337,25 @@ def hand_view_angle_deg(lh) -> Optional[float]:
                              palm_normal_abs(lh.abs26, lh.hand_side))
 
 
+def row_view_angle_deg(row: dict) -> Optional[float]:
+    """The same angle, from a recorded JSONL line. None without geometry.
+
+    The live session and `--recompute` have to agree to the degree, so they
+    read the same two keys through the same function rather than each
+    rebuilding the palm basis their own way.
+    """
+    palm, abs26 = row.get("palm_abs"), row.get("abs26")
+    if not palm or not abs26:
+        return None
+    return viewing_angle_deg(
+        palm, palm_normal_abs(abs26, row.get("hand_side", "right")))
+
+
+def row_height_cm(row: dict) -> Optional[float]:
+    palm = row.get("palm_abs")
+    return None if not palm else palm_height_cm(palm)
+
+
 @dataclass
 class HandReading:
     """The four numbers the coaching turns on, for one tracked hand."""
@@ -462,7 +481,7 @@ HUD_EVERY = 0.25                    # ~4 refreshes a second
 
 def hud_line(phase: str, seconds_left: Optional[float],
              reading: Optional[HandReading], expected_hand: str,
-             band: Tuple[float, float], glove_hz: float,
+             band: Tuple[float, float], glove_hz: Optional[float] = None,
              saw_other_hand: bool = False, extra: str = "") -> str:
     """The one line the operator reads while their hands are over the camera.
 
@@ -472,6 +491,9 @@ def hud_line(phase: str, seconds_left: Optional[float],
     out separately from `no hand` because the fix is completely different —
     one is "put your hand there", the other is "the tracker has decided your
     left hand is a right hand, open it and start again".
+
+    `glove_hz` is None where there is no glove in the session (the gate runs
+    the camera alone), and the field is left off rather than printed as zero.
     """
     left = "  --" if seconds_left is None else f"{max(0.0, seconds_left):4.1f}s"
     if reading is not None and reading.hand_side == expected_hand:
@@ -484,8 +506,9 @@ def hud_line(phase: str, seconds_left: Optional[float],
         tracked = WRONG_HAND if saw_other_hand else f"{expected_hand} no "
         height = f"{'   -- cm':<9} {'':<8}"
         angle = "view  -- deg"
-    line = (f"{phase:<8} {left}  {tracked:<12} {height} {angle}  "
-            f"glove {glove_hz:5.1f}/s")
+    line = f"{phase:<8} {left}  {tracked:<12} {height} {angle}"
+    if glove_hz is not None:
+        line += f"  glove {glove_hz:5.1f}/s"
     if extra:
         line += f"  {extra}"
     return line
