@@ -224,12 +224,19 @@ python scripts\glove\playback.py recordings\leap\poses\<file>.jsonl
 python scripts\glove\export_keypoints21.py recordings\leap\poses
 python scripts\glove\export_prof_format.py recordings\leap\poses
 ```
-One caveat in `playback.py`: Leap frames carry the hand's **real position** in
-camera space (a wrist 25 cm above the module), while that viewer's box is
-fixed at ±0.22 m around the origin, so the hand can sit outside the view.
-`scripts\leap\live_view.py` re-anchors the wrist and does not have this
-problem, and every export is wrist-centred, so only that one viewer is
-affected.
+Two consequences of Leap frames carrying the hand's **real position** in
+camera space (a wrist 25 cm above the module), where a glove frame carries
+nothing outside the wrist:
+
+  * `playback.py`'s view box is fixed at ±0.22 m around the origin, so the
+    hand can sit outside the view. `scripts\leap\live_view.py` re-anchors the
+    wrist and does not have this problem.
+  * `export_prof_format.py` writes absolute camera millimetres, so its
+    `Wrist:` line is a real position instead of the glove's `(0, 0, 0)`. The
+    landmark block is unchanged in layout, and `compare_to_tracker.py` aligns
+    rigidly before scoring, so this only matters if a file is read by eye.
+
+`export_keypoints21.py` is wrist-centred either way and is unaffected.
 
 **Units and frame.** Positions are metres, the same unit as glove
 `HandFrame`s (LeapC's millimetres are converted once, in

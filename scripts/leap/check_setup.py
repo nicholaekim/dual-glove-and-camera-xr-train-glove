@@ -181,9 +181,12 @@ def check_live(seconds: float) -> Check:
         stream = LeapStream(mode="desktop", device_timeout=max(seconds, 3.0))
         stream.start()
     except LeapUnavailable as e:
+        # LeapUnavailable already ends with the next step; unwrap it so it is
+        # not printed as "fix: Next step: ...".
         first, _, rest = str(e).partition("\n")
-        return Check("live tracking", FAIL, first,
-                     rest.strip() or "see the message above")
+        fix = " ".join(line.strip() for line in rest.splitlines() if line.strip())
+        fix = fix.removeprefix("Next step:").strip()
+        return Check("live tracking", FAIL, first, fix or "see the message above")
     except Exception as e:      # pragma: no cover - hardware path
         return Check("live tracking", FAIL, f"{type(e).__name__}: {e}",
                      "unexpected SDK error — re-run with the Control Panel open "
@@ -258,12 +261,18 @@ def check_mock(seconds: float) -> List[Check]:
 
 
 def report(checks: List[Check]) -> int:
+    import textwrap
+
     width = max(len(c.name) for c in checks)
+    indent = " " * (width + 8)
     print()
     for c in checks:
         print(f"{c.status}  {c.name:<{width}}  {c.detail}")
         if c.status == FAIL and c.fix:
-            print(f"      {' ' * width}  fix: {c.fix}")
+            wrapped = textwrap.wrap(f"fix: {c.fix}", width=100 - len(indent),
+                                    subsequent_indent="     ")
+            for line in wrapped:
+                print(indent + line)
     counted = [c for c in checks if c.counts]
     failed = [c for c in counted if c.status == FAIL]
     print()
