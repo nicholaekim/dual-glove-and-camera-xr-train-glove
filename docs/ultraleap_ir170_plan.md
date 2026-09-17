@@ -565,6 +565,56 @@ streaming, 6 poses x 1 take x 5 s, both hands over the camera at once)
   exists, even when the hand is edge-on or the glove says the finger is
   fully curled, which is when the camera is guessing.
 
+Second Path A session and what it changed (2026-09-17, 13:52, left hand
+only, 6 poses x 3 takes)
+- Glove side complete. Camera side: open_palm 3/3 with one continuous hand
+  id; fist 34 % / 0 / 66 %; index_point almost nothing, once tracked for 3 s
+  but labelled a RIGHT hand; thumbs_up never; pinch never as left; peace 1/3.
+  The tracked id changed on almost every take and was often acquired late.
+- Reading: the tracker follows an open hand into a pose but cannot acquire a
+  gloved hand that is already closed, and when it re-acquires from a closed
+  pose it sometimes picks the wrong chirality (a mirrored skeleton, not just
+  a wrong label). The hand also sat at 131 to 154 mm; good takes were 160 to
+  210 mm. The idle other hand was picked up 20 cm to the side.
+- Fix, merged (179 then 183 tests): the recorder coaches each take as
+  ACQUIRE (open palm, expected hand, in band, palm facing, centred, tracked
+  500 ms) then "NOW: <pose>" with a settle, and records only if the same
+  hand_id survived; otherwise both files are discarded and the take retried.
+  Frames of the other chirality are never written. `<take>.meta.json` holds
+  coverage, attempts, height and viewing angle. The gate uses the same
+  module for a timed per-pose schedule and a pose-by-pose verdict against
+  the bare hand.
+- Live camera window (`scripts/leap/camera_view.py`), opened by every
+  real-camera script and usable on its own: IR image, fitted skeleton,
+  height against the band, palm facing, wrong-hand warning, the script's
+  instruction as a caption. The 3D-to-pixel mapping
+  (`LeapRectilinearToPixel` with slopes -(x - 32)/y and z/y for the left
+  lens) was checked against the saved gate stills.
+
+Gated fusion (ChatGPT-reviewed design, merged, 159 tests at the time)
+- Spread is read from the proximal bone. A finger's spread comes from the
+  camera only when the glove says it is not curled and the palm faces the
+  lens within 50 degrees; the thumb comes from the camera only when the
+  camera also agrees with the glove about the other four fingers (median
+  curl disagreement below 0.35). Frame gates: visible 0.3 s, no recent id
+  change, central field. Nothing is dropped; a rejected frame is the glove.
+- On the first session: thumbs_up uses the camera for 0 % of every DOF
+  (edge-on at 70 to 78 degrees, curl disagreement 0.88), as intended. The
+  report's headline is now per DOF with camera-use rates and rejection
+  reasons; the classifier is secondary and leave-one-take-out.
+- Open issue, the glove's dead zone: during pinch the glove's five curls are
+  bit-identical to its open palm, on both hands, in July and now, while the
+  camera sees the index flex from 1.76 to 1.27. Since the glove owns curl,
+  a fused pinch stays open. Reviewed extension, not yet built: treat a
+  glove finger sitting on its open-palm rail as possibly censored, and take
+  that finger's curl from the camera only when the camera passes its gates
+  and shows flexion beyond a margin for several frames, with hysteresis,
+  index finger first. Before telling the professor, measure it:
+  `..\xr trainer\measure_dead_zone.py --hand left --finger index` sweeps one
+  finger slowly and reports the dead-zone width, its hysteresis and the
+  glove's lag against the camera (validated on a synthetic 30 % / 120 ms
+  sweep: recovered 30 % and 115 ms).
+
 Path A review round (ChatGPT, 2026-09-17; all fixed, 146 tests)
 - Pairing clock. Frames were stamped when written, not when captured, so a
   drained burst of camera frames shared one time. Both sensors now carry
