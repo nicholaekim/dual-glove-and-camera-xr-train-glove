@@ -327,23 +327,76 @@ section 9.
 
 The gate said Path A, which means one hand, one instant, both sensors — the
 glove supplying flexion, the camera supplying spread, thumb opposition, palm
-pose and wrist. Two commands, in order. Wear the glove, keep the hand 20 to
-50 cm above the module, and have XR Trainer streaming to `127.0.0.1:9002`.
+pose and wrist. Two commands, in order. Wear the glove on **one** hand, keep
+the other out of the module's field, and have XR Trainer streaming to
+`127.0.0.1:9002`.
 
 ```powershell
-python scripts\record_simultaneous.py --camera leap
+python scripts\record_simultaneous.py --camera leap --hand left
 python scripts\fuse_poses.py recordings\sync --write
 ```
 
-The first is the glove pipeline's guided beep protocol with the Ultraleap as
-the camera: announce the pose, count down, record, move on, nothing to type.
-Each take writes two files under **one name**, `recordings\sync\glove\...`
-and `recordings\sync\leap\...`, both stamped with `time.time()` at the write
-— the one clock the sensors share. There is no preview window: your hands are
+`--hand` is required with `--camera leap`, and it is the whole protocol.
+Measured on 2026-09-17, left gloved hand: `open_palm` tracked 3/3 takes on one
+continuous hand id, and **every other pose failed** — fist 34 %/0 %/66 %,
+index_point 0/8 %/tracked-but-labelled-RIGHT, thumbs_up 0/0/0, pinch 0 as
+left, peace 1/3. The tracker will follow an open hand into a pose, but it
+cannot acquire a gloved hand that is already closed, and when it re-acquires
+from a closed pose it sometimes returns a **mirrored skeleton labelled as the
+other hand** — which fuses against the other glove and produces a plausible,
+wrong result. The idle other hand, 20 cm off to the side, was picked up too.
+
+**What the operator sees.** Each take is three phases with one live line,
+rewritten in place about four times a second:
+
+```
+ACQUIRE    --  left YES      24.3 cm OK       view  12 deg  glove 60.2/s
+SETTLE    0.9s left YES      24.1 cm OK       view  14 deg  glove 60.1/s
+REC       3.4s left YES      23.8 cm OK       view  11 deg  glove 59.8/s
+```
+
+* **ACQUIRE** prints `hold the LEFT hand OPEN PALM over the camera` plus a
+  per-pose hint where the pose has a known trap (thumbs_up: tilt the whole
+  forearm 30-45 degrees so the camera still sees some palm; pinch: palm
+  facing the lens; fist: close slowly). Nothing is recorded and the pose is
+  never called until the expected hand is tracked for half a second, inside
+  the height band (`--band`, default 18-28 cm — the takes that worked sat at
+  16-21 cm, the ones that failed at 13-15 cm), with the palm within 40 degrees
+  of facing the lens and roughly over the module. The line says which of those
+  is missing (`need: TOO LOW, turn palm to lens`), and `WRONG HAND` when the
+  only thing in view is the other chirality.
+* **SETTLE** beeps, prints `NOW: FIST`, and gives `--settle` seconds (default
+  1.5) for the hand to change shape while the tracker follows it.
+* **REC** records `--duration` seconds — but only if the hand id pinned at
+  acquire is still on the hand. If it changed, or the hand was lost, the
+  attempt says so, **both files are deleted**, and the take is retried from
+  ACQUIRE up to `--retries` times (default 3). A take is complete when the
+  expected hand, on that one id, covers >= 90 % of it.
+
+A camera hand of the other chirality is dropped before it can reach the
+recorder, so `--hand left` cannot produce a right-handed line; the wrong-hand
+and second-hand-in-view counts are printed per session and stored per take.
+Each take writes two files under **one name**, `recordings\sync\glove\...` and
+`recordings\sync\leap\...`, both stamped with `time.time()` at the write — the
+one clock the sensors share — plus `<take>.meta.json` beside the camera file
+with the hand, pose, hand id, coverage, attempts, median height, median
+viewing angle and the rejection counts. The session summary ends with the
+exact command to redo only the poses that failed:
+
+```
+  open_palm    3/3 complete (3 attempt(s))
+  thumbs_up    0/3 complete (12 attempt(s))   last failure: the tracker let go
+                                              and re-acquired the hand (id 12 -> 15)
+
+  Redo ONLY the poses that failed:
+    python scripts/record_simultaneous.py --camera leap --hand left --poses thumbs_up --takes 3
+```
+
+`--hand both` is the old uncoached behaviour: both hands, no acquire phase,
+the once-a-second HUD. There is no preview window either way — your hands are
 over the module and an 850 nm brightness image is not something to check a
-pose against, so it prints a one-line HUD (hands seen, tracking framerate)
-once a second instead. The camera is **not** throttled by `--hz` (which stays
-the glove's rate): keeping every frame at 90 Hz is what guarantees each glove
+pose against. The camera is **not** throttled by `--hz` (which stays the
+glove's rate): keeping every frame at 90 Hz is what guarantees each glove
 frame a partner within a few milliseconds, and `--leap-hz` overrides that if
 disk ever matters more than pairing.
 
@@ -360,7 +413,7 @@ both kinds can sit in one session folder.
 Rehearse the whole thing with no hardware at all:
 
 ```powershell
-python scripts\record_simultaneous.py --camera leap --mock-glove --mock-leap --poses fist --takes 1 --duration 3 --prep 1
+python scripts\record_simultaneous.py --camera leap --hand left --mock-glove --mock-leap --poses fist --takes 1 --duration 3
 python scripts\fuse_poses.py recordings\sync
 ```
 
@@ -378,7 +431,7 @@ python scripts\leap\record_poses.py --mock --takes 1 --duration 2 --prep 1 --pos
 python scripts\leap\ir_snapshot.py --mock --label demo --count 2
 python scripts\leap\gate.py --mock --conditions bare,glove --seconds 3 --prep 0
 python scripts\leap\record_frame.py 128166 --mock --prep 0 --seconds 1
-python scripts\record_simultaneous.py --camera leap --mock-glove --mock-leap --poses fist --takes 1 --duration 3 --prep 1
+python scripts\record_simultaneous.py --camera leap --hand left --mock-glove --mock-leap --poses fist --takes 1 --duration 3
 python scripts\leap\stats.py --mock
 ```
 `--mock` images are obviously synthetic gradients and their sidecars say so;
@@ -667,7 +720,8 @@ scripts/
   train_glove_model.py       fine-tune YOLO pose on it (old venv)
   predict_glove.py           run the trained model on the real glove
   record_poses_cam.py        guided camera-only pose session
-  record_simultaneous.py     guided glove + camera session (shared clock)
+  record_simultaneous.py     guided glove + camera session (shared clock);
+                             coached one-hand protocol with --camera leap
   fuse_poses.py              fuse + glove/camera/fused comparison report
   selftest_sync.py           synthetic paired dataset, answer known
   compare_sensors.py         glove vs camera, same features, same classifier

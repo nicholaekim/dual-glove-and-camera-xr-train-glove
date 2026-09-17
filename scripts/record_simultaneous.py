@@ -30,22 +30,37 @@ look at and your hands are over the module, so it prints a one-line HUD
 The protocol is the glove pipeline's either way: announce the pose, count
 down with beeps, record, move on — no keyboard while wearing the glove.
 
+With `--camera leap` it is the COACHED protocol, one hand at a time, because
+the plain one does not work on a gloved hand. Measured 2026-09-17 on the left
+gloved hand: `open_palm` tracked 3/3 takes on one hand id and every other pose
+failed — fist 34 %/0 %/66 %, thumbs_up 0/0/0, pinch tracked only as the wrong
+hand. The tracker follows an OPEN hand into a pose but cannot acquire a gloved
+hand that is already closed, and when it re-acquires from a closed pose it
+sometimes returns a mirrored skeleton labelled as the other hand. So each take
+is: acquire the expected hand open and steady, beep, call the pose, let the
+tracker follow it through the transition, and record only if the same hand id
+survived. See `leap_hand.protocol` for the numbers and why they are those.
+
 Needs XR Trainer streaming to 127.0.0.1:9002 plus the camera. Rehearse the
 whole thing with no hardware at all:
 
   python scripts/record_simultaneous.py --mock-glove --takes 1 --duration 3 --prep 2
-  python scripts/record_simultaneous.py --camera leap --mock-glove --mock-leap \
-      --poses fist --takes 1 --duration 3 --prep 1
+  python scripts/record_simultaneous.py --camera leap --hand left \
+      --mock-glove --mock-leap --poses fist --takes 1 --duration 3
 
 Usage:
   python scripts/record_simultaneous.py                       # 6 poses x 3 takes
   python scripts/record_simultaneous.py --poses pinch,fist --takes 2
-  python scripts/record_simultaneous.py --camera leap         # Path A
+  python scripts/record_simultaneous.py --camera leap --hand left   # Path A
+  python scripts/record_simultaneous.py --camera leap --hand both   # uncoached
 """
 import argparse
 import json
+import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import List, Optional
 
 import cv2
 
@@ -58,6 +73,22 @@ from cam_hand.recorder import hand_tag as cam_hand_tag
 
 # The Ultraleap backend (--camera leap). Importing these is free: leap_hand
 # only touches the `leap` bindings inside LeapStream.start().
+from leap_hand.protocol import (
+    COMPLETE_COVERAGE,
+    DEFAULT_BAND,
+    DEFAULT_RETRIES,
+    DEFAULT_SETTLE,
+    AsyncBeeper,
+    Hud,
+    acquire_failures,
+    acquire_prompt,
+    band_text,
+    coverage,
+    hud_line,
+    median,
+    parse_band,
+    read_hand,
+)
 from leap_hand.recorder import LeapRecorder
 from leap_hand.stream import LeapUnavailable, open_stream
 
@@ -69,7 +100,15 @@ from xr_hand.validator import StreamMonitor, validate_raw_message
 
 DEFAULT_POSES = ["open_palm", "fist", "index_point", "thumbs_up", "peace", "pinch"]
 LEAP = "leap"
+BOTH = "both"
 MIN_VISIBLE_TIME_US = 300_000     # plan section 6: a hand counts after 0.3 s
+# A tracked hand goes stale on the HUD this long after its last frame, so the
+# line says "no hand" while the hand is actually gone rather than freezing on
+# the last good reading. Well under the loss threshold below.
+HUD_STALE_S = 0.30
+# No frame from the acquired hand for this long IS a loss, not a dropped
+# frame: at 90 Hz it is 45 missed tracking intervals in a row.
+LOST_S = 0.50
 # Bounds on the post-beep flush (see SyncSession.discard_backlog). A 250 ms
 # beep leaves at most ~45 Leap hands and ~30 glove packets behind it, so a
 # handful of drain(64) rounds always clears it; the bound is only there so a
@@ -288,12 +327,20 @@ class SyncSession:
                 self._warn(f"[{hand}] {w}")
             seen += 1
             self.glove_sides.add(frame.hand_side)
-            if recorder is not None:
+            if recorder is not None and self.accept_glove(frame):
                 # recv_time: when the OSC packet landed, stamped on the server
                 # thread. A drained burst shares a write time but not this.
                 recorder.record(frame, capture_time=getattr(item, "recv_time",
                                                             None) or None)
         return seen
+
+    def accept_glove(self, frame) -> bool:
+        """Does this glove frame belong in the take? Everything does, here.
+
+        XR Trainer streams both gloves whatever the session is doing, so a
+        one-hand session overrides this — see `CoachedLeapSession`.
+        """
+        return True
 
     def _warn(self, msg: str) -> None:
         if msg not in self._warned:
@@ -444,6 +491,9 @@ class SyncSession:
                           " — this take cannot be fused")
                 print()
             self.results.append(entry)
+
+    def finish(self) -> None:
+        """Leave the terminal usable. Overridden where there is a live HUD."""
 
     def print_summary(self) -> None:
         if not self.results:
@@ -626,6 +676,497 @@ class LeapSyncSession(SyncSession):
                   f"than {MIN_VISIBLE_TIME_US / 1000:.0f} ms (settling)")
 
 
+@dataclass
+class Attempt:
+    """One try at one take: what it produced, or why it was thrown away."""
+
+    complete: bool = False
+    why: str = ""
+    hand_id: Optional[int] = None
+    coverage: float = 0.0
+    cam_frames: int = 0
+    glove_frames: int = 0
+    median_height_cm: Optional[float] = None
+    median_view_deg: Optional[float] = None
+    rejected_chirality: int = 0
+    second_hand: int = 0
+    file: str = ""
+
+
+@dataclass
+class TakeResult:
+    """Every attempt at one take, and the one that stuck."""
+
+    pose: str
+    take: int
+    attempts: int = 0
+    complete: bool = False
+    why: str = ""
+    final: Optional[Attempt] = None
+    tries: List[Attempt] = field(default_factory=list)
+
+
+class Quit(Exception):
+    """The operator asked to stop (Ctrl+C), mid-acquire."""
+
+
+class CoachedLeapSession(LeapSyncSession):
+    """One hand at a time: acquire it OPEN, call the pose, verify the track.
+
+    The uncoached session records whatever the tracker hands it for
+    `--duration` seconds. On a gloved hand that produced takes in which the
+    pose was never tracked at all, or was tracked as the other hand — a
+    mirrored skeleton — and nobody knew until the files were analysed. This
+    session refuses to produce those files. Per take:
+
+      ACQUIRE   the expected hand, OPEN, held for half a second, inside the
+                height band, palm toward the lens and roughly over the module.
+                Nothing is recorded and no pose is asked for until all of that
+                holds at once, because the measured failure is that the
+                tracker cannot pick up a gloved hand that is already closed.
+      SETTLE    a beep, "NOW: <pose>", and `--settle` seconds for the hand to
+                change shape while the tracker follows it. The hand id is
+                pinned at acquire; if it changes here, the tracker let go and
+                found the hand again, which is exactly the re-acquisition that
+                guesses the wrong chirality.
+      REC       `--duration` seconds, and only if that same id is still on the
+                hand. A take counts as complete when the expected hand, on
+                that one id, covers >= 90 % of it.
+
+    Anything less is discarded — both files, so a failed attempt leaves no
+    half-take on disk to be analysed later by mistake — and retried from
+    ACQUIRE up to `--retries` times before the take is marked failed.
+
+    Chirality is enforced on every frame, not checked afterwards: a camera
+    hand of the other side is counted and dropped, never written. That is the
+    one failure the old files could not be rescued from, because a mirrored
+    left hand labelled `right` fuses against the right glove and produces a
+    plausible, wrong result.
+    """
+
+    dots = False
+
+    def __init__(self, leap_source, glove_source, hz, out_dir: Path,
+                 leap_hz=None, hand: str = "left", band=DEFAULT_BAND,
+                 settle: float = DEFAULT_SETTLE, retries: int = DEFAULT_RETRIES,
+                 acquire_timeout: float = 60.0):
+        super().__init__(leap_source, glove_source, hz=hz, out_dir=out_dir,
+                         leap_hz=leap_hz)
+        self.hand = hand
+        self.band = band
+        self.settle = float(settle)
+        self.retries = int(retries)
+        self.acquire_timeout = float(acquire_timeout)
+
+        # Counted for the whole session and per attempt (see `_mark`).
+        self.rejected_chirality = 0      # camera hands of the OTHER side
+        self.second_hand = 0             # expected side, but not our hand id
+        self.glove_other_hand = 0        # glove packets from the other hand
+        self.takes: List[TakeResult] = []
+
+        self.beeper = AsyncBeeper(beep)
+        self.hud = Hud(self._write)
+        self._phase = "start"
+        self._deadline: Optional[float] = None
+        self._hud_extra = ""
+        # The latest reading of the expected hand, and when it arrived. Held
+        # with its timestamp rather than cleared, so the HUD can tell "the
+        # hand is gone" from "no frame has been drained this millisecond".
+        self._reading = None
+        self._reading_at = 0.0
+        self._other_at = 0.0
+        self._pinned_id: Optional[int] = None
+        self._pinned_at = 0.0
+        self._changed_to: Optional[int] = None
+        self._heights: List[float] = []
+        self._angles: List[float] = []
+        self._times: List[float] = []
+        self._glove_hz = 0.0
+        self._rate_at = time.time()
+        self._rate_mark = 0
+
+    # --- plumbing --------------------------------------------------------
+    @staticmethod
+    def _write(text: str) -> None:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def accept_glove(self, frame) -> bool:
+        """Only the hand this session is about. See the class docstring.
+
+        XR Trainer streams both gloves regardless, and a take whose camera
+        file holds one hand and whose glove file holds two is tagged `both`
+        and half of it can never pair.
+        """
+        if frame.hand_side == self.hand:
+            return True
+        self.glove_other_hand += 1
+        return False
+
+    def tick(self, cam_rec=None, glove_rec=None, banner="", sub="", rec=False):
+        """Drain both sensors once. The chirality gate lives here.
+
+        This is the only place a camera hand can reach a recorder, which is
+        why the wrong-hand and second-hand checks are here and not in a
+        post-pass: a frame that is never accepted here is never written, and
+        `--hand left` therefore cannot produce a right-handed line.
+        """
+        self.glove_total += self._pump_glove(glove_rec)
+        hands = []
+        now = time.time()
+        for _side, lh in self.leap.drain(64):
+            if lh.framerate:
+                self._framerate = float(lh.framerate)
+            self._sides.add(lh.hand_side)
+            self.hand_total += 1
+            if lh.hand_side != self.hand:
+                self.rejected_chirality += 1
+                self._other_at = now
+                continue
+            if self._pinned_id is not None and lh.hand_id != self._pinned_id:
+                # Right side, wrong hand: either a second hand in the field or
+                # the tracker re-acquiring ours under a new id. Which one it is
+                # comes out of `_lost_reason`, which knows whether the pinned
+                # id is still delivering.
+                self.second_hand += 1
+                self._changed_to = lh.hand_id
+                continue
+            reading = read_hand(lh)
+            self._reading, self._reading_at = reading, now
+            if lh.visible_time_us < MIN_VISIBLE_TIME_US:
+                self.skipped_young += 1
+                continue
+            self.cam_sides.add(lh.hand_side)
+            hands.append(lh)
+            if self._pinned_id is not None:
+                self._pinned_at = now
+            if cam_rec is not None:
+                cam_rec.record(lh)
+                self._heights.append(reading.height_cm)
+                if reading.view_angle_deg is not None:
+                    self._angles.append(reading.view_angle_deg)
+                self._times.append(float(lh.capture_time)
+                                   if lh.capture_time is not None else now)
+        self._show_hud(now)
+        # Nothing in this loop blocks — the beeps are on their own thread — so
+        # yield the CPU rather than spin on an empty queue.
+        time.sleep(0.005)
+        return hands
+
+    def _print_hud(self, rec: bool) -> None:
+        """The once-a-second HUD of the uncoached session. Replaced here."""
+
+    def _show_hud(self, now: float) -> None:
+        fresh = (self._reading
+                 if now - self._reading_at < HUD_STALE_S else None)
+        if now - self._rate_at >= 1.0:
+            self._glove_hz = ((self.glove_total - self._rate_mark)
+                              / (now - self._rate_at))
+            self._rate_at, self._rate_mark = now, self.glove_total
+        left = None if self._deadline is None else self._deadline - now
+        self.hud.show(hud_line(self._phase, left, fresh, self.hand, self.band,
+                               self._glove_hz,
+                               saw_other_hand=now - self._other_at < HUD_STALE_S,
+                               extra=self._hud_extra), now)
+
+    def _say(self, *lines: str) -> None:
+        """Print above the HUD line, leaving the HUD to reopen underneath."""
+        self.hud.close()
+        for line in lines:
+            print(line, flush=True)
+
+    # --- readiness -------------------------------------------------------
+    def wait_for_both(self, timeout: float = 120.0) -> None:
+        """Wait for the GLOVE only; the camera is the ACQUIRE phase's job.
+
+        The uncoached session will not start until both sensors have seen the
+        same hand. Here that check would be in the wrong place twice over: the
+        camera side is re-checked, harder, at the start of every single take,
+        and blocking on it up front means an operator with no hand over the
+        module gets a timeout instead of the ACQUIRE prompt telling them what
+        to do about it.
+        """
+        print(f"Waiting for the glove on the {self.hand.upper()} hand "
+              f"({self.host_text()})...")
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            self.glove_total += self._pump_glove()
+            time.sleep(0.01)
+            if self.glove_total >= 10 and self.hand in self.glove_sides:
+                print(f"  OK - glove streaming: {self.hand}\n")
+                return
+        raise SystemExit(self.not_ready_message(self.glove_total,
+                                                self.hand_total))
+
+    def host_text(self) -> str:
+        return "mock" if isinstance(self.glove, MockGloveSource) else "OSC"
+
+    def not_ready_message(self, glove_ok: int, cam_ok: int) -> str:
+        if glove_ok and self.hand not in self.glove_sides:
+            return (f"The glove is streaming {hands_text(self.glove_sides)}, "
+                    f"not {self.hand}. Put the glove on the {self.hand} hand, "
+                    f"or re-run with --hand "
+                    f"{'right' if self.hand == 'left' else 'left'}.")
+        return (f"Only got {glove_ok} glove packets. Check XR Trainer is "
+                "streaming (scripts/glove/run_osc.py --dump --no-viz).")
+
+    # --- one attempt -----------------------------------------------------
+    def _mark(self) -> tuple:
+        """The two per-frame rejection counters, for differencing."""
+        return (self.rejected_chirality, self.second_hand)
+
+    def _lost_reason(self, now: float) -> str:
+        """Why the acquired hand is no longer the acquired hand, or ""."""
+        if self._changed_to is not None and now - self._pinned_at > LOST_S:
+            return (f"the tracker let go and re-acquired the hand "
+                    f"(id {self._pinned_id} -> {self._changed_to})")
+        if now - self._pinned_at > LOST_S:
+            return (f"the {self.hand} hand was lost for "
+                    f"{now - self._pinned_at:.1f} s")
+        return ""
+
+    def _acquire(self, pose: str, attempt: int) -> None:
+        """Block until the expected hand is open, steady and well placed."""
+        self._pinned_id, self._changed_to = None, None
+        self._reading, self._reading_at = None, 0.0
+        self._phase, self._deadline = "ACQUIRE", None
+        self._say(*[f"      {line}" for line in acquire_prompt(pose, self.hand)],
+                  f"      Height band {band_text(self.band)}; "
+                  f"attempt {attempt}/{self.retries + 1}.")
+        t0 = time.time()
+        while True:
+            self.tick()
+            now = time.time()
+            fresh = (self._reading
+                     if now - self._reading_at < HUD_STALE_S else None)
+            bad = acquire_failures(fresh, self.hand, self.band)
+            self._hud_extra = "" if not bad else "need: " + ", ".join(bad)
+            if not bad:
+                self._pinned_id = fresh.hand_id
+                self._pinned_at = now
+                self._changed_to = None
+                self._hud_extra = ""
+                return
+            if now - t0 > self.acquire_timeout:
+                raise TimeoutError(
+                    f"no acquirable {self.hand} hand in "
+                    f"{self.acquire_timeout:g} s ({self._hud_extra})")
+
+    def _hold(self, phase: str, seconds: float, cam_rec=None,
+              glove_rec=None) -> str:
+        """Tick for `seconds`, watching the pinned hand. "" = it survived."""
+        self._phase = phase
+        t_end = time.time() + seconds
+        self._deadline = t_end
+        while time.time() < t_end:
+            self.tick(cam_rec, glove_rec)
+            reason = self._lost_reason(time.time())
+            if reason:
+                return reason
+        return ""
+
+    def _attempt(self, pose: str, take: int, duration: float,
+                 attempt: int) -> Attempt:
+        self._acquire(pose, attempt)
+        before = self._mark()
+
+        # The beep goes to a thread: this one is the capture clock now, and a
+        # quarter second of blocked frame loop in the middle of a take is a
+        # quarter second of hand that nobody recorded.
+        self.beeper.beep(1000, 200)
+        self._say(f"      NOW: {pose.replace('_', ' ').upper()}  "
+                  f"({self.settle:g} s to change shape, "
+                  f"hand id {self._pinned_id})")
+        lost = self._hold("SETTLE", self.settle)
+        if lost:
+            return Attempt(why=f"{lost} during the settle",
+                           hand_id=self._pinned_id,
+                           rejected_chirality=self.rejected_chirality - before[0],
+                           second_hand=self.second_hand - before[1])
+
+        name = pose_filename(pose, take)          # one name, two files
+        cam_rec = self.make_cam_recorder(pose, take)
+        glove_rec = StampedFrameRecorder(hz=self.hz, pose=pose, take=take)
+        self._heights, self._angles, self._times = [], [], []
+        self.discard_backlog()
+        cam_rec.start(self.cam_dir / name)
+        glove_rec.start(self.glove_dir / name)
+        self.beeper.beep(1400, 120)
+        t0 = time.time()
+        try:
+            lost = self._hold("REC", duration, cam_rec, glove_rec)
+        except BaseException:
+            # Ctrl+C included. An interrupted take is an unverified take, and
+            # the whole point of this session is that unverified takes do not
+            # reach the disk.
+            cam_rec.stop()
+            glove_rec.stop()
+            self._deadline = None
+            (self.cam_dir / name).unlink(missing_ok=True)
+            (self.glove_dir / name).unlink(missing_ok=True)
+            raise
+        cam_rec.stop()
+        glove_rec.stop()
+        self.beeper.beep(500, 200)
+        self._deadline = None
+        t1 = time.time()
+
+        got = Attempt(
+            hand_id=self._pinned_id,
+            coverage=coverage(self._times, t0, min(t1, t0 + duration)),
+            cam_frames=cam_rec.count, glove_frames=glove_rec.count,
+            median_height_cm=median(self._heights),
+            median_view_deg=median(self._angles),
+            rejected_chirality=self.rejected_chirality - before[0],
+            second_hand=self.second_hand - before[1],
+        )
+        if lost:
+            got.why = f"{lost} during the take"
+        elif got.coverage < COMPLETE_COVERAGE:
+            got.why = (f"the {self.hand} hand covered only "
+                       f"{got.coverage * 100:.0f} % of the take "
+                       f"(need {COMPLETE_COVERAGE * 100:.0f} %)")
+        else:
+            got.complete = True
+
+        if not got.complete:
+            # Both files, so a thrown-away attempt leaves nothing on disk that
+            # a later analysis could mistake for a take.
+            (self.cam_dir / name).unlink(missing_ok=True)
+            (self.glove_dir / name).unlink(missing_ok=True)
+            return got
+
+        final = cam_finalize(self.cam_dir / name, {self.hand})
+        cam_finalize(self.glove_dir / name, {self.hand})
+        got.file = final.name
+        return got
+
+    # --- one take --------------------------------------------------------
+    def run_take(self, pose: str, take: int, n_takes: int, pose_idx: int,
+                 n_poses: int, duration: float, prep: float) -> None:
+        self._warned = set()
+        title = pose.replace("_", " ").upper()
+        self._say("", f"--- Pose {pose_idx}/{n_poses}: {title}  "
+                      f"(take {take}/{n_takes}, {self.hand} hand) ---")
+        result = TakeResult(pose=pose, take=take)
+        try:
+            for attempt in range(1, self.retries + 2):
+                result.attempts = attempt
+                got = self._attempt(pose, take, duration, attempt)
+                result.tries.append(got)
+                if got.complete:
+                    result.complete, result.final = True, got
+                    self._say(f"      OK  {got.file}  coverage "
+                              f"{got.coverage * 100:.0f} %, hand id "
+                              f"{got.hand_id}, {got.cam_frames} camera / "
+                              f"{got.glove_frames} glove frames")
+                    break
+                self._say(f"      DISCARDED: {got.why}")
+                if attempt <= self.retries:
+                    self._say(f"      retrying ({attempt}/{self.retries})")
+            if not result.complete:
+                result.why = result.tries[-1].why if result.tries else "no attempt"
+                result.final = result.tries[-1] if result.tries else None
+                self._say(f"      FAILED after {result.attempts} attempt(s): "
+                          f"{result.why}")
+        except TimeoutError as e:
+            result.why = str(e)
+            self._say(f"      FAILED: {e}")
+        finally:
+            self.hud.close()
+            self._phase, self._deadline, self._hud_extra = "idle", None, ""
+            self._pinned_id = None
+            self.takes.append(result)
+            self._write_meta(result)
+
+    def _write_meta(self, result: TakeResult) -> None:
+        """`<take>.meta.json`: how the take was got, beside the take itself.
+
+        Only for a take that produced a file — there is nothing for a failed
+        take to sit beside, and the session summary is where those are
+        reported. Everything here is a fact about the capture, which is what
+        the fusion gates and the next session's protocol both read.
+        """
+        got = result.final
+        if not (result.complete and got and got.file):
+            return
+        path = self.cam_dir / (got.file[:-len(".jsonl")] + ".meta.json")
+        path.write_text(json.dumps({
+            "hand": self.hand,
+            "pose": result.pose,
+            "take": result.take,
+            "hand_id": got.hand_id,
+            "coverage": round(got.coverage, 4),
+            "attempts": result.attempts,
+            "median_height_cm": (None if got.median_height_cm is None
+                                 else round(got.median_height_cm, 1)),
+            "median_view_angle_deg": (None if got.median_view_deg is None
+                                      else round(got.median_view_deg, 1)),
+            "rejected_chirality": got.rejected_chirality,
+            "second_hand_frames": got.second_hand,
+            "band_cm": list(self.band),
+            "settle_s": self.settle,
+            "cam_frames": got.cam_frames,
+            "glove_frames": got.glove_frames,
+            "file": got.file,
+        }, indent=2) + "\n", encoding="utf-8")
+
+    # --- the end ---------------------------------------------------------
+    def finish(self) -> None:
+        """End the HUD line and let the queued beeps drain. Ctrl+C safe."""
+        self.hud.close()
+        self.beeper.stop()
+
+    def redo_command(self, failed: List[str], takes: int) -> str:
+        return ("python scripts/record_simultaneous.py --camera leap "
+                f"--hand {self.hand} --poses {','.join(failed)} "
+                f"--takes {takes}")
+
+    def print_summary(self) -> None:
+        self.hud.close()
+        if not self.takes:
+            print("\nNothing recorded.")
+            return
+        by_pose: dict = {}
+        for r in self.takes:
+            by_pose.setdefault(r.pose, []).append(r)
+        done = sum(1 for r in self.takes if r.complete)
+        print("=" * 62)
+        print(f"Session summary ({self.hand} hand): {done}/{len(self.takes)} "
+              "takes complete")
+        for pose, rows in by_pose.items():
+            ok = [r for r in rows if r.complete]
+            note = ""
+            if len(ok) < len(rows):
+                last = next(r.why for r in reversed(rows) if not r.complete)
+                note = f"   last failure: {last}"
+            attempts = sum(r.attempts for r in rows)
+            print(f"  {pose:<12} {len(ok)}/{len(rows)} complete "
+                  f"({attempts} attempt(s)){note}")
+        print(f"\n  camera hands dropped as the wrong chirality: "
+              f"{self.rejected_chirality}")
+        print(f"  camera hands dropped as a second hand in view:  "
+              f"{self.second_hand}")
+        if self.glove_other_hand:
+            print(f"  glove packets dropped from the other hand:     "
+                  f"{self.glove_other_hand}")
+        if self.skipped_young:
+            print(f"  camera hands skipped while settling (<"
+                  f"{MIN_VISIBLE_TIME_US / 1000:.0f} ms): {self.skipped_young}")
+        if done:
+            print(f"\n  glove files: {self.glove_dir}")
+            print(f"  cam files:   {self.cam_dir}   (+ <take>.meta.json)")
+            print(f"  fuse + compare:  python scripts/fuse_poses.py "
+                  f"{self.out_dir}")
+        failed = [p for p, rows in by_pose.items()
+                  if any(not r.complete for r in rows)]
+        if failed:
+            takes = max(sum(1 for r in by_pose[p] if not r.complete)
+                        for p in failed)
+            print("\n  Redo ONLY the poses that failed:")
+            print(f"    {self.redo_command(failed, takes)}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Guided pose session recording glove and camera together.")
@@ -663,6 +1204,25 @@ def main() -> None:
     p.add_argument("--mode", default="desktop",
                    choices=("desktop", "hmd", "screentop"),
                    help="Ultraleap tracking mode (--camera leap)")
+    p.add_argument("--hand", default=None, choices=("left", "right", BOTH),
+                   help="which hand this session is about. REQUIRED with "
+                        "--camera leap: 'left' or 'right' runs the coached "
+                        "one-hand protocol (acquire open, then pose) and "
+                        "records only that hand; 'both' is the old uncoached "
+                        "behaviour. Ignored by the webcam backend.")
+    p.add_argument("--settle", type=float, default=DEFAULT_SETTLE,
+                   help="seconds to change from open palm into the pose while "
+                        f"the tracker follows (default: {DEFAULT_SETTLE:g})")
+    p.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
+                   help="retries per take after a lost or re-acquired hand, "
+                        f"so 1 + this many attempts (default: {DEFAULT_RETRIES})")
+    p.add_argument("--band", default=None,
+                   help="palm height band LOW,HIGH in centimetres for the "
+                        f"coached HUD (default: {DEFAULT_BAND[0]:g},"
+                        f"{DEFAULT_BAND[1]:g})")
+    p.add_argument("--acquire-timeout", type=float, default=60.0,
+                   help="seconds to wait for an acquirable hand before the "
+                        "take is marked failed (default: 60)")
     p.add_argument("--no-mirror", action="store_true")
     p.add_argument("--no-preview", action="store_true")
     args = p.parse_args()
@@ -680,6 +1240,25 @@ def main() -> None:
                 f"--camera takes a webcam index or 'leap', not {args.camera!r}")
     if args.mock_leap and backend != LEAP:
         raise SystemExit("--mock-leap only means anything with --camera leap")
+    if backend == LEAP and args.hand is None:
+        raise SystemExit(
+            "--hand is required with --camera leap. The tracker cannot pick "
+            "up a gloved hand that is already in a pose, and when it "
+            "re-acquires one it sometimes returns the mirror image labelled "
+            "as the other hand, so a session has to say which hand it is "
+            "about:\n"
+            "  --hand left     coached, one hand, nothing else recorded\n"
+            "  --hand right    the same for the right hand\n"
+            "  --hand both     the old uncoached behaviour, both hands kept")
+    if args.retries < 0:
+        raise SystemExit("--retries cannot be negative")
+    if args.settle < 0:
+        raise SystemExit("--settle cannot be negative")
+    try:
+        band = parse_band(args.band) if args.band else DEFAULT_BAND
+    except ValueError as e:
+        raise SystemExit(str(e))
+    coached = backend == LEAP and args.hand in ("left", "right")
 
     eta = len(poses) * args.takes * (args.prep + args.duration)
     camera_text = (("MOCK leap" if args.mock_leap else "Ultraleap SIR 170")
@@ -690,9 +1269,18 @@ def main() -> None:
     print(f"  poses: {', '.join(poses)}")
     print(f"  glove: {'MOCK' if args.mock_glove else f'{args.host}:{args.port}'}"
           f"   camera: {camera_text}   output: {args.out_dir}")
-    print("  Wear the glove AND keep the hand "
-          + ("20 to 50 cm above the module." if backend == LEAP
-             else "in the camera frame."))
+    if coached:
+        print(f"  COACHED, {args.hand.upper()} HAND ONLY: each take is "
+              "acquired with an open palm, then")
+        print(f"  the pose is called and the same hand id has to survive "
+              f"{args.settle:g} s of transition.")
+        print(f"  Height band {band_text(band)}; up to {args.retries} "
+              "retries per take. ONE HAND OVER THE")
+        print("  MODULE — keep the other one out of the field.")
+    else:
+        print("  Wear the glove AND keep the hand "
+              + ("20 to 50 cm above the module." if backend == LEAP
+                 else "in the camera frame."))
     print("=" * 62 + "\n")
 
     glove = (MockGloveSource() if args.mock_glove
@@ -707,9 +1295,16 @@ def main() -> None:
                 leap = open_stream(mock=args.mock_leap, mode=args.mode)
             except LeapUnavailable as e:
                 raise SystemExit(f"\nNo live tracking: {e}\n")
-            session = LeapSyncSession(leap, glove, hz=args.hz or None,
-                                      out_dir=args.out_dir,
-                                      leap_hz=args.leap_hz or None)
+            if coached:
+                session = CoachedLeapSession(
+                    leap, glove, hz=args.hz or None, out_dir=args.out_dir,
+                    leap_hz=args.leap_hz or None, hand=args.hand, band=band,
+                    settle=args.settle, retries=args.retries,
+                    acquire_timeout=args.acquire_timeout)
+            else:
+                session = LeapSyncSession(leap, glove, hz=args.hz or None,
+                                          out_dir=args.out_dir,
+                                          leap_hz=args.leap_hz or None)
         else:
             cap = open_camera(camera_index, args.width, args.height)
             tracker = HandTracker(model_path=args.model, running_mode="video",
@@ -728,8 +1323,10 @@ def main() -> None:
                     session.run_take(pose, take, args.takes, i, len(poses),
                                      args.duration, args.prep)
         except (KeyboardInterrupt, QuitSession):
+            session.finish()
             print("\nInterrupted — keeping the takes recorded so far.")
         finally:
+            session.finish()
             session.print_summary()
     finally:
         glove.stop()
