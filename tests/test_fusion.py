@@ -439,3 +439,90 @@ def test_the_same_hand_fuses_the_same_through_either_camera_loader(tmp_path):
     assert info_leap["alignment"] == "rigid"
     assert info_cam["alignment"] == "similarity"
     assert np.allclose(through_leap, through_cam, atol=1e-9)
+
+
+# --- which clock pairs the two streams ---------------------------------
+# `wall_time` is a WRITER stamp. Both recorders drain a queue and write the
+# burst it held, so frames captured hundreds of ms apart can share a
+# wall_time. `capture_time` is when the sensor had the frame. These pin that
+# the right one is chosen, and that choosing it actually changes the answer.
+
+def test_pairing_clock_needs_capture_time_on_every_frame():
+    from cam_hand.fusion import pairing_clock
+
+    full = [{"wall_time": 1.0, "capture_time": 0.9},
+            {"wall_time": 1.1, "capture_time": 1.0}]
+    assert pairing_clock(full, full) == "capture_time"
+    # one stream without it: a mixture would compare two different clocks
+    old = [{"wall_time": 1.0}, {"wall_time": 1.1}]
+    assert pairing_clock(full, old) == "wall_time"
+    assert pairing_clock(old, full) == "wall_time"
+    # one FRAME without it is enough, and so is an explicit null
+    partial = [{"wall_time": 1.0, "capture_time": 0.9}, {"wall_time": 1.1}]
+    assert pairing_clock(full, partial) == "wall_time"
+    nulled = [{"wall_time": 1.0, "capture_time": None}]
+    assert pairing_clock(full, nulled) == "wall_time"
+    assert pairing_clock([], []) == "wall_time"
+
+
+def test_a_written_burst_pairs_wrong_on_wall_time_and_right_on_capture_time():
+    """The bug, in eight frames.
+
+    The camera queued four frames 30 ms apart and they were all written in
+    one pass, a millisecond apart. On the writer's clock every one of them
+    looks equally close to the glove frame, so the FIRST wins by scan order;
+    on the capture clock the one actually taken at that moment wins.
+    """
+    glove = [{"wall_time": 100.000, "capture_time": 100.000,
+              "hand_side": "right"}]
+    cam = [{"wall_time": 100.050 + i * 0.001, "capture_time": 99.940 + i * 0.030,
+            "hand_side": "right", "tag": i} for i in range(4)]
+    #        capture times: 99.940, 99.970, 100.000, 100.030
+    #        the glove frame was captured at 100.000, so tag 2 is the partner
+
+    on_wall = pair_by_time(glove, cam, max_dt=0.05, clock="wall_time")[0][1]
+    on_capture = pair_by_time(glove, cam, max_dt=0.05, clock="capture_time")[0][1]
+    assert on_capture["tag"] == 2, "capture_time must pick the frame of that instant"
+    assert on_wall["tag"] != 2, "wall_time cannot tell these four apart"
+    # auto picks the right one, because every frame here has a capture_time
+    assert pair_by_time(glove, cam, max_dt=0.05)[0][1]["tag"] == 2
+
+
+def test_wall_time_pairing_can_exceed_the_window_it_reports():
+    """Worse than picking wrong: it picks a frame outside --max-dt and says ok."""
+    glove = [{"wall_time": 100.0, "capture_time": 100.0, "hand_side": "left"}]
+    cam = [{"wall_time": 100.001, "capture_time": 99.80, "hand_side": "left"}]
+
+    paired = pair_by_time(glove, cam, max_dt=0.05, clock="wall_time")[0][1]
+    assert paired is not None                       # "matched within 50 ms"
+    assert abs(paired["capture_time"] - glove[0]["capture_time"]) > 0.05
+    # on the real clock it is correctly refused
+    assert pair_by_time(glove, cam, max_dt=0.05)[0][1] is None
+
+
+def test_old_recordings_without_capture_time_still_pair():
+    """Files recorded before capture_time existed must keep working."""
+    glove = [{"wall_time": 10.00, "hand_side": "right"},
+             {"wall_time": 10.10, "hand_side": "right"}]
+    cam = [{"wall_time": 9.99, "hand_side": "right", "tag": "a"},
+           {"wall_time": 10.12, "hand_side": "right", "tag": "b"}]
+    assert [c["tag"] for _g, c in pair_by_time(glove, cam, max_dt=0.05)] == ["a", "b"]
+
+
+def test_one_take_name_under_two_cameras_is_an_error_not_a_coin_flip(tmp_path):
+    """Two sensors, two alignments: picking by folder order picks by accident."""
+    fuse = _fuse_module()
+    name = "fist_right_take1_20260916_230000.jsonl"
+    _write_leap_take(tmp_path / "leap" / name, spread_deg=10.0, curl=0.2)
+    (tmp_path / "cam").mkdir()
+    (tmp_path / "cam" / name).write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(fuse.AmbiguousTake) as e:
+        fuse.find_camera_take(tmp_path, name)
+    assert "cam" in str(e.value) and "leap" in str(e.value)
+    assert "--camera" in str(e.value)            # and it says how to resolve it
+
+    # naming a camera resolves it, and only looks where it was told
+    assert fuse.find_camera_take(tmp_path, name, "leap") == tmp_path / "leap" / name
+    assert fuse.find_camera_take(tmp_path, name, "cam") == tmp_path / "cam" / name
+    assert fuse.find_camera_take(tmp_path, "absent.jsonl", "leap") is None

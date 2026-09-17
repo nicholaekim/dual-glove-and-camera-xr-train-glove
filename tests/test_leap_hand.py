@@ -1280,6 +1280,102 @@ def test_the_start_beep_cannot_backdate_the_head_of_a_take(tmp_path: Path,
         "the beep's backlog, written as if it had just been captured")
 
 
+def test_both_sides_record_a_capture_time_and_it_is_used(tmp_path: Path,
+                                                         monkeypatch):
+    """The clock the two files are actually paired on, end to end."""
+    import json
+
+    from cam_hand.fusion import pairing_clock
+    from xr_hand.recorder import FrameRecorder as PlainFrameRecorder
+
+    _sync, out_dir = _mock_sync_run(tmp_path, monkeypatch)
+    glove_path = sorted((out_dir / "glove").glob("*.jsonl"))[0]
+    cam_path = sorted((out_dir / "leap").glob("*.jsonl"))[0]
+
+    def rows(path):
+        return [json.loads(line) for line
+                in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    glove, cam = rows(glove_path), rows(cam_path)
+    for name, side in (("glove", glove), ("leap", cam)):
+        assert all(r.get("capture_time") is not None for r in side), name
+        # it is a real wall-clock instant, at or before the write
+        for r in side:
+            assert 0.0 <= r["wall_time"] - r["capture_time"] < 5.0, name
+    # the camera keeps the keys a later latency question is answered from
+    assert all(r.get("timestamp_us") is not None for r in cam)
+    assert all("frame_age_us" in r for r in cam)
+    assert pairing_clock(glove, cam) == "capture_time"
+
+    # the added key must not stop any existing reader: this is the loader
+    # every glove tool in the repo uses
+    frames = list(PlainFrameRecorder.load(glove_path))
+    assert len(frames) == len(glove)
+    assert frames[0][0].hand_side in ("left", "right")
+
+
+def test_the_glove_recorder_adds_capture_time_without_changing_the_default():
+    """StampedFrameRecorder adds one key; FrameRecorder's output is untouched."""
+    import json
+    import tempfile
+
+    from xr_hand.mock import MockHandGenerator
+    from xr_hand.parser import parse_hand_message
+    from xr_hand.recorder import FrameRecorder as PlainFrameRecorder
+
+    sync = _load_repo_script("record_simultaneous")
+    frame = parse_hand_message(MockHandGenerator(hand="right").next_frame(),
+                               hand_side_hint="right")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stamped = Path(tmp) / "stamped.jsonl"
+        plain = Path(tmp) / "plain.jsonl"
+
+        rec = sync.StampedFrameRecorder(pose="fist", take=1)
+        rec.start(stamped)
+        rec.record(frame, capture_time=1234.5)
+        rec.record(frame)                      # no stamp given -> no key
+        rec.stop()
+
+        ref = PlainFrameRecorder(pose="fist", take=1)
+        ref.start(plain)
+        ref.record(frame)
+        ref.stop()
+
+        lines = [json.loads(x) for x
+                 in stamped.read_text(encoding="utf-8").splitlines() if x.strip()]
+        base = json.loads(plain.read_text(encoding="utf-8").splitlines()[0])
+
+    assert lines[0]["capture_time"] == pytest.approx(1234.5)
+    assert "capture_time" not in lines[1]
+    assert "capture_time" not in base, "the plain recorder must be unchanged"
+    # everything else is identical, key for key
+    assert set(lines[0]) - {"capture_time"} == set(base)
+
+
+def test_the_osc_queue_item_carries_arrival_time_and_still_unpacks():
+    """Frozen scripts do `for hand, raw in drain(64)`; that must keep working."""
+    import time as _time
+
+    from xr_hand.receiver import OSCHandReceiver, QueueItem
+
+    item = QueueItem("left", [1.0, 2.0], recv_time=99.5)
+    hand, raw = item                            # the two-value unpack
+    assert hand == "left" and raw == [1.0, 2.0]
+    assert item.recv_time == 99.5
+    assert item == ("left", [1.0, 2.0])         # still equal to a plain tuple
+    assert QueueItem("left", [1.0]).recv_time == 0.0   # default
+
+    # and the receiver really stamps it, on the thread that took the packet
+    rx = OSCHandReceiver()
+    before = _time.time()
+    rx._enqueue("right", "/addr", [0.0] * 187)
+    after = _time.time()
+    queued = rx.drain(4)[0]
+    assert before <= queued.recv_time <= after
+    assert queued[0] == "right"
+
+
 def test_a_take_needs_one_hand_on_BOTH_sensors_not_frames_on_each():
     """camera=left + glove=right is plenty of frames and exactly zero pairs."""
     sync = _load_repo_script("record_simultaneous")

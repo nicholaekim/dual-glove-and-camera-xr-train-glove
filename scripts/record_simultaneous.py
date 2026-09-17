@@ -43,6 +43,7 @@ Usage:
   python scripts/record_simultaneous.py --camera leap         # Path A
 """
 import argparse
+import json
 import time
 from pathlib import Path
 
@@ -62,7 +63,7 @@ from leap_hand.stream import LeapUnavailable, open_stream
 
 # The glove side comes from the xr_hand package in this repo.
 from xr_hand.parser import parse_hand_message
-from xr_hand.receiver import OSCHandReceiver
+from xr_hand.receiver import OSCHandReceiver, QueueItem
 from xr_hand.recorder import FrameRecorder
 from xr_hand.validator import StreamMonitor, validate_raw_message
 
@@ -96,6 +97,62 @@ def beep(freq: int = 880, ms: int = 180) -> None:
 
 class QuitSession(Exception):
     pass
+
+
+class _CaptureTimeWriter:
+    """The recorder's file handle, with `capture_time` added to each line.
+
+    `FrameRecorder.record` builds its dict and writes it in one call, and
+    `FrameRecorder` itself is not changed here: other callers' files must
+    keep exactly the keys they have. So the stamp is added where the line
+    meets the file, rather than by reimplementing `record()` along with its
+    per-hand rate throttle — one key injected, no logic duplicated.
+
+    `FrameRecorder.load` ignores keys it does not know, so playback, the
+    exporters and keypoints21 read these files unchanged.
+    """
+
+    def __init__(self, fh, owner):
+        self._fh = fh
+        self._owner = owner
+
+    def write(self, text: str) -> int:
+        capture = self._owner.capture_time
+        if capture is not None and text.strip():
+            d = json.loads(text)
+            d["capture_time"] = round(float(capture), 6)
+            text = json.dumps(d) + "\n"
+        return self._fh.write(text)
+
+    def flush(self) -> None:
+        self._fh.flush()
+
+    def close(self) -> None:
+        self._fh.close()
+
+
+class StampedFrameRecorder(FrameRecorder):
+    """A glove recorder that also records WHEN THE PACKET ARRIVED.
+
+    `wall_time` is the moment the line was written, which on a busy loop can
+    be tens of milliseconds after the packet landed and is near-identical
+    across a drained burst. `capture_time` is `QueueItem.recv_time`, taken on
+    the OSC server thread as the packet arrived — the glove's closest
+    equivalent to the camera's capture instant, and the clock `fuse_poses.py`
+    pairs on when both sides have it.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.capture_time = None
+
+    def start(self, path):
+        super().start(path)
+        self._file = _CaptureTimeWriter(self._file, self)
+
+    def record(self, frame, capture_time=None) -> None:
+        self.capture_time = capture_time
+        super().record(frame)
 
 
 def hands_text(sides) -> str:
@@ -139,9 +196,14 @@ class MockGloveSource:
         n = min(int((now - self._last) * 60.0), max_items // 2)
         if n <= 0:
             return []
+        # `recv_time` is reconstructed from the paced clock rather than set to
+        # `now`, so a backlog drained in one pass carries the arrival times it
+        # would have had — the same property the real receiver gives, and the
+        # reason pairing on the writer's clock fails against this mock too.
+        t0 = self._last
         self._last += n / 60.0
-        return [(hand, gen.next_frame())
-                for _ in range(n) for hand, gen in self.gens.items()]
+        return [QueueItem(hand, gen.next_frame(), recv_time=t0 + k / 60.0)
+                for k in range(n) for hand, gen in self.gens.items()]
 
 
 class SyncSession:
@@ -215,7 +277,8 @@ class SyncSession:
     def _pump_glove(self, recorder=None) -> int:
         """Drain and optionally record glove packets. Returns frames seen."""
         seen = 0
-        for hand, raw in self.glove.drain(64):
+        for item in self.glove.drain(64):
+            hand, raw = item
             result = validate_raw_message(raw)
             if not result.is_valid:
                 self._warn(f"[{hand}] invalid packet: " + "; ".join(result.errors))
@@ -226,7 +289,10 @@ class SyncSession:
             seen += 1
             self.glove_sides.add(frame.hand_side)
             if recorder is not None:
-                recorder.record(frame)
+                # recv_time: when the OSC packet landed, stamped on the server
+                # thread. A drained burst shares a write time but not this.
+                recorder.record(frame, capture_time=getattr(item, "recv_time",
+                                                            None) or None)
         return seen
 
     def _warn(self, msg: str) -> None:
@@ -309,7 +375,7 @@ class SyncSession:
 
         name = pose_filename(pose, take)      # one name, two files
         cam_rec = self.make_cam_recorder(pose, take)
-        glove_rec = FrameRecorder(hz=self.hz, pose=pose, take=take)
+        glove_rec = StampedFrameRecorder(hz=self.hz, pose=pose, take=take)
         # Order matters, and it is not the obvious one. `winsound.Beep`
         # BLOCKS for its whole duration while the OSC thread and the LeapC
         # polling thread keep filling their queues behind it, so whatever is

@@ -191,28 +191,73 @@ def fuse_skeletons(
 
 # --- time alignment ----------------------------------------------------
 
-def pair_by_time(glove: Sequence[dict], cam: Sequence[dict],
-                 max_dt: float = 0.05) -> List[Tuple[dict, Optional[dict]]]:
-    """Match camera frames to glove frames by wall-clock, per hand.
+CAPTURE_CLOCK = "capture_time"
+WALL_CLOCK = "wall_time"
+AUTO = "auto"
 
-    Both recorders stamp time.time() at write, so the streams share a clock
-    even though the glove runs at ~60 Hz and the camera at ~30 Hz. Each glove
-    frame takes the nearest camera frame of the SAME hand within max_dt
-    seconds; frames with no partner pair with None and stay glove-only.
+
+def pairing_clock(*streams: Sequence[dict]) -> str:
+    """Which clock these streams can be paired on: capture_time or wall_time.
+
+    `wall_time` is a WRITER timestamp — the moment a line was written. Both
+    recorders drain a queue and write the burst it held, so frames the
+    sensors captured hundreds of milliseconds apart can carry wall_times a
+    millisecond apart. Pairing on it matches on write order rather than on
+    when the hand was in the pose, and at 90 Hz against 5 Hz that is most of
+    the error budget.
+
+    `capture_time` is when the sensor actually had the frame: for the camera,
+    `time.time()` in the tracking callback minus the frame's age; for the
+    glove, the arrival stamp taken on the OSC server thread. It is the right
+    clock, and it is used only when EVERY frame of EVERY stream carries it —
+    a mixture would silently compare two different clocks, which is worse
+    than using the blunt one consistently. Recordings made before this
+    existed have no `capture_time` at all, so `wall_time` stays the fallback
+    and those files still fuse.
     """
+    for rows in streams:
+        if not rows or any(r.get(CAPTURE_CLOCK) is None for r in rows):
+            return WALL_CLOCK
+    return CAPTURE_CLOCK
+
+
+def _stamp(d: dict, clock: str) -> float:
+    """One frame's time on `clock`, falling back to wall_time if it lacks it.
+
+    The fallback cannot fire under `pairing_clock`, which only chooses a
+    clock every frame has; it is there for a caller that forces one.
+    """
+    v = d.get(clock)
+    return float(v if v is not None else d[WALL_CLOCK])
+
+
+def pair_by_time(glove: Sequence[dict], cam: Sequence[dict],
+                 max_dt: float = 0.05,
+                 clock: str = AUTO) -> List[Tuple[dict, Optional[dict]]]:
+    """Match camera frames to glove frames by a shared clock, per hand.
+
+    Each glove frame takes the nearest camera frame of the SAME hand within
+    max_dt seconds; frames with no partner pair with None and stay
+    glove-only. `clock` is "auto" (ask `pairing_clock`) or a key to force —
+    see `pairing_clock` for why the choice matters.
+    """
+    if clock == AUTO:
+        clock = pairing_clock(glove, cam)
+
     by_hand: Dict[str, List[dict]] = {}
     for c in cam:
         by_hand.setdefault(c["hand_side"], []).append(c)
     for v in by_hand.values():
-        v.sort(key=lambda d: d["wall_time"])
+        v.sort(key=lambda d: _stamp(d, clock))
 
     out: List[Tuple[dict, Optional[dict]]] = []
-    for g in sorted(glove, key=lambda d: d["wall_time"]):
+    for g in sorted(glove, key=lambda d: _stamp(d, clock)):
+        t_g = _stamp(g, clock)
         candidates = by_hand.get(g["hand_side"], [])
         best, best_dt = None, max_dt
         # linear scan is fine: takes are seconds long, not hours
         for c in candidates:
-            dt = abs(c["wall_time"] - g["wall_time"])
+            dt = abs(_stamp(c, clock) - t_g)
             if dt <= best_dt:
                 best, best_dt = c, dt
         out.append((g, best))

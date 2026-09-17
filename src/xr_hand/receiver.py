@@ -21,9 +21,10 @@ Strings in the header are replaced with 0.0 placeholders before queueing so
 the downstream validator/parser only ever see numeric data.
 """
 import logging
+import time
 from queue import Empty, Full, Queue
 from threading import Thread
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 from pythonosc.dispatcher import Dispatcher
 from pythonosc.osc_server import ThreadingOSCUDPServer
@@ -32,7 +33,47 @@ from .joints import EXPECTED_VALUE_COUNT
 
 log = logging.getLogger(__name__)
 
-QueueItem = Tuple[str, List[float]]  # (hand_side, raw_values)
+
+class QueueItem(tuple):
+    """`(hand_side, raw_values)`, carrying `recv_time`: when the packet arrived.
+
+    Still a two-element tuple, deliberately. Every consumer in this repo
+    writes `for hand, raw in receiver.drain(64)`, so widening it would break
+    all of them at once; the arrival stamp rides along as an attribute
+    instead, and code that wants it asks for `item.recv_time`.
+
+    Why it exists: a recorder stamps a frame with `time.time()` as it WRITES
+    the line, and the OSC server fills this queue on its own thread while the
+    main thread is busy elsewhere — beeping, drawing a preview, waiting on a
+    camera frame. A burst drained in one pass therefore gets near-identical
+    write stamps although the packets arrived milliseconds apart. `recv_time`
+    is taken in `_enqueue`, on the server thread, the moment the packet is in
+    hand; it is the closest thing to a capture time the glove offers.
+    `scripts/record_simultaneous.py` writes it into the JSONL as
+    `capture_time` so `fuse_poses.py` can pair glove and camera frames on
+    when they happened rather than on when they were written.
+
+    `recv_time` defaults to 0.0, so `QueueItem(hand, values)` still builds,
+    and a tuple subclass still compares equal to the plain tuple it was.
+
+    No `__slots__`: CPython refuses a non-empty one on a variable-length base
+    like tuple. The per-item `__dict__` costs a little memory on a queue that
+    is bounded at a few hundred items — not worth a second data structure.
+    """
+
+    def __new__(cls, hand_side: str, values: List[float],
+                recv_time: float = 0.0):
+        item = super().__new__(cls, (hand_side, values))
+        item.recv_time = float(recv_time)
+        return item
+
+    @property
+    def hand_side(self) -> str:
+        return self[0]
+
+    @property
+    def values(self) -> List[float]:
+        return self[1]
 
 
 def _hand_from_device_label(label: str) -> Optional[str]:
@@ -116,13 +157,16 @@ class OSCHandReceiver:
         log.debug("ignored OSC address %s (%d args)", address, len(args))
 
     def _enqueue(self, hand: str, address: str, values: List[float]) -> None:
+        # Stamped here, on the OSC server thread, because this is the earliest
+        # moment the packet exists for us. See QueueItem.
+        item = QueueItem(hand, values, recv_time=time.time())
         self.msg_count[hand] += 1
         try:
-            self.queue.put_nowait((hand, values))
+            self.queue.put_nowait(item)
         except Full:
             try:
                 self.queue.get_nowait()
-                self.queue.put_nowait((hand, values))
+                self.queue.put_nowait(item)
             except (Empty, Full):
                 pass
             self.dropped += 1

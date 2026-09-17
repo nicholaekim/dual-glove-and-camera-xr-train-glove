@@ -55,7 +55,7 @@ from cam_hand.features import (
     loo_nearest_centroid,
     mean_vector,
 )
-from cam_hand.fusion import fuse_skeletons, pair_by_time
+from cam_hand.fusion import AUTO, fuse_skeletons, pair_by_time, pairing_clock
 from cam_hand.landmarks import MP21_NAMES
 from cam_hand.recorder import CamRecorder
 
@@ -71,13 +71,19 @@ CAM_DIRS = ("cam", LEAP)
 
 
 def load_glove(path: Path):
-    """Glove JSONL -> dicts with wall_time, hand_side, pose, take, pts (21x3 m)."""
+    """Glove JSONL -> dicts with the clocks, hand_side, pose, take, pts (21x3 m).
+
+    `capture_time` — when the OSC packet arrived, if the file has it — is
+    carried through, because that is the clock `pair_by_time` prefers.
+    Recordings made before it existed simply do not have the key.
+    """
     with open(path, "r", encoding="utf-8") as f:
         labels = [json.loads(line) for line in f if line.strip()]
     out = []
     for d, (frame, wall) in zip(labels, FrameRecorder.load(path)):
         out.append({
             "wall_time": wall,
+            "capture_time": d.get("capture_time"),
             "hand_side": frame.hand_side,
             "pose": d.get("pose", ""),
             "take": d.get("take", ""),
@@ -111,6 +117,11 @@ def load_leap_cam(path: Path):
     There is no confidence to carry: LeapC reports `confidence` as a constant
     1.0, so gating on it would be gating on nothing. A line in the file is a
     frame the tracker actually reported, and `score` is 1.0 to say so.
+
+    The camera-only timing keys ride along untouched — `capture_time` because
+    `pair_by_time` pairs on it, `timestamp_us` and `frame_age_us` because
+    they are what any later question about latency or cadence is answered
+    from, and dropping them here would mean re-reading the file to ask.
     """
     with open(path, "r", encoding="utf-8") as f:
         labels = [json.loads(line) for line in f if line.strip()]
@@ -118,6 +129,9 @@ def load_leap_cam(path: Path):
     for d, (frame, wall) in zip(labels, FrameRecorder.load(path)):
         out.append({
             "wall_time": wall,
+            "capture_time": d.get("capture_time"),
+            "timestamp_us": d.get("timestamp_us"),
+            "frame_age_us": d.get("frame_age_us"),
             "hand_side": frame.hand_side,
             "pose": d.get("pose", ""),
             "take": d.get("take", ""),
@@ -138,6 +152,7 @@ def load_cam(path: Path):
             continue
         out.append({
             "wall_time": d["wall_time"],
+            "capture_time": d.get("capture_time"),
             "hand_side": d["hand_side"],
             "pose": d.get("pose", ""),
             "take": d.get("take", ""),
@@ -147,13 +162,33 @@ def load_cam(path: Path):
     return out, source
 
 
-def find_camera_take(input_dir: Path, name: str):
-    """The camera file paired with a glove take, in cam/ or in leap/."""
-    for folder in CAM_DIRS:
-        candidate = input_dir / folder / name
-        if candidate.is_file():
-            return candidate
-    return None
+class AmbiguousTake(RuntimeError):
+    """One take name, a camera file under cam/ AND under leap/."""
+
+
+def find_camera_take(input_dir: Path, name: str, camera: str = AUTO):
+    """The camera file paired with a glove take, in cam/ or in leap/.
+
+    With `camera` set to a folder, only that folder is looked in. In `auto`,
+    a name present in BOTH folders raises: the two were recorded by different
+    sensors, they align differently (scaled vs rigid), and quietly preferring
+    whichever folder is listed first would pick one on an implementation
+    detail and report numbers for a take nobody chose.
+    """
+    if camera != AUTO:
+        candidate = input_dir / camera / name
+        return candidate if candidate.is_file() else None
+
+    found = [input_dir / folder / name for folder in CAM_DIRS
+             if (input_dir / folder / name).is_file()]
+    if len(found) > 1:
+        raise AmbiguousTake(
+            f"{name} exists under two cameras:\n    "
+            + "\n    ".join(str(p) for p in found)
+            + "\n  They are different sensors and are aligned differently, so "
+              "pick one with --camera "
+              f"{{{','.join(CAM_DIRS)}}} (or move the take you do not want).")
+    return found[0] if found else None
 
 
 def loo_table(samples, cols, label, lines):
@@ -180,17 +215,21 @@ def main() -> None:
                    help="camera confidence below which the glove is kept as-is")
     p.add_argument("--no-thumb-camera", action="store_true",
                    help="do not take the thumb direction from the camera")
+    p.add_argument("--camera", choices=(AUTO,) + CAM_DIRS, default=AUTO,
+                   help="which camera folder to read (default: auto — both, "
+                        "and a take name in both is an error)")
     p.add_argument("--export-csv", type=Path, default=None,
                    help="write the fused frames as a 21-keypoint CSV")
     p.add_argument("--write", action="store_true", help="write <input>/REPORT.txt")
     args = p.parse_args()
 
     glove_dir = args.input / "glove"
-    cam_dirs = [args.input / d for d in CAM_DIRS if (args.input / d).is_dir()]
+    wanted = CAM_DIRS if args.camera == AUTO else (args.camera,)
+    cam_dirs = [args.input / d for d in wanted if (args.input / d).is_dir()]
     if not glove_dir.is_dir() or not cam_dirs:
         raise SystemExit(
             f"expected {glove_dir} and one of "
-            + " or ".join(str(args.input / d) for d in CAM_DIRS) + "\n"
+            + " or ".join(str(args.input / d) for d in wanted) + "\n"
             "Record them with: python scripts/record_simultaneous.py\n"
             "                  python scripts/record_simultaneous.py --camera leap")
 
@@ -203,9 +242,13 @@ def main() -> None:
     n_pairs = n_matched = n_cam_used = 0
     skipped = []
     by_source = defaultdict(int)          # camera -> takes read from it
+    by_clock = defaultdict(int)           # pairing clock -> takes paired on it
 
     for gpath in takes:
-        cpath = find_camera_take(args.input, gpath.name)
+        try:
+            cpath = find_camera_take(args.input, gpath.name, args.camera)
+        except AmbiguousTake as e:
+            raise SystemExit(f"\n{e}\n")
         if cpath is None:
             skipped.append((gpath.name, "no matching camera file"))
             continue
@@ -217,13 +260,17 @@ def main() -> None:
         by_source[source] += 1
         # Metric camera, rigid fit; normalised camera, fit the scale too.
         with_scale = source != LEAP
+        # Per take, because one session can hold takes recorded before
+        # capture_time existed alongside takes recorded after.
+        clock = pairing_clock(glove, cam)
+        by_clock[clock] += 1
 
         per_hand_g = defaultdict(list)
         per_hand_c = defaultdict(list)
         per_hand_f = defaultdict(list)
         pose = glove[0]["pose"]
 
-        for g, c in pair_by_time(glove, cam, max_dt=args.max_dt):
+        for g, c in pair_by_time(glove, cam, max_dt=args.max_dt, clock=clock):
             n_pairs += 1
             hand = g["hand_side"]
             G = np.asarray(g["pts"], dtype=float)
@@ -272,7 +319,14 @@ def main() -> None:
                     "rotation + scale")
         lines.append(f"  {n} take(s)   {what}")
     lines.append("")
-    lines.append("Pairing (glove frames matched to a camera frame by wall clock)")
+    lines.append("Pairing (each glove frame matched to the nearest camera "
+                 "frame of the same hand)")
+    for clock, n in sorted(by_clock.items()):
+        why = ("when each sensor actually had the frame"
+               if clock == "capture_time"
+               else "when each line was WRITTEN — the take has no "
+                    "capture_time, so this is the best available")
+        lines.append(f"  clock                   {clock} on {n} take(s): {why}")
     lines.append(f"  glove frames            {n_pairs}")
     lines.append(f"  matched within {args.max_dt * 1000:.0f} ms   {n_matched} "
                  f"({100.0 * n_matched / max(n_pairs, 1):.0f}%)")
