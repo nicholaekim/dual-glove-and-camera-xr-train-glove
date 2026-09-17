@@ -163,6 +163,19 @@ python scripts/compare_to_tracker.py "..\xr trainer\xr trainer poses" --csv resu
 
 ## Daily use — Ultraleap (Stereo IR 170)
 
+**See what the camera sees.** Every real-camera script opens a live window
+(`scripts/leap/camera_view.py`): the IR image mirrored like a mirror, the
+fitted skeleton, tracked / NO HAND / wrong hand, palm height against the
+target band, palm facing, and the script's current instruction as a caption.
+A green border means record-ready. It is a second, read-only client of the
+tracking service, so it also runs on its own next to anything:
+
+```powershell
+python scripts\leap\camera_view.py --hand left
+```
+
+`--no-view` turns it off; the mocks never open it.
+
 Full plan, phases and acceptance: `docs/ultraleap_ir170_plan.md`. This section
 is the operating procedure.
 
