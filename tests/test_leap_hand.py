@@ -1167,14 +1167,19 @@ def _load_repo_script(name: str):
 
 
 def _mock_sync_run(tmp_path: Path, monkeypatch, extra=()) -> tuple:
-    """A whole --camera leap session on mock glove + mock leap."""
+    """A whole --camera leap session on mock glove + mock leap.
+
+    `--hand both` is the uncoached protocol these tests were written against:
+    both hands kept, no acquire phase. The coached one-hand protocol has its
+    own tests further down.
+    """
     import sys
 
     sync = _load_repo_script("record_simultaneous")
     monkeypatch.setattr(sync, "beep", lambda *a, **k: None)
     out_dir = tmp_path / "sync"
     monkeypatch.setattr(sys, "argv", [
-        "record_simultaneous.py", "--camera", "leap",
+        "record_simultaneous.py", "--camera", "leap", "--hand", "both",
         "--mock-glove", "--mock-leap", "--poses", "fist", "--takes", "1",
         "--duration", "2", "--prep", "0", "--out-dir", str(out_dir), *extra,
     ])
@@ -1256,9 +1261,9 @@ def test_the_start_beep_cannot_backdate_the_head_of_a_take(tmp_path: Path,
     monkeypatch.setattr(sync, "beep", slow_beep)
     out_dir = tmp_path / "sync"
     monkeypatch.setattr(sys, "argv", [
-        "record_simultaneous.py", "--camera", "leap", "--mock-glove",
-        "--mock-leap", "--poses", "fist", "--takes", "1", "--duration", "1",
-        "--prep", "0", "--out-dir", str(out_dir),
+        "record_simultaneous.py", "--camera", "leap", "--hand", "both",
+        "--mock-glove", "--mock-leap", "--poses", "fist", "--takes", "1",
+        "--duration", "1", "--prep", "0", "--out-dir", str(out_dir),
     ])
     sync.main()
 
@@ -1432,6 +1437,633 @@ def test_leap_backend_rejects_a_camera_name_that_is_neither(monkeypatch):
                         ["record_simultaneous.py", "--mock-leap"])
     with pytest.raises(SystemExit):
         sync.main()
+
+
+# --- the coached one-hand protocol ------------------------------------------
+# The measured failure these cover (2026-09-17, left gloved hand): every pose
+# but open_palm was recorded with a hand id that changed mid-take, or with the
+# skeleton labelled as the other hand, and nothing in the recorder noticed.
+class ScriptedLeap:
+    """A Leap source whose hands a test decides, second by second.
+
+    `MockLeapStream` is the right stand-in for "a camera is running", but its
+    artefacts are on its own schedule: to test that a re-acquisition triggers
+    a retry, the re-acquisition has to happen at a known moment. `plan(t)`
+    returns `(side, hand_id, visible_time_us)` for every hand in view at
+    `t` seconds into the run, and an empty list is a hand that is not there.
+
+    Hands are stamped with the drain time, so a frame loop that stalls shows
+    up as a burst of identical capture times — which is what the beep test
+    looks for.
+    """
+
+    def __init__(self, plan, hz: float = 90.0):
+        self.plan = plan
+        self.hz = float(hz)
+        self.frames = 0
+        self.framerate = self.hz
+        self.device_serial = "SCRIPTED"
+        self._t0 = None
+        self._next = 0.0
+        self._shape = MockLeapStream(noise_mm=0.0, dropout_every=0,
+                                     reacquire_every=0, pose="open_palm")
+
+    def start(self):
+        import time as _time
+        self._t0 = _time.time()
+        self._next = self._t0
+
+    def stop(self):
+        pass
+
+    def drain(self, max_items: int = 16):
+        import time as _time
+        if self._t0 is None:
+            self.start()
+        now = _time.time()
+        out = []
+        while self._next <= now and len(out) < max_items:
+            t = self._next - self._t0
+            self._next += 1.0 / self.hz
+            self.frames += 1
+            shapes = dict(self._shape.generate(1))
+            for side, hand_id, visible_us in self.plan(t):
+                lh = shapes[side]
+                lh.hand_id = hand_id
+                lh.visible_time_us = int(visible_us)
+                lh.capture_time = now
+                lh.framerate = self.hz
+                out.append((side, lh))
+        return out
+
+
+def _coached_run(tmp_path: Path, monkeypatch, plan, extra=(), beep=None):
+    """A whole coached `--hand left` session over a scripted camera."""
+    import sys
+
+    sync = _load_repo_script("record_simultaneous")
+    monkeypatch.setattr(sync, "beep", beep or (lambda *a, **k: None))
+    monkeypatch.setattr(sync, "open_stream",
+                        lambda **kw: _started(ScriptedLeap(plan)))
+    out_dir = tmp_path / "sync"
+    monkeypatch.setattr(sys, "argv", [
+        "record_simultaneous.py", "--camera", "leap", "--hand", "left",
+        "--mock-glove", "--mock-leap", "--poses", "fist", "--takes", "1",
+        "--out-dir", str(out_dir), *extra,
+    ])
+    sync.main()
+    return sync, out_dir
+
+
+def _started(source):
+    source.start()
+    return source
+
+
+def _takes(out_dir: Path, folder: str):
+    return sorted((out_dir / folder).glob("*.jsonl"))
+
+
+def _meta(out_dir: Path) -> dict:
+    import json
+    files = sorted((out_dir / "leap").glob("*.meta.json"))
+    assert len(files) == 1, f"expected one meta.json, got {files}"
+    return json.loads(files[0].read_text(encoding="utf-8"))
+
+
+def _rows(path: Path):
+    import json
+    return [json.loads(line) for line
+            in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_a_camera_hand_of_the_wrong_chirality_is_never_written(
+        tmp_path: Path, monkeypatch):
+    """--hand left must not be able to produce a right-handed line.
+
+    The tracker re-acquiring a gloved hand from a closed pose sometimes
+    returns the mirror image labelled as the other hand. That take fuses
+    against the other glove and produces a plausible, wrong result, so the
+    rejection has to happen before the frame reaches the recorder — not as a
+    filter someone remembers to run afterwards.
+    """
+    def plan(t):
+        return [("left", 4001, 5_000_000), ("right", 9001, 5_000_000)]
+
+    _sync, out_dir = _coached_run(tmp_path, monkeypatch, plan,
+                                  ["--duration", "1", "--settle", "0.2"])
+    cam = _takes(out_dir, "leap")
+    glove = _takes(out_dir, "glove")
+    assert len(cam) == len(glove) == 1
+    assert {r["hand_side"] for r in _rows(cam[0])} == {"left"}
+    assert {r["hand_side"] for r in _rows(glove[0])} == {"left"}
+    assert "_left_" in cam[0].name and cam[0].name == glove[0].name
+
+    meta = _meta(out_dir)
+    assert meta["hand"] == "left"
+    assert meta["rejected_chirality"] > 0, (
+        "the right hand was in view for the whole take and must be counted")
+    assert meta["second_hand_frames"] == 0
+
+
+def test_an_id_change_during_the_settle_retries_and_leaves_no_file(
+        tmp_path: Path, monkeypatch):
+    """The failure that ruined every gloved pose but open_palm.
+
+    The hand is acquired open on id 5001; the tracker lets go a second later
+    and comes back as 5002. That attempt must be abandoned — nothing written,
+    nothing renamed — and the take retried from the acquire prompt.
+    """
+    def plan(t):
+        if t < 1.0:
+            return [("left", 5001, int(t * 1e6))]
+        return [("left", 5002, int((t - 1.0) * 1e6))]
+
+    _sync, out_dir = _coached_run(
+        tmp_path, monkeypatch, plan,
+        ["--duration", "0.8", "--settle", "1.5", "--retries", "1"])
+
+    meta = _meta(out_dir)
+    assert meta["attempts"] == 2, "the first attempt must have been retried"
+    assert meta["hand_id"] == 5002, "the retry re-acquires under the new id"
+    # exactly one take on each side: the abandoned attempt left nothing at all
+    assert len(_takes(out_dir, "leap")) == 1
+    assert len(_takes(out_dir, "glove")) == 1
+    assert {r["hand_id"] for r in _rows(_takes(out_dir, "leap")[0])} == {5002}
+
+
+def test_a_take_the_hand_flickered_through_is_not_complete(tmp_path: Path,
+                                                           monkeypatch):
+    """One unbroken hand id is not enough; it has to be there the whole time.
+
+    Here the id never changes — the hand simply keeps dropping out for a third
+    of a second at a time. Coverage is what catches it, and a take under 90 %
+    is discarded rather than written and blamed on the glove later.
+    """
+    def plan(t):
+        if 1.2 <= t < 1.55 or 1.9 <= t < 2.25 or 2.6 <= t < 2.95:
+            return []
+        return [("left", 6001, 5_000_000)]
+
+    _sync, out_dir = _coached_run(
+        tmp_path, monkeypatch, plan,
+        ["--duration", "2.5", "--settle", "0", "--retries", "0",
+         "--acquire-timeout", "3"])
+
+    assert _takes(out_dir, "leap") == [], "an incomplete take is not kept"
+    assert _takes(out_dir, "glove") == []
+    assert sorted((out_dir / "leap").glob("*.meta.json")) == []
+
+
+def test_a_clean_take_records_its_coverage_and_how_it_was_got(tmp_path: Path,
+                                                              monkeypatch):
+    """meta.json is the take's provenance: hand, id, coverage, height, angle."""
+    def plan(t):
+        return [("left", 7001, 5_000_000)]
+
+    _sync, out_dir = _coached_run(tmp_path, monkeypatch, plan,
+                                  ["--duration", "1", "--settle", "0.2"])
+    meta = _meta(out_dir)
+    assert meta["coverage"] == pytest.approx(1.0, abs=0.02)
+    assert meta["attempts"] == 1
+    assert meta["hand_id"] == 7001 and meta["hand"] == "left"
+    assert meta["pose"] == "fist" and meta["take"] == 1
+    # the mock hand hovers 25 cm up with the palm toward the module, which is
+    # inside the coached band and well inside the 40 degree view gate
+    assert 18.0 <= meta["median_height_cm"] <= 28.0
+    assert meta["median_view_angle_deg"] < 40.0
+    assert meta["band_cm"] == [18.0, 28.0]
+    assert meta["file"].endswith(".jsonl") and "_left_" in meta["file"]
+    assert (out_dir / "leap" / meta["file"]).exists()
+
+
+def test_the_hud_beeps_cannot_stall_the_frame_loop(tmp_path: Path,
+                                                   monkeypatch):
+    """The coached protocol beeps in the middle of a live capture clock.
+
+    `winsound.Beep` blocks for its whole duration. The old protocol beeped
+    before the files were open and threw the backlog away, which cannot work
+    here: the pose cue lands between the acquire and the take, and the stop
+    beep lands at its end. A blocking beep on this thread would be a quarter
+    second of hand that nobody recorded, so the beeps go to a thread — and
+    this is what holds that. Nothing may pile up at one instant.
+    """
+    import time as _time
+
+    beeps = []
+
+    def slow_beep(freq=880, ms=180):
+        end = _time.time() + 0.25            # a real beep blocks; so does this
+        while _time.time() < end:
+            _time.sleep(0.005)
+        beeps.append(_time.time())
+
+    def plan(t):
+        return [("left", 8001, 5_000_000)]
+
+    _sync, out_dir = _coached_run(tmp_path, monkeypatch, plan,
+                                  ["--duration", "1.5", "--settle", "0.6"],
+                                  beep=slow_beep)
+    assert len(beeps) >= 2, "the pose cue and the stop beep both really ran"
+
+    rows = _rows(_takes(out_dir, "leap")[0])
+    assert len(rows) > 50
+    times = sorted(r["capture_time"] for r in rows)
+    # A stalled loop drains its whole backlog in one pass, so every frame the
+    # beep queued shares one capture instant. A 250 ms beep at 90 Hz is about
+    # 22 of them.
+    t0 = times[0]
+    assert sum(1 for t in times if t - t0 < 0.020) < 8, (
+        "frames piled up at the head of the take — the beep blocked the loop")
+    assert max(b - a for a, b in zip(times, times[1:])) < 0.10, (
+        "the frame loop went quiet for longer than a beep")
+    # and the take is still the length it was asked for, not beep-stretched
+    assert 1.4 <= times[-1] - times[0] <= 1.9
+    assert _meta(out_dir)["coverage"] == pytest.approx(1.0, abs=0.02)
+
+
+def test_the_leap_backend_insists_on_being_told_which_hand(monkeypatch):
+    """A session that does not say which hand cannot enforce chirality."""
+    import sys
+
+    sync = _load_repo_script("record_simultaneous")
+    monkeypatch.setattr(sys, "argv",
+                        ["record_simultaneous.py", "--camera", "leap"])
+    with pytest.raises(SystemExit) as e:
+        sync.main()
+    assert "--hand" in str(e.value) and "both" in str(e.value)
+
+
+def test_the_acquire_gate_is_the_one_the_analysis_uses():
+    """Every reason a hand is not ready yet, and the all-clear."""
+    from leap_hand.protocol import (
+        NOT_FACING,
+        NOT_TRACKED,
+        OFF_AXIS,
+        TOO_HIGH,
+        TOO_LOW,
+        TOO_YOUNG,
+        WRONG_HAND,
+        HandReading,
+        acquire_failures,
+    )
+
+    band = (18.0, 28.0)
+
+    def reading(**kw):
+        d = dict(hand_side="left", hand_id=1, visible_time_us=800_000,
+                 height_cm=23.0, lateral_cm=5.0, view_angle_deg=10.0)
+        d.update(kw)
+        return HandReading(**d)
+
+    assert acquire_failures(None, "left", band) == [NOT_TRACKED]
+    assert acquire_failures(reading(hand_side="right"), "left",
+                            band) == [WRONG_HAND]
+    assert acquire_failures(reading(), "left", band) == []
+    assert TOO_YOUNG in acquire_failures(reading(visible_time_us=400_000),
+                                         "left", band)
+    assert TOO_LOW in acquire_failures(reading(height_cm=14.0), "left", band)
+    assert TOO_HIGH in acquire_failures(reading(height_cm=33.0), "left", band)
+    # 40 degrees is the angle cam_hand.fusion stops trusting a camera DOF at;
+    # coaching to anything looser just moves the failure downstream
+    assert NOT_FACING in acquire_failures(reading(view_angle_deg=55.0),
+                                          "left", band)
+    assert NOT_FACING in acquire_failures(reading(view_angle_deg=None),
+                                          "left", band)
+    # the idle other hand, 20 cm off to the side of a hand 23 cm up
+    assert OFF_AXIS in acquire_failures(reading(lateral_cm=20.0), "left", band)
+
+
+def test_coverage_measures_the_hole_not_the_frame_count():
+    """Coverage has to mean the same thing at 90 Hz and at --leap-hz 5."""
+    from leap_hand.protocol import coverage, longest_gap
+
+    dense = [i / 90.0 for i in range(int(2.0 * 90))]
+    assert coverage(dense, 0.0, 2.0) == pytest.approx(1.0, abs=0.01)
+    # the same two seconds saved at 5 Hz is the same hand and scores the same,
+    # which is the whole reason this is not frames-recorded / frames-expected:
+    # that ratio would call the throttled file 6 % covered
+    sparse = [i / 5.0 for i in range(10)]
+    assert coverage(sparse, 0.0, 2.0) == pytest.approx(1.0, abs=0.01)
+    # below the gap tolerance the saved frames really are further apart than a
+    # loss, and the measurement says so rather than pretending
+    assert coverage([i / 2.0 for i in range(4)], 0.0, 2.0) < 0.2
+    # half a second missing out of two is exactly a quarter of the take
+    holed = [t for t in dense if not 0.5 <= t < 1.0]
+    assert coverage(holed, 0.0, 2.0) == pytest.approx(0.75, abs=0.02)
+    assert longest_gap(holed, 0.0, 2.0) == pytest.approx(0.5, abs=0.02)
+    assert coverage([], 0.0, 2.0) == 0.0
+    assert longest_gap([], 0.0, 2.0) == 2.0
+
+
+def test_the_hud_line_says_which_hand_and_how_high():
+    """The operator's eyes are on the camera; the line has one second to work."""
+    from leap_hand.protocol import HandReading, hud_line
+
+    band = (18.0, 28.0)
+    good = HandReading(hand_side="left", hand_id=1, visible_time_us=900_000,
+                       height_cm=23.0, lateral_cm=4.0, view_angle_deg=12.0)
+    line = hud_line("REC", 3.2, good, "left", band, 61.0)
+    assert "REC" in line and "3.2s" in line and "left YES" in line
+    assert "23.0 cm" in line and "OK" in line and "12 deg" in line
+    assert "61.0/s" in line
+
+    low = hud_line("ACQUIRE", None, HandReading("left", 1, 900_000, 13.0, 4.0,
+                                                12.0), "left", band, 0.0)
+    assert "TOO LOW" in low
+    high = hud_line("ACQUIRE", None, HandReading("left", 1, 900_000, 40.0, 4.0,
+                                                 12.0), "left", band, 0.0)
+    assert "TOO HIGH" in high
+    # only the other chirality in view is a different problem from no hand
+    assert "WRONG HAND" in hud_line("ACQUIRE", None, None, "left", band, 60.0,
+                                    saw_other_hand=True)
+    assert "left no" in hud_line("ACQUIRE", None, None, "left", band, 60.0)
+
+
+def test_the_presentation_hints_reach_the_acquire_prompt():
+    """The poses that failed get told how to be presented, not just named."""
+    from leap_hand.protocol import acquire_prompt
+
+    thumbs = " ".join(acquire_prompt("thumbs_up", "left"))
+    assert "OPEN PALM" in thumbs and "LEFT" in thumbs
+    assert "forearm" in thumbs and "30-45" in thumbs
+    assert "palm facing the lens" in " ".join(acquire_prompt("pinch", "right"))
+    assert "close slowly" in " ".join(acquire_prompt("fist", "left"))
+    # a pose with no known trap is prompted without inventing advice
+    assert len(acquire_prompt("peace", "left")) == 1
+
+
+# --- the coached gate: per scheduled pose -----------------------------------
+def _write_scheduled_take(path: Path, plan: str = "open_palm:1,fist:1",
+                          present=None, side: str = "left", hand_id: int = 1,
+                          hz: float = 90.0, condition: str = "glove",
+                          ids=None):
+    """A take recorded under `plan`, with `present(t)` deciding each frame.
+
+    `pose_t` is the capture clock offset into the schedule, so a test can put
+    a hole exactly inside one pose window and nowhere else.
+    """
+    from leap_hand.protocol import parse_schedule
+
+    rec = LeapRecorder(pose=condition, take=1, pose_plan=plan)
+    rec.start(path)
+    rec.schedule_t0 = 0.0
+    shape = MockLeapStream(noise_mm=0.0, dropout_every=0, reacquire_every=0,
+                           pose="open_palm")
+    for i in range(int(parse_schedule(plan).total * hz)):
+        t = i / hz
+        hands = dict(shape.generate(1))
+        if present is not None and not present(t):
+            continue
+        lh = hands[side]
+        lh.hand_id = ids(t) if ids else hand_id
+        lh.visible_time_us = 5_000_000
+        lh.framerate = hz
+        lh.capture_time = t                    # schedule_t0 is 0, so pose_t = t
+        rec.record(lh)
+    rec.stop()
+    return path
+
+
+def _pose(**kw):
+    """A `PoseStats` row with plausible defaults, for judging in isolation."""
+    from leap_hand.stats import PoseStats
+
+    d = dict(file="f.jsonl", condition="glove", hand_side="left",
+             pose="fist", frames=450, scheduled_s=5.0, detection_rate=0.95,
+             longest_loss_s=0.05, reacquisitions=0)
+    d.update(kw)
+    return PoseStats(**d)
+
+
+def test_a_pose_passes_on_its_own_merit_or_level_with_the_bare_hand():
+    """Absolute OR relative, on both clauses, and nothing without a bare row."""
+    from leap_hand.gate import judge_pose
+
+    bare = _pose(condition="bare", detection_rate=0.98, longest_loss_s=0.04)
+
+    passed, why = judge_pose(_pose(detection_rate=0.93), bare)
+    assert passed is True and "93.0%" in why[0]
+
+    # well under 80 %, but the bare hand was no better: that is not about the
+    # glove, and the pose passes
+    poor_bare = _pose(condition="bare", detection_rate=0.55,
+                      longest_loss_s=3.0)
+    assert judge_pose(_pose(detection_rate=0.50, longest_loss_s=2.5),
+                      poor_bare)[0] is True
+
+    # the fist case: far below 80 % and far below a bare hand that managed it
+    passed, why = judge_pose(_pose(detection_rate=0.41, longest_loss_s=2.3),
+                             bare)
+    assert passed is False
+    assert any("41.0%" in r and "below bare" in r for r in why)
+    assert any("2.30 s" in r for r in why)
+
+    # a long loss alone fails it, even with the detection rate up
+    assert judge_pose(_pose(detection_rate=0.99, longest_loss_s=1.6),
+                      bare)[0] is False
+    # ...unless the bare hand lost it for just as long
+    assert judge_pose(_pose(detection_rate=0.99, longest_loss_s=1.6),
+                      _pose(condition="bare", longest_loss_s=2.0))[0] is True
+
+
+def test_a_pose_with_no_bare_partner_is_reported_missing_never_guessed():
+    """The 2026-09-17 failure: four gloved fists, no bare fist anywhere."""
+    from leap_hand.gate import NO_BARE, judge_pose
+
+    passed, why = judge_pose(_pose(pose="fist", detection_rate=0.94), None)
+    assert passed is None, "an unpaired pose must not be scored either way"
+    assert "no bare fist" in why[0] and "left hand" in why[0]
+    assert "94.0%" in why[0], "its own numbers are still reported"
+
+    from leap_hand.gate import PoseVerdict
+
+    assert PoseVerdict(condition="glove", hand_side="left", pose="fist",
+                       glove=_pose(), passed=None).status == NO_BARE
+
+
+def test_the_paired_verdict_pairs_by_pose_and_by_hand():
+    """Fist against fist, left against left — and 20 cm against 20 cm."""
+    from leap_hand.gate import ConditionResult, pose_verdicts
+
+    bare = ConditionResult(condition="bare", pose_stats=[
+        _pose(condition="bare", pose="open_palm", detection_rate=0.98),
+        _pose(condition="bare", pose="fist", detection_rate=0.96),
+        _pose(condition="bare", pose="fist", hand_side="right",
+              detection_rate=0.30, longest_loss_s=4.0),
+    ])
+    glove = ConditionResult(condition="glove", pose_stats=[
+        _pose(pose="open_palm", detection_rate=0.97),
+        _pose(pose="fist", detection_rate=0.35, longest_loss_s=2.2),
+        _pose(pose="fist", hand_side="right", detection_rate=0.31,
+              longest_loss_s=3.5),
+        _pose(pose="pinch", detection_rate=0.88),
+    ])
+    got = {(v.pose, v.hand_side): v for v in pose_verdicts([bare, glove])}
+    assert got[("open_palm", "left")].passed is True
+    assert got[("fist", "left")].passed is False
+    # the right hand's bare fist was just as bad, so the glove is not blamed
+    assert got[("fist", "right")].passed is True
+    # no bare pinch at all: reported, not guessed
+    assert got[("pinch", "left")].passed is None
+    assert got[("pinch", "left")].bare is None
+    # bare rows are not judged against themselves
+    assert all(v.condition == "glove" for v in pose_verdicts([bare, glove]))
+
+
+def test_a_distance_run_is_paired_against_the_bare_run_at_that_distance():
+    """Detection falls off with height; 20 cm vs 35 cm measures the height."""
+    from leap_hand.gate import ConditionResult, pose_verdicts
+
+    results = [
+        ConditionResult(condition="bare", pose_stats=[
+            _pose(condition="bare", detection_rate=0.99)]),
+        ConditionResult(condition="bare_50cm", pose_stats=[
+            _pose(condition="bare_50cm", detection_rate=0.45)]),
+        ConditionResult(condition="glove_50cm", pose_stats=[
+            _pose(condition="glove_50cm", detection_rate=0.44)]),
+    ]
+    v = pose_verdicts(results)[0]
+    assert v.baseline_condition == "bare_50cm"
+    assert v.passed is True, "44 % against a bare 45 % is not a glove failure"
+
+
+def test_the_height_band_comes_from_the_condition_name():
+    """`glove_20cm` says its own band; that is the point of a distance sweep."""
+    from leap_hand.protocol import DEFAULT_BAND, band_for_condition, parse_band
+
+    assert band_for_condition("glove") == DEFAULT_BAND
+    assert band_for_condition("glove_20cm") == (15.0, 25.0)
+    assert band_for_condition("bare_50cm") == (45.0, 55.0)
+    # an explicit --band wins over the name
+    assert band_for_condition("glove_20cm", (10.0, 40.0)) == (10.0, 40.0)
+    assert parse_band("18,28") == (18.0, 28.0)
+    with pytest.raises(ValueError):
+        parse_band("28,18")
+
+
+def test_per_pose_stats_measure_each_window_against_its_own_seconds(
+        tmp_path: Path):
+    """A pose the tracker saw for half a second must not score 100 %."""
+    from leap_hand.stats import analyse_poses
+
+    # open_palm 0-2 s fully tracked; fist 2-4 s lost for a second in the middle
+    path = _write_scheduled_take(
+        tmp_path / "glove_left_take1.jsonl", plan="open_palm:2,fist:2",
+        present=lambda t: not (2.5 <= t < 3.5))
+    rows = {s.pose: s for s in analyse_poses(path)}
+    assert set(rows) == {"open_palm", "fist"}
+    assert rows["open_palm"].detection_rate == pytest.approx(1.0, abs=0.02)
+    assert rows["open_palm"].longest_loss_s < 0.05
+    assert rows["fist"].detection_rate == pytest.approx(0.5, abs=0.03)
+    assert rows["fist"].longest_loss_s == pytest.approx(1.0, abs=0.05)
+    assert rows["fist"].scheduled_s == 2.0
+    # the mock hand hovers 25 cm up with the palm toward the module
+    assert rows["fist"].median_height_cm == pytest.approx(25.0, abs=0.5)
+    assert rows["fist"].facing_pct == pytest.approx(100.0, abs=0.1)
+    assert rows["fist"].in_band_pct == pytest.approx(100.0, abs=0.1)
+
+
+def test_a_pose_the_tracker_never_saw_reports_the_whole_window_as_lost(
+        tmp_path: Path):
+    from leap_hand.stats import analyse_poses
+
+    path = _write_scheduled_take(
+        tmp_path / "glove_left_take1.jsonl", plan="open_palm:2,fist:2",
+        present=lambda t: t < 2.0)
+    rows = {s.pose: s for s in analyse_poses(path)}
+    assert rows["fist"].frames == 0
+    assert rows["fist"].detection_rate == 0.0
+    assert rows["fist"].longest_loss_s == pytest.approx(2.0, abs=0.05)
+
+
+def test_a_reacquisition_is_counted_inside_the_pose_it_happened_in(
+        tmp_path: Path):
+    from leap_hand.stats import analyse_poses
+
+    path = _write_scheduled_take(
+        tmp_path / "glove_left_take1.jsonl", plan="open_palm:2,fist:2",
+        ids=lambda t: 11 if t < 3.0 else 12)
+    rows = {s.pose: s for s in analyse_poses(path)}
+    assert rows["open_palm"].reacquisitions == 0
+    assert rows["fist"].reacquisitions == 1
+
+
+def test_an_unscheduled_take_has_no_per_pose_rows_and_says_so(tmp_path: Path):
+    """--recompute on last week's data: the old table, and why it is the old
+    table."""
+    import sys
+
+    from leap_hand.stats import analyse_poses
+
+    gate = _load_script("gate")
+    for condition in ("bare", "glove"):
+        folder = tmp_path / "gate" / condition
+        folder.mkdir(parents=True)
+        rec = LeapRecorder(pose=condition, take=1)      # no pose_plan
+        rec.start(folder / f"{condition}_left_take1_20260916_120000.jsonl")
+        shape = MockLeapStream(noise_mm=0.0, dropout_every=0,
+                               reacquire_every=0, pose="open_palm")
+        for _ in range(200):
+            lh = dict(shape.generate(1))["left"]
+            lh.visible_time_us = 5_000_000
+            rec.record(lh)
+        rec.stop()
+        assert analyse_poses(rec.path) == [], "no plan, no per-pose rows"
+
+    report = tmp_path / "R.txt"
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(sys, "argv", [
+        "gate.py", "--recompute", "--out-dir", str(tmp_path / "gate"),
+        "--report", str(report)])
+    try:
+        gate.main()
+    finally:
+        monkey.undo()
+
+    text = report.read_text(encoding="utf-8")
+    assert "Per pose" in text
+    assert "was recorded under a --schedule" in text
+    assert "Paired verdict per pose" not in text
+    # the per-condition table is still the whole report it always was
+    assert "thresholds: detection >= 80%" in text
+    assert "bare" in text and "glove" in text
+
+
+def test_the_gate_records_the_schedule_on_every_frame(tmp_path: Path,
+                                                      monkeypatch):
+    """A scheduled mock run, end to end: plan and offset on each line."""
+    import json
+    import sys
+
+    gate = _load_script("gate")
+    monkeypatch.setattr(gate, "beep", lambda *a, **k: None)
+    out_dir = tmp_path / "gate"
+    monkeypatch.setattr(sys, "argv", [
+        "gate.py", "--mock", "--conditions", "bare,glove", "--prep", "0",
+        "--schedule", "open_palm:1,fist:1", "--snapshots", "0",
+        "--out-dir", str(out_dir), "--report", str(tmp_path / "R.txt"),
+    ])
+    gate.main()
+
+    take = sorted((out_dir / "glove").glob("*.jsonl"))[0]
+    rows = [json.loads(line) for line
+            in take.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert rows
+    assert {r["pose_plan"] for r in rows} == {"open_palm:1,fist:1"}
+    # `pose_t` is on the CAPTURE clock, so the first frames drained after the
+    # file opened can be a few milliseconds older than the schedule's start.
+    # Those belong to no window and are simply outside every pose's rows.
+    assert all(-0.1 <= r["pose_t"] < 2.1 for r in rows)
+    assert any(r["pose_t"] >= 1.0 for r in rows), "the fist window was recorded"
+    # the condition label is untouched: it is what the folder and the
+    # per-condition table are keyed on
+    assert {r["pose"] for r in rows} == {"glove"}
+
+    text = (tmp_path / "R.txt").read_text(encoding="utf-8")
+    assert "Per pose (schedule: open_palm:1,fist:1" in text
+    assert "Paired verdict per pose" in text
+    assert "open_palm" in text and "fist" in text
 
 
 # --- the professor-frame replication ----------------------------------------
