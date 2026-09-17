@@ -536,6 +536,35 @@ Second gate session (2026-09-17, 13:19 to 13:23, daytime)
   band, and per-pose detection rates with a paired bare run, so that a
   fist with the glove is compared with a fist without it.
 
+First real Path A session (2026-09-17, 13:44, both gloves, XR Trainer
+streaming, 6 poses x 1 take x 5 s, both hands over the camera at once)
+- A first attempt recorded nothing: the script waited for a tracked hand
+  while its HUD printed "0.0 Hz", which read as a dead camera. The HUD now
+  says "camera: running, NO HAND IN VIEW", tells the operator to hold the
+  hand over the lens, and beeps until it sees one.
+- Plumbing: paired on `capture_time`, 193 of 242 glove frames matched within
+  50 ms. Where the camera had a hand it held it for the whole take: 100 %
+  detection, 0 re-acquisitions, 0.10 to 0.93 mm jitter, frame age 10 to
+  12 ms, including a gloved FIST (right hand, grab 1.00, 449 of 450 frames).
+  Palm-fit diagnostic 4.7 mm median: the template hand versus the real one.
+- Coverage gaps: `peace` has no camera frames at all, and the left hand is
+  missing from the camera in `fist` and `thumbs_up`. With two hands in view
+  each sits 8 to 10 cm off centre.
+- What each sensor saw, from the features: the glove's `pinch` is
+  numerically identical to its `open_palm` (as in July), while the camera
+  shows the index curling (1.76 to 1.27) and the thumb-index gap closing
+  (0.87 to 0.35): the camera supplies exactly what the glove lacks. The
+  reverse holds for `thumbs_up`: the glove has the four fingers curled
+  (0.66) but the camera, looking at an edge-on hand, reports them nearly
+  straight (1.69, grab 0.04). Each sensor is wrong where the other is right.
+- Classifier on this session: glove 9/10 (misses pinch), camera 6/8, fused
+  5/10. The fused number is not meaningful yet: one take per pose leaves one
+  training sample per class, and classes mix fused and glove-only samples
+  where the camera lost a hand. It does expose a real design gap: fusion
+  takes spread and thumb direction from the camera whenever a camera frame
+  exists, even when the hand is edge-on or the glove says the finger is
+  fully curled, which is when the camera is guessing.
+
 Path A review round (ChatGPT, 2026-09-17; all fixed, 146 tests)
 - Pairing clock. Frames were stamped when written, not when captured, so a
   drained burst of camera frames shared one time. Both sensors now carry
