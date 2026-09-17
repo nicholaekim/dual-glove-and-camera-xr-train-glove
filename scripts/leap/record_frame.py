@@ -16,6 +16,13 @@ a take that wobbles shortens every bone, so the "average" hand is a hand
 nobody has. A medoid is a real frame, with real bone lengths, and the take it
 came from is kept beside it.
 
+Candidates are compared after a RIGID alignment onto the take's mean (see
+`medoid_index`), because a hand held still for three seconds still turns
+slowly and a 5-degree drift moves a fingertip 8.7 mm — far above the tracker's
+0.20 mm jitter. Without that, "most typical" quietly means "held at the
+average angle" rather than "in the right pose". The frame written out is the
+original, untouched one: the alignment decides the winner and nothing else.
+
 Why this matters for Phase 3. Of the professor's 102 frames the glove
 replicated 81 and could not do 21 at all (`reference/frames/_folder_status.csv`
 lists them NA): they need spread, thumb opposition or wrist angles the glove
@@ -42,6 +49,10 @@ import re
 import time
 from pathlib import Path
 
+import numpy as np
+
+from cam_hand.align import align_points
+from cam_hand.fusion import PALM_IDX
 from leap_hand.recorder import LeapRecorder
 from leap_hand.stream import LeapUnavailable, open_stream
 from xr_hand.keypoints21 import frame_to_keypoints21
@@ -115,19 +126,42 @@ def glove_exporter():
 
 
 def medoid_index(frames) -> int:
-    """The frame closest to the mean of the take, over 21 keypoints.
+    """Which frame of the take is the most typical POSE. Returns its index.
 
-    Exactly what `scripts/glove/export_keypoints21.py` does for its summary
-    row: flatten each frame to wrist-centred coordinates, take the mean of
-    the take, and return the REAL frame with the smallest squared distance to
-    it. Never the mean itself — that hand has shortened bones.
+    Same idea as `scripts/glove/export_keypoints21.py`: take the mean of the
+    take and pick the REAL frame nearest it, never the mean itself — averaged
+    joint positions have shortened bones, so the "average" hand is a hand
+    nobody has.
+
+    What differs, and why. Wrist-centring alone removes translation but not
+    ORIENTATION. A hand held still for three seconds still rotates slowly,
+    and at 100 mm from the wrist a 5-degree drift moves a fingertip 8.7 mm —
+    an order of magnitude above the 0.20 mm jitter the gate measured. Judged
+    on raw wrist-centred coordinates, "closest to the mean" therefore means
+    "held at the average ANGLE", and a frame in a plainly wrong pose taken
+    mid-sweep can win over a correct one recorded early.
+
+    So each candidate is first aligned RIGIDLY — rotation and translation,
+    scale 1 — onto the take's mean using the palm landmarks, which are the
+    near-rigid part of a hand. What is left after that alignment is the only
+    thing this is supposed to be ranking: how the FINGERS are posed.
+
+    The alignment is used for scoring only. The caller exports the original,
+    untouched frame, because the deliverable is a measurement of the hand in
+    camera space, not a re-oriented copy of it.
     """
-    rows = [[c for pt in frame_to_keypoints21(f) for c in pt] for f in frames]
-    n = len(rows)
-    mean = [sum(r[i] for r in rows) / n for i in range(len(rows[0]))]
+    pts = [np.asarray(frame_to_keypoints21(f), dtype=float) for f in frames]
+    if len(pts) == 1:
+        return 0
+
+    # The mean is only a reference to align against, so a plain elementwise
+    # mean is fine here: nothing is exported from it.
+    mean = np.mean(np.stack(pts), axis=0)
     best, best_d = 0, None
-    for i, r in enumerate(rows):
-        d = sum((a - b) ** 2 for a, b in zip(r, mean))
+    for i, p in enumerate(pts):
+        aligned, _rmse, _err, _s = align_points(p, mean, with_scale=False,
+                                                subset=PALM_IDX)
+        d = float(((aligned - mean) ** 2).sum())
         if best_d is None or d < best_d:
             best, best_d = i, d
     return best

@@ -1462,18 +1462,29 @@ def test_medoid_is_a_real_recorded_frame_not_an_average(tmp_path: Path):
     path = _record_mock(tmp_path, frames=120)
     frames = [f for f, _w in FrameRecorder.load(path)
               if f.hand_side == "right"]
+    import numpy as np
+
+    from cam_hand.align import align_points
+    from cam_hand.fusion import PALM_IDX
+
     i = record_frame.medoid_index(frames)
     assert 0 <= i < len(frames)
-    chosen = frame_to_keypoints21(frames[i])
-    # it IS one of the frames, identical to the one at that index
-    assert chosen == frame_to_keypoints21(frames[i])
-    # and it is closer to the take's mean than the worst frame is
-    def dist(f):
-        pts = [c for p in frame_to_keypoints21(f) for c in p]
-        return sum((a - b) ** 2 for a, b in zip(pts, mean))
-    rows = [[c for p in frame_to_keypoints21(f) for c in p] for f in frames]
-    mean = [sum(r[k] for r in rows) / len(rows) for k in range(len(rows[0]))]
-    assert dist(frames[i]) == min(dist(f) for f in frames)
+    # it IS one of the recorded frames — a real hand with real bone lengths,
+    # never the mean, whose bones are shorter than any frame's
+    assert frame_to_keypoints21(frames[i]) == frame_to_keypoints21(frames[i])
+
+    # and it is the one closest to the take's mean once orientation is taken
+    # out of the comparison, which is the criterion medoid_index applies
+    pts = [np.asarray(frame_to_keypoints21(f), float) for f in frames]
+    mean = np.mean(np.stack(pts), axis=0)
+
+    def aligned_dist(p):
+        moved, _r, _e, _s = align_points(p, mean, with_scale=False,
+                                         subset=PALM_IDX)
+        return float(((moved - mean) ** 2).sum())
+
+    assert aligned_dist(pts[i]) == pytest.approx(
+        min(aligned_dist(p) for p in pts))
 
 
 def test_record_frame_writes_the_professor_format_on_the_mock(tmp_path: Path,
@@ -1601,3 +1612,113 @@ class TestAgainstTheRealBindings:
             assert not hasattr(Image, name), f"Image.{name} exists now"
         from leap.events import ImageEvent
         assert hasattr(ImageEvent, "image")
+
+
+# --- the medoid must rank POSE, not orientation -----------------------------
+def _rotated_take(angles, pose=(15.0, 0.30), outlier=None, outlier_at=None):
+    """Frames of one hand: a slow rotation about +z, optionally one bad pose.
+
+    Built from test_fusion's 26-joint synthetic hand so the geometry is the
+    one the fusion tests already reason about.
+    """
+    import math
+
+    import numpy as np
+    from test_fusion import _hand26
+
+    from xr_hand.joints import HandFrame
+    from xr_hand.kinematics import absolute_to_relative
+
+    identity = [[0.0, 0.0, 0.0, 1.0]] * 26
+    frames = []
+    for i, deg in enumerate(angles):
+        spread, curl = outlier if (outlier and i == outlier_at) else pose
+        pts = np.asarray(_hand26(spread, curl), dtype=float)
+        wrist = pts[JOINT_NAMES.index("WRIST")].copy()
+        a = math.radians(deg)
+        rot = np.array([[math.cos(a), -math.sin(a), 0.0],
+                        [math.sin(a), math.cos(a), 0.0],
+                        [0.0, 0.0, 1.0]])
+        pts = (rot @ (pts - wrist).T).T + wrist
+        frames.append(HandFrame(
+            timestamp=float(i), packet_counter=i, hand_side="right",
+            frame_id=i, status=0,
+            joints=absolute_to_relative([list(p) for p in pts], identity)))
+    return frames
+
+
+def test_the_medoid_ignores_slow_rotation_and_rejects_the_bad_pose():
+    """A hand held still still turns; that must not decide which frame wins.
+
+    Twenty frames of one pose over a 10-degree drift, plus one frame in a
+    plainly wrong pose at the middle of the sweep. Scored on raw
+    wrist-centred coordinates, identical poses span a 48x range of "distance
+    from the mean" purely because of the drift — at 100 mm from the wrist
+    5 degrees is 8.7 mm, against the 0.20 mm jitter the gate measured. After
+    a rigid palm alignment they are all equal, and only the pose is left to
+    rank.
+    """
+    import numpy as np
+
+    from cam_hand.align import align_points
+    from cam_hand.fusion import PALM_IDX
+
+    record_frame = _load_script("record_frame")
+    angles = list(np.linspace(0.0, 10.0, 20))
+    bad = 10
+    frames = _rotated_take(angles, outlier=(0.0, 0.75), outlier_at=bad)
+
+    chosen = record_frame.medoid_index(frames)
+    assert chosen != bad, "the medoid picked the frame in the wrong pose"
+
+    pts = [np.asarray(frame_to_keypoints21(f), float) for f in frames]
+    mean = np.mean(np.stack(pts), axis=0)
+    good = [i for i in range(len(frames)) if i != bad]
+
+    def naive(i):
+        return float(((pts[i] - mean) ** 2).sum())
+
+    def aligned(i):
+        moved, _r, _e, _s = align_points(pts[i], mean, with_scale=False,
+                                         subset=PALM_IDX)
+        return float(((moved - mean) ** 2).sum())
+
+    # identical poses, scored purely on where they sit in the drift
+    assert max(naive(i) for i in good) / min(naive(i) for i in good) > 10.0
+    # ...and scored on pose alone, they are the same frame as far as this cares
+    assert max(aligned(i) for i in good) / min(aligned(i) for i in good) < 1.01
+    # the outlier is the worst of the take, by a wide margin
+    assert aligned(bad) > 10.0 * max(aligned(i) for i in good)
+
+
+def test_the_medoid_exports_the_original_frame_not_an_aligned_copy(tmp_path: Path):
+    """Alignment picks the winner. What gets written is the measurement."""
+    import numpy as np
+
+    from cam_hand.prof_format import load_file
+
+    record_frame = _load_script("record_frame")
+    frames = _rotated_take(list(np.linspace(0.0, 10.0, 8)))
+
+    take = tmp_path / "frame_99_right_take1.jsonl"
+    rec = FrameRecorder(pose="frame_99", take=1)
+    rec.start(take)
+    for f in frames:
+        rec.record(f)
+    rec.stop()
+
+    out = tmp_path / "frame_99_keypoints.txt"
+    chosen = record_frame.write_prof_file(take, out)
+    assert set(chosen) == {"right"}
+    index, total = chosen["right"]
+    assert total == len(frames)
+
+    # the file holds exactly the frame that won, unrotated: its coordinates
+    # are the ones the recorder stored, not a copy turned to face the mean
+    winner, wall = list(FrameRecorder.load(take))[index]
+    exporter = record_frame.glove_exporter()
+    expected = exporter.frame_block(winner, wall)
+    assert out.read_text(encoding="utf-8").strip() == expected
+
+    block = load_file(out)[0]
+    assert block.frame == winner.packet_counter and len(block.points) == 21
