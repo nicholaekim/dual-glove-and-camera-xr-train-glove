@@ -544,18 +544,93 @@ measurement with a guess degrades both. Instead:
    near-rigid palm landmarks (wrist + four knuckles).
 2. Build a palm frame from the glove. A finger's direction then splits into an
    out-of-plane part (curl — the glove's) and an in-plane azimuth (spread —
-   the camera's).
-3. Rotate each glove finger chain rigidly about its knuckle so the azimuth
-   matches the camera's, leaving curl untouched. Because it is a rotation
-   about the knuckle, **every bone keeps exactly the glove's length** — the
-   fused hand cannot shrink, which a per-joint blend of two point clouds
-   would do (same reason the exporters use a medoid rather than a mean).
+   the camera's). The azimuth is read off the **proximal bone** (knuckle ->
+   PIP) on both sides, not knuckle -> tip: abduction happens at the knuckle,
+   so once the PIP and DIP are bent the tip swings far off its own bone and a
+   few degrees of flexion error would arrive as tens of degrees of fake
+   abduction.
+3. Rotate each glove finger chain about its knuckle, **about the palm
+   normal**, until its azimuth matches the camera's. A rotation about the
+   normal changes only the azimuth, so the glove's curl survives exactly, and
+   because it is a rotation about the knuckle **every bone keeps exactly the
+   glove's length** — the fused hand cannot shrink, which a per-joint blend of
+   two point clouds would do (same reason the exporters use a medoid rather
+   than a mean).
 4. The thumb takes its whole direction from the camera: opposition *is*
    out-of-plane rotation, and the glove cannot see it.
 
 Below `--min-score`, or when the camera did not see the hand, the glove
 skeleton passes through untouched. Fusion degrades to glove-only, never to
 garbage.
+
+### Which sensor is right on THIS frame
+
+Steps 1-4 say which sensor *owns* a degree of freedom. They do not say whether
+the camera actually measured it on this frame, and the first real simultaneous
+session showed that the difference decides the result:
+
+| pose | glove | camera | who is right |
+|------|-------|--------|--------------|
+| `pinch` | index curl 1.97, thumb-index gap 0.99 — **numerically its own open palm** | index curl 1.31, gap 0.46 | camera |
+| `thumbs_up` | four fingers curled, 0.66 | four fingers nearly straight, 1.68, `grab_strength` 0.04 | glove |
+
+Taking the camera whenever a camera frame existed imported the second case
+along with the first, and the fused classifier scored *below* glove-only. Each
+camera-owned DOF is now gated per frame, on evidence that is not the tracker's
+opinion of itself:
+
+- **frame level** — the hand has been visible for `min_visible_time_us`
+  (300 ms), its `hand_id` has not changed within `hand_id_settle_s` (0.25 s),
+  and the palm is inside the module's central field (lateral offset less than
+  height, i.e. within `field_half_angle_deg` = 45 degrees of vertical).
+- **spread, per finger** — only when the *glove* says that finger is not
+  strongly curled (curl above `curl_gate` = 1.2, the midpoint between the
+  glove's fist and open-palm values; a curled finger has no abduction left to
+  see and its proximal bone points end-on at the camera) **and** the palm is
+  turned toward the module (`view_gate_deg` = 50, measured between the
+  camera's palm normal and the ray from the palm to the module, which is the
+  origin of leap space).
+- **thumb** — only when the viewing-angle gate passes **and** the camera
+  agrees with the glove about index..little: median absolute curl
+  disagreement below `curl_agree_tol` = 0.35. A camera that has the four
+  fingers wrong has the hand's orientation wrong, and orientation error moves
+  the thumb most of all. `pinch` measures 0.24-0.28 and passes; `thumbs_up`
+  measures 0.88 and does not — and was edge-on at 70-78 degrees, so it fails
+  twice over.
+
+`grab_strength`, `pinch_strength` and `confidence` are deliberately **not**
+used as weights: the first two are outputs of the same model that produced the
+joints, so they cannot corroborate it, and LeapC reports `confidence` as a
+constant 1.0.
+
+Every threshold is a named field of `fusion.GateParams`, overridable on the
+command line (`--curl-gate`, `--view-gate-deg`, `--curl-agree-tol`) and
+printed in every report. They are **empirical starting points read off one
+session**, not calibrated constants.
+
+No frame is ever dropped: a frame that fails every gate is the glove
+skeleton, unchanged. `fuse_skeletons` returns, per frame, `dof_source` (which
+DOFs the camera supplied) and `rejected` (why the glove kept the rest), which
+is what the report counts. A MediaPipe frame carries none of these capture
+facts — no absolute palm, no hand id, no visibility clock — so it passes
+`cam_meta=None` and is fused ungated, exactly as before; gating a sensor on
+evidence it does not produce would mean rejecting all of it.
+
+### What the report says
+
+`scripts/fuse_poses.py` leads with a **per-DOF table**: for each pose, hand
+and take, the glove / camera / fused value of the five curls, the four
+adjacent proximal-bone spreads and the thumb-index gap, with a `from` column
+saying how much of each row the camera actually supplied. Under it are the
+camera-use rate per gated DOF, every rejection reason with its count, and the
+thresholds in force.
+
+The leave-one-out classifier is below that, as a **secondary** metric, and it
+is now leave-one-**TAKE**-out: holding out one *sample* left the other hand of
+the same five seconds in the training set, which mostly measured whether a
+person's two hands look alike. With only one take per pose the held-out pose
+has no centroid at all and the number is meaningless; the report says so
+instead of quoting it.
 
 **Chirality matters and is handled explicitly.** A left hand is the mirror of
 a right one, so a palm normal built from the knuckles points out of the back
