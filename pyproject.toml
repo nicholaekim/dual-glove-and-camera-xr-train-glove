@@ -1,7 +1,7 @@
 [project]
 name = "xr_hand_dual"
 version = "0.2.0"
-description = "Dual-sensor hand tracking: StretchSense glove pipeline (xr_hand) + webcam MediaPipe pipeline (cam_hand), shared 21-keypoint formats"
+description = "Multi-sensor hand tracking: StretchSense glove pipeline (xr_hand), webcam MediaPipe pipeline (cam_hand) and Ultraleap Stereo IR 170 pipeline (leap_hand), shared 26-joint and 21-keypoint formats"
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.26",
@@ -12,6 +12,16 @@ dependencies = [
     "matplotlib>=3.7",
     "openpyxl>=3.1",
 ]
+
+[project.optional-dependencies]
+# Ultraleap Stereo IR 170. Deliberately empty: the `leap` bindings are built
+# on `leapc_cffi`, a cffi module compiled against the LeapSDK on this machine,
+# and neither is on PyPI - pip cannot resolve them. Install them with
+#   powershell -ExecutionPolicy Bypass -File scripts\leap\setup_bindings.ps1
+# (clone, build, install, verify), then check with scripts\leap\check_setup.py.
+# Everything in src/leap_hand imports `leap` lazily and every leap script
+# takes --mock, so this repo installs and its tests pass either way.
+leap = []
 
 [build-system]
 requires = ["setuptools>=68"]
