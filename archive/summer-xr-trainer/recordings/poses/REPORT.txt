@@ -1,0 +1,16 @@
+﻿pose           n |       thumb       index      middle        ring      little   (mean +/- spread, cm)
+----------------------------------------------------------------------------
+fist           6 |   8.2+/-0.5    6.1+/-0.6    5.5+/-0.5    5.8+/-0.6    5.9+/-0.2 
+index_point    6 |   9.2+/-0.6   16.0+/-0.1    6.6+/-0.9    6.2+/-0.8    6.6+/-0.5 
+open_palm      6 |  11.6+/-0.0   16.1+/-0.0   16.9+/-0.0   16.0+/-0.0   13.9+/-0.0 
+peace          6 |   9.1+/-0.5   16.1+/-0.0   16.9+/-0.0    7.2+/-0.9    7.6+/-0.5 
+pinch          6 |   9.8+/-0.6   10.5+/-2.3   16.7+/-0.2   16.0+/-0.0   13.3+/-0.9 
+three          6 |   9.8+/-0.6   15.5+/-0.7   16.3+/-0.8   13.5+/-3.7    7.0+/-1.4 
+thumbs_up      6 |  10.8+/-0.4    5.6+/-0.3    7.5+/-0.7    6.6+/-0.6    7.2+/-0.5 
+
+Leave-one-out nearest-centroid classification: 38/42 samples correct (90%)
+Misclassified:
+  pinch        (right, pinch_both_take1_20260701_192823.jsonl) classified as open_palm
+  pinch        (left, pinch_both_take1_20260701_192823.jsonl) classified as open_palm
+  three        (left, three_both_take1_20260701_192750.jsonl) classified as peace
+  three        (right, three_both_take1_20260701_192750.jsonl) classified as peace
