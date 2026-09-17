@@ -34,7 +34,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from xr_hand.kinematics import mat3_to_quat
+from xr_hand.kinematics import mat3_to_quat, quat_canonical
 
 from .to_openxr import from_leap_mm
 from .types import LeapHand
@@ -113,6 +113,9 @@ class MockLeapStream:
         self._buffer: deque = deque()
         self._clock: Optional[float] = None
         self._t0_us = 0
+        # Last frame's quaternions per hand, so the sequence this generator
+        # emits never flips sign between frames (see quat_canonical).
+        self._prev_quats: dict = {}
         self.frames = 0                  # events emitted (dropouts included)
         self.hands_emitted = 0
         self.device_serial = "MOCK-SIR170"
@@ -244,6 +247,17 @@ class MockLeapStream:
                           v[2] + self._rng.gauss(0.0, sigma)])
             for v in abs26
         ]
+
+        # Keep the sign continuous with the previous frame of this hand. Real
+        # LeapC rotations are whatever the tracker emits; this is a generator,
+        # and a generator that flips sign mid-sweep would hand anyone
+        # differencing quaternions a fake discontinuity to chase.
+        previous = self._prev_quats.get(side)
+        quat26 = [
+            quat_canonical(q, previous[k] if previous else None)
+            for k, q in enumerate(quat26)
+        ]
+        self._prev_quats[side] = quat26
 
         generation = i // self.reacquire_every if self.reacquire_every else 0
         since_reacquire = i - generation * self.reacquire_every if self.reacquire_every else i

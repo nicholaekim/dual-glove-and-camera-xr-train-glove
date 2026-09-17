@@ -15,6 +15,16 @@ that is not a hypothetical.
   the same `leap_hand_from_api` conversion the live path uses. Replay does
   not go through `Connection` listeners: the events are fed in directly.
 
+What an `.lmt` does **not** hold: it is a stream of `TrackingEvent`s only —
+solved skeletons. No IR images, no device events, no policy events
+(`Recording.read_frame` builds a `TrackingEvent` out of every frame it reads,
+and `Recorder` implements `on_tracking_event` alone). So an `.lmt` cannot
+answer "what did the camera actually see through the glove". That needs image
+capture: enable `leap.enums.PolicyFlag.Images` — the flag is in
+`leap.enums`, not on the package root — and save `on_image_event` frames
+separately. Worth knowing before the Phase 2 gate, where the IR picture is
+the evidence.
+
 Both need the `leap` bindings; neither is on the mock path.
 """
 from pathlib import Path
@@ -83,6 +93,14 @@ class RawRecording:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         connection = getattr(self.stream, "connection", None)
+        if self._recorder is not None:
+            # Stop writing FIRST: the polling thread is still delivering
+            # tracking events, and a write that lands after LeapRecordingClose
+            # is a race on a closed handle.
+            try:
+                self._recorder.stop()
+            except Exception:       # pragma: no cover - hardware path
+                pass
         if connection is not None and self._recorder is not None:
             try:
                 connection.remove_listener(self._recorder)

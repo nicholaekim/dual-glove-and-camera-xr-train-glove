@@ -13,7 +13,7 @@ output back through `forward_kinematics` and the world positions come back
 unchanged, so camera data reaches every existing tool in the glove's own
 convention.
 """
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -92,6 +92,32 @@ def quat_conjugate(q: Sequence[float]) -> Tuple[float, float, float, float]:
     """Conjugate of an XYZW quaternion — the inverse, for unit quaternions."""
     qx, qy, qz, qw = (float(v) for v in q)
     return (-qx, -qy, -qz, qw)
+
+
+def quat_canonical(q: Sequence[float], prev: Optional[Sequence[float]] = None
+                   ) -> Tuple[float, float, float, float]:
+    """Pick the sign of `q` that keeps a sequence of quaternions continuous.
+
+    q and -q are the same rotation, and any matrix-to-quaternion conversion is
+    free to return either — `mat3_to_quat` switches branch on the largest
+    diagonal term, so a hand rotating smoothly can produce a sign flip from
+    one frame to the next. Harmless to `quat_to_mat3`, but it wrecks anything
+    that differences, interpolates or averages quaternions over time, and it
+    reads as a violent rotation in a plot of the raw components.
+
+    With `prev`, returns whichever of +q or -q has a non-negative dot product
+    with it. Without `prev`, canonicalises on w >= 0, so a lone quaternion
+    still has a defined sign.
+    """
+    qx, qy, qz, qw = quat_normalize(q)
+    if prev is None:
+        flip = qw < 0.0
+    else:
+        px, py, pz, pw = prev
+        flip = (qx * px + qy * py + qz * pz + qw * pw) < 0.0
+    if flip:
+        return (-qx, -qy, -qz, -qw)
+    return (qx, qy, qz, qw)
 
 
 def quat_mul(a: Sequence[float], b: Sequence[float]) -> Tuple[float, float, float, float]:
@@ -180,13 +206,23 @@ def absolute_to_relative(
     Units pass through untouched: feed metres, get metres.
 
     Args:
-        abs_pos: 26 world positions [x, y, z], in `names` order.
+        abs_pos: 26 world positions [x, y, z], in JOINT_NAMES order.
         abs_quat_xyzw: 26 world rotations as XYZW quaternions, same order.
-        names: joint names to stamp on the result (default JOINT_NAMES).
+        names: the joint names to stamp on the result. It exists to make the
+            order explicit at the call site, not to change it: `PARENT` is
+            derived from `BONES`, which is indexed by JOINT_NAMES position, so
+            any other order would silently attach joints to the wrong parents.
+            Anything but JOINT_NAMES is a ValueError.
 
     Returns:
         A list of `Joint`, ready for `HandFrame(joints=...)`.
     """
+    if list(names) != list(JOINT_NAMES):
+        raise ValueError(
+            "names must be JOINT_NAMES in its own order: the parent table is "
+            "derived from BONES, which indexes joints by position, so a "
+            "different order would reparent joints silently"
+        )
     n = len(names)
     if len(abs_pos) != n or len(abs_quat_xyzw) != n:
         raise ValueError(

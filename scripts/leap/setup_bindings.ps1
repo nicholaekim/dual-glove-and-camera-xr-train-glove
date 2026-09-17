@@ -9,13 +9,22 @@
     venv is 3.14). So this script does what the bindings' README does, in
     order, and stops with a readable message the moment a step fails:
 
-      1. clone github.com/ultraleap/leapc-python-bindings into TEMP
+      1. clone github.com/ultraleap/leapc-python-bindings into the Ultraleap
+         archive folder (see -Source)
       2. pip install its requirements, plus `build`
       3. python -m build leapc-cffi     (the compile step; needs LeapSDK and
-                                         the MSVC C++ toolset)
-      4. pip install the built sdist/wheel
+                                         the MSVC C++ toolset). Skipped when a
+                                         wheel for this interpreter is already
+                                         in the archive.
+      4. pip install the built wheel/sdist
       5. pip install -e leapc-python-api
       6. run check_setup.py
+
+    The clone lives in the archive folder, not in TEMP, and `leap` is
+    installed editable FROM there - so the working install and the archived
+    copy are the same files, and Windows cleaning TEMP cannot break the venv.
+    Ultraleap releases have disappeared before (plan section 1), which is the
+    whole reason for archiving in the first place.
 
     Prerequisites: Ultraleap Hyperion 6.2.0 installed (for the LeapSDK), git,
     and Visual Studio Build Tools with the C++ toolset. Set
@@ -23,7 +32,11 @@
     C:\Program Files\Ultraleap\LeapSDK.
 
 .PARAMETER Source
-    Where to clone/find the bindings. Default: $env:TEMP\leapc-python-bindings.
+    Where to clone/find the bindings. Default:
+    <Desktop>\xr trainer\reference\ultraleap\leapc-python-bindings, the
+    archive folder the plan puts the installer and LeapSDK in; falls back to
+    this repo's own reference\ultraleap\ if that is not there. Created if
+    missing.
 
 .PARAMETER Python
     The interpreter to install into. Default: this repo's .venv.
@@ -40,7 +53,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string] $Source = (Join-Path $env:TEMP "leapc-python-bindings"),
+    [string] $Source,
     [string] $Python,
     [switch] $Fresh
 )
@@ -48,6 +61,20 @@ param(
 $ErrorActionPreference = "Stop"
 $RepoUrl = "https://github.com/ultraleap/leapc-python-bindings"
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+
+function Get-ArchiveRoot {
+    # Plan section 1 archives the installer and the LeapSDK into
+    # <Desktop>\xr trainer\reference\ultraleap. Prefer that; fall back to this
+    # repo's own (gitignored) reference folder if the sibling is not there.
+    $candidates = @(
+        (Join-Path (Split-Path -Parent $RepoRoot) "xr trainer\reference\ultraleap"),
+        (Join-Path $RepoRoot "reference\ultraleap")
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { return $c }
+    }
+    return $candidates[0]
+}
 
 function Step([string] $Message) {
     Write-Host ""
@@ -70,7 +97,19 @@ if (-not (Test-Path $Python)) {
         "create the venv first:  python -m venv .venv ; .\.venv\Scripts\Activate.ps1 ; pip install -e ."
 }
 $version = & $Python -c "import sys; print('.'.join(map(str, sys.version_info[:3])))"
-Write-Host "Installing the Ultraleap bindings into: $Python  (Python $version)"
+$pyTag = & $Python -c "import sys; print('cp%d%d' % sys.version_info[:2])"
+Write-Host "Installing the Ultraleap bindings into: $Python  (Python $version, $pyTag)"
+
+# --- where the bindings live ------------------------------------------------
+if (-not $Source) {
+    $archive = Get-ArchiveRoot
+    if (-not (Test-Path $archive)) {
+        Write-Host "  creating the Ultraleap archive folder: $archive"
+        New-Item -ItemType Directory -Force -Path $archive | Out-Null
+    }
+    $Source = Join-Path $archive "leapc-python-bindings"
+}
+Write-Host "Bindings source: $Source"
 
 # --- the SDK ----------------------------------------------------------------
 Step "LeapSDK"
@@ -154,22 +193,39 @@ if (Test-Path $req) {
 if ($LASTEXITCODE -ne 0) { Stop-With "pip could not install 'build'" "read pip's error above" }
 
 # --- compile leapc_cffi -----------------------------------------------------
-Step "python -m build leapc-cffi   (compiles against $sdk)"
-Push-Location $Source
-try {
-    & $Python -m build $cffiDir
-    if ($LASTEXITCODE -ne 0) {
-        Stop-With "the leapc_cffi build failed" `
-            "this is the compile step: it needs Visual Studio Build Tools with the C++ toolset, and a LeapC.h matching the DLL. If it fails only on Python $version, create a 3.11 venv (winget install Python.Python.3.11) and re-run with -Python <that venv>\Scripts\python.exe (see docs/ultraleap_ir170_plan.md section 4)"
+# A wheel already in the archive for THIS interpreter is the build's output:
+# reuse it rather than spending a compile, unless -Fresh was asked for. Wheels
+# are tagged per Python version, so a cp314 wheel is no use to a 3.11 venv and
+# the filter below will not match one.
+$distDir = Join-Path $cffiDir "dist"
+$artifact = $null
+if (-not $Fresh -and (Test-Path $distDir)) {
+    $artifact = Get-ChildItem $distDir -Filter "*.whl" |
+        Where-Object { $_.Name -match $pyTag } |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($artifact) {
+        Step "reusing the archived wheel $($artifact.Name)   (skipping the build; -Fresh forces a rebuild)"
     }
-} finally {
-    Pop-Location
 }
 
-$artifact = Get-ChildItem (Join-Path $cffiDir "dist") -Include *.whl, *.tar.gz -Recurse |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $artifact) {
-    Stop-With "the build produced nothing in $cffiDir\dist" "re-run with -Fresh and read the build output"
+    Step "python -m build leapc-cffi   (compiles against $sdk)"
+    Push-Location $Source
+    try {
+        & $Python -m build $cffiDir
+        if ($LASTEXITCODE -ne 0) {
+            Stop-With "the leapc_cffi build failed" `
+                "this is the compile step: it needs Visual Studio Build Tools with the C++ toolset, and a LeapC.h matching the DLL. If it fails only on Python $version, create a 3.11 venv (winget install Python.Python.3.11) and re-run with -Python <that venv>\Scripts\python.exe (see docs/ultraleap_ir170_plan.md section 4)"
+        }
+    } finally {
+        Pop-Location
+    }
+
+    $artifact = Get-ChildItem $distDir -Include *.whl, *.tar.gz -Recurse |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $artifact) {
+        Stop-With "the build produced nothing in $distDir" "re-run with -Fresh and read the build output"
+    }
 }
 
 Step "pip install $($artifact.Name)"
@@ -199,5 +255,10 @@ if ($checkExit -eq 0) {
     Write-Host "The bindings are installed, but check_setup.py still reports problems above." -ForegroundColor Yellow
     Write-Host "Those are device/service issues, not build issues; fix them top to bottom." -ForegroundColor Yellow
 }
-Write-Host "Archive the installer and $sdk into reference\ultraleap\ today (plan section 1)." -ForegroundColor Yellow
+Write-Host "The leap package is installed editable from $apiDir - keep that folder." -ForegroundColor Yellow
+$archiveNote = Split-Path -Parent $Source
+if (-not (Test-Path (Join-Path $archiveNote "LeapSDK"))) {
+    Write-Host "Still to archive (plan section 1): the Hyperion installer and a copy of" -ForegroundColor Yellow
+    Write-Host "  $sdk  ->  $archiveNote" -ForegroundColor Yellow
+}
 exit $checkExit

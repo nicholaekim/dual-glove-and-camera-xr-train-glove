@@ -25,6 +25,14 @@ not read these quaternions as if an OpenXR runtime had produced them.
 Leap's thumb `bones[0]` is a zero-length metacarpal, so the thumb chain
 starts at `bones[1]`; that is why the thumb row of the table below is offset
 by one relative to the other fingers.
+
+WRIST is the other special case. Its position is `arm.next_joint`, the far
+end of the forearm bone, which is the wrist. Its orientation is
+`arm.rotation`: the **forearm bone's** world rotation. LeapC defines no wrist
+joint frame of its own, so a "wrist angle" read straight out of this
+quaternion is the forearm's orientation in space, not flexion or deviation of
+the hand against the forearm. Take those from the WRIST / PALM / metacarpal
+geometry instead.
 """
 from typing import List, Optional, Sequence, Tuple
 
@@ -191,6 +199,14 @@ def to_hand_frame(lh: LeapHand, names: Sequence[str] = JOINT_NAMES) -> HandFrame
     glove pipeline treats a dropped packet. `packet_counter` carries the
     tracking frame id so the existing per-frame filenames and the playback
     viewer's frame numbers stay meaningful.
+
+    `timestamp` is `event.timestamp` in seconds: **the LeapC clock**, whose
+    epoch is arbitrary and is not wall time. That mirrors the glove, whose
+    `timestamp` is its own device tick counter, so nothing downstream is
+    surprised. The clock two sensors share is `wall_time`, which
+    `LeapRecorder` stamps with `time.time()` as each line is written - that
+    is what `fuse_poses.py` pairs glove and camera takes on. Use `timestamp`
+    for intervals within one sensor, `wall_time` across sensors.
     """
     joints = absolute_to_relative(lh.abs26, lh.quat26, names=names)
     return HandFrame(

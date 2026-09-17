@@ -31,6 +31,8 @@ from xr_hand.kinematics import (
     forward_kinematics,
     forward_kinematics_full,
     mat3_to_quat,
+    quat_canonical,
+    quat_normalize,
 )
 from xr_hand.recorder import FrameRecorder
 
@@ -239,6 +241,42 @@ def test_absolute_to_relative_rejects_the_wrong_length():
         absolute_to_relative([[0.0, 0.0, 0.0]] * 25, [[0.0, 0.0, 0.0, 1.0]] * 25)
 
 
+def test_absolute_to_relative_rejects_a_reordered_name_list():
+    """PARENT is indexed by position, so another order would reparent joints."""
+    pos = [[0.0, 0.0, 0.0]] * 26
+    quat = [[0.0, 0.0, 0.0, 1.0]] * 26
+    with pytest.raises(ValueError):
+        absolute_to_relative(pos, quat, names=list(reversed(JOINT_NAMES)))
+    assert len(absolute_to_relative(pos, quat, names=list(JOINT_NAMES))) == 26
+
+
+def test_quat_canonical_keeps_a_sequence_continuous():
+    q = quat_normalize((0.1, 0.2, 0.3, 0.9))
+    flipped = tuple(-c for c in q)
+    # Same rotation, opposite sign: against a reference, the sign that stays
+    # on the reference's side wins.
+    assert quat_canonical(flipped, q) == pytest.approx(q)
+    assert quat_canonical(q, q) == pytest.approx(q)
+    # With no reference, w >= 0 decides, so a lone quaternion still has a sign.
+    assert quat_canonical(flipped)[3] >= 0.0
+    # Either sign is the same rotation - that is why this is safe to do.
+    from xr_hand.kinematics import quat_to_mat3
+    assert quat_to_mat3(*flipped) == pytest.approx(quat_to_mat3(*q))
+
+
+def test_mock_quaternions_never_flip_sign_between_frames():
+    """A generator that flipped sign mid-sweep would fake a discontinuity."""
+    stream = MockLeapStream(pose=None, noise_mm=0.0)
+    stream.start()
+    previous = {}
+    for side, lh in stream.generate(400):
+        if side in previous:
+            for k, (was, now) in enumerate(zip(previous[side], lh.quat26)):
+                dot = sum(a * b for a, b in zip(was, now))
+                assert dot >= 0.0, f"{side} joint {k} flipped sign"
+        previous[side] = lh.quat26
+
+
 # --- the mock stream --------------------------------------------------------
 def test_mock_stream_yields_both_hands():
     stream = MockLeapStream()
@@ -325,10 +363,35 @@ def test_recording_keeps_the_glove_keys_and_adds_the_leap_extras(tmp_path: Path)
     assert row["space"] == "leap_desktop"
     assert row["units"] == "m"
     for key in ("hand_id", "visible_time_us", "framerate", "pinch_strength",
-                "grab_strength", "palm_abs", "abs26"):
+                "grab_strength", "palm_abs", "abs26", "timestamp_us"):
         assert key in row
     assert len(row["abs26"]) == 26 and len(row["palm_abs"]) == 3
     assert row["pose"] == "open_palm" and row["take"] == 1
+
+
+def test_recording_carries_both_clocks(tmp_path: Path):
+    """wall_time is the shared clock (fuse_poses pairs on it); timestamp is LeapC's."""
+    import json
+    import time
+
+    before = time.time()
+    path = _record_mock(tmp_path, frames=5)
+    after = time.time()
+    rows = [json.loads(line) for line in
+            path.read_text(encoding="utf-8").splitlines()]
+
+    for row in rows:
+        # wall_time must be real wall clock, taken at the write.
+        assert before <= row["wall_time"] <= after
+        # timestamp is the LeapC clock in seconds, matching timestamp_us.
+        assert row["timestamp"] == pytest.approx(row["timestamp_us"] / 1e6)
+
+    # ...and the LeapC clock advances by the frame interval, not by however
+    # long the writer took.
+    per_hand = [r for r in rows if r["hand_side"] == "right"]
+    if len(per_hand) > 1:
+        step = per_hand[1]["timestamp"] - per_hand[0]["timestamp"]
+        assert step == pytest.approx(1.0 / 90.0, abs=1e-4)
 
 
 def test_keypoints21_from_a_recorded_leap_frame(tmp_path: Path):

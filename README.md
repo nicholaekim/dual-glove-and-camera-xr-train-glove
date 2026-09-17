@@ -183,17 +183,26 @@ machine, so `pip install` cannot do it and the `leap` extra in
    powershell -ExecutionPolicy Bypass -File scripts\leap\setup_bindings.ps1
    python scripts\leap\check_setup.py
    ```
-   `setup_bindings.ps1` clones the bindings into `%TEMP%`, compiles
+   `setup_bindings.ps1` clones the bindings into the Ultraleap archive folder
+   (`..\xr trainer\reference\ultraleap\`, created if missing), compiles
    `leapc_cffi` against the SDK, installs both packages into `.venv` and ends
-   by running the checker. `check_setup.py` prints PASS/FAIL for the SDK
-   folder, `LeapC.h`, `LeapC.dll`/`.lib`, the tracking service, `import leap`
-   and a 3 s live tracking test, with the fix on every FAIL, and exits 2 if
-   anything failed. Set `LEAPSDK_INSTALL_LOCATION` first if the SDK is not at
-   the default path.
+   by running the checker. It reuses an archived wheel built for the running
+   interpreter when there is one, so a repeat setup takes seconds instead of
+   a compile; `-Fresh` forces a rebuild. `check_setup.py` prints PASS/FAIL for
+   the SDK folder, `LeapC.h`, `LeapC.dll`/`.lib`, the tracking service,
+   `import leap` and a 3 s live tracking test, with the fix on every FAIL, and
+   exits 2 if anything failed. Set `LEAPSDK_INSTALL_LOCATION` first if the SDK
+   is not at the default path.
 5. Archive the installer and the `LeapSDK` folder into
-   `reference\ultraleap\` the day they are downloaded (Ultraleap releases
-   have disappeared before). The bindings clone lives in `%TEMP%` and is
-   disposable — re-run the script to recreate it, or copy it there too.
+   `..\xr trainer\reference\ultraleap\` the day they are downloaded —
+   Ultraleap releases have disappeared before. The bindings clone already
+   lives there and `leap` is installed **editable from it**, so that folder
+   is not a copy of the working install, it *is* the working install: do not
+   delete it.
+
+   Verified on this machine: Hyperion `6.2.0+2025.07.11`, and `leapc_cffi`
+   compiles cleanly on Python 3.14 (`leapc_cffi-0.0.1-cp314-cp314-win_amd64`),
+   so the 3.11 fallback venv in plan section 4 is not needed.
 
 **Daily.**
 ```powershell
@@ -244,7 +253,24 @@ nothing outside the wrist:
 space: right-handed, origin at the module, +x along the baseline, +y up, +z
 toward the user. `hand.confidence` is never used anywhere — LeapC documents
 it as a constant 1.0; recordings are gated on presence and `visible_time`
-instead.
+instead. The stream refuses to run unless the service confirms Desktop mode,
+because a recording made in the wrong mode is in the wrong frame.
+
+**Two clocks in every recording**, and they are not interchangeable:
+
+  * `wall_time` — `time.time()` as the line is written, the same stamp the
+    glove and camera recorders use. This is the **only clock the three
+    sensors share**, and it is what `fuse_poses.py` pairs takes on.
+  * `timestamp` (and `timestamp_us`) — `event.timestamp`, the **LeapC
+    clock**, whose epoch is arbitrary. Right for intervals inside one
+    recording, since it carries none of the jitter our writer adds — that is
+    why `stats.py` measures cadence from it — and meaningless compared
+    against wall time or another sensor. The glove's `timestamp` is likewise
+    its own tick counter, so this matches the existing convention.
+
+`frame_age_us` is `leap.get_now() - event.timestamp` sampled in the tracking
+callback: how old the data already was when we received it. Frame age, not
+end-to-end latency.
 
 ## Results so far (102 reference frames)
 

@@ -8,9 +8,22 @@ glove frame — `wall_time`, `timestamp`, `packet_counter`, `hand_side`,
 changes at all. That is the whole point: the camera is a new sensor, not a
 new format.
 
+Two clocks, and the difference matters:
+
+  wall_time     `time.time()` as the line is written, exactly as the glove
+                and camera recorders stamp it. It is the only clock the three
+                sensors share, and it is what `fuse_poses.py` pairs takes on.
+  timestamp     `event.timestamp` in seconds - the **LeapC clock**, whose
+                epoch is arbitrary. Right for intervals inside one recording
+                (free of the jitter our writer adds, so `stats.py` prefers
+                it), meaningless against wall time or another sensor. The
+                glove's `timestamp` is likewise its own tick counter, so this
+                matches the convention rather than inventing one.
+
 The extras, none of which the glove can produce:
 
   source            "leap"
+  timestamp_us      event.timestamp unrounded, LeapC's integer microseconds
   space             "leap_desktop" — absolute LeapC desktop-mode camera space
   units             "m" — same unit as glove HandFrames (LeapC's millimetres
                     are converted once, in to_openxr.from_leap_mm)
@@ -96,6 +109,8 @@ class LeapRecorder:
             self._next_sample[lh.hand_side] = now + self._interval
 
         frame = to_hand_frame(lh)
+        # wall_time is time.time() at the write, the same stamp the glove and
+        # camera recorders use; frame.timestamp is the LeapC clock.
         d = _frame_to_dict(frame, wall_time=now)
         if self.pose is not None:
             d["pose"] = self.pose
@@ -105,6 +120,7 @@ class LeapRecorder:
             "source": SOURCE,
             "space": SPACE,
             "units": FRAME_UNITS,
+            "timestamp_us": lh.timestamp_us,
             "hand_id": lh.hand_id,
             "visible_time_us": lh.visible_time_us,
             "framerate": round(lh.framerate, 3),
