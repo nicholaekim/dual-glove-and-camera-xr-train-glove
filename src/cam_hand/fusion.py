@@ -12,8 +12,8 @@ actually measures it:
   absolute pose         CAMERA — the glove reports nothing outside the wrist
 
 How a fused finger is built
-  1. Scale + rotate the camera skeleton into the glove's frame, solving on
-     the near-rigid palm landmarks (wrist + the four knuckles) — align.py.
+  1. Rotate the camera skeleton into the glove's frame, solving on the
+     near-rigid palm landmarks (wrist + the four knuckles) — align.py.
   2. Build a palm frame from the glove: the palm normal plus two in-plane
      axes. In that frame, a finger's direction splits into an out-of-plane
      component (curl — the glove's) and an in-plane azimuth (spread — the
@@ -29,6 +29,25 @@ rather than a mean).
 The thumb is handled differently: its whole direction is taken from the
 camera, not just the azimuth, because opposition IS out-of-plane rotation and
 the glove cannot see it.
+
+Scale in step 1 (`with_scale`) depends on which camera took the frame, and
+the plan (section 3, "Coordinate policy") is explicit about it:
+
+  MediaPipe      with_scale=True. Its world landmarks are a normalised
+                 hand — a shape, not a size — so the fit has to solve for
+                 scale or the palms will not sit on each other at all.
+  Ultraleap      with_scale=False, a RIGID fit. Leap joints are measured
+                 millimetres. Letting a least-squares fit stretch them would
+                 silently absorb a real disagreement between the two sensors
+                 (a glove template hand that is not the size of the hand
+                 wearing it) into a scale factor, and that disagreement is
+                 something Phase 5 means to measure, not to hide.
+
+The fused *angles* come out the same either way — step 3 normalises every
+direction, which is why `test_fusion_is_scale_invariant` passes — so this
+flag does not change the fused hand. It changes what the aligned camera
+points mean, and therefore what any residual computed against them means.
+`info["alignment"]` records which fit was used.
 
 Confidence gating: below `min_score`, or when the camera never saw the hand,
 the glove skeleton is returned untouched. Fusion therefore degrades to
@@ -94,9 +113,14 @@ def rotation_between(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.eye(3) + K + K @ K * ((1 - c) / (s * s))
 
 
-def camera_into_glove_frame(glove: np.ndarray, cam: np.ndarray) -> np.ndarray:
-    """Scale + rotate the camera hand onto the glove hand via the palm."""
-    R, s, t = umeyama(cam[PALM_IDX], glove[PALM_IDX], with_scale=True)
+def camera_into_glove_frame(glove: np.ndarray, cam: np.ndarray,
+                            with_scale: bool = True) -> np.ndarray:
+    """Put the camera hand in the glove's frame, solving on the palm.
+
+    with_scale=True is the MediaPipe fit (rotation + uniform scale); False is
+    the rigid fit a metric camera gets. See the module docstring.
+    """
+    R, s, t = umeyama(cam[PALM_IDX], glove[PALM_IDX], with_scale=with_scale)
     return (s * (R @ cam.T)).T + t
 
 
@@ -107,15 +131,19 @@ def fuse_skeletons(
     min_score: float = 0.5,
     thumb_from_camera: bool = True,
     fingers: Optional[Sequence[str]] = None,
+    with_scale: bool = True,
 ) -> Tuple[np.ndarray, dict]:
     """Fuse one glove frame with one camera frame -> 21 points + info.
 
-    Both inputs are 21 x 3 wrist-centred metres. Returns the fused points
-    (wrist-centred) and a dict describing what was actually used, so callers
-    can report how often the camera contributed.
+    Both inputs are 21 x 3 wrist-centred metres. `with_scale` picks the
+    alignment: True for a normalised (MediaPipe) camera, False for a metric
+    one (Ultraleap). Returns the fused points (wrist-centred) and a dict
+    describing what was actually used, so callers can report how often the
+    camera contributed and under which fit.
     """
     G = np.asarray(glove_pts, dtype=float)
-    info = {"camera_used": False, "reason": "", "fingers_adjusted": []}
+    info = {"camera_used": False, "reason": "", "fingers_adjusted": [],
+            "alignment": "similarity" if with_scale else "rigid"}
 
     if cam_pts is None:
         info["reason"] = "no camera frame"
@@ -124,7 +152,8 @@ def fuse_skeletons(
         info["reason"] = f"camera score {cam_score:.2f} < {min_score:.2f}"
         return G, info
 
-    C = camera_into_glove_frame(G, np.asarray(cam_pts, dtype=float))
+    C = camera_into_glove_frame(G, np.asarray(cam_pts, dtype=float),
+                                with_scale=with_scale)
     n, _x, _y = palm_frame(G)
     fused = G.copy()
     names = list(FINGER_CHAINS) if fingers is None else list(fingers)
