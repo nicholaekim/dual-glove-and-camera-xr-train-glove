@@ -5,9 +5,9 @@ Both halves of the hand-tracking work in one place:
 
   `src/xr_hand`   the StretchSense glove pipeline (OSC receive -> validate ->
                   parse -> forward kinematics -> record/export). Started as
-                  the July feasibility project; the copy in
-                  `..\xr trainer\summer-xr-trainer` is the archived version
-                  submitted to the professor and is no longer edited.
+                  the July feasibility project; that repo is merged in under
+                  `archive/summer-xr-trainer/` with its full history (July
+                  dataset, technical PDF) and is frozen there.
   `src/cam_hand`  the webcam pipeline (MediaPipe 21 landmarks), plus fusion,
                   alignment, features and the comparison tooling.
 
@@ -318,6 +318,10 @@ scripts/
   analyze_poses_cam.py       camera pose separability report
 tests/                       pytest: fusion invariants, recording, formats
 models/hand_landmarker.task  MediaPipe model
+docs/ultraleap_ir170_plan.md Ultraleap Stereo IR 170 integration plan (next phase)
+archive/summer-xr-trainer/   July glove-only repo, merged with history: the
+                             42-take July dataset, REPORT.txt, technical PDF,
+                             record_frame.ps1 (frozen, see archive/README.md)
 ```
 
 ```powershell
@@ -339,6 +343,17 @@ usable data:
 `img` is image-space pixels (`z` is MediaPipe's relative depth). `world` is
 metric-ish metres, hand-centred; everything downstream re-centres on the
 wrist. Frames are never mirrored — the preview window is, the data is not.
+
+## Repository history
+
+- July 2026: glove-only pipeline at https://github.com/nicholaekim/summer-xr-trainer
+  (now read-only; merged here on 2026-09-16 under `archive/summer-xr-trainer/`
+  with all of its commits).
+- August 2026: this repo, https://github.com/nicholaekim/dual-glove-and-camera-xr-train-glove,
+  adds the webcam pipeline, fusion and the tracker comparison; the glove code
+  was consolidated into `src/xr_hand` and `scripts/glove/`.
+- September 2026: Ultraleap Stereo IR 170 planned as the second sensor, see
+  `docs/ultraleap_ir170_plan.md`.
 
 ## Known limits
 
