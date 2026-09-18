@@ -10,23 +10,35 @@ from cam_hand.features import all_features, flexion_features, spread_features
 from cam_hand.fusion import (
     CAMERA_DOFS,
     DEFAULT_GATES,
+    DEFAULT_RAIL,
     FINGER_CHAINS,
+    GATED_DOFS,
+    RAIL_DOFS,
     GateParams,
+    RailDecision,
+    RailOverrideParams,
+    RailOverrideTracker,
     R_CURLED,
     R_DISAGREE,
     R_FIELD,
     R_HAND_ID,
     R_NO_FRAME,
+    R_RAIL_EXTENDED,
+    R_RAIL_NONE,
+    R_RAIL_OFF,
     R_VIEW,
     R_VISIBLE,
+    SPREAD_FINGERS,
     flag_hand_id_stability,
     frame_trust,
     fuse_skeletons,
+    learn_rails,
     pair_by_time,
     palm_field_angle_deg,
     palm_frame,
     proximal_direction,
     rotation_between,
+    transfer_finger_flexion,
     viewing_angle_deg,
 )
 
@@ -917,8 +929,11 @@ def test_every_frame_reports_where_each_dof_came_from_and_why():
     _f, info = fuse_skeletons(glove, cam, with_scale=False,
                               cam_meta=facing_meta())
     assert info["gated"] is True
-    assert set(info["dof_source"]) == set(CAMERA_DOFS)
-    assert set(info["dof_source"].values()) == {"camera"}
+    assert set(info["dof_source"]) == set(GATED_DOFS)
+    assert {info["dof_source"][d] for d in CAMERA_DOFS} == {"camera"}
+    # the curls are accounted for too, and with no rail decision handed in they
+    # stay the glove's: the override is the only thing that can move them
+    assert {info["dof_source"][d] for d in RAIL_DOFS} == {"glove"}
     assert info["rejected"] == {}
     # every DOF is either sourced from the camera or carries a reason it is not
     for dof in CAMERA_DOFS:
@@ -948,7 +963,8 @@ def test_an_ungated_mediapipe_frame_is_fused_exactly_as_before():
     fused, info = fuse_skeletons(glove, cam, with_scale=True)
     assert info["gated"] is False
     assert info["rejected"] == {}
-    assert set(info["dof_source"].values()) == {"camera"}
+    assert {info["dof_source"][d] for d in CAMERA_DOFS} == {"camera"}
+    assert {info["dof_source"][d] for d in RAIL_DOFS} == {"glove"}
     assert info["fingers_adjusted"] == list(FINGER_CHAINS)
     assert not np.allclose(fused, glove - glove[0], atol=1e-6)
 
@@ -957,7 +973,8 @@ def test_gate_thresholds_are_named_parameters_and_are_reported():
     described = DEFAULT_GATES.described()
     assert described == {"curl_gate": 1.2, "view_gate_deg": 50.0,
                          "curl_agree_tol": 0.35, "min_visible_time_us": 300_000,
-                         "hand_id_settle_s": 0.25, "field_half_angle_deg": 45.0}
+                         "hand_id_settle_s": 0.25, "field_half_angle_deg": 45.0,
+                         "min_usable_fingers": 2}
     # and they are honoured, not just stored
     glove = make_hand(spread_deg=0.0, curl=0.0)
     cam = make_hand(spread_deg=25.0, curl=0.0)
@@ -965,3 +982,499 @@ def test_gate_thresholds_are_named_parameters_and_are_reported():
     _f, info = fuse_skeletons(glove, cam, with_scale=False, gates=strict,
                               cam_meta=facing_meta())
     assert info["rejected"]["spread index"] == R_CURLED
+
+
+# --- the rail-disagreement override ------------------------------------
+# The glove reports a bit-exact CONSTANT whenever a finger is straight, and on
+# recordings/sync_day1 it sits on that constant through every pinch while the
+# camera watches the index fold. These cover the three things that have to be
+# true for the camera to win a curl, the hysteresis that makes it a decision
+# rather than a twitch, and the geometry of the transfer itself.
+
+RAIL = 1.9740                      # an index rail, as the glove reports it
+
+
+def rail_samples(rail=RAIL, on=200, off=40, hand="right", finger_index=1):
+    """(hand, curls) frames: `on` of them bit-exact on the rail, `off` moving."""
+    out = []
+    for _ in range(on):
+        curls = [1.0, 1.0, 1.0, 1.0, 1.0]
+        curls[finger_index] = rail
+        out.append((hand, curls))
+    for k in range(off):
+        curls = [1.0, 1.0, 1.0, 1.0, 1.0]
+        curls[finger_index] = 0.70 + 0.02 * k      # nowhere near the rail
+        out.append((hand, curls))
+    return out
+
+
+def test_learn_rails_finds_the_saturation_spike():
+    """A rail is the value the glove repeats exactly, at the top of its range."""
+    rails = learn_rails(rail_samples())
+    assert rails[("right", "index")] == pytest.approx(RAIL, abs=1e-9)
+
+    # the third decimal is the DATA's, not the histogram bin's: jitter in the
+    # last digit must still resolve to one rail
+    jittered = [("right", [1.0, RAIL + d, 1.0, 1.0, 1.0])
+                for d in (0.0, 0.001, -0.001, 0.0, 0.001)] * 40
+    assert learn_rails(jittered)[("right", "index")] == pytest.approx(
+        RAIL, abs=0.002)
+
+
+def test_a_finger_that_is_never_straight_teaches_no_rail():
+    """A session with no open hand in it must teach nothing, not nonsense.
+
+    The most common value of a moving finger is just the pose that was held
+    longest. It is not a rail, and calling it one would let the override fire
+    against a glove that is measuring perfectly well.
+    """
+    # 'most common' but far below the biggest curl seen: a held pose
+    held = [("right", [1.0, 0.80, 1.0, 1.0, 1.0])] * 200
+    reached = [("right", [1.0, 1.60, 1.0, 1.0, 1.0])] * 10
+    rails = learn_rails(held + reached)
+    assert ("right", "index") not in rails
+
+    # and a rail glimpsed on too few frames is not yet evidence of one
+    rare = ([("right", [1.0, 0.80 + 0.001 * k, 1.0, 1.0, 1.0])
+             for k in range(400)] + [("right", [1.0, 1.60, 1.0, 1.0, 1.0])] * 3)
+    assert ("right", "index") not in learn_rails(rare)
+
+
+def rail_tracker(enter=3, leave=2, **over):
+    params = RailOverrideParams(enter_frames=enter, exit_frames=leave, **over)
+    return RailOverrideTracker({("right", "index"): RAIL}, params), params
+
+
+def on_rail_curls(index=RAIL):
+    return [1.2, index, 1.2, 1.2, 1.2]
+
+
+def flexed_cam_curls(index=1.20):
+    """Camera curls whose index is well below its open reference minus margin."""
+    return [1.2, index, 1.8, 1.8, 1.8]
+
+
+def test_rail_override_enters_and_leaves_with_hysteresis():
+    """N consecutive frames to arm, M to disarm — never one frame of either."""
+    tracker, _params = rail_tracker(enter=3, leave=2)
+    meta = facing_meta()
+
+    # arming: two qualifying frames are not enough, the third is
+    for expected in (False, False, True):
+        d = tracker.update("right", on_rail_curls(), flexed_cam_curls(), meta)
+        assert ("index" in d.active) is expected
+    assert tracker.update("right", on_rail_curls(), flexed_cam_curls(),
+                          meta).rejected == {}
+
+    # disarming: one non-qualifying frame is not enough, the second is.
+    # The camera now sees the index straight, so nothing disagrees any more.
+    straight = flexed_cam_curls(index=1.80)
+    d = tracker.update("right", on_rail_curls(), straight, meta)
+    assert "index" in d.active, "one bad frame must not drop the override"
+    d = tracker.update("right", on_rail_curls(), straight, meta)
+    assert "index" not in d.active
+    assert d.rejected["curl index"] == R_RAIL_EXTENDED
+
+    # and re-arming costs the full N again
+    for expected in (False, False, True):
+        d = tracker.update("right", on_rail_curls(), flexed_cam_curls(), meta)
+        assert ("index" in d.active) is expected
+
+
+def test_the_other_hand_has_its_own_run_and_its_own_rail():
+    """Two hands interleave in one file; their evidence must not pool."""
+    params = RailOverrideParams(enter_frames=3, exit_frames=2)
+    tracker = RailOverrideTracker({("right", "index"): RAIL}, params)
+    meta = facing_meta()
+    d_left = None
+    for _ in range(3):
+        tracker.update("right", on_rail_curls(), flexed_cam_curls(), meta)
+        d_left = tracker.update("left", on_rail_curls(), flexed_cam_curls(), meta)
+    assert "index" in tracker.update("right", on_rail_curls(),
+                                     flexed_cam_curls(), meta).active
+    # the left hand was never given a rail, so it can never override
+    assert "index" not in d_left.active
+    assert d_left.rejected["curl index"] == R_RAIL_NONE
+
+
+def test_no_override_when_the_camera_frame_is_not_trusted():
+    """The override needs the same trusted frame the spread and thumb need."""
+    meta_cases = {
+        R_VISIBLE: facing_meta(visible_time_us=1_000),
+        R_FIELD: facing_meta(palm_abs=[0.4, 0.05, 0.0]),
+        R_VIEW: facing_meta(view_deg=70.0),
+        R_NO_FRAME: None,
+    }
+    for expected, meta in meta_cases.items():
+        tracker, _p = rail_tracker(enter=2)
+        d = None
+        for _ in range(30):
+            d = tracker.update("right", on_rail_curls(),
+                               None if meta is None else flexed_cam_curls(),
+                               meta)
+        assert not d.active, expected
+        assert d.rejected["curl index"] == expected
+
+    # a hand the tracker has just re-acquired is refused too
+    tracker, _p = rail_tracker(enter=2)
+    d = None
+    for _ in range(30):
+        d = tracker.update("right", on_rail_curls(), flexed_cam_curls(),
+                           facing_meta(hand_id_stable=False))
+    assert not d.active
+
+
+def test_no_override_when_the_glove_is_off_its_rail():
+    """A glove that is measuring keeps the curl, however bent the camera says.
+
+    This is the whole reason the override is safe: the isolated slow index bend
+    leaves the rail the moment the camera sees flexion, so the glove is not in
+    a dead zone there and must be believed.
+    """
+    tracker, _params = rail_tracker(enter=2)
+    d = None
+    for _ in range(30):
+        d = tracker.update("right", on_rail_curls(index=RAIL - 0.05),
+                           flexed_cam_curls(), facing_meta())
+    assert not d.active
+    assert d.rejected["curl index"] == R_RAIL_OFF
+
+    # just off the rail, by more than the tolerance, is still off it
+    tracker, params = rail_tracker(enter=2)
+    for _ in range(30):
+        d = tracker.update("right", on_rail_curls(index=RAIL - 2 * params.tol),
+                           flexed_cam_curls(), facing_meta())
+    assert not d.active
+
+
+def test_no_override_when_the_camera_agrees_the_finger_is_straight():
+    """The camera has to actually SEE flexion, not merely be present."""
+    tracker, params = rail_tracker(enter=2)
+    open_ref = params.open_curl("index")
+    d = None
+    # exactly at the threshold is not below it
+    for _ in range(30):
+        d = tracker.update("right", on_rail_curls(),
+                           flexed_cam_curls(index=open_ref - params.margin),
+                           facing_meta())
+    assert not d.active
+    assert d.rejected["curl index"] == R_RAIL_EXTENDED
+
+
+def test_the_curl_transfer_is_a_valid_chain_with_the_cameras_flexion():
+    """Camera bone DIRECTIONS on glove bone LENGTHS: angles move, bones do not."""
+    glove = make_hand(curl=0.0)          # index straight
+    cam = make_hand(curl=0.9)            # camera sees it folded
+
+    rebuilt = transfer_finger_flexion(glove, cam, "index")
+    chain = FINGER_CHAINS["index"]
+
+    # the knuckle belongs to the palm and does not move
+    assert np.allclose(rebuilt[0], glove[chain[0]], atol=1e-12)
+    # every bone keeps exactly the glove's length — the chain is still a chain
+    for k in range(3):
+        assert (float(np.linalg.norm(rebuilt[k + 1] - rebuilt[k]))
+                == pytest.approx(
+                    float(np.linalg.norm(glove[chain[k + 1]] - glove[chain[k]])),
+                    abs=1e-12))
+    # these two hands share their bone lengths, so the transfer must land on
+    # the camera's finger exactly: the angles are the camera's, all three
+    assert np.allclose(rebuilt, cam[chain], atol=1e-12)
+
+    # a camera of a different SIZE moves the angles and not the lengths
+    small = make_hand(curl=0.9) * 0.6
+    rebuilt = transfer_finger_flexion(glove, small, "index")
+    for k in range(3):
+        assert (float(np.linalg.norm(rebuilt[k + 1] - rebuilt[k]))
+                == pytest.approx(
+                    float(np.linalg.norm(glove[chain[k + 1]] - glove[chain[k]])),
+                    abs=1e-12))
+
+
+def test_an_active_override_gives_the_fused_finger_the_cameras_curl():
+    """End of the chain: the fused index reads flexed, not railed."""
+    glove = make_hand(curl=0.0)
+    cam = make_hand(curl=0.9)
+    decision = RailDecision(active=("index",))
+
+    fused, info = fuse_skeletons(glove, cam, with_scale=False,
+                                 cam_meta=facing_meta(), rail=decision)
+    assert info["rail_override"] == ["index"]
+    assert info["dof_source"]["curl index"] == "camera (rail override)"
+
+    curl_g = flexion_features(glove)[1]
+    curl_c = flexion_features(cam)[1]
+    curl_f = flexion_features(fused)[1]
+    assert curl_f == pytest.approx(curl_c, abs=1e-9), "same bones: exact"
+    # this toy hand spans only 1.79 (straight) to 1.60 (curl=0.9) where a real
+    # one spans 1.97 to 0.66, so the absolute move is small and what is worth
+    # asserting is that it IS a move, off the glove's value
+    assert abs(curl_f - curl_g) > 0.15, "and off the glove's rail"
+
+    # no bone was stretched to do it
+    assert bone_lengths(fused) == pytest.approx(bone_lengths(glove), abs=1e-9)
+    # and the fingers nobody overrode kept the glove's curl
+    for k, name in ((2, "middle"), (3, "ring"), (4, "pinky")):
+        assert flexion_features(fused)[k] == pytest.approx(
+            flexion_features(glove)[k], abs=1e-9), name
+
+
+def test_without_a_decision_the_fusion_is_exactly_what_it_was():
+    """The override is opt-in per frame: no decision, no change at all."""
+    glove = make_hand(spread_deg=0.0, curl=0.0)
+    cam = make_hand(spread_deg=20.0, curl=0.9)
+    before, info_b = fuse_skeletons(glove, cam, with_scale=False,
+                                    cam_meta=facing_meta())
+    after, info_a = fuse_skeletons(glove, cam, with_scale=False,
+                                   cam_meta=facing_meta(),
+                                   rail=RailDecision())
+    assert np.allclose(before, after, atol=1e-15)
+    assert info_b["rail_override"] == info_a["rail_override"] == []
+    # the camera saw a folded index and still did not get it: the curl stays
+    # the glove's. (Not to 1e-9 — adopting the camera's AZIMUTH swings the
+    # finger about a knuckle offset from the wrist, which moves the tip a
+    # little at constant curl. See test_fusion_keeps_glove_curl.)
+    curl_f = flexion_features(after)[1]
+    assert (abs(curl_f - flexion_features(glove)[1])
+            < abs(curl_f - flexion_features(cam)[1]) / 10)
+
+
+def test_rail_params_are_named_parameters_and_are_reported():
+    described = DEFAULT_RAIL.described()
+    assert described["tol"] == 0.005
+    assert described["margin"] == 0.25
+    assert described["enter_frames"] == 10
+    assert described["exit_frames"] == 5
+    assert described["fingers"] == "index"
+    assert "index 1.75" in described["cam_open_curl"]
+    assert DEFAULT_RAIL.open_curl("index") == 1.75
+    assert DEFAULT_RAIL.open_curl("pinky") == 1.44
+
+
+def test_a_railed_glove_take_and_a_flexed_leap_take_fuse_end_to_end(tmp_path):
+    """The whole path on real files: learn the rail, arm, and move the curl.
+
+    A glove take with the index straight (its rail) against a leap take of the
+    same seconds with the index folded — sync_day1's pinch, in miniature. The
+    rail is learned from the glove file itself, the tracker arms, and the fused
+    index ends up reading the camera's flexion instead of the glove's constant.
+    """
+    fuse = _fuse_module()
+    name = "pinch_right_take1_20260918_184722.jsonl"
+    _write_glove_take(tmp_path / "glove" / name, spread_deg=0.0, curl=0.0, n=14)
+    _write_leap_take(tmp_path / "leap" / name, spread_deg=0.0, curl=1.5, n=14)
+
+    glove = fuse.load_glove(tmp_path / "glove" / name)
+    cam, source = fuse.load_cam(fuse.find_camera_take(tmp_path, name))
+    assert source == "leap"
+    flag_hand_id_stability(cam, DEFAULT_GATES)
+
+    # the rail is learned from the glove frames about to be fused
+    rails = learn_rails((g["hand_side"], flexion_features(np.asarray(g["pts"], float)))
+                        for g in glove)
+    rail = rails[("right", "index")]
+    assert rail == pytest.approx(flexion_features(np.asarray(glove[0]["pts"]))[1],
+                                 abs=1e-6)
+
+    params = RailOverrideParams(enter_frames=5,
+                                # this toy hand's straight index reads 1.79,
+                                # not a real hand's 1.75, and it folds to 1.28
+                                # rather than a real 0.66
+                                cam_open_curl=(1.23, 1.79, 1.83, 1.79, 1.72))
+    tracker = RailOverrideTracker(rails, params)
+
+    curls_fused, n_active = [], 0
+    # a generous window: the two takes are written one after the other here, so
+    # they do not interleave the way two live sensors do. Pairing has its own
+    # tests; this one is about the override.
+    # The capture facts come from `facing_meta`, not from the file: the toy
+    # hand is built flat in one plane, so its own palm normal is perpendicular
+    # to the ray from the module and it reads as permanently edge-on. That
+    # geometry is what `viewing_angle_deg`, `palm_field_angle_deg` and
+    # `frame_trust` are tested on directly; here the point is the override.
+    assert fuse.cam_meta_of(cam[0], source) is not None, "the file carries them"
+    for g, c in pair_by_time(glove, cam, max_dt=1.0):
+        assert c is not None, "every glove frame finds a camera frame"
+        G = np.asarray(g["pts"], float)
+        C = np.asarray(c["pts"], float)
+        meta = facing_meta()
+        decision = tracker.update(g["hand_side"], flexion_features(G),
+                                  flexion_features(C), meta)
+        fused, info = fuse_skeletons(G, c["pts"], with_scale=False,
+                                     cam_meta=meta, rail=decision)
+        n_active += int("index" in info["rail_override"])
+        curls_fused.append(flexion_features(fused)[1])
+        # whatever happens, the template's bones are never rescaled
+        assert bone_lengths(fused) == pytest.approx(bone_lengths(G), abs=1e-9)
+
+    curl_g = flexion_features(np.asarray(glove[0]["pts"], float))[1]
+    curl_c = flexion_features(np.asarray(cam[0]["pts"], float))[1]
+    assert n_active == len(curls_fused) - (params.enter_frames - 1)
+    # the first frames are the glove's rail, the armed ones are the camera's
+    assert curls_fused[0] == pytest.approx(curl_g, abs=1e-9)
+    assert curls_fused[-1] == pytest.approx(curl_c, abs=1e-6)
+    assert abs(curls_fused[-1] - curl_g) > 0.3
+
+
+# --- who is allowed to vote on the camera's thumb ----------------------
+# The thumb gate asks the other fingers whether the camera has this hand
+# right. A finger can only answer if its GLOVE curl is a measurement.
+
+# A glove reporting its own open palm against a camera that has the index and
+# middle folded onto the thumb. The railed pair "disagree" by ~0.7 each, which
+# is the rail talking and not evidence about the camera. Two of four is what it
+# takes to move a median — one outlier would not, which is what a median is for
+# and why this needed a rule rather than a wider tolerance.
+RAILED_GLOVE_CURLS = [1.43, 1.97, 2.07, 1.97, 1.71]
+RAILED_CAM_CURLS = [1.33, 1.27, 1.30, 1.95, 1.70]
+
+
+def test_disputed_fingers_do_not_vote_on_the_thumb():
+    """sync_day1's pinch: a railed curl the camera contradicts is not evidence."""
+    glove = hand_with_curls(RAILED_GLOVE_CURLS)
+    cam = hand_with_curls(RAILED_CAM_CURLS)
+    meta = facing_meta(view_deg=40.0)
+
+    # with the disputed pair voting, they refuse a thumb the camera had right
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta)
+    assert info["thumb_vote_fingers"] == ["index", "middle", "ring", "pinky"]
+    assert info["curl_disagreement"] > DEFAULT_GATES.curl_agree_tol
+    assert info["rejected"]["thumb"] == R_DISAGREE
+
+    # told the camera contradicts those two rails, the vote drops them
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta,
+                              rail=RailDecision(disputed=("index", "middle")))
+    assert info["thumb_vote_fingers"] == ["ring", "pinky"]
+    assert info["dof_source"]["thumb"] == "camera"
+
+    # and if every finger were disputed, nobody votes and the geometry decides
+    _f, info = fuse_skeletons(
+        glove, cam, with_scale=False, cam_meta=meta,
+        rail=RailDecision(disputed=("index", "middle", "ring", "pinky")))
+    assert info["thumb_vote_fingers"] == []
+    assert info["curl_disagreement"] is None
+    assert info["dof_source"]["thumb"] == "camera"
+
+
+def test_a_railed_finger_the_camera_agrees_with_still_votes():
+    """Being on the rail is not a reason to distrust a finger.
+
+    In peace, open palm and index point the extended fingers sit on their
+    rails and the camera says they are extended too. That agreement is the
+    best evidence the vote has — excluding it once left the verdict to the
+    curled fingers alone and refused a correct camera thumb on almost every
+    right-hand peace frame.
+    """
+    tracker = RailOverrideTracker(
+        {("right", f): RAIL for f in ("index", "middle")},
+        RailOverrideParams(enter_frames=1))
+    meta = facing_meta()
+
+    # both railed, camera agrees they are extended -> neither is disputed
+    agreeing = [1.2, 1.78, 1.85, 1.2, 1.2]
+    d = tracker.update("right", [1.2, RAIL, RAIL, 1.2, 1.2], agreeing, meta)
+    assert d.disputed == ()
+    assert d.active == (), "and nothing is overridden either"
+
+    # the camera now says the index is folded: that one is disputed, and the
+    # middle, which it still agrees about, is not
+    folded = [1.2, 1.20, 1.85, 1.2, 1.2]
+    d = tracker.update("right", [1.2, RAIL, RAIL, 1.2, 1.2], folded, meta)
+    assert d.disputed == ("index",)
+
+
+def test_an_overridden_finger_does_not_vote_on_the_thumb():
+    """The loser of one argument does not get to judge the next.
+
+    Listed separately from `disputed` rather than implied by it: hysteresis
+    keeps a finger overridden for `exit_frames` after the disagreement stops,
+    and during that window it is active without being disputed.
+    """
+    glove = hand_with_curls(RAILED_GLOVE_CURLS)
+    cam = hand_with_curls(RAILED_CAM_CURLS)
+    _f, info = fuse_skeletons(
+        glove, cam, with_scale=False, cam_meta=facing_meta(view_deg=40.0),
+        rail=RailDecision(active=("index", "middle")))
+    assert info["thumb_vote_fingers"] == ["ring", "pinky"]
+    assert info["dof_source"]["thumb"] == "camera"
+
+
+def test_an_unreliable_finger_does_not_vote_on_the_thumb():
+    """A glove finger the operator has declared broken is not evidence.
+
+    sync_day1's RIGHT glove reports ring and pinky partly extended through
+    thumbs_up and peace while the camera has them curled, take after take.
+    That is a fault in those two fingers, not a reason to distrust the camera.
+    """
+    glove = hand_with_curls([1.43, 1.12, 1.18, 1.53, 1.60])
+    cam = hand_with_curls([1.36, 1.05, 1.10, 0.81, 0.82])
+    meta = facing_meta(view_deg=40.0)
+
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta)
+    assert info["rejected"]["thumb"] == R_DISAGREE, "ring and pinky veto it"
+
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta,
+                              unreliable_fingers=("ring", "pinky"))
+    assert info["thumb_vote_fingers"] == ["index", "middle"]
+    assert info["dof_source"]["thumb"] == "camera"
+
+
+def test_a_camera_wrong_about_every_usable_finger_is_still_rejected():
+    """The edge-on thumbs_up rejection must survive all of the above.
+
+    Nothing here is railed, overridden or declared unreliable, so all four
+    fingers vote — and all four say the camera has the hand wrong.
+    """
+    glove = hand_with_curls(THUMBSUP_GLOVE_CURLS)
+    cam = hand_with_curls(THUMBSUP_CAM_CURLS)
+    _f, info = fuse_skeletons(glove, cam, with_scale=False,
+                              cam_meta=facing_meta(view_deg=40.0))
+    assert info["thumb_vote_fingers"] == ["index", "middle", "ring", "pinky"]
+    assert info["curl_disagreement"] > DEFAULT_GATES.curl_agree_tol
+    assert info["rejected"]["thumb"] == R_DISAGREE
+
+    # and excluding a minority of them does not rescue it: the rest still say no
+    _f, info = fuse_skeletons(glove, cam, with_scale=False,
+                              cam_meta=facing_meta(view_deg=40.0),
+                              unreliable_fingers=("pinky",))
+    assert info["rejected"]["thumb"] == R_DISAGREE
+
+
+def test_too_few_usable_fingers_means_the_glove_casts_no_veto():
+    """With nothing left that is measuring, the camera's geometry decides.
+
+    This is a deliberate choice to fail toward the sensor that still has
+    evidence: a glove with one usable finger has no opinion worth acting on.
+    """
+    glove = hand_with_curls(THUMBSUP_GLOVE_CURLS)
+    cam = hand_with_curls(THUMBSUP_CAM_CURLS)
+    meta = facing_meta(view_deg=40.0)
+
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta,
+                              unreliable_fingers=("middle", "ring", "pinky"))
+    assert info["thumb_vote_fingers"] == ["index"]
+    assert info["dof_source"]["thumb"] == "camera", "one finger is not a vote"
+
+    # two is a vote again, and these two still say no
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta,
+                              unreliable_fingers=("ring", "pinky"))
+    assert info["thumb_vote_fingers"] == ["index", "middle"]
+    assert info["rejected"]["thumb"] == R_DISAGREE
+
+    # ...and the geometry gates still bite when there is no vote at all
+    _f, info = fuse_skeletons(glove, cam, with_scale=False,
+                              cam_meta=facing_meta(view_deg=75.0),
+                              unreliable_fingers=SPREAD_FINGERS)
+    assert info["thumb_vote_fingers"] == []
+    assert info["rejected"]["thumb"] == R_VIEW
+
+
+def test_min_usable_fingers_is_a_named_parameter():
+    glove = hand_with_curls(THUMBSUP_GLOVE_CURLS)
+    cam = hand_with_curls(THUMBSUP_CAM_CURLS)
+    meta = facing_meta(view_deg=40.0)
+    # demanding three voters, with only two left, means no veto
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta,
+                              gates=GateParams(min_usable_fingers=3),
+                              unreliable_fingers=("ring", "pinky"))
+    assert info["dof_source"]["thumb"] == "camera"

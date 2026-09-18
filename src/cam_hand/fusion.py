@@ -92,10 +92,20 @@ come from the tracker's own opinion of itself:
                 its proximal bone points at the camera) and the palm is
                 turned toward the module.
   thumb         only when the palm is turned toward the module AND the camera
-                agrees with the glove about the other four fingers. A camera
-                that has the four fingers wrong has the hand's orientation
-                wrong, and the thumb is the DOF that orientation error moves
-                the most. This is what rejects thumbs_up and admits pinch.
+                agrees with the glove about the other fingers. A camera that
+                has the fingers wrong has the hand's orientation wrong, and
+                the thumb is the DOF that orientation error moves the most.
+                This is what rejects thumbs_up and admits pinch.
+
+                "the other fingers" is not all four. A finger only votes if
+                its glove curl is a MEASUREMENT: not pinned on its rail WHILE
+                the camera reads it flexed, not already overridden by the
+                rail-disagreement rule, and not named in
+                `unreliable_fingers`. A railed finger the camera also calls
+                extended votes normally — the two sensors agree about it, and
+                that is evidence. Below `min_usable_fingers` survivors the
+                glove casts no veto and the camera's own geometry decides —
+                see `fuse_skeletons`.
 
 `grab_strength`, `pinch_strength` and `confidence` are deliberately NOT used.
 The first two are model outputs — the same model that produced the joints, so
@@ -108,10 +118,97 @@ one of them is printed in the report so a later session can move it.
 No frame is ever dropped. A frame that fails every gate is the glove skeleton,
 unchanged, which is exactly what the pipeline produced before the camera
 existed.
+
+WHEN THE GLOVE IS WRONG: THE RAIL-DISAGREEMENT OVERRIDE
+-------------------------------------------------------
+The split above gives the glove the finger curls outright, and on
+`recordings/sync_day1` that is wrong in one specific, reproducible way.
+
+Whenever a finger is straight the glove does not report a measurement, it
+reports a CONSTANT: index 1.97 on the left hand and 1.98 on the right, middle
+2.07/2.08, ring 1.97, pinky 1.71, thumb 1.43 — identical to two decimals on
+every open-palm frame of all 59 takes. That constant is the finger's RAIL: the
+top of the stretch sensor's range, where the fabric has stopped stretching and
+the number has stopped meaning anything.
+
+In all ten pinch takes the glove index sits exactly on its rail while the
+camera watches the index fold down to meet the thumb (camera index curl
+1.16-1.39 against 1.72-1.81 for a genuinely open palm, thumb-index tip gap
+0.11-0.28 palm lengths). The fused pinch therefore had a perfectly straight
+index — the one joint the gesture is named after.
+
+This is NOT a dead zone. An isolated slow index bend leaves the rail as soon
+as the camera sees any flexion, so the glove does measure that finger. It
+fails only at the top of its range, and only there.
+
+So one narrow override, per finger, per frame, with three conditions that must
+hold together:
+
+  on the rail    the glove's curl is within `tol` (0.005 — the value is
+                 bit-exact, so this is a float-equality test, not a band) of
+                 the rail LEARNED for that hand and finger.
+  camera trusted the same frame gates the spread and thumb already use —
+                 visible time, no recent hand-id change, central field, and the
+                 viewing angle inside `view_gate_deg`.
+  camera flexed  the camera's curl for that finger is below its open reference
+                 minus `margin`.
+
+...and then a hysteresis, because a single frame is not evidence: the override
+arms only after `enter_frames` consecutive qualifying frames and disarms only
+after `exit_frames` consecutive non-qualifying ones.
+
+WHY THE RAIL IS LEARNED AND THE CAMERA'S OPEN REFERENCE IS NOT
+  The rail is a SENSOR ARTEFACT. There is no physical reason index should
+  saturate at 1.97 and pinky at 1.71, or that the two hands differ in the
+  third decimal; those numbers are facts about this glove, and the only way to
+  know them is to look. `learn_rails` finds them as the most frequent curl
+  value per hand and finger — a saturating sensor puts a huge bit-exact spike
+  where a moving one spreads out — and refuses to believe one unless it also
+  sits at the top of the observed range, so a session that never shows a
+  finger straight teaches no rail and the override simply never arms.
+
+  The camera's open reference is a GEOMETRIC FACT, so it is a constant
+  (`cam_open_curl`). Curl here is fingertip-to-wrist over palm length: a
+  dimensionless ratio, so a straight finger reads about the same number on any
+  hand and any metric camera. Measured on sync_day1's open-palm frames the two
+  hands differ by 0.03 (index) to 0.05 (pinky) — an order of magnitude under
+  the 0.25 margin.
+
+  It must NOT be learned from the frames being fused, and that is the whole
+  point. Without pose labels the only label-free way to call a frame "open" is
+  to ask the glove — and the glove saying "open" is exactly the claim under
+  suspicion. A reference learned that way would let a session of nothing but
+  pinches teach the detector that a pinched index is what open looks like, and
+  the override would never fire on the one case it exists for. A constant
+  cannot be poisoned by the data it is judging.
+
+WHAT THE OVERRIDE DOES
+  The finger is rebuilt from the glove's knuckle with the camera's three bone
+  DIRECTIONS and the glove's three bone LENGTHS (`transfer_finger_flexion`).
+  It is the spread transfer's idea carried one step further: there a single
+  rotation about the knuckle adopted the camera's azimuth, here each bone in
+  turn adopts the camera's direction, and in both cases the template's bones
+  keep exactly their lengths.
+
+  A consequence worth stating plainly, because it shows up in every report:
+  the fused curl does NOT land on the camera's number. It lands about 11%
+  above it, because the curl metric is a LENGTH ratio and the glove's template
+  index is about 11% longer per palm length than the operator's (rail 1.97
+  against the camera's 1.75 open). Measured over the ten pinch takes the fused
+  index is 1.29-1.56 against the camera's 1.16-1.39 — and the two agree to
+  within 0.003 once each is expressed as a fraction of its own sensor's open
+  value, which is the comparison that is actually free of the template. The
+  joint ANGLES are the camera's exactly; only the bones they are hung on are
+  the glove's, and making the number match outright would mean rescaling the
+  template, which is the one thing this module never does.
+
+`fingers` defaults to ("index",) — the finger the session actually shows the
+failure on. The rest are implemented and off.
 """
 import math
-from dataclasses import asdict, dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -147,6 +244,21 @@ PALM_IDX = [WRIST, 5, 9, 13, 17]
 SPREAD_FINGERS = ("index", "middle", "ring", "pinky")
 CAMERA_DOFS = tuple(f"spread {f}" for f in SPREAD_FINGERS) + ("thumb",)
 
+# The curls the rail-disagreement override can take from the camera. The thumb
+# is not among them: its whole DIRECTION is already the camera's when the thumb
+# gate passes, so there is no separate curl left for an override to win.
+RAIL_FINGERS = ("index", "middle", "ring", "pinky")
+RAIL_DOFS = tuple(f"curl {f}" for f in RAIL_FINGERS)
+
+# Every DOF the report accounts for: owned by the camera by design, or takeable
+# from it by the override.
+GATED_DOFS = CAMERA_DOFS + RAIL_DOFS
+
+# dof_source values.
+SRC_GLOVE = "glove"
+SRC_CAMERA = "camera"
+SRC_RAIL = "camera (rail override)"
+
 
 @dataclass(frozen=True)
 class GateParams:
@@ -178,6 +290,13 @@ class GateParams:
                          camera for this long.
     field_half_angle_deg the palm must sit within this angle of the module's
                          vertical axis — lateral offset less than height.
+    min_usable_fingers   how many fingers must still be worth comparing before
+                         the glove is allowed to veto the camera's thumb. See
+                         `fuse_skeletons`: a finger on its rail, a finger the
+                         rail override has taken, and a finger the operator has
+                         declared unreliable are all excluded from the vote,
+                         and with fewer than this many left the glove has no
+                         opinion worth acting on and does not cast one.
     """
     curl_gate: float = 1.2
     view_gate_deg: float = 50.0
@@ -185,6 +304,7 @@ class GateParams:
     min_visible_time_us: int = 300_000
     hand_id_settle_s: float = 0.25
     field_half_angle_deg: float = 45.0
+    min_usable_fingers: int = 2
 
     def described(self) -> Dict[str, float]:
         return asdict(self)
@@ -202,6 +322,268 @@ R_NO_GEOMETRY = "no palm geometry to measure the view from"
 R_VIEW = "palm turned away from the camera"
 R_CURLED = "glove says the finger is curled"
 R_DISAGREE = "camera disagrees with the glove about the fingers"
+
+# Rail-override reasons: why a finger's curl stayed the glove's.
+R_RAIL_NONE = "no rail learned for this finger"
+R_RAIL_OFF = "glove is off its rail, so it is measuring"
+R_RAIL_EXTENDED = "camera does not see the finger flexed"
+R_RAIL_ARMING = "rail disagreement not sustained yet"
+
+
+@dataclass(frozen=True)
+class RailOverrideParams:
+    """Thresholds for the rail-disagreement override. See the module docstring.
+
+    tol              how close the glove's curl must be to the learned rail to
+                     count as ON it. The glove's open-palm value is bit-exact
+                     to three decimals, so 0.005 is a float-equality test with
+                     room for the last digit's jitter, not a tolerance band.
+    margin           how far BELOW its open reference the camera's curl must
+                     sit before it counts as seeing real flexion. 0.25 puts
+                     the index threshold at 1.50: clear of every genuinely
+                     straight index in sync_day1 (lowest 1.74) and clear above
+                     every pinch take's median (highest 1.39).
+    enter_frames     consecutive qualifying frames before the override arms.
+                     10 at the glove's 60 Hz is about 170 ms — long enough
+                     that a single mistracked frame cannot straighten or bend
+                     a finger, short enough to be inside a 5 s take many times
+                     over.
+    exit_frames      consecutive non-qualifying frames before it disarms.
+                     Deliberately shorter than enter_frames: the override is
+                     the exception, so it should be easier to leave than to
+                     enter.
+    fingers          which fingers it is enabled on. Default ("index",): the
+                     one finger sync_day1 actually shows the failure on.
+    cam_open_curl    the camera's curl for a STRAIGHT finger, per finger in
+                     FINGER_NAMES order. A constant on purpose — see the
+                     module docstring. Read off sync_day1's open-palm frames,
+                     taking the lower of the two hands so the threshold errs
+                     toward not firing.
+    min_rail_share   a learned rail must account for at least this share of a
+                     finger's frames, so a value that merely happens to be
+                     most common is not mistaken for a saturation spike.
+    rail_max_gap     a learned rail must also sit within this of the LARGEST
+                     curl seen for that finger. A rail is the top of the
+                     sensor's range; a mode well below the maximum is a pose
+                     that was simply held a lot, and teaches no rail.
+    """
+    tol: float = 0.005
+    margin: float = 0.25
+    enter_frames: int = 10
+    exit_frames: int = 5
+    fingers: Tuple[str, ...] = ("index",)
+    cam_open_curl: Tuple[float, ...] = (1.30, 1.75, 1.82, 1.69, 1.44)
+    min_rail_share: float = 0.05
+    rail_max_gap: float = 0.02
+
+    def open_curl(self, finger: str) -> float:
+        return self.cam_open_curl[FINGER_NAMES.index(finger)]
+
+    def described(self) -> Dict[str, str]:
+        d = asdict(self)
+        d["fingers"] = ", ".join(self.fingers) if self.fingers else "(none)"
+        d["cam_open_curl"] = "  ".join(
+            f"{n} {v:.2f}" for n, v in zip(FINGER_NAMES, self.cam_open_curl))
+        return d
+
+
+DEFAULT_RAIL = RailOverrideParams()
+
+
+def learn_rails(samples: Iterable[Tuple[str, Sequence[float]]],
+                params: Optional[RailOverrideParams] = None
+                ) -> Dict[Tuple[str, str], float]:
+    """Find each (hand, finger)'s rail from the frames about to be fused.
+
+    `samples` is (hand_side, curls) per frame, `curls` in FINGER_NAMES order —
+    i.e. `features.flexion_features` of the GLOVE skeleton.
+
+    A saturating sensor writes the same bits every time it is against the stop,
+    so the rail is a spike in the histogram: on sync_day1 the mode accounts for
+    27-69% of a finger's frames while every other value is under 13%. Moving
+    fingers spread out and cannot compete with that.
+
+    Two sanity conditions, both of which exist to make a session with no open
+    hand in it teach nothing rather than teach nonsense:
+
+      share   the mode must cover `min_rail_share` of the finger's frames
+      top     it must sit within `rail_max_gap` of the finger's LARGEST curl,
+              because a rail is by definition the straightest reading there is
+
+    A finger failing either gets no entry, and the override can never arm for
+    it. The value returned is the median of the frames within `tol` of the
+    mode, not the rounded mode itself, so the third decimal is not an artefact
+    of the histogram's bin.
+    """
+    params = params or DEFAULT_RAIL
+    hist: Dict[Tuple[str, str], Counter] = defaultdict(Counter)
+    seen: Dict[Tuple[str, str], List[float]] = defaultdict(list)
+    for hand, curls in samples:
+        for finger, c in zip(FINGER_NAMES, curls):
+            c = float(c)
+            hist[(hand, finger)][round(c, 3)] += 1
+            seen[(hand, finger)].append(c)
+
+    rails: Dict[Tuple[str, str], float] = {}
+    for key, counter in hist.items():
+        candidate = counter.most_common(1)[0][0]
+        values = seen[key]
+        near = [v for v in values if abs(v - candidate) <= params.tol]
+        if len(near) < params.min_rail_share * len(values):
+            continue
+        if max(values) - candidate > params.rail_max_gap:
+            continue
+        rails[key] = median(near)
+    return rails
+
+
+@dataclass(frozen=True)
+class RailDecision:
+    """One frame's verdict: which fingers the override owns, and why not.
+
+    Produced by `RailOverrideTracker`, consumed by `fuse_skeletons`. Keeping it
+    a value means the hysteresis — the only state in this module — lives in one
+    object the caller holds, and `fuse_skeletons` stays a pure function of its
+    arguments.
+
+    `disputed` is the wider fact `active` is drawn from: every finger sitting
+    on its learned rail this frame WHILE the camera reads that finger as
+    flexed — whether or not the override is enabled on it, and without the
+    consecutive-frame run that arming needs. The thumb gate reads it.
+
+    Being on the rail is not by itself a reason to distrust a finger, and an
+    earlier version of this that excluded every railed finger from the thumb
+    vote was wrong about that. In peace, open palm and index point the
+    extended fingers sit on their rails and the camera agrees they are
+    extended — that agreement is the best evidence the vote has. Discarding it
+    left the vote to the curled fingers alone and refused a correct camera
+    thumb on almost every right-hand peace frame. A rail is suspect only when
+    the camera contradicts it, which is the same disagreement the override
+    itself is built on.
+    """
+    active: Tuple[str, ...] = ()
+    rejected: Mapping[str, str] = field(default_factory=dict)
+    disputed: Tuple[str, ...] = ()
+
+
+NO_RAIL_OVERRIDE = RailDecision()
+
+
+class RailOverrideTracker:
+    """Per-hand, per-finger hysteresis over the rail-disagreement test.
+
+    One tracker per fusion run, NOT per take: it holds the learned rails and
+    the run-length counters. `update` is called once per glove frame, in time
+    order, and returns that frame's `RailDecision`.
+
+    Counters are keyed by (hand, finger) because the two hands interleave in
+    one file and are separate pieces of evidence.
+    """
+
+    def __init__(self, rails: Optional[Mapping[Tuple[str, str], float]] = None,
+                 params: Optional[RailOverrideParams] = None,
+                 gates: Optional[GateParams] = None):
+        self.params = params or DEFAULT_RAIL
+        self.gates = gates or DEFAULT_GATES
+        self.rails = dict(rails or {})
+        self._run: Dict[Tuple[str, str], int] = defaultdict(int)
+        self._idle: Dict[Tuple[str, str], int] = defaultdict(int)
+        self._active: set = set()
+
+    def qualifies(self, hand: str, finger: str, glove_curl: float,
+                  cam_curl: Optional[float],
+                  frame_reasons: Sequence[str] = (),
+                  view_deg: Optional[float] = None) -> Optional[str]:
+        """None if this FRAME qualifies for the override, else why it does not.
+
+        `frame_reasons` is `frame_trust`'s verdict, empty when the frame passed.
+        Its first entry is reported verbatim rather than re-derived, so the
+        override's rejections land in the same buckets the spread's and thumb's
+        do and the report's table stays one table.
+
+        Order matters only for which reason gets reported, and it is chosen so
+        the report names the state of the HAND before the state of the capture:
+        a fist rejects because the glove is off its rail (it is measuring, and
+        should be believed), not because of anything about the camera.
+        """
+        rail = self.rails.get((hand, finger))
+        if rail is None:
+            return R_RAIL_NONE
+        if abs(float(glove_curl) - rail) > self.params.tol:
+            return R_RAIL_OFF
+        if cam_curl is None:
+            return R_NO_FRAME
+        if frame_reasons:
+            return frame_reasons[0]
+        if view_deg is None:
+            return R_NO_GEOMETRY
+        if view_deg >= self.gates.view_gate_deg:
+            return R_VIEW
+        if float(cam_curl) >= self.params.open_curl(finger) - self.params.margin:
+            return R_RAIL_EXTENDED
+        return None
+
+    def update(self, hand: str, glove_curls: Sequence[float],
+               cam_curls: Optional[Sequence[float]] = None,
+               cam_meta: Optional[dict] = None) -> RailDecision:
+        """Advance the hysteresis one frame and return this frame's decision.
+
+        `glove_curls` and `cam_curls` are `features.flexion_features` of the
+        two skeletons; `cam_meta` is what `frame_trust` reads. A frame with no
+        camera (either argument None) is a non-qualifying frame — it decays the
+        run, it does not reset the whole state — which is what keeps a dropped
+        camera frame mid-pinch from flickering the override off and on.
+        """
+        frame_reasons: Sequence[str] = (R_NO_FRAME,)
+        view_deg = None
+        if cam_meta is not None:
+            _ok, frame_reasons, metrics = frame_trust(cam_meta, self.gates)
+            view_deg = metrics["view_angle_deg"]
+
+        # Every finger the two sensors CONTRADICT each other about — on its
+        # rail while the camera reads it flexed — computed for all four, not
+        # only the enabled ones, because the thumb gate needs it even when
+        # nothing is being overridden. No run length here: this is the
+        # instantaneous disagreement, and it is arming that needs patience.
+        #
+        # A railed finger the camera ALSO calls extended is not on this list.
+        # The two sensors agree about it, which is exactly the evidence the
+        # thumb vote wants.
+        disputed = tuple(
+            f for f in RAIL_FINGERS
+            if (hand, f) in self.rails
+            and abs(float(glove_curls[FINGER_NAMES.index(f)])
+                    - self.rails[(hand, f)]) <= self.params.tol
+            and cam_curls is not None
+            and float(cam_curls[FINGER_NAMES.index(f)])
+            < self.params.open_curl(f) - self.params.margin)
+
+        active: List[str] = []
+        rejected: Dict[str, str] = {}
+        for finger in self.params.fingers:
+            if finger not in RAIL_FINGERS:
+                continue
+            key = (hand, finger)
+            i = FINGER_NAMES.index(finger)
+            why = self.qualifies(
+                hand, finger, glove_curls[i],
+                None if cam_curls is None else cam_curls[i],
+                frame_reasons, view_deg)
+            if why is None:
+                self._run[key] += 1
+                self._idle[key] = 0
+                if self._run[key] >= self.params.enter_frames:
+                    self._active.add(key)
+            else:
+                self._idle[key] += 1
+                self._run[key] = 0
+                if self._idle[key] >= self.params.exit_frames:
+                    self._active.discard(key)
+            if key in self._active:
+                active.append(finger)
+            else:
+                rejected[f"curl {finger}"] = why if why is not None else R_RAIL_ARMING
+        return RailDecision(tuple(active), rejected, disputed)
 
 
 def _unit(v: np.ndarray) -> np.ndarray:
@@ -265,6 +647,40 @@ def proximal_direction(pts: np.ndarray, finger: str) -> np.ndarray:
 def azimuth_in_frame(d: np.ndarray, x: np.ndarray, y: np.ndarray) -> float:
     """In-plane angle of `d` in the palm frame, radians. 0 = down the palm."""
     return math.atan2(float(np.dot(d, y)), float(np.dot(d, x)))
+
+
+def transfer_finger_flexion(glove: np.ndarray, cam_aligned: np.ndarray,
+                            finger: str) -> Optional[np.ndarray]:
+    """Rebuild one finger: the camera's bone DIRECTIONS on the glove's LENGTHS.
+
+    `cam_aligned` is the camera hand already rotated into the glove's palm
+    frame (`camera_into_glove_frame`), so a direction read off it is directly
+    comparable with the glove's. The chain is walked from the knuckle outwards:
+    the knuckle itself never moves — it belongs to the palm, which the camera
+    is not being asked about — and each following joint is placed one GLOVE
+    bone length along the corresponding CAMERA bone's direction.
+
+    That is the spread transfer taken one step further. There a single rotation
+    about the knuckle gave the whole chain the camera's azimuth and kept the
+    glove's curl; here each of the three bones takes the camera's direction
+    outright, so the MCP, PIP and DIP angles all become the camera's. Both are
+    built out of unit directions and glove lengths, so both preserve every bone
+    length exactly — the invariant the rest of this module rests on.
+
+    Returns 4 points (knuckle, PIP, DIP, tip) for `FINGER_CHAINS[finger]`, or
+    None if a camera bone has no length to take a direction from.
+    """
+    chain = FINGER_CHAINS[finger]
+    G = np.asarray(glove, float)
+    C = np.asarray(cam_aligned, float)
+    out = [G[chain[0]]]
+    for k in range(len(chain) - 1):
+        d = C[chain[k + 1]] - C[chain[k]]
+        if float(np.linalg.norm(d)) < 1e-12:
+            return None
+        length = float(np.linalg.norm(G[chain[k + 1]] - G[chain[k]]))
+        out.append(out[-1] + length * _unit(d))
+    return np.asarray(out)
 
 
 # --- frame-level trust, measured on the camera's own geometry ----------
@@ -447,15 +863,24 @@ def _blank_info(with_scale: bool) -> dict:
             "kabsch_rmse_mm": None,
             # bookkeeping: which DOFs the camera supplied, and why not
             "gated": False,
-            "dof_source": {dof: "glove" for dof in CAMERA_DOFS},
+            "dof_source": {dof: SRC_GLOVE for dof in GATED_DOFS},
             "rejected": {},
             "frame_reasons": [],
+            "rail_override": [],
+            "thumb_vote_fingers": [],
             "view_angle_deg": None, "field_angle_deg": None,
             "curl_disagreement": None}
 
 
-def _reject_all(info: dict, reason: str) -> dict:
-    for dof in CAMERA_DOFS:
+def _reject_all(info: dict, reason: str, rail_dofs: Sequence[str] = ()) -> dict:
+    """Blame `reason` for every DOF the camera could have supplied.
+
+    `rail_dofs` is passed separately because a curl DOF is only the camera's to
+    lose when the override is enabled on that finger: a finger nobody asked for
+    has not been rejected, it was never in the running, and counting it would
+    bury the real reasons under one disabled-by-default line per frame.
+    """
+    for dof in tuple(CAMERA_DOFS) + tuple(rail_dofs):
         info["rejected"][dof] = reason
     return info
 
@@ -470,6 +895,8 @@ def fuse_skeletons(
     with_scale: bool = True,
     cam_meta: Optional[dict] = None,
     gates: Optional[GateParams] = None,
+    rail: Optional[RailDecision] = None,
+    unreliable_fingers: Sequence[str] = (),
 ) -> Tuple[np.ndarray, dict]:
     """Fuse one glove frame with one camera frame -> 21 points + info.
 
@@ -485,23 +912,41 @@ def fuse_skeletons(
     every camera-owned DOF taken. Gating a sensor on evidence it does not
     produce would mean rejecting all of it.
 
+    `rail` is this frame's rail-disagreement verdict, from
+    `RailOverrideTracker.update`. It is the ONLY way a finger's curl can come
+    from the camera, and leaving it None (the default) reproduces the fusion
+    exactly as it was before the override existed. The hysteresis behind it
+    needs memory of earlier frames, which is why the decision is made outside
+    and handed in: this function stays a pure function of its arguments.
+
+    `unreliable_fingers` names fingers of THIS hand whose glove curl the
+    operator does not trust, excluding them from the thumb gate's vote. It is
+    per hand because gloves fail per hand: on sync_day1 the right glove's ring
+    and pinky read partly extended through thumbs_up and peace while the left
+    glove's do not.
+
     Returns the fused points and an info dict: `dof_source` says where each
     camera-owned DOF actually came from, `rejected` says why the glove kept
-    the ones it kept, and `frame_reasons` lists any frame-level failure. A
-    frame that fails everything returns the glove skeleton unchanged — it is
-    never dropped.
+    the ones it kept, `rail_override` lists the fingers the override owned,
+    and `frame_reasons` lists any frame-level failure. A frame that fails
+    everything returns the glove skeleton unchanged — it is never dropped.
     """
     G = np.asarray(glove_pts, dtype=float)
     gates = gates or DEFAULT_GATES
+    rail = rail if rail is not None else NO_RAIL_OVERRIDE
     info = _blank_info(with_scale)
+    # Only fingers the override was actually asked about can be "rejected" by
+    # it: the ones it named, plus any it is currently winning.
+    rail_dofs = tuple(dict.fromkeys(tuple(rail.rejected)
+                                    + tuple(f"curl {f}" for f in rail.active)))
 
     if cam_pts is None:
         info["reason"] = R_NO_FRAME
-        _reject_all(info, R_NO_FRAME)
+        _reject_all(info, R_NO_FRAME, rail_dofs)
         return G, info
     if cam_score < min_score:
         info["reason"] = f"camera score {cam_score:.2f} < {min_score:.2f}"
-        _reject_all(info, R_SCORE)
+        _reject_all(info, R_SCORE, rail_dofs)
         return G, info
 
     C_in = np.asarray(cam_pts, dtype=float)
@@ -521,14 +966,61 @@ def fuse_skeletons(
         view_deg = metrics["view_angle_deg"]
         if not ok:
             info["reason"] = "; ".join(frame_reasons)
-            _reject_all(info, frame_reasons[0])
+            _reject_all(info, frame_reasons[0], rail_dofs)
             return G, info              # glove skeleton, unchanged
 
     curl_g = flexion_features(G)
     curl_c = flexion_features(C_in)      # a ratio, so alignment cannot change it
+
+    # Who is allowed to vote on whether the camera has this hand right.
+    #
     # index..little only: the thumb is the DOF being decided, so it cannot vote
-    disagreement = median([abs(a - b) for a, b in
-                           zip(curl_g[1:], curl_c[1:])])
+    # for itself. And of those four, a finger only counts if its GLOVE curl is
+    # a measurement:
+    #
+    #   disputed      the glove is on this finger's rail — reporting a
+    #                 constant — AND the camera reads it flexed. In
+    #                 sync_day1's pinch the railed index "disagrees" with the
+    #                 camera by 0.70 purely because the glove stopped
+    #                 measuring, and one such number is enough to drag the
+    #                 median over the tolerance and veto a thumb the camera
+    #                 had right.
+    #
+    #                 Being on the rail is NOT enough on its own, and an
+    #                 earlier version of this rule that excluded every railed
+    #                 finger was wrong. In peace, open palm and index point
+    #                 the extended fingers are on their rails and the camera
+    #                 agrees they are extended: that agreement is the best
+    #                 evidence this vote has, and discarding it left the
+    #                 verdict to the curled fingers alone and refused a
+    #                 correct camera thumb on almost every right-hand peace
+    #                 frame. A rail is suspect only when the camera
+    #                 contradicts it.
+    #   overridden    the rail override has already ruled the glove wrong
+    #                 about this finger. Letting it vote would be asking the
+    #                 loser of one argument to judge the next. Not implied by
+    #                 `disputed`: hysteresis keeps a finger overridden for
+    #                 `exit_frames` after the disagreement stops.
+    #   unreliable    the operator has said so. On sync_day1 the RIGHT glove
+    #                 reports ring and pinky partly extended through thumbs_up
+    #                 and peace (pinky 1.55-1.68 where the camera says
+    #                 0.78-0.90, consistently, take after take), which is a
+    #                 fault in that glove's fingers rather than evidence about
+    #                 the camera.
+    #
+    # Below `min_usable_fingers` the glove has no opinion worth acting on, so
+    # it casts no veto at all and the camera's own geometry — visibility, id
+    # continuity, central field, viewing angle — is left to decide. That is a
+    # deliberate choice to fail toward the sensor that still has evidence.
+    excluded = set(rail.disputed) | set(rail.active) | set(unreliable_fingers)
+    usable = [f for f in SPREAD_FINGERS if f not in excluded]
+    info["thumb_vote_fingers"] = list(usable)
+    if usable:
+        disagreement = median([abs(curl_g[FINGER_NAMES.index(f)]
+                                   - curl_c[FINGER_NAMES.index(f)])
+                               for f in usable])
+    else:
+        disagreement = None
     info["curl_disagreement"] = disagreement
 
     def spread_verdict(finger: str) -> Optional[str]:
@@ -550,6 +1042,9 @@ def fuse_skeletons(
             return R_NO_GEOMETRY
         if view_deg >= gates.view_gate_deg:
             return R_VIEW
+        # too few fingers still measuring to hold a vote: no veto
+        if len(usable) < gates.min_usable_fingers:
+            return None
         if disagreement >= gates.curl_agree_tol:
             return R_DISAGREE
         return None
@@ -559,11 +1054,36 @@ def fuse_skeletons(
     fused = G.copy()
     names = list(FINGER_CHAINS) if fingers is None else list(fingers)
 
+    # Why the override kept its hands off the fingers it did. The ones it WON
+    # are recorded below, after the transfer has actually succeeded.
+    for dof, why in rail.rejected.items():
+        info["rejected"][dof] = why
+
     for finger in names:
         chain = FINGER_CHAINS[finger]
         knuckle = G[chain[0]]
         is_thumb = finger == "thumb" and thumb_from_camera
         dof = "thumb" if is_thumb else f"spread {finger}"
+
+        if finger in rail.active:
+            # The glove is on this finger's rail and a trusted camera has seen
+            # it flexed for long enough. Rebuild the whole chain from the
+            # camera's bone directions: that carries the azimuth too, so the
+            # spread rotation below MUST NOT also run on this finger or the
+            # same correction would be applied twice.
+            rebuilt = transfer_finger_flexion(G, C, finger)
+            if rebuilt is not None:
+                fused[chain] = rebuilt
+                info["fingers_adjusted"].append(finger)
+                info["rail_override"].append(finger)
+                info["dof_source"][f"curl {finger}"] = SRC_RAIL
+                # The proximal bone's direction came from the camera as well,
+                # so the spread is the camera's — by the ordinary route, which
+                # is what the spread row should keep reporting.
+                if dof in info["dof_source"]:
+                    info["dof_source"][dof] = SRC_CAMERA
+                continue
+            info["rejected"][f"curl {finger}"] = R_NO_GEOMETRY
 
         why = thumb_verdict() if is_thumb else spread_verdict(finger)
         if why is not None:
@@ -596,7 +1116,7 @@ def fuse_skeletons(
         fused[chain] = (R @ (G[chain] - knuckle).T).T + knuckle
         info["fingers_adjusted"].append(finger)
         if dof in info["dof_source"]:
-            info["dof_source"][dof] = "camera"
+            info["dof_source"][dof] = SRC_CAMERA
 
     info["camera_used"] = bool(info["fingers_adjusted"])
     fused = fused - fused[WRIST]

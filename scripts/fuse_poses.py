@@ -66,10 +66,13 @@ from cam_hand.export21 import wrist_centered
 from cam_hand.features import (
     ALL_COLS,
     ALL_NAMES,
+    DESCRIPTIVE_ROWS,
     DOF_ROWS,
     FLEXION_COLS,
+    FLEXION_NAMES,
     all_features,
     dof_values,
+    flexion_features,
     loo_take_nearest_centroid,
     mean_vector,
     median,
@@ -79,9 +82,16 @@ from cam_hand.fusion import (
     AUTO,
     CAMERA_DOFS,
     DEFAULT_GATES,
+    DEFAULT_RAIL,
+    GATED_DOFS,
+    RAIL_FINGERS,
+    SRC_RAIL,
     GateParams,
+    RailOverrideParams,
+    RailOverrideTracker,
     flag_hand_id_stability,
     fuse_skeletons,
+    learn_rails,
     pair_by_time,
     pairing_clock,
 )
@@ -273,7 +283,14 @@ def cam_meta_of(row, source):
 # the table shows it precisely because it is what the camera must NOT change.
 ROW_OWNERS = {
     "curl thumb": ("thumb",),
-    "spread thumb-index": ("thumb", "spread index"),
+    # A finger's curl is the glove's unless the rail-disagreement override
+    # takes it, which is the whole point of listing them here: the row that
+    # used to read "glove (by design)" now has to say when the design was
+    # overruled.
+    "curl index": ("curl index",),
+    "curl middle": ("curl middle",),
+    "curl ring": ("curl ring",),
+    "curl pinky": ("curl pinky",),
     "spread index-middle": ("spread index", "spread middle"),
     "spread middle-ring": ("spread middle", "spread ring"),
     "spread ring-pinky": ("spread ring", "spread pinky"),
@@ -283,16 +300,24 @@ ROW_OWNERS = {
 
 def row_owner(label, sources, n_paired):
     """The 'from' column: how much of this row the camera actually supplied."""
+    if label in DESCRIPTIVE_ROWS:
+        return "descriptive"
     owners = ROW_OWNERS.get(label, ())
     if not owners:
         return "glove (by design)"
     if not n_paired:
         return "glove (no camera)"
-    hits = sum(1 for frame in sources
-               if any(frame.get(d) == "camera" for d in owners))
+    hits = rail_hits = 0
+    for frame in sources:
+        values = [frame.get(d) for d in owners]
+        if any(v is not None and v.startswith("camera") for v in values):
+            hits += 1
+        if any(v == SRC_RAIL for v in values):
+            rail_hits += 1
     if hits == 0:
         return "glove"
-    return f"camera {100.0 * hits / n_paired:.0f}%"
+    what = SRC_RAIL if rail_hits else "camera"
+    return f"{what} {100.0 * hits / n_paired:.0f}%"
 
 
 def dof_table(per_pose, lines):
@@ -304,12 +329,20 @@ def dof_table(per_pose, lines):
                  "is tip-to-tip over palm length.")
     lines.append("  The camera column is blank where no camera frame paired "
                  "with that take at all.")
-    lines.append("  'spread thumb-index' is the angle of the thumb's BASE "
-                 "bone: the camera supplies the")
-    lines.append("  thumb's whole direction, not its base angle, so that row "
-                 "moves only incidentally —")
     lines.append("  'thumb-index gap' is where the thumb's contribution "
-                 "actually shows.")
+                 "actually shows. (The old 'spread")
+    lines.append("  thumb-index' row, the angle of the thumb's BASE bone, is "
+                 "gone: the camera supplies the")
+    lines.append("  thumb's whole DIRECTION and it is grafted onto the glove "
+                 "template's own CMC, so that")
+    lines.append("  angle described neither hand.)")
+    lines.append("  'thumb dir elevation/azimuth' are the CMC-to-tip "
+                 "direction in the palm frame —")
+    lines.append("  elevation is opposition, out of the palm plane. They are "
+                 "marked DESCRIPTIVE because")
+    lines.append("  the fused thumb is the camera's by construction: agreeing "
+                 "with the camera column")
+    lines.append("  restates what fusion did and validates nothing.")
     lines.append("")
     lines.append(f"  {'pose':<12} {'hand':<6} {'tk':<3} {'DOF':<20} "
                  f"{'glove':>8} {'camera':>8} {'fused':>8}   from")
@@ -327,13 +360,19 @@ def dof_table(per_pose, lines):
         lines.append("")
 
 
-def gate_tables(dof_used, dof_total, reasons, gates, lines):
+def gate_tables(dof_used, dof_total, reasons, gates, rail_params, rails,
+                unreliable, lines):
     lines.append("Camera-use rate per gated DOF "
                  "(share of paired frames the camera actually supplied)")
-    for dof in CAMERA_DOFS:
+    for dof in GATED_DOFS:
         n = dof_total.get(dof, 0)
         pct = 100.0 * dof_used.get(dof, 0) / n if n else 0.0
         lines.append(f"  {dof:<16} {dof_used.get(dof, 0):>5}/{n:<5} {pct:5.1f}%")
+    lines.append("  The four 'curl' rows are the rail-disagreement override, "
+                 "and read 0% unless it is")
+    lines.append("  enabled on that finger: a curl is the glove's by design "
+                 "and the override is the")
+    lines.append("  one thing that can take it.")
     lines.append("")
     lines.append("Why the glove kept a DOF (counted over DOF x paired frame)")
     if not reasons:
@@ -346,6 +385,39 @@ def gate_tables(dof_used, dof_total, reasons, gates, lines):
     lines.append("  not calibrated constants — every one is a named parameter)")
     for k, v in gates.described().items():
         lines.append(f"  {k:<22} {v}")
+    lines.append("  Only fingers whose GLOVE curl is a measurement vote on "
+                 "whether the camera has")
+    lines.append("  the hand right. Excluded: a DISPUTED finger (on its rail "
+                 "while the camera reads")
+    lines.append("  it flexed), one the rail override has taken, and one "
+                 "named --unreliable. A railed")
+    lines.append("  finger the camera AGREES is extended still votes — that "
+                 "agreement is evidence.")
+    lines.append("  Below min_usable_fingers the glove casts no veto and the "
+                 "camera's own geometry")
+    lines.append("  decides.")
+    lines.append(f"  {'unreliable fingers':<22} "
+                 + ("; ".join(f"{h}: {', '.join(f)}"
+                              for h, f in sorted(unreliable.items()))
+                    if unreliable else "(none)"))
+    lines.append("")
+    lines.append("Rail-disagreement override (the glove's curl is a CONSTANT "
+                 "at full extension;")
+    lines.append("  when a trusted camera sees that finger flexed anyway, the "
+                 "camera wins that curl)")
+    if rail_params is None:
+        lines.append("  DISABLED (--no-rail-override)")
+        return
+    for k, v in rail_params.described().items():
+        lines.append(f"  {k:<22} {v}")
+    lines.append("  rails learned from this session's own glove frames "
+                 "(mode of the curl, per hand and finger):")
+    if not rails:
+        lines.append("    (none — no finger sat at the top of its range "
+                     "often enough to teach one)")
+    for (hand, finger), value in sorted(rails.items()):
+        mark = "  <- enabled" if finger in rail_params.fingers else ""
+        lines.append(f"    {hand:<6} {finger:<7} {value:.3f}{mark}")
 
 
 def main() -> None:
@@ -371,6 +443,20 @@ def main() -> None:
                    help="max median curl disagreement over index..little for "
                         f"the camera to own the thumb "
                         f"(default {DEFAULT_GATES.curl_agree_tol})")
+    p.add_argument("--unreliable", action="append", default=[],
+                   metavar="HAND:FINGER[,FINGER]",
+                   help="fingers whose GLOVE curl is not to be trusted on that "
+                        "hand, e.g. 'right:ring,pinky'. They are excluded from "
+                        "the thumb gate's vote. Repeatable, once per hand.")
+    p.add_argument("--no-rail-override", action="store_true",
+                   help="do not let the camera take a finger's curl when the "
+                        "glove is pinned at full extension and the camera "
+                        "sees that finger flexed (default: the override is on)")
+    p.add_argument("--rail-fingers",
+                   default=",".join(DEFAULT_RAIL.fingers),
+                   help="comma-separated fingers the rail override may act on "
+                        f"(any of {','.join(RAIL_FINGERS)}; "
+                        f"default {','.join(DEFAULT_RAIL.fingers)})")
     p.add_argument("--camera", choices=(AUTO,) + CAM_DIRS, default=AUTO,
                    help="which camera folder to read (default: auto — both, "
                         "and a take name in both is an error)")
@@ -397,6 +483,32 @@ def main() -> None:
                        view_gate_deg=args.view_gate_deg,
                        curl_agree_tol=args.curl_agree_tol)
 
+    unreliable = {}
+    for spec in args.unreliable:
+        if ":" not in spec:
+            raise SystemExit(f"--unreliable {spec}: expected HAND:FINGER[,FINGER], "
+                             "e.g. right:ring,pinky")
+        hand, _, fingers_txt = spec.partition(":")
+        picked = tuple(f.strip() for f in fingers_txt.split(",") if f.strip())
+        bad = [f for f in picked if f not in FLEXION_NAMES]
+        if bad:
+            raise SystemExit(f"--unreliable {spec}: {', '.join(bad)} is not a "
+                             f"finger (choose from {', '.join(FLEXION_NAMES)})")
+        unreliable[hand.strip().lower()] = picked
+
+    rail_params = None
+    if not args.no_rail_override:
+        picked = tuple(f.strip() for f in args.rail_fingers.split(",")
+                       if f.strip())
+        bad = [f for f in picked if f not in RAIL_FINGERS]
+        if bad:
+            raise SystemExit(
+                f"--rail-fingers: {', '.join(bad)} is not a finger the rail "
+                f"override can act on (choose from {', '.join(RAIL_FINGERS)}).\n"
+                "  The thumb is not among them: its whole direction is already "
+                "the camera's when the thumb gate passes.")
+        rail_params = RailOverrideParams(fingers=picked)
+
     glove_samples, cam_samples, fused_samples = [], [], []
     fused_rows = []
     n_pairs = n_matched = n_cam_used = 0
@@ -409,6 +521,13 @@ def main() -> None:
     dof_total = defaultdict(int)          # gated DOF -> paired frames
     reasons = defaultdict(int)            # rejection reason -> count
 
+    # --- pass 1: read every take ---------------------------------------
+    # The rail override has to know each finger's rail BEFORE it can fuse a
+    # frame, and a rail is only visible across a whole session: a take of
+    # nothing but fists never shows one. So the reading is separated from the
+    # fusing, and the rails are learned in between, from the same frames that
+    # are about to be fused.
+    loaded = []
     for gpath in takes:
         try:
             cpath = find_camera_take(args.input, gpath.name, args.camera)
@@ -423,8 +542,6 @@ def main() -> None:
             skipped.append((gpath.name, "one side is empty"))
             continue
         by_source[source] += 1
-        # Metric camera, rigid fit; normalised camera, fit the scale too.
-        with_scale = source != LEAP
         # Per take, because one session can hold takes recorded before
         # capture_time existed alongside takes recorded after.
         clock = pairing_clock(glove, cam)
@@ -432,6 +549,31 @@ def main() -> None:
         # Needs the whole take at once: "did the id change 0.25 s ago" is a
         # question about the frames around this one, not about this one.
         flag_hand_id_stability(cam, gates, clock=clock)
+        loaded.append({"name": gpath.name, "glove": glove, "cam": cam,
+                       "source": source, "clock": clock,
+                       # Metric camera, rigid fit; normalised camera, fit scale.
+                       "with_scale": source != LEAP})
+
+    # --- learn the rails ------------------------------------------------
+    rails = {}
+    if rail_params is not None:
+        rails = learn_rails(
+            ((g["hand_side"], flexion_features(np.asarray(g["pts"], float)))
+             for take in loaded for g in take["glove"]),
+            rail_params)
+
+    # --- pass 2: fuse ---------------------------------------------------
+    for entry in loaded:
+        glove, cam = entry["glove"], entry["cam"]
+        source, clock = entry["source"], entry["clock"]
+        with_scale = entry["with_scale"]
+        gpath = Path(entry["name"])
+        # A fresh tracker per take. The hysteresis counts CONSECUTIVE frames,
+        # and consecutive across a take boundary is a fiction: the takes are
+        # separate recordings seconds apart, so a run built at the end of one
+        # must not still be armed at the start of the next.
+        tracker = (RailOverrideTracker(rails, rail_params, gates)
+                   if rail_params is not None else None)
 
         per_hand_g = defaultdict(list)
         per_hand_c = defaultdict(list)
@@ -449,23 +591,31 @@ def main() -> None:
                  "paired": 0})
             slot["glove"].append(dof_values(G, hand_side=hand))
             if c is None:
+                rail = (tracker.update(hand, flexion_features(G))
+                        if tracker is not None else None)
                 fused, info = fuse_skeletons(G, None, min_score=args.min_score,
-                                             with_scale=with_scale, gates=gates)
+                                             with_scale=with_scale, gates=gates,
+                                             rail=rail)
             else:
                 n_matched += 1
                 slot["paired"] += 1
                 C = np.asarray(c["pts"], float)
                 per_hand_c[hand].append(all_features(C, hand_side=hand))
                 slot["camera"].append(dof_values(C, hand_side=hand))
+                meta = cam_meta_of(c, source)
+                rail = (tracker.update(hand, flexion_features(G),
+                                       flexion_features(C), meta)
+                        if tracker is not None else None)
                 fused, info = fuse_skeletons(
                     G, c["pts"], cam_score=c.get("score", 1.0),
                     min_score=args.min_score,
                     thumb_from_camera=not args.no_thumb_camera,
                     with_scale=with_scale,
-                    cam_meta=cam_meta_of(c, source), gates=gates)
-                for dof in CAMERA_DOFS:
+                    cam_meta=meta, gates=gates, rail=rail,
+                    unreliable_fingers=unreliable.get(str(hand).lower(), ()))
+                for dof in GATED_DOFS:
                     dof_total[dof] += 1
-                    if info["dof_source"][dof] == "camera":
+                    if info["dof_source"][dof].startswith("camera"):
                         dof_used[dof] += 1
                 for why in info["rejected"].values():
                     reasons[why] += 1
@@ -525,10 +675,12 @@ def main() -> None:
             lines.append(f"    {name}: {why}")
     if palm_residuals:
         ordered = sorted(palm_residuals)
-        median = ordered[len(ordered) // 2]
+        # NOT named `median`: that would rebind the imported function for the
+        # whole of main() and make any earlier call to it an UnboundLocalError.
+        median_mm = ordered[len(ordered) // 2]
         lines.append("")
         lines.append("Palm agreement (diagnostic — nothing is rejected on it)")
-        lines.append(f"  median {median:.1f} mm, worst {ordered[-1]:.1f} mm  "
+        lines.append(f"  median {median_mm:.1f} mm, worst {ordered[-1]:.1f} mm  "
                      "RMSE of a rigid 5-point palm fit")
         lines.append("  This is the glove's TEMPLATE hand against the real "
                      "one, not a tracking error. It is")
@@ -539,7 +691,8 @@ def main() -> None:
     lines.append("")
     lines.append("=" * 66)
     dof_table(per_pose, lines)
-    gate_tables(dof_used, dof_total, reasons, gates, lines)
+    gate_tables(dof_used, dof_total, reasons, gates, rail_params, rails,
+                unreliable, lines)
 
     lines.append("")
     lines.append("=" * 66)

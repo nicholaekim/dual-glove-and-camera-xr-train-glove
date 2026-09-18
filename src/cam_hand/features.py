@@ -266,11 +266,51 @@ def thumb_index_gap(pts, normalize: bool = True) -> float:
     return _norm(_sub(pts[TIP_IDX[1]], pts[TIP_IDX[0]])) / scale
 
 
+def thumb_direction_deg(pts, hand_side: str = "right") -> List[float]:
+    """(elevation, azimuth) of the thumb's CMC -> TIP direction, degrees.
+
+    Measured in the palm frame, so it says where the thumb is POINTING rather
+    than how any one of its joints is bent:
+
+      elevation  angle out of the palm plane. This is opposition — the motion
+                 that makes a pinch, and the one the glove cannot see at all.
+                 0 is in the plane of the palm, positive is out of the front.
+      azimuth    in-plane angle, 0 down the palm, positive toward the thumb
+                 side on both hands (see `palm_axes`).
+
+    DESCRIPTIVE ONLY. On a fused hand the thumb's whole direction is taken
+    from the camera whenever the thumb gate passes, so these two numbers
+    agreeing with the camera's is a restatement of what fusion did, not a
+    check on it. They are reported because they say plainly where the thumb
+    ended up, which the angle of its base bone does not.
+    """
+    a, _b = PROXIMAL_BONE["thumb"]
+    u = _unit3(_sub(pts[TIP_IDX[0]], pts[a]))
+    n, x, y = palm_axes(pts, hand_side)
+    elevation = math.degrees(math.asin(max(-1.0, min(1.0, _dot(u, n)))))
+    azimuth = math.degrees(math.atan2(_dot(u, y), _dot(u, x)))
+    return [elevation, azimuth]
+
+
 # Rows of the per-DOF report: (label, kind, index-within-kind).
+#
+# 'spread thumb-index' is deliberately absent. It was the in-plane angle of the
+# thumb's BASE bone, and on a fused hand that is a number with no referent: the
+# camera supplies the thumb's whole direction, which is then grafted onto the
+# glove template's own CMC, so the base angle describes neither hand. The
+# thumb-index GAP survives because it is a tip-to-tip distance, and the two
+# thumb-direction rows below say where the thumb points.
 DOF_ROWS = ([(f"curl {n}", "curl", i) for i, n in enumerate(FLEXION_NAMES)]
             + [(f"spread {n}", "spread_deg", i)
-               for i, n in enumerate(ADJACENT_SPREAD_NAMES)]
-            + [("thumb-index gap", "ti_gap", 0)])
+               for i, n in enumerate(ADJACENT_SPREAD_NAMES)
+               if n != "thumb-index"]
+            + [("thumb-index gap", "ti_gap", 0),
+               ("thumb dir elevation", "thumb_dir", 0),
+               ("thumb dir azimuth", "thumb_dir", 1)])
+
+# Rows that describe the fused hand rather than scoring it. See
+# `thumb_direction_deg`: the fused thumb IS the camera's by construction.
+DESCRIPTIVE_ROWS = ("thumb dir elevation", "thumb dir azimuth")
 
 
 def dof_values(pts, hand_side: str = "right") -> List[float]:
@@ -278,7 +318,8 @@ def dof_values(pts, hand_side: str = "right") -> List[float]:
     curls = flexion_features(pts)
     spreads = adjacent_spreads_deg(pts, hand_side)
     gap = thumb_index_gap(pts)
-    picked = {"curl": curls, "spread_deg": spreads, "ti_gap": [gap]}
+    picked = {"curl": curls, "spread_deg": spreads, "ti_gap": [gap],
+              "thumb_dir": thumb_direction_deg(pts, hand_side)}
     return [picked[kind][i] for _label, kind, i in DOF_ROWS]
 
 
