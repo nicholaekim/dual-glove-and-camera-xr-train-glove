@@ -794,6 +794,97 @@ facts — no absolute palm, no hand id, no visibility clock — so it passes
 `cam_meta=None` and is fused ungated, exactly as before; gating a sensor on
 evidence it does not produce would mean rejecting all of it.
 
+### When the GLOVE is wrong: the rail-disagreement override
+
+The split above hands the glove every finger curl, and on
+`recordings/sync_day1` that is wrong in one specific, reproducible way.
+
+Whenever a finger is straight the glove does not report a measurement, it
+reports a **constant** — index 1.97 (left) / 1.98 (right), middle 2.07/2.08,
+ring 1.97, pinky 1.71, thumb 1.43, identical to two decimals on every
+open-palm frame of all 59 takes. That constant is the finger's **rail**: the
+top of the stretch sensor's range, where the fabric has stopped stretching and
+the number has stopped meaning anything.
+
+In all ten pinch takes the glove index sits exactly on its rail while the
+camera watches the index fold down to the thumb (camera index curl 1.16-1.39,
+against 1.72-1.81 for a genuinely open palm; thumb-index tip gap 0.11-0.28
+palm lengths). The fused pinch therefore had a perfectly straight index — the
+one joint the gesture is named after.
+
+This is **not** a dead zone. An isolated slow index bend leaves the rail as
+soon as the camera sees any flexion, so the glove does measure that finger; it
+fails only at the very top of its range. So the override is narrow, and all
+three conditions must hold together, per finger, per frame:
+
+- **on the rail** — the glove's curl is within `tol` (0.005) of the rail
+  *learned* for that hand and finger. The value is bit-exact, so this is a
+  float-equality test, not a band.
+- **camera trusted** — the same frame gates the spread and thumb already use:
+  visible time, no recent `hand_id` change, central field, and viewing angle
+  inside `view_gate_deg`.
+- **camera flexed** — the camera's curl for that finger is below its open
+  reference minus `margin` (0.25), i.e. 1.50 for the index.
+
+...and then hysteresis, because one frame is not evidence: the override arms
+only after `enter_frames` (10, about 170 ms at the glove's 60 Hz) consecutive
+qualifying frames and disarms after `exit_frames` (5) non-qualifying ones. A
+fresh tracker per take, since "consecutive" across a take boundary is a
+fiction.
+
+**Why the rail is learned and the camera's open reference is not.** The rail
+is a *sensor artefact*: there is no physical reason index saturates at 1.97
+and pinky at 1.71, or that the two hands differ in the third decimal. Those
+are facts about this glove and the only way to know them is to look, so
+`learn_rails` finds them as the most frequent curl per hand and finger — a
+saturating sensor puts a huge bit-exact spike where a moving one spreads out —
+and refuses to believe one unless it also sits at the top of the observed
+range, so a session that never shows a finger straight teaches no rail and the
+override never arms.
+
+The camera's open reference is a *geometric fact*, so it is a constant
+(`cam_open_curl`). Curl here is fingertip-to-wrist over palm length — a
+dimensionless ratio — so a straight finger reads about the same on any hand:
+on sync_day1's open-palm frames the two hands differ by 0.03 (index) to 0.05
+(pinky), an order of magnitude under the margin. It must **not** be learned
+from the frames being fused, and that is the point: without pose labels the
+only label-free way to call a frame "open" is to ask the glove, and the glove
+saying "open" is exactly the claim under suspicion. A reference learned that
+way would let a session of nothing but pinches teach the detector that a
+pinched index is what open looks like. A constant cannot be poisoned by the
+data it is judging.
+
+**What it does.** The finger is rebuilt from the glove's knuckle with the
+camera's three bone *directions* and the glove's three bone *lengths*
+(`transfer_finger_flexion`) — the spread transfer's idea one step further,
+where a single rotation about the knuckle becomes each bone in turn adopting
+the camera's direction. Bone lengths are preserved exactly, as everywhere else
+in this module.
+
+One consequence shows up in every report and is worth stating plainly: **the
+fused curl does not land on the camera's number.** It lands about 11% above
+it, because the curl metric is a *length* ratio and the glove's template index
+is about 11% longer per palm length than the operator's (rail 1.97 against the
+camera's 1.75 open). Over the ten pinch takes the fused index reads 1.29-1.56
+against the camera's 1.16-1.39. The joint *angles* are the camera's exactly —
+expressed as a fraction of each sensor's own open value the two agree to
+within 0.01 — and only the bones they hang on are the glove's. Making the
+number match outright would mean rescaling the template, which is the one
+thing this module never does.
+
+Defaults: **on, index only**. `--no-rail-override` turns it off,
+`--rail-fingers index,middle,...` widens it. Every threshold is a named field
+of `fusion.RailOverrideParams` and is printed in the report, along with the
+rails actually learned.
+
+**Measured on `recordings/sync_day1`** (59 takes, `--camera leap`): the
+override is active on 77.9% of paired pinch frames and 0.00% of fist,
+index_point, peace and thumbs_up frames. The only non-pinch activation is 23
+contiguous frames (0.77%) near the end of one open_palm take, where the camera
+saw the index at 0.90 — fist-like — and the glove had itself left the rail for
+part of it, i.e. a real movement at the end of the take rather than a false
+positive.
+
 ### What the report says
 
 `scripts/fuse_poses.py` leads with a **per-DOF table**: for each pose, hand
