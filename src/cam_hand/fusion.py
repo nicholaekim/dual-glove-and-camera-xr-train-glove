@@ -92,10 +92,17 @@ come from the tracker's own opinion of itself:
                 its proximal bone points at the camera) and the palm is
                 turned toward the module.
   thumb         only when the palm is turned toward the module AND the camera
-                agrees with the glove about the other four fingers. A camera
-                that has the four fingers wrong has the hand's orientation
-                wrong, and the thumb is the DOF that orientation error moves
-                the most. This is what rejects thumbs_up and admits pinch.
+                agrees with the glove about the other fingers. A camera that
+                has the fingers wrong has the hand's orientation wrong, and
+                the thumb is the DOF that orientation error moves the most.
+                This is what rejects thumbs_up and admits pinch.
+
+                "the other fingers" is not all four. A finger only votes if
+                its glove curl is a MEASUREMENT: not pinned on its rail, not
+                already overridden by the rail-disagreement rule, and not
+                named in `unreliable_fingers`. Below `min_usable_fingers`
+                survivors the glove casts no veto and the camera's own
+                geometry decides — see `fuse_skeletons`.
 
 `grab_strength`, `pinch_strength` and `confidence` are deliberately NOT used.
 The first two are model outputs — the same model that produced the joints, so
@@ -280,6 +287,13 @@ class GateParams:
                          camera for this long.
     field_half_angle_deg the palm must sit within this angle of the module's
                          vertical axis — lateral offset less than height.
+    min_usable_fingers   how many fingers must still be worth comparing before
+                         the glove is allowed to veto the camera's thumb. See
+                         `fuse_skeletons`: a finger on its rail, a finger the
+                         rail override has taken, and a finger the operator has
+                         declared unreliable are all excluded from the vote,
+                         and with fewer than this many left the glove has no
+                         opinion worth acting on and does not cast one.
     """
     curl_gate: float = 1.2
     view_gate_deg: float = 50.0
@@ -287,6 +301,7 @@ class GateParams:
     min_visible_time_us: int = 300_000
     hand_id_settle_s: float = 0.25
     field_half_angle_deg: float = 45.0
+    min_usable_fingers: int = 2
 
     def described(self) -> Dict[str, float]:
         return asdict(self)
@@ -427,9 +442,16 @@ class RailDecision:
     a value means the hysteresis — the only state in this module — lives in one
     object the caller holds, and `fuse_skeletons` stays a pure function of its
     arguments.
+
+    `on_rail` is the wider fact `active` is drawn from: every finger whose
+    glove curl is sitting on its learned rail this frame, whether or not the
+    override is enabled on it. The thumb gate reads it, because a railed
+    finger's curl is a constant and comparing a constant against the camera
+    measures nothing.
     """
     active: Tuple[str, ...] = ()
     rejected: Mapping[str, str] = field(default_factory=dict)
+    on_rail: Tuple[str, ...] = ()
 
 
 NO_RAIL_OVERRIDE = RailDecision()
@@ -506,6 +528,15 @@ class RailOverrideTracker:
             _ok, frame_reasons, metrics = frame_trust(cam_meta, self.gates)
             view_deg = metrics["view_angle_deg"]
 
+        # Every finger sitting on its rail, not only the enabled ones: the
+        # thumb gate needs to know which glove curls are constants even when
+        # nothing is being overridden.
+        on_rail = tuple(
+            f for f in RAIL_FINGERS
+            if (hand, f) in self.rails
+            and abs(float(glove_curls[FINGER_NAMES.index(f)])
+                    - self.rails[(hand, f)]) <= self.params.tol)
+
         active: List[str] = []
         rejected: Dict[str, str] = {}
         for finger in self.params.fingers:
@@ -531,7 +562,7 @@ class RailOverrideTracker:
                 active.append(finger)
             else:
                 rejected[f"curl {finger}"] = why if why is not None else R_RAIL_ARMING
-        return RailDecision(tuple(active), rejected)
+        return RailDecision(tuple(active), rejected, on_rail)
 
 
 def _unit(v: np.ndarray) -> np.ndarray:
@@ -815,6 +846,7 @@ def _blank_info(with_scale: bool) -> dict:
             "rejected": {},
             "frame_reasons": [],
             "rail_override": [],
+            "thumb_vote_fingers": [],
             "view_angle_deg": None, "field_angle_deg": None,
             "curl_disagreement": None}
 
@@ -843,6 +875,7 @@ def fuse_skeletons(
     cam_meta: Optional[dict] = None,
     gates: Optional[GateParams] = None,
     rail: Optional[RailDecision] = None,
+    unreliable_fingers: Sequence[str] = (),
 ) -> Tuple[np.ndarray, dict]:
     """Fuse one glove frame with one camera frame -> 21 points + info.
 
@@ -864,6 +897,12 @@ def fuse_skeletons(
     exactly as it was before the override existed. The hysteresis behind it
     needs memory of earlier frames, which is why the decision is made outside
     and handed in: this function stays a pure function of its arguments.
+
+    `unreliable_fingers` names fingers of THIS hand whose glove curl the
+    operator does not trust, excluding them from the thumb gate's vote. It is
+    per hand because gloves fail per hand: on sync_day1 the right glove's ring
+    and pinky read partly extended through thumbs_up and peace while the left
+    glove's do not.
 
     Returns the fused points and an info dict: `dof_source` says where each
     camera-owned DOF actually came from, `rejected` says why the glove kept
@@ -911,9 +950,42 @@ def fuse_skeletons(
 
     curl_g = flexion_features(G)
     curl_c = flexion_features(C_in)      # a ratio, so alignment cannot change it
+
+    # Who is allowed to vote on whether the camera has this hand right.
+    #
     # index..little only: the thumb is the DOF being decided, so it cannot vote
-    disagreement = median([abs(a - b) for a, b in
-                           zip(curl_g[1:], curl_c[1:])])
+    # for itself. And of those four, a finger only counts if its GLOVE curl is
+    # a measurement:
+    #
+    #   on its rail   the glove is reporting a constant, not a reading. In
+    #                 sync_day1's pinch the railed index disagrees with the
+    #                 camera by 0.70 purely because the glove stopped
+    #                 measuring, and that one number is enough to drag the
+    #                 median over the tolerance and veto a thumb the camera
+    #                 had right.
+    #   overridden    the rail override has already ruled the glove wrong
+    #                 about this finger. Letting it vote would be asking the
+    #                 loser of one argument to judge the next.
+    #   unreliable    the operator has said so. On sync_day1 the RIGHT glove
+    #                 reports ring and pinky partly extended through thumbs_up
+    #                 and peace (pinky 1.55-1.68 where the camera says
+    #                 0.78-0.90, consistently, take after take), which is a
+    #                 fault in that glove's fingers rather than evidence about
+    #                 the camera.
+    #
+    # Below `min_usable_fingers` the glove has no opinion worth acting on, so
+    # it casts no veto at all and the camera's own geometry — visibility, id
+    # continuity, central field, viewing angle — is left to decide. That is a
+    # deliberate choice to fail toward the sensor that still has evidence.
+    excluded = set(rail.on_rail) | set(rail.active) | set(unreliable_fingers)
+    usable = [f for f in SPREAD_FINGERS if f not in excluded]
+    info["thumb_vote_fingers"] = list(usable)
+    if usable:
+        disagreement = median([abs(curl_g[FINGER_NAMES.index(f)]
+                                   - curl_c[FINGER_NAMES.index(f)])
+                               for f in usable])
+    else:
+        disagreement = None
     info["curl_disagreement"] = disagreement
 
     def spread_verdict(finger: str) -> Optional[str]:
@@ -935,6 +1007,9 @@ def fuse_skeletons(
             return R_NO_GEOMETRY
         if view_deg >= gates.view_gate_deg:
             return R_VIEW
+        # too few fingers still measuring to hold a vote: no veto
+        if len(usable) < gates.min_usable_fingers:
+            return None
         if disagreement >= gates.curl_agree_tol:
             return R_DISAGREE
         return None

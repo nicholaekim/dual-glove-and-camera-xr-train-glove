@@ -28,6 +28,7 @@ from cam_hand.fusion import (
     R_RAIL_OFF,
     R_VIEW,
     R_VISIBLE,
+    SPREAD_FINGERS,
     flag_hand_id_stability,
     frame_trust,
     fuse_skeletons,
@@ -972,7 +973,8 @@ def test_gate_thresholds_are_named_parameters_and_are_reported():
     described = DEFAULT_GATES.described()
     assert described == {"curl_gate": 1.2, "view_gate_deg": 50.0,
                          "curl_agree_tol": 0.35, "min_visible_time_us": 300_000,
-                         "hand_id_settle_s": 0.25, "field_half_angle_deg": 45.0}
+                         "hand_id_settle_s": 0.25, "field_half_angle_deg": 45.0,
+                         "min_usable_fingers": 2}
     # and they are honoured, not just stored
     glove = make_hand(spread_deg=0.0, curl=0.0)
     cam = make_hand(spread_deg=25.0, curl=0.0)
@@ -1312,3 +1314,136 @@ def test_a_railed_glove_take_and_a_flexed_leap_take_fuse_end_to_end(tmp_path):
     assert curls_fused[0] == pytest.approx(curl_g, abs=1e-9)
     assert curls_fused[-1] == pytest.approx(curl_c, abs=1e-6)
     assert abs(curls_fused[-1] - curl_g) > 0.3
+
+
+# --- who is allowed to vote on the camera's thumb ----------------------
+# The thumb gate asks the other fingers whether the camera has this hand
+# right. A finger can only answer if its GLOVE curl is a measurement.
+
+# A glove reporting its own open palm against a camera that has the index and
+# middle folded onto the thumb. The railed pair "disagree" by ~0.7 each, which
+# is the rail talking and not evidence about the camera. Two of four is what it
+# takes to move a median — one outlier would not, which is what a median is for
+# and why this needed a rule rather than a wider tolerance.
+RAILED_GLOVE_CURLS = [1.43, 1.97, 2.07, 1.97, 1.71]
+RAILED_CAM_CURLS = [1.33, 1.27, 1.30, 1.95, 1.70]
+
+
+def test_railed_fingers_do_not_vote_on_the_thumb():
+    """sync_day1's pinch: a railed curl is a constant, not a disagreement."""
+    glove = hand_with_curls(RAILED_GLOVE_CURLS)
+    cam = hand_with_curls(RAILED_CAM_CURLS)
+    meta = facing_meta(view_deg=40.0)
+
+    # with the railed pair voting, they refuse a thumb the camera had right
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta)
+    assert info["thumb_vote_fingers"] == ["index", "middle", "ring", "pinky"]
+    assert info["curl_disagreement"] > DEFAULT_GATES.curl_agree_tol
+    assert info["rejected"]["thumb"] == R_DISAGREE
+
+    # told they are on their rails, the vote drops them and the thumb is taken
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta,
+                              rail=RailDecision(on_rail=("index", "middle")))
+    assert info["thumb_vote_fingers"] == ["ring", "pinky"]
+    assert info["dof_source"]["thumb"] == "camera"
+
+    # a real pinch rails ALL FOUR, so nobody votes and the geometry decides
+    _f, info = fuse_skeletons(
+        glove, cam, with_scale=False, cam_meta=meta,
+        rail=RailDecision(on_rail=("index", "middle", "ring", "pinky")))
+    assert info["thumb_vote_fingers"] == []
+    assert info["curl_disagreement"] is None
+    assert info["dof_source"]["thumb"] == "camera"
+
+
+def test_an_overridden_finger_does_not_vote_on_the_thumb():
+    """The loser of one argument does not get to judge the next."""
+    glove = hand_with_curls(RAILED_GLOVE_CURLS)
+    cam = hand_with_curls(RAILED_CAM_CURLS)
+    _f, info = fuse_skeletons(
+        glove, cam, with_scale=False, cam_meta=facing_meta(view_deg=40.0),
+        rail=RailDecision(active=("index", "middle"),
+                          on_rail=("index", "middle")))
+    assert info["thumb_vote_fingers"] == ["ring", "pinky"]
+    assert info["dof_source"]["thumb"] == "camera"
+
+
+def test_an_unreliable_finger_does_not_vote_on_the_thumb():
+    """A glove finger the operator has declared broken is not evidence.
+
+    sync_day1's RIGHT glove reports ring and pinky partly extended through
+    thumbs_up and peace while the camera has them curled, take after take.
+    That is a fault in those two fingers, not a reason to distrust the camera.
+    """
+    glove = hand_with_curls([1.43, 1.12, 1.18, 1.53, 1.60])
+    cam = hand_with_curls([1.36, 1.05, 1.10, 0.81, 0.82])
+    meta = facing_meta(view_deg=40.0)
+
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta)
+    assert info["rejected"]["thumb"] == R_DISAGREE, "ring and pinky veto it"
+
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta,
+                              unreliable_fingers=("ring", "pinky"))
+    assert info["thumb_vote_fingers"] == ["index", "middle"]
+    assert info["dof_source"]["thumb"] == "camera"
+
+
+def test_a_camera_wrong_about_every_usable_finger_is_still_rejected():
+    """The edge-on thumbs_up rejection must survive all of the above.
+
+    Nothing here is railed, overridden or declared unreliable, so all four
+    fingers vote — and all four say the camera has the hand wrong.
+    """
+    glove = hand_with_curls(THUMBSUP_GLOVE_CURLS)
+    cam = hand_with_curls(THUMBSUP_CAM_CURLS)
+    _f, info = fuse_skeletons(glove, cam, with_scale=False,
+                              cam_meta=facing_meta(view_deg=40.0))
+    assert info["thumb_vote_fingers"] == ["index", "middle", "ring", "pinky"]
+    assert info["curl_disagreement"] > DEFAULT_GATES.curl_agree_tol
+    assert info["rejected"]["thumb"] == R_DISAGREE
+
+    # and excluding a minority of them does not rescue it: the rest still say no
+    _f, info = fuse_skeletons(glove, cam, with_scale=False,
+                              cam_meta=facing_meta(view_deg=40.0),
+                              unreliable_fingers=("pinky",))
+    assert info["rejected"]["thumb"] == R_DISAGREE
+
+
+def test_too_few_usable_fingers_means_the_glove_casts_no_veto():
+    """With nothing left that is measuring, the camera's geometry decides.
+
+    This is a deliberate choice to fail toward the sensor that still has
+    evidence: a glove with one usable finger has no opinion worth acting on.
+    """
+    glove = hand_with_curls(THUMBSUP_GLOVE_CURLS)
+    cam = hand_with_curls(THUMBSUP_CAM_CURLS)
+    meta = facing_meta(view_deg=40.0)
+
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta,
+                              unreliable_fingers=("middle", "ring", "pinky"))
+    assert info["thumb_vote_fingers"] == ["index"]
+    assert info["dof_source"]["thumb"] == "camera", "one finger is not a vote"
+
+    # two is a vote again, and these two still say no
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta,
+                              unreliable_fingers=("ring", "pinky"))
+    assert info["thumb_vote_fingers"] == ["index", "middle"]
+    assert info["rejected"]["thumb"] == R_DISAGREE
+
+    # ...and the geometry gates still bite when there is no vote at all
+    _f, info = fuse_skeletons(glove, cam, with_scale=False,
+                              cam_meta=facing_meta(view_deg=75.0),
+                              unreliable_fingers=SPREAD_FINGERS)
+    assert info["thumb_vote_fingers"] == []
+    assert info["rejected"]["thumb"] == R_VIEW
+
+
+def test_min_usable_fingers_is_a_named_parameter():
+    glove = hand_with_curls(THUMBSUP_GLOVE_CURLS)
+    cam = hand_with_curls(THUMBSUP_CAM_CURLS)
+    meta = facing_meta(view_deg=40.0)
+    # demanding three voters, with only two left, means no veto
+    _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta,
+                              gates=GateParams(min_usable_fingers=3),
+                              unreliable_fingers=("ring", "pinky"))
+    assert info["dof_source"]["thumb"] == "camera"

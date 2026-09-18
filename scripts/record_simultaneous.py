@@ -1192,8 +1192,25 @@ class CoachedLeapSession(LeapSyncSession):
         takes survive: an exclusion nobody can look at is an exclusion nobody
         can check. So the files move, keep their name plus which attempt they
         were, and get a `meta.json` saying `accepted: false` and why.
+
+        The name they move to is the one the take would have been ACCEPTED
+        under, plus the attempt suffix. Recording starts before the hand side
+        is known, so the working name carries no hand and `finalize_pose_name`
+        inserts it on the way to `glove/`. A rejected attempt never reaches
+        that step, and used to keep the working name — so `rejected/` held
+        `fist_take1_<stamp>_attempt1.jsonl` beside an accepted
+        `fist_left_take1_<stamp>.jsonl`, which could be matched to its take
+        neither by name nor by hand. The hand is known by the time an attempt
+        is judged (it is the hand this session is recording), so it goes in
+        here the same way, for both files, the meta and the still.
+
+        `stem` itself is left alone: it is also where the still was SAVED,
+        under the working name, and that file has to be found before it can
+        be moved.
         """
-        target = f"{stem}_attempt{attempt}"
+        final_stem = stem.replace("_take",
+                                  f"_{cam_hand_tag({self.hand})}_take", 1)
+        target = f"{final_stem}_attempt{attempt}"
         moved = []
         for folder in (self.cam_dir, self.glove_dir):
             src = folder / name

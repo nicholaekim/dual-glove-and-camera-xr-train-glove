@@ -546,6 +546,24 @@ def test_a_mock_holding_the_wrong_pose_is_rejected_and_the_take_retried(
     assert rejected[1].name.endswith("_attempt2.jsonl")
     assert len(list((out / "rejected" / "glove").glob("*.jsonl"))) == 2
 
+    # A rejected attempt carries the name it would have been ACCEPTED under,
+    # plus the attempt — hand side included. Recording starts before the hand
+    # is known, so the working name has none and it is inserted on the way
+    # out; an attempt that kept the working name could be matched to its
+    # accepted siblings neither by name nor by hand.
+    # (no still: this mock session never writes one, so stills/ is checked
+    # only if it is there — the code names it from the same stem as the rest)
+    for folder, suffix, required in (("glove", "*.jsonl", True),
+                                     ("leap", "*.jsonl", True),
+                                     ("leap", "*.meta.json", True),
+                                     ("stills", "*.jpg", False)):
+        where = out / "rejected" / folder
+        found = sorted(where.glob(suffix)) if where.is_dir() else []
+        assert found or not required, f"nothing under rejected/{folder}/{suffix}"
+        for path in found:
+            assert path.name.startswith("open_palm_left_take1_"), path.name
+            assert "_attempt" in path.name, path.name
+
     meta = json.loads(rejected[0].with_name(rejected[0].stem + ".meta.json")
                       .read_text(encoding="utf-8"))
     assert meta["accepted"] is False

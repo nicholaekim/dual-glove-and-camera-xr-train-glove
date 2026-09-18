@@ -66,8 +66,10 @@ from cam_hand.export21 import wrist_centered
 from cam_hand.features import (
     ALL_COLS,
     ALL_NAMES,
+    DESCRIPTIVE_ROWS,
     DOF_ROWS,
     FLEXION_COLS,
+    FLEXION_NAMES,
     all_features,
     dof_values,
     flexion_features,
@@ -289,7 +291,6 @@ ROW_OWNERS = {
     "curl middle": ("curl middle",),
     "curl ring": ("curl ring",),
     "curl pinky": ("curl pinky",),
-    "spread thumb-index": ("thumb", "spread index"),
     "spread index-middle": ("spread index", "spread middle"),
     "spread middle-ring": ("spread middle", "spread ring"),
     "spread ring-pinky": ("spread ring", "spread pinky"),
@@ -299,6 +300,8 @@ ROW_OWNERS = {
 
 def row_owner(label, sources, n_paired):
     """The 'from' column: how much of this row the camera actually supplied."""
+    if label in DESCRIPTIVE_ROWS:
+        return "descriptive"
     owners = ROW_OWNERS.get(label, ())
     if not owners:
         return "glove (by design)"
@@ -326,12 +329,20 @@ def dof_table(per_pose, lines):
                  "is tip-to-tip over palm length.")
     lines.append("  The camera column is blank where no camera frame paired "
                  "with that take at all.")
-    lines.append("  'spread thumb-index' is the angle of the thumb's BASE "
-                 "bone: the camera supplies the")
-    lines.append("  thumb's whole direction, not its base angle, so that row "
-                 "moves only incidentally —")
     lines.append("  'thumb-index gap' is where the thumb's contribution "
-                 "actually shows.")
+                 "actually shows. (The old 'spread")
+    lines.append("  thumb-index' row, the angle of the thumb's BASE bone, is "
+                 "gone: the camera supplies the")
+    lines.append("  thumb's whole DIRECTION and it is grafted onto the glove "
+                 "template's own CMC, so that")
+    lines.append("  angle described neither hand.)")
+    lines.append("  'thumb dir elevation/azimuth' are the CMC-to-tip "
+                 "direction in the palm frame —")
+    lines.append("  elevation is opposition, out of the palm plane. They are "
+                 "marked DESCRIPTIVE because")
+    lines.append("  the fused thumb is the camera's by construction: agreeing "
+                 "with the camera column")
+    lines.append("  restates what fusion did and validates nothing.")
     lines.append("")
     lines.append(f"  {'pose':<12} {'hand':<6} {'tk':<3} {'DOF':<20} "
                  f"{'glove':>8} {'camera':>8} {'fused':>8}   from")
@@ -349,7 +360,8 @@ def dof_table(per_pose, lines):
         lines.append("")
 
 
-def gate_tables(dof_used, dof_total, reasons, gates, rail_params, rails, lines):
+def gate_tables(dof_used, dof_total, reasons, gates, rail_params, rails,
+                unreliable, lines):
     lines.append("Camera-use rate per gated DOF "
                  "(share of paired frames the camera actually supplied)")
     for dof in GATED_DOFS:
@@ -373,6 +385,17 @@ def gate_tables(dof_used, dof_total, reasons, gates, rail_params, rails, lines):
     lines.append("  not calibrated constants — every one is a named parameter)")
     for k, v in gates.described().items():
         lines.append(f"  {k:<22} {v}")
+    lines.append("  Only fingers whose GLOVE curl is a measurement vote on "
+                 "whether the camera has")
+    lines.append("  the hand right: a finger on its rail, one the rail "
+                 "override has taken, and one")
+    lines.append("  named --unreliable are all excluded. Below "
+                 "min_usable_fingers the glove casts no")
+    lines.append("  veto and the camera's own geometry decides.")
+    lines.append(f"  {'unreliable fingers':<22} "
+                 + ("; ".join(f"{h}: {', '.join(f)}"
+                              for h, f in sorted(unreliable.items()))
+                    if unreliable else "(none)"))
     lines.append("")
     lines.append("Rail-disagreement override (the glove's curl is a CONSTANT "
                  "at full extension;")
@@ -416,6 +439,11 @@ def main() -> None:
                    help="max median curl disagreement over index..little for "
                         f"the camera to own the thumb "
                         f"(default {DEFAULT_GATES.curl_agree_tol})")
+    p.add_argument("--unreliable", action="append", default=[],
+                   metavar="HAND:FINGER[,FINGER]",
+                   help="fingers whose GLOVE curl is not to be trusted on that "
+                        "hand, e.g. 'right:ring,pinky'. They are excluded from "
+                        "the thumb gate's vote. Repeatable, once per hand.")
     p.add_argument("--no-rail-override", action="store_true",
                    help="do not let the camera take a finger's curl when the "
                         "glove is pinned at full extension and the camera "
@@ -450,6 +478,19 @@ def main() -> None:
     gates = GateParams(curl_gate=args.curl_gate,
                        view_gate_deg=args.view_gate_deg,
                        curl_agree_tol=args.curl_agree_tol)
+
+    unreliable = {}
+    for spec in args.unreliable:
+        if ":" not in spec:
+            raise SystemExit(f"--unreliable {spec}: expected HAND:FINGER[,FINGER], "
+                             "e.g. right:ring,pinky")
+        hand, _, fingers_txt = spec.partition(":")
+        picked = tuple(f.strip() for f in fingers_txt.split(",") if f.strip())
+        bad = [f for f in picked if f not in FLEXION_NAMES]
+        if bad:
+            raise SystemExit(f"--unreliable {spec}: {', '.join(bad)} is not a "
+                             f"finger (choose from {', '.join(FLEXION_NAMES)})")
+        unreliable[hand.strip().lower()] = picked
 
     rail_params = None
     if not args.no_rail_override:
@@ -566,7 +607,8 @@ def main() -> None:
                     min_score=args.min_score,
                     thumb_from_camera=not args.no_thumb_camera,
                     with_scale=with_scale,
-                    cam_meta=meta, gates=gates, rail=rail)
+                    cam_meta=meta, gates=gates, rail=rail,
+                    unreliable_fingers=unreliable.get(str(hand).lower(), ()))
                 for dof in GATED_DOFS:
                     dof_total[dof] += 1
                     if info["dof_source"][dof].startswith("camera"):
@@ -645,7 +687,8 @@ def main() -> None:
     lines.append("")
     lines.append("=" * 66)
     dof_table(per_pose, lines)
-    gate_tables(dof_used, dof_total, reasons, gates, rail_params, rails, lines)
+    gate_tables(dof_used, dof_total, reasons, gates, rail_params, rails,
+                unreliable, lines)
 
     lines.append("")
     lines.append("=" * 66)

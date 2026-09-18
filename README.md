@@ -769,12 +769,38 @@ opinion of itself:
   camera's palm normal and the ray from the palm to the module, which is the
   origin of leap space).
 - **thumb** — only when the viewing-angle gate passes **and** the camera
-  agrees with the glove about index..little: median absolute curl
-  disagreement below `curl_agree_tol` = 0.35. A camera that has the four
-  fingers wrong has the hand's orientation wrong, and orientation error moves
-  the thumb most of all. `pinch` measures 0.24-0.28 and passes; `thumbs_up`
-  measures 0.88 and does not — and was edge-on at 70-78 degrees, so it fails
-  twice over.
+  agrees with the glove about the other fingers: median absolute curl
+  disagreement below `curl_agree_tol` = 0.35. A camera that has the fingers
+  wrong has the hand's orientation wrong, and orientation error moves the
+  thumb most of all. `thumbs_up` measures 0.88 and is refused; on the first
+  session it was also edge-on at 70-78 degrees, so it failed twice over.
+
+  **Who is allowed to vote.** Not all four — only fingers whose *glove* curl
+  is a measurement. A finger is excluded when it is **on its rail** (the glove
+  is reporting a constant; in `pinch` all four are, so the glove has no
+  opinion at all), when the **rail override has already taken it** (the loser
+  of one argument does not judge the next), or when it is named
+  **`--unreliable`**. Below `min_usable_fingers` = 2 survivors the glove casts
+  no veto and the camera's own geometry decides — failing toward the sensor
+  that still has evidence.
+
+  `--unreliable HAND:FINGER[,FINGER]` exists because gloves fail per hand and
+  per finger: on `sync_day1` the **right** glove reports ring and pinky partly
+  extended right through `thumbs_up` and `peace` (pinky 1.55-1.68 where the
+  camera says 0.78-0.90, take after take) while the left glove's do not. That
+  is a fault in two of that glove's fingers, not evidence about the camera,
+  and left in the vote it refused a correct camera thumb on almost every right
+  `thumbs_up`, `peace` and `index_point` frame. Measured over the 59 takes,
+  thumb camera-use per pose:
+
+  | pose / hand | before | `--unreliable right:ring,pinky` |
+  |---|---|---|
+  | `index_point` right | 32.3% | 100% |
+  | `peace` right | 33.0% | 98.9% |
+  | `thumbs_up` right | 14.0% | 46.7% |
+  | **all poses, both hands** | **77.1%** | **89.5%** |
+
+  and the fused leave-one-take-out classifier goes 56/59 to **57/59**.
 
 `grab_strength`, `pinch_strength` and `confidence` are deliberately **not**
 used as weights: the first two are outputs of the same model that produced the
@@ -888,9 +914,26 @@ positive.
 ### What the report says
 
 `scripts/fuse_poses.py` leads with a **per-DOF table**: for each pose, hand
-and take, the glove / camera / fused value of the five curls, the four
-adjacent proximal-bone spreads and the thumb-index gap, with a `from` column
-saying how much of each row the camera actually supplied. Under it are the
+and take, the glove / camera / fused value of the five curls, the three
+adjacent proximal-bone spreads, the thumb-index gap and the thumb's direction,
+with a `from` column saying how much of each row the camera actually supplied.
+
+Two rows deserve a note. The old **`spread thumb-index`** row — the in-plane
+angle of the thumb's base bone — is **gone**: the camera supplies the thumb's
+whole *direction*, which is then grafted onto the glove template's own CMC, so
+that angle described neither hand and moved for reasons that meant nothing.
+In its place, **`thumb dir elevation` / `thumb dir azimuth`** give the
+CMC-to-tip direction in the palm frame (elevation is opposition, out of the
+palm plane), which says plainly where the thumb ended up. They are marked
+**descriptive**, not scored: the fused thumb *is* the camera's by
+construction, so agreeing with the camera column restates what fusion did and
+validates nothing. The **`thumb-index gap`** row survives unchanged — it is a
+tip-to-tip distance, and it is where a pinch actually shows.
+
+None of this touches the classifier's features. Those come from
+`features.spread_features`, whose `thumb-index` entry is the tip-to-tip *gap*,
+not the base angle; the base angle was only ever a report row, so dropping it
+leaves every before/after comparison valid. Under it are the
 camera-use rate per gated DOF, every rejection reason with its count, and the
 thresholds in force.
 
