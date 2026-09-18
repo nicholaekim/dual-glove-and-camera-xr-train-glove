@@ -776,13 +776,23 @@ opinion of itself:
   session it was also edge-on at 70-78 degrees, so it failed twice over.
 
   **Who is allowed to vote.** Not all four — only fingers whose *glove* curl
-  is a measurement. A finger is excluded when it is **on its rail** (the glove
-  is reporting a constant; in `pinch` all four are, so the glove has no
-  opinion at all), when the **rail override has already taken it** (the loser
-  of one argument does not judge the next), or when it is named
-  **`--unreliable`**. Below `min_usable_fingers` = 2 survivors the glove casts
-  no veto and the camera's own geometry decides — failing toward the sensor
-  that still has evidence.
+  is a measurement. A finger is excluded when it is **disputed** (on its rail
+  *while the camera reads it flexed*), when the **rail override has already
+  taken it** (the loser of one argument does not judge the next), or when it
+  is named **`--unreliable`**. Below `min_usable_fingers` = 2 survivors the
+  glove casts no veto and the camera's own geometry decides — failing toward
+  the sensor that still has evidence.
+
+  Being on the rail is **not** on its own a reason to exclude a finger, and a
+  first version of this rule that did exclude every railed finger was wrong.
+  In `peace`, `open_palm` and `index_point` the extended fingers sit on their
+  rails and the camera agrees they are extended — that agreement is the best
+  evidence the vote has. Discarding it left the verdict to the curled fingers
+  alone and *dropped* right-hand `peace` from 33% to 7%. A rail is suspect
+  only when the camera contradicts it, which is the same disagreement the
+  override itself is built on. (In `pinch` that is the index alone: the middle,
+  ring and pinky are railed and the camera agrees they are extended, so they
+  keep voting, and they are why the pinch thumb is accepted.)
 
   `--unreliable HAND:FINGER[,FINGER]` exists because gloves fail per hand and
   per finger: on `sync_day1` the **right** glove reports ring and pinky partly
@@ -793,14 +803,25 @@ opinion of itself:
   `thumbs_up`, `peace` and `index_point` frame. Measured over the 59 takes,
   thumb camera-use per pose:
 
-  | pose / hand | before | `--unreliable right:ring,pinky` |
-  |---|---|---|
-  | `index_point` right | 32.3% | 100% |
-  | `peace` right | 33.0% | 98.9% |
-  | `thumbs_up` right | 14.0% | 46.7% |
-  | **all poses, both hands** | **77.1%** | **89.5%** |
+  | pose / hand | before | this rule | + `--unreliable right:ring,pinky` |
+  |---|---|---|---|
+  | `index_point` right | 32.3% | 32.3% | 30.7% |
+  | `peace` right | 33.0% | 33.5% | **98.9%** |
+  | `thumbs_up` right | 14.0% | 14.0% | **46.7%** |
+  | `open_palm` right | 96.5% | 98.4% | 98.5% |
+  | **all poses, both hands** | **77.1%** | **77.4%** | **85.5%** |
 
-  and the fused leave-one-take-out classifier goes 56/59 to **57/59**.
+  and the fused leave-one-take-out classifier goes 56/59 to **57/59**. The
+  rule alone barely moves the total — it fires only where the two sensors
+  actually contradict each other — and it is `--unreliable` that pays, which
+  is the right division of labour: one is a fact about the data, the other is
+  a judgement the operator has to make and record.
+
+  `index_point` right is the one cell that falls, 32.3% to 30.7%. It is
+  honest: with ring and pinky out, the vote is index and middle, and on the
+  right hand the *middle* also reads 1.57 where the camera says 0.93. That
+  glove finger looks as suspect as the two that were named, and the report
+  says so rather than hiding it behind a quorum of one.
 
 `grab_strength`, `pinch_strength` and `confidence` are deliberately **not**
 used as weights: the first two are outputs of the same model that produced the

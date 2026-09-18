@@ -387,11 +387,15 @@ def gate_tables(dof_used, dof_total, reasons, gates, rail_params, rails,
         lines.append(f"  {k:<22} {v}")
     lines.append("  Only fingers whose GLOVE curl is a measurement vote on "
                  "whether the camera has")
-    lines.append("  the hand right: a finger on its rail, one the rail "
-                 "override has taken, and one")
-    lines.append("  named --unreliable are all excluded. Below "
-                 "min_usable_fingers the glove casts no")
-    lines.append("  veto and the camera's own geometry decides.")
+    lines.append("  the hand right. Excluded: a DISPUTED finger (on its rail "
+                 "while the camera reads")
+    lines.append("  it flexed), one the rail override has taken, and one "
+                 "named --unreliable. A railed")
+    lines.append("  finger the camera AGREES is extended still votes — that "
+                 "agreement is evidence.")
+    lines.append("  Below min_usable_fingers the glove casts no veto and the "
+                 "camera's own geometry")
+    lines.append("  decides.")
     lines.append(f"  {'unreliable fingers':<22} "
                  + ("; ".join(f"{h}: {', '.join(f)}"
                               for h, f in sorted(unreliable.items()))

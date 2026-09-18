@@ -98,11 +98,14 @@ come from the tracker's own opinion of itself:
                 This is what rejects thumbs_up and admits pinch.
 
                 "the other fingers" is not all four. A finger only votes if
-                its glove curl is a MEASUREMENT: not pinned on its rail, not
-                already overridden by the rail-disagreement rule, and not
-                named in `unreliable_fingers`. Below `min_usable_fingers`
-                survivors the glove casts no veto and the camera's own
-                geometry decides — see `fuse_skeletons`.
+                its glove curl is a MEASUREMENT: not pinned on its rail WHILE
+                the camera reads it flexed, not already overridden by the
+                rail-disagreement rule, and not named in
+                `unreliable_fingers`. A railed finger the camera also calls
+                extended votes normally — the two sensors agree about it, and
+                that is evidence. Below `min_usable_fingers` survivors the
+                glove casts no veto and the camera's own geometry decides —
+                see `fuse_skeletons`.
 
 `grab_strength`, `pinch_strength` and `confidence` are deliberately NOT used.
 The first two are model outputs — the same model that produced the joints, so
@@ -443,15 +446,24 @@ class RailDecision:
     object the caller holds, and `fuse_skeletons` stays a pure function of its
     arguments.
 
-    `on_rail` is the wider fact `active` is drawn from: every finger whose
-    glove curl is sitting on its learned rail this frame, whether or not the
-    override is enabled on it. The thumb gate reads it, because a railed
-    finger's curl is a constant and comparing a constant against the camera
-    measures nothing.
+    `disputed` is the wider fact `active` is drawn from: every finger sitting
+    on its learned rail this frame WHILE the camera reads that finger as
+    flexed — whether or not the override is enabled on it, and without the
+    consecutive-frame run that arming needs. The thumb gate reads it.
+
+    Being on the rail is not by itself a reason to distrust a finger, and an
+    earlier version of this that excluded every railed finger from the thumb
+    vote was wrong about that. In peace, open palm and index point the
+    extended fingers sit on their rails and the camera agrees they are
+    extended — that agreement is the best evidence the vote has. Discarding it
+    left the vote to the curled fingers alone and refused a correct camera
+    thumb on almost every right-hand peace frame. A rail is suspect only when
+    the camera contradicts it, which is the same disagreement the override
+    itself is built on.
     """
     active: Tuple[str, ...] = ()
     rejected: Mapping[str, str] = field(default_factory=dict)
-    on_rail: Tuple[str, ...] = ()
+    disputed: Tuple[str, ...] = ()
 
 
 NO_RAIL_OVERRIDE = RailDecision()
@@ -528,14 +540,23 @@ class RailOverrideTracker:
             _ok, frame_reasons, metrics = frame_trust(cam_meta, self.gates)
             view_deg = metrics["view_angle_deg"]
 
-        # Every finger sitting on its rail, not only the enabled ones: the
-        # thumb gate needs to know which glove curls are constants even when
-        # nothing is being overridden.
-        on_rail = tuple(
+        # Every finger the two sensors CONTRADICT each other about — on its
+        # rail while the camera reads it flexed — computed for all four, not
+        # only the enabled ones, because the thumb gate needs it even when
+        # nothing is being overridden. No run length here: this is the
+        # instantaneous disagreement, and it is arming that needs patience.
+        #
+        # A railed finger the camera ALSO calls extended is not on this list.
+        # The two sensors agree about it, which is exactly the evidence the
+        # thumb vote wants.
+        disputed = tuple(
             f for f in RAIL_FINGERS
             if (hand, f) in self.rails
             and abs(float(glove_curls[FINGER_NAMES.index(f)])
-                    - self.rails[(hand, f)]) <= self.params.tol)
+                    - self.rails[(hand, f)]) <= self.params.tol
+            and cam_curls is not None
+            and float(cam_curls[FINGER_NAMES.index(f)])
+            < self.params.open_curl(f) - self.params.margin)
 
         active: List[str] = []
         rejected: Dict[str, str] = {}
@@ -562,7 +583,7 @@ class RailOverrideTracker:
                 active.append(finger)
             else:
                 rejected[f"curl {finger}"] = why if why is not None else R_RAIL_ARMING
-        return RailDecision(tuple(active), rejected, on_rail)
+        return RailDecision(tuple(active), rejected, disputed)
 
 
 def _unit(v: np.ndarray) -> np.ndarray:
@@ -957,15 +978,29 @@ def fuse_skeletons(
     # for itself. And of those four, a finger only counts if its GLOVE curl is
     # a measurement:
     #
-    #   on its rail   the glove is reporting a constant, not a reading. In
-    #                 sync_day1's pinch the railed index disagrees with the
+    #   disputed      the glove is on this finger's rail — reporting a
+    #                 constant — AND the camera reads it flexed. In
+    #                 sync_day1's pinch the railed index "disagrees" with the
     #                 camera by 0.70 purely because the glove stopped
-    #                 measuring, and that one number is enough to drag the
+    #                 measuring, and one such number is enough to drag the
     #                 median over the tolerance and veto a thumb the camera
     #                 had right.
+    #
+    #                 Being on the rail is NOT enough on its own, and an
+    #                 earlier version of this rule that excluded every railed
+    #                 finger was wrong. In peace, open palm and index point
+    #                 the extended fingers are on their rails and the camera
+    #                 agrees they are extended: that agreement is the best
+    #                 evidence this vote has, and discarding it left the
+    #                 verdict to the curled fingers alone and refused a
+    #                 correct camera thumb on almost every right-hand peace
+    #                 frame. A rail is suspect only when the camera
+    #                 contradicts it.
     #   overridden    the rail override has already ruled the glove wrong
     #                 about this finger. Letting it vote would be asking the
-    #                 loser of one argument to judge the next.
+    #                 loser of one argument to judge the next. Not implied by
+    #                 `disputed`: hysteresis keeps a finger overridden for
+    #                 `exit_frames` after the disagreement stops.
     #   unreliable    the operator has said so. On sync_day1 the RIGHT glove
     #                 reports ring and pinky partly extended through thumbs_up
     #                 and peace (pinky 1.55-1.68 where the camera says
@@ -977,7 +1012,7 @@ def fuse_skeletons(
     # it casts no veto at all and the camera's own geometry — visibility, id
     # continuity, central field, viewing angle — is left to decide. That is a
     # deliberate choice to fail toward the sensor that still has evidence.
-    excluded = set(rail.on_rail) | set(rail.active) | set(unreliable_fingers)
+    excluded = set(rail.disputed) | set(rail.active) | set(unreliable_fingers)
     usable = [f for f in SPREAD_FINGERS if f not in excluded]
     info["thumb_vote_fingers"] = list(usable)
     if usable:

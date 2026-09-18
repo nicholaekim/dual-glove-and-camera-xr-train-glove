@@ -1329,41 +1329,72 @@ RAILED_GLOVE_CURLS = [1.43, 1.97, 2.07, 1.97, 1.71]
 RAILED_CAM_CURLS = [1.33, 1.27, 1.30, 1.95, 1.70]
 
 
-def test_railed_fingers_do_not_vote_on_the_thumb():
-    """sync_day1's pinch: a railed curl is a constant, not a disagreement."""
+def test_disputed_fingers_do_not_vote_on_the_thumb():
+    """sync_day1's pinch: a railed curl the camera contradicts is not evidence."""
     glove = hand_with_curls(RAILED_GLOVE_CURLS)
     cam = hand_with_curls(RAILED_CAM_CURLS)
     meta = facing_meta(view_deg=40.0)
 
-    # with the railed pair voting, they refuse a thumb the camera had right
+    # with the disputed pair voting, they refuse a thumb the camera had right
     _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta)
     assert info["thumb_vote_fingers"] == ["index", "middle", "ring", "pinky"]
     assert info["curl_disagreement"] > DEFAULT_GATES.curl_agree_tol
     assert info["rejected"]["thumb"] == R_DISAGREE
 
-    # told they are on their rails, the vote drops them and the thumb is taken
+    # told the camera contradicts those two rails, the vote drops them
     _f, info = fuse_skeletons(glove, cam, with_scale=False, cam_meta=meta,
-                              rail=RailDecision(on_rail=("index", "middle")))
+                              rail=RailDecision(disputed=("index", "middle")))
     assert info["thumb_vote_fingers"] == ["ring", "pinky"]
     assert info["dof_source"]["thumb"] == "camera"
 
-    # a real pinch rails ALL FOUR, so nobody votes and the geometry decides
+    # and if every finger were disputed, nobody votes and the geometry decides
     _f, info = fuse_skeletons(
         glove, cam, with_scale=False, cam_meta=meta,
-        rail=RailDecision(on_rail=("index", "middle", "ring", "pinky")))
+        rail=RailDecision(disputed=("index", "middle", "ring", "pinky")))
     assert info["thumb_vote_fingers"] == []
     assert info["curl_disagreement"] is None
     assert info["dof_source"]["thumb"] == "camera"
 
 
+def test_a_railed_finger_the_camera_agrees_with_still_votes():
+    """Being on the rail is not a reason to distrust a finger.
+
+    In peace, open palm and index point the extended fingers sit on their
+    rails and the camera says they are extended too. That agreement is the
+    best evidence the vote has — excluding it once left the verdict to the
+    curled fingers alone and refused a correct camera thumb on almost every
+    right-hand peace frame.
+    """
+    tracker = RailOverrideTracker(
+        {("right", f): RAIL for f in ("index", "middle")},
+        RailOverrideParams(enter_frames=1))
+    meta = facing_meta()
+
+    # both railed, camera agrees they are extended -> neither is disputed
+    agreeing = [1.2, 1.78, 1.85, 1.2, 1.2]
+    d = tracker.update("right", [1.2, RAIL, RAIL, 1.2, 1.2], agreeing, meta)
+    assert d.disputed == ()
+    assert d.active == (), "and nothing is overridden either"
+
+    # the camera now says the index is folded: that one is disputed, and the
+    # middle, which it still agrees about, is not
+    folded = [1.2, 1.20, 1.85, 1.2, 1.2]
+    d = tracker.update("right", [1.2, RAIL, RAIL, 1.2, 1.2], folded, meta)
+    assert d.disputed == ("index",)
+
+
 def test_an_overridden_finger_does_not_vote_on_the_thumb():
-    """The loser of one argument does not get to judge the next."""
+    """The loser of one argument does not get to judge the next.
+
+    Listed separately from `disputed` rather than implied by it: hysteresis
+    keeps a finger overridden for `exit_frames` after the disagreement stops,
+    and during that window it is active without being disputed.
+    """
     glove = hand_with_curls(RAILED_GLOVE_CURLS)
     cam = hand_with_curls(RAILED_CAM_CURLS)
     _f, info = fuse_skeletons(
         glove, cam, with_scale=False, cam_meta=facing_meta(view_deg=40.0),
-        rail=RailDecision(active=("index", "middle"),
-                          on_rail=("index", "middle")))
+        rail=RailDecision(active=("index", "middle")))
     assert info["thumb_vote_fingers"] == ["ring", "pinky"]
     assert info["dof_source"]["thumb"] == "camera"
 
