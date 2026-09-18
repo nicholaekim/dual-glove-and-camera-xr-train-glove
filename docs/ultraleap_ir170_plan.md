@@ -565,6 +565,123 @@ streaming, 6 poses x 1 take x 5 s, both hands over the camera at once)
   exists, even when the hand is edge-on or the glove says the finger is
   fully curled, which is when the camera is guessing.
 
+Day-1 session with the corrected recorder (2026-09-18, 18:36 to 18:48,
+6 poses x 5 takes x 2 hands, one hand at a time; `recordings/sync_day1`)
+- 59/60 takes. fist_left take 1 failed all four attempts: the tracker lost
+  the gloved left hand for 0.5 s right after it closed. Ten rejected
+  attempts in all (six left fists, two left thumbs up, two left pinch), all
+  "hand lost" or "re-acquired", kept under `rejected/`. Right hand: none.
+- Pose check: 39 ok, 20 warn (one sensor disagreeing), 0 mismatch. So the
+  previous session's label errors were the missing pose name, as suspected.
+- Glove at 60 Hz, 300 frames per take, worst gap 33 ms, no dropout in about
+  12 minutes. Pairing 17689/17695 within 50 ms, camera used 97 %, palm fit
+  3.0 mm median. One IR still per take in `stills/`.
+- Per DOF (median over takes): curl agrees between sensors on the left hand
+  within about 0.2 (template offset). The RIGHT glove under-reads ring and
+  pinky curl in peace, thumbs up and index point (pinky 1.55 to 1.68 where
+  the camera says 0.78 to 0.90, consistent across takes; right pinky in a
+  fist 1.28 vs left 0.77). Pinch: camera index 1.16 to 1.39 and tip gap
+  0.11 to 0.28 in 10/10 takes, glove exactly on its rail in 10/10. Spread
+  from the glove is a template constant (5.96 / 12.89 / 7.92 on every open
+  palm); the camera gives 19 to 24 / 2 to 4 / 17 to 19 deg with a few
+  degrees of take-to-take spread. Right thumbs up: the thumb agreement gate
+  rejects a correct camera on every frame because the glove's ring/pinky
+  are wrong. The "spread thumb-index" (base bone) row produces fused values
+  outside both inputs (a hybrid-skeleton artifact).
+- Leave-one-take-out classifier: glove 43/59, camera 59/59, fused 56/59;
+  the three fused misses are right-hand takes where glove-owned curl is
+  wrong. Reported as is: fusion needs per-hand, per-finger reliability
+  logic; glove curl does not automatically dominate.
+
+Rail-disagreement override, trust-based thumb vote, report changes (merged
+2026-09-18, 253 tests)
+- `RailOverrideParams`: rail learned per hand/finger as the mode of the
+  glove curl (tol 0.005; recovered 1.974/1.975 index, 2.072/2.075 middle,
+  1.970/1.973 ring, 1.707/1.710 pinky, 1.426 thumb); camera open reference
+  a constant per finger (index 1.75) minus margin 0.25; enter after 10
+  qualifying frames, leave after 5; index only by default. The camera's
+  bone directions are put on the glove's bone lengths from the knuckle out.
+- On `sync_day1`: active on 77.9 % of pinch frames, 0.00 % on fist, index
+  point, peace, thumbs up, 0.77 % on open palm (one real movement). Fused
+  pinch index 1.98 -> 1.40 to 1.56 (camera 1.17 to 1.39; the +0.13 to +0.18
+  is the template's longer index, agreement is within 0.02 as a fraction of
+  each sensor's open value); fused thumb-index gap 0.94 -> 0.36 (camera
+  0.28). Pinch L1 and R1 stay glove-only: viewing angle 52 deg fails the
+  50 deg gate, and that bimodality costs the classifier one take (56 ->
+  55/59 at the default gate, 57/59 at 55 deg; default left at 50).
+- Thumb vote counts only fingers that are measuring: excluded when in the
+  override, listed unreliable (`--unreliable right:ring,pinky`), or on the
+  rail WHILE the camera reads that finger flexed (a railed finger the camera
+  agrees with still votes; excluding every railed finger had dropped peace
+  right from 33 % to 7 %). Fewer than two usable fingers = no glove veto.
+  Thumb camera use overall 77.1 -> 77.4 % (rule alone) -> 85.5 % with
+  `--unreliable`; thumbs up right 14 -> 47 %, peace right 33 -> 99 %;
+  classifier 57/59 with `--unreliable`. The vote also surfaces the right
+  MIDDLE finger (1.57 vs camera 0.93 in index point) as suspect.
+- Report: "spread thumb-index" (base bone angle) dropped; thumb direction in
+  the palm frame added as descriptive only; rejected attempts named with
+  the hand.
+
+Right-glove recalibration check and pose-hold drift (2026-09-18, 19:01 to
+19:11; `recordings/right_recal_check`, `..\xr trainer\hold_drift_*.csv`)
+- Reseat + fresh Basic calibration, then fist / peace / thumbs up / index
+  point x 3 (12 takes, none rejected, pose check 6 ok 6 warn). Right ring:
+  fist 1.03 -> 0.82, peace 1.51 -> 1.00 (fixed). Right pinky: fist 1.28 ->
+  0.94, peace 1.62 -> 1.42, thumbs up 1.59 -> 1.45 (half fixed; still reads
+  half open in mixed poses while the camera reads 0.8). Defensible
+  statement for the professor, as an observation, not a defect.
+- Creep: glove curl rises while a pose is held and the camera stays flat.
+  Day-1 take order showed it (left peace pinky 0.92 -> 1.36 over five takes,
+  camera 0.79 to 0.83). 60 s fist holds (`measure_hold_drift.py`): right
+  index +0.26, ring +0.17, middle +0.12, pinky +0.11; left index +0.20,
+  others +0.06 to +0.07; camera within +/-0.03 (right) and +/-0.06 (left).
+  +0.26 is about 20 % of the glove's open-to-fist range in one minute.
+- Lag by cross-correlation on the close/open transitions: right glove trails
+  the camera by about 485 ms, left by about 100 ms (camera frames ~10 ms
+  old). Yesterday the left was the slow one and dropped out for 3.1 s; today
+  neither hand had a gap over 25 ms in 60 s. So the slow hand changes
+  between days: not a fixed per-glove filter.
+
+ChatGPT on the recalibration check and creep (2026-09-18), adopted
+- Creep is consistent with viscoelastic creep/hysteresis in soft stretch
+  sensing but cannot yet be located in the capacitive element; fabric/fit
+  and XR Trainer filtering/calibration may contribute. 485 ms is too large
+  for a BLE connection interval alone.
+- Protocol: recalibrate at the start of every session; keep the open-palm
+  reset and 5 s takes; standardise the analysis window (early 2 to 3 s
+  after settle) for static-pose metrics. Do not invent a universal drift
+  threshold: learn it from camera-stable hold trials and mark a glove DOF
+  low-confidence when its within-hold drift exceeds that hand/finger's
+  normal 95th percentile while the camera is stable. (To do: `--window` in
+  fuse_poses.py; drift-confidence in fusion after the day-2 holds.)
+- Best discriminator for lag and creep: record raw glove capacitance next
+  to the solved kinematics and cross-correlate both against the camera.
+  StretchSense software can expose `animation/capacitances/all` in some
+  configurations; check whether XR Trainer can stream it (the OSC sniff of
+  2026-09-17 did not see it with the default settings).
+- Day 2: identical primary protocol, then diagnostics: 60 s fist and peace
+  holds per hand, a repeated close/open transition block (with capacitance
+  if available), the slow per-finger sweeps.
+
+ChatGPT review of day 1 (2026-09-18), adopted
+- Do not conclude the right glove hardware is worse: reseat the right
+  glove, fresh Basic calibration, repeat fist / peace / thumbs up / index
+  point three times; only a persistent under-read justifies "less reliable
+  on those DOFs".
+- Thumb gate compares only against trustworthy glove fingers (not on rail,
+  not in the override, not listed unreliable), at least two usable fingers;
+  with fewer, the camera's own gates decide.
+- Drop the "spread thumb-index" row; keep the tip gap; add thumb direction
+  in the palm frame as a descriptive row only.
+- Report fused 95 % vs camera 100 % exactly as it is; classifier stays
+  secondary.
+- No documented left-hand tracking disadvantage: for day 2 close the left
+  fist slowly after acquisition, keep knuckles visible, check the IR view
+  for glare first. Day 2 = identical protocol, then a separate diagnostic
+  block (slow flex/extend sweep per finger per hand, 2 to 3 cycles, right
+  ring and pinky first; optionally three half-fists per hand), kept out of
+  the primary dataset.
+
 Third Path A session, coached recorder (2026-09-17, 15:34 to 15:41, both
 hands one at a time, 6 poses x 3 takes each; copy in
 `recordings/sync_coached_20260917`)
