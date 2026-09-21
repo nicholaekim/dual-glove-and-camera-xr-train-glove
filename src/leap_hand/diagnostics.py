@@ -39,6 +39,23 @@ WHY A BINNED TRANSFER CURVE, AND WHY BINNED BY THE **CAMERA**
   sweep that visited 1.3, however it started. The rail-saturation point then
   falls out of the same table: the camera curl above which the glove's answer
   stops changing.
+
+...WHICH ONLY WORKS IF THE CAMERA FOLLOWED THE FINGER
+  Binning by the camera makes the camera the measuring axis, so a run in
+  which the camera's own curl barely moved has no axis to bin against.
+  `dead_zone_right_ring_20260920_212254.csv` is exactly that: an isolated
+  right-ring bend that the glove read from 0.87 to 1.97 while the camera's
+  ring curl stayed inside half a unit, because a gloved ring folding on its
+  own is a shape the tracker does not resolve. The curve built on it came out
+  non-monotonic and a saturation point was quoted off it anyway.
+
+  So `camera_range` is checked BEFORE anything is binned, per finger, and a
+  finger it fails gets no transfer curve and no saturation point — see
+  `FingerSweep`, which simply does not carry them. The fix for such a run is
+  not a slower sweep; it is the WHOLE-HAND sweep (`--finger all`), where
+  every finger moves through its full range and the camera resolves all of
+  them, with `analyse_sweep` reading the four (or five) transfer curves out
+  of the one recording.
 """
 import math
 from dataclasses import dataclass
@@ -81,6 +98,17 @@ OPEN_SETTLE = 0.5
 BIN_WIDTH = 0.1
 MIN_BIN_SAMPLES = 5
 RAIL_TOL = 0.05
+# How much of its own range the CAMERA has to have covered on a finger before
+# anything is reported about that finger. A full bend spans about 0.8 to 1.7
+# of camera curl, so 0.5 is a comfortably bent finger and still well clear of
+# a finger that only wobbled. See `camera_range` for why this is a separate
+# check from coverage.
+MIN_CAMERA_RANGE = 0.50
+# Measured between these percentiles rather than min to max: one mistracked
+# frame at either end can invent a third of a unit of range out of nothing,
+# and the guard exists precisely to catch the runs where the real range was
+# small.
+RANGE_PERCENTILES = (5.0, 95.0)
 # Cross-correlation search window, seconds: the glove may lead the camera a
 # little (negative) and is expected to trail it (positive).
 LAG_MIN = -0.2
@@ -465,6 +493,78 @@ def coverage_gaps(cam: Sequence[float], low: float, high: float,
     return gaps
 
 
+# --- did the camera follow the finger at all? --------------------------------
+
+@dataclass(frozen=True)
+class CameraRange:
+    """How much camera curl one finger covered, and whether that is enough.
+
+    The guard that `coverage_gaps` is not. Coverage asks whether the range
+    the finger DID visit was sampled evenly; this asks whether there was a
+    range at all. A sweep can pass coverage perfectly while the camera watched
+    the finger move a tenth of a unit, and the binned curve built on it is
+    then a picture of tracking noise with a saturation point read off it.
+    """
+
+    finger: str
+    low: float                      # camera curl at the low percentile
+    high: float                     # ...and at the high one
+    needed: float                   # the threshold it is being held to
+    n: int                          # samples the range was measured over
+
+    @property
+    def span(self) -> float:
+        return self.high - self.low
+
+    @property
+    def followed(self) -> bool:
+        """Did the camera see this finger move enough to say anything?"""
+        return self.n > 0 and self.span >= self.needed
+
+
+def camera_range(cam: Sequence[float], finger: str = "",
+                 min_range: float = MIN_CAMERA_RANGE,
+                 percentiles: Tuple[float, float] = RANGE_PERCENTILES
+                 ) -> CameraRange:
+    """The camera's own range over one finger, as a pass/fail on the run.
+
+    This exists because of `dead_zone_right_ring_20260920_212254.csv`. The
+    operator bent the right ring through most of the glove's range — the
+    glove swung 0.87 to 1.97 — and the camera's ring curl stayed inside half
+    a unit the whole time, because an isolated ring bend on a gloved hand is
+    a shape the tracker does not resolve. Every later number in that run was
+    computed anyway: a transfer curve binned by a camera axis that barely
+    moved, non-monotonic, with a rail-saturation point quoted off it to two
+    decimals. None of it was a measurement, and nothing in the tool said so.
+
+    So: measure the camera's range first, and when it is too small, report
+    that and STOP. A finger the camera did not follow has no transfer curve,
+    no saturation point and no lag worth printing, and the honest output is
+    the raw CSV plus a sentence saying why there is nothing else.
+    """
+    c = np.asarray(cam, dtype=float)
+    c = c[np.isfinite(c)]
+    if c.size == 0:
+        return CameraRange(finger=str(finger), low=0.0, high=0.0,
+                           needed=float(min_range), n=0)
+    low, high = (float(v) for v in np.percentile(c, list(percentiles)))
+    return CameraRange(finger=str(finger), low=low, high=high,
+                       needed=float(min_range), n=int(c.size))
+
+
+def camera_range_verdict(r: CameraRange) -> List[str]:
+    """The sentence printed instead of a transfer curve, when it comes to it."""
+    name = r.finger or "finger"
+    if r.n == 0:
+        return [f"camera did not follow the {name}: it was never tracked; "
+                f"this run is descriptive only, no transfer curve or "
+                f"saturation point is reported"]
+    return [f"camera did not follow the {name}: its range was {r.span:.2f} "
+            f"(camera curl {r.low:.2f} to {r.high:.2f}), need {r.needed:.2f}; "
+            f"this run is descriptive only, no transfer curve or saturation "
+            f"point is reported"]
+
+
 @dataclass(frozen=True)
 class LagEstimate:
     """How far the glove's trace trails the camera's, and how well they match."""
@@ -534,6 +634,111 @@ def estimate_lag(glove_t: Sequence[float], glove_v: Sequence[float],
     if best_k is None:
         return None
     return LagEstimate(seconds=best_k * step, correlation=best)
+
+
+# --- a whole sweep, finger by finger -----------------------------------------
+
+@dataclass(frozen=True, eq=False)
+class FingerSweep:
+    """One finger's share of a sweep: the paired traces, and what they say.
+
+    `camera` is the camera's curl at the instant each glove sample describes,
+    already shifted by this finger's own measured lag — every finger of a
+    whole-hand sweep gets its own alignment, because the four stretch sensors
+    are not obliged to answer at the same speed.
+
+    `bins` and `saturation` are empty and None whenever `span.followed` is
+    False. That is the guard, carried in the result rather than left to the
+    caller to remember: a finger the camera did not follow has no transfer
+    curve to hand out, so there is none in the object.
+    """
+
+    finger: str
+    times: np.ndarray                    # glove sample times
+    glove: np.ndarray                    # the glove's curl at each
+    camera: np.ndarray                   # the camera's, at the same instants
+    rail: float                          # the glove's open-palm constant
+    lag: Optional[LagEstimate]
+    span: CameraRange
+    bins: List[CurveBin]
+    saturation: Optional[float]
+
+    @property
+    def measured(self) -> bool:
+        """Is there a transfer curve in here, or only a description?"""
+        return self.span.followed
+
+
+def analyse_finger(glove_t: Sequence[float], glove_v: Sequence[float],
+                   cam_t: Sequence[float], cam_v: Sequence[float],
+                   rail: float, finger: str = "",
+                   bin_width: float = BIN_WIDTH,
+                   min_range: float = MIN_CAMERA_RANGE,
+                   rail_tol: float = RAIL_TOL) -> FingerSweep:
+    """Lag, camera range, transfer curve and saturation for ONE finger.
+
+    The order matters and is the whole point of the rewrite: the lag is
+    measured, the traces are paired on it, the camera's range is checked, and
+    only then — if the camera moved enough to have been watching a finger
+    bend — is a curve binned and a saturation point read off it.
+    """
+    gt = np.asarray(glove_t, dtype=float)
+    gv = np.asarray(glove_v, dtype=float)
+    ct = np.asarray(cam_t, dtype=float)
+    cv = np.asarray(cam_v, dtype=float)
+    lag = estimate_lag(gt, gv, ct, cv)
+    shift = 0.0 if lag is None else lag.seconds
+    if gt.size == 0 or ct.size == 0:
+        cam_at_glove = np.zeros(gt.shape, dtype=float)
+    else:
+        cam_at_glove = np.interp(gt - shift, ct, cv)
+    span = camera_range(cam_at_glove, finger=finger, min_range=min_range)
+    if not span.followed:
+        return FingerSweep(finger=finger, times=gt, glove=gv,
+                           camera=cam_at_glove, rail=float(rail), lag=lag,
+                           span=span, bins=[], saturation=None)
+    bins = transfer_curve(cam_at_glove, gv, bin_width=bin_width)
+    return FingerSweep(finger=finger, times=gt, glove=gv, camera=cam_at_glove,
+                       rail=float(rail), lag=lag, span=span, bins=bins,
+                       saturation=rail_saturation(bins, rail, tol=rail_tol))
+
+
+def analyse_sweep(glove_t: Sequence[float],
+                  glove_curls: Sequence[Sequence[float]],
+                  cam_t: Sequence[float],
+                  cam_curls: Sequence[Sequence[float]],
+                  rails: Sequence[float],
+                  fingers: Optional[Sequence[str]] = None,
+                  names: Sequence[str] = FINGERS,
+                  bin_width: float = BIN_WIDTH,
+                  min_range: float = MIN_CAMERA_RANGE,
+                  rail_tol: float = RAIL_TOL) -> List[FingerSweep]:
+    """`analyse_finger` over every finger of a whole-hand sweep.
+
+    `glove_curls` and `cam_curls` are one row per frame, one column per
+    finger of `names`, on their own clocks. `fingers` picks which subset to
+    analyse; the default is all of them.
+
+    A single-finger run records all five columns too, so the same call
+    re-reads an isolated ring sweep for what the index was doing — which is
+    the only way to tell "the camera did not follow the ring" apart from
+    "the camera was not tracking the hand".
+    """
+    gv = np.asarray(glove_curls, dtype=float)
+    cv = np.asarray(cam_curls, dtype=float)
+    if gv.ndim != 2 or cv.ndim != 2:
+        return []
+    wanted = list(names) if fingers is None else list(fingers)
+    out: List[FingerSweep] = []
+    for name in wanted:
+        i = list(names).index(name)
+        if i >= gv.shape[1] or i >= cv.shape[1]:
+            continue
+        out.append(analyse_finger(glove_t, gv[:, i], cam_t, cv[:, i],
+                                  float(rails[i]), finger=name,
+                                  bin_width=bin_width, min_range=min_range,
+                                  rail_tol=rail_tol))
+    return out
 
 
 # --- the glove's stream, second by second ------------------------------------
