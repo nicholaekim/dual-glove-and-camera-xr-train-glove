@@ -649,6 +649,51 @@ def parse_status(text: str):
     return caption, band, snap
 
 
+# --- the viewer's "no picture" banner ----------------------------------------
+# How long the IR image may be missing before the window says so. A few
+# seconds: long enough that the first frame after connect, or one dropped
+# image event, does not raise an alarm, short enough that a viewer showing
+# black says why while the operator is still looking at it.
+IMAGE_STALE_S = 3.0
+IMAGES_OFF = ("camera images are off: enable 'Allow Images' in the Ultraleap "
+              "Control Panel")
+
+
+def image_banner(now: float, last_image_time: Optional[float],
+                 started: float, stale_s: float = IMAGE_STALE_S) -> str:
+    """The warning the camera window shows about the IR image, or "".
+
+    Until 2026-09-20 the window decided this from the ANSWER to
+    `set_policy_flags(Images)` alone, and it was wrong in the one direction
+    that matters: every still in `recordings/sync_day2/stills/` carries
+    "camera images are off" printed over a perfectly good IR picture of the
+    hand. The policy call is a request whose reply the service may report in
+    a form the viewer did not recognise; whether the picture is THERE is a
+    fact about the stream, so it is read off the stream.
+
+    Three states, because they need three different things from whoever is
+    reading the window:
+
+      ""                image events are arriving; say nothing
+      IMAGES_OFF        none has EVER arrived and the grace period is over —
+                        the policy really is off, and the fix is in the
+                        Control Panel
+      "stopped ...s ago" images were arriving and stopped, which is a
+                        different fault (the service, the USB, another app
+                        taking the device) and must not be reported as a
+                        setting the operator has already set.
+
+    `started` is when the viewer connected, so the grace period is measured
+    from there and a window that has only just opened does not accuse the
+    Control Panel of anything.
+    """
+    if last_image_time is not None and now - last_image_time <= stale_s:
+        return ""
+    if last_image_time is None:
+        return IMAGES_OFF if now - started > stale_s else ""
+    return f"camera images stopped {now - last_image_time:.0f} s ago"
+
+
 # --- stream health -----------------------------------------------------------
 def stream_health(times: Sequence[float], t0: Optional[float] = None,
                   t1: Optional[float] = None,

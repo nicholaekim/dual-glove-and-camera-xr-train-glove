@@ -610,6 +610,88 @@ because a recording made in the wrong mode is in the wrong frame.
 callback: how old the data already was when we received it. Frame age, not
 end-to-end latency.
 
+### Measuring the glove itself: hold test and finger sweep
+
+Two tools that ask the glove questions the fusion report cannot, because both
+need the operator to do something specific in front of the camera. The camera
+is the reference in each: it has nothing to creep and no rail to sit on.
+
+```powershell
+python scripts\leap\hold_test.py    --hand right --pose fist
+python scripts\leap\finger_sweep.py --hand right --finger ring
+```
+
+**`hold_test.py` — does the glove drift while a pose is held still?** Hold one
+pose for a minute; the summary gives, per finger, the glove's curl over the
+first and last five seconds against the camera's over the same windows. A
+glove that relaxes toward "open" while the camera stays flat is drifting.
+
+It will not start the clock until the **camera** says the pose is there —
+`leap_hand.pose_check`'s finger bands, held without a break for `--confirm`
+seconds (1.5 by default), refused after `--confirm-timeout` (30 s). That is
+not caution: `hold_drift_right_fist_20260920_200335.csv` is sixty seconds of
+**open palm** recorded under the label `fist`, because the old tool waited for
+the camera to track *anything*, beeped and started counting. The glove is
+deliberately not consulted — it is the instrument under test, and the failure
+being measured is exactly the case where it would say yes.
+
+Before the pose is called it also records an **open-palm baseline** (median
+glove and camera curls over a hand the ACQUIRE gate has already vouched for)
+into the CSV and the summary. That is what makes the drift readable: the
+glove's open-palm output is a *constant* (its rail), so knowing it separates
+"the glove has not responded to the pose yet" from "the glove has responded
+and is now creeping". On `hold_drift_right_fist_20260918_190912.csv` those are
+5.6 s apart — the camera saw the fist from the first frame while the glove sat
+on its open value — and reading the drift from the wrong one turns **+0.29**
+into **-0.90**.
+
+**`finger_sweep.py` — what does the glove report as one finger bends slowly?**
+It refuses to start until the camera confirms an **open palm** of the expected
+hand, then runs a **paced** protocol with captions and beeps: `--cycles` (3)
+cycles of *bend the finger slowly* (`--phase`, 5 s) and *straighten slowly*
+(5 s).
+
+It reports the **transfer curve binned by CAMERA curl** — the glove's median
+in each 0.1-wide slice, separately while bending and while straightening — the
+**lag** by cross-correlation, and the **rail-saturation point**: the camera
+curl above which the glove is back on its open-palm value and reporting a
+constant. Binning by the camera is the point. The old tool reported "the glove
+stayed on its rail until the finger was N % bent", a percentage measured from
+the finger's own *open* reading — and `dead_zone_right_ring_20260920_200435.csv`
+is a sweep that started with the ring already bent, so its open reference is
+wrong and every percentage from it is wrong too. The camera measures the
+finger's shape frame by frame, so "what does the glove say when the camera
+says 1.3?" is answerable from any sweep that visited 1.3. Re-read that way,
+that file gives a clean answer: the right ring glove is back on its rail
+(1.971) from **camera curl 1.45** upward.
+
+At the end the **coverage is checked**: at least `--min-bin` (5) samples in
+every 0.1-wide camera-curl bin between the finger's open value and its fully
+bent value. A sweep that fails prints the bins it is missing and exits 2, with
+the CSV saved anyway — a binned curve interpolates over its own holes without
+saying so, which is how a sweep with whole stretches of the range missing came
+to look finished.
+
+Both tools keep `--no-view` (no camera window) and hand the window
+`--parent-pid` so it closes with them; neither ever signals a process. Both
+log the glove's stream continuously — frames, worst gap and **packet-counter
+jumps**, per second — into a `*.stream.csv` sidecar and print the run summary,
+because a drift or a lag measured over a stream that stopped for two seconds
+is an artefact of the stream, and the counter is what says whether the packets
+never arrived or we never drained them. Both take `--mock` and `--mock-glove`
+to rehearse with no hardware.
+
+The arithmetic behind both — drift summary, binned transfer curve, coverage
+check, lag estimate, stream health — is in `src/leap_hand/diagnostics.py`,
+with no I/O in it, so `tests/test_diagnostics.py` can hand it a synthetic
+sweep with a known saturation point and a known lag and check that both come
+back. The live rig they share (both sensors, the window, the ACQUIRE gate) is
+`src/leap_hand/live.py`.
+
+Output goes to `results\diagnostics\` (`--out`), in the same CSV columns the
+scratch versions of these tools wrote, so old files and new ones are read by
+the same code.
+
 ## Results so far (102 reference frames)
 
 Measured by `compare_to_tracker.py` against the professor's dataset:
@@ -932,6 +1014,58 @@ saw the index at 0.90 — fist-like — and the glove had itself left the rail f
 part of it, i.e. a real movement at the end of the take rather than a false
 positive.
 
+**Leaving takes out: `--exclude`.** `--exclude pinch_right_take1` skips every
+take whose file name contains that text, on the glove side **and** in every
+camera folder, and names what it dropped in the report header. It is a
+substring and not a glob because what is being named is a take
+(`pinch_right_take1`) while the file carries a timestamp nobody remembers
+(`pinch_right_take1_20260920_200113.jsonl`). It is repeatable and accepts
+comma-separated lists, and a pattern that matched nothing is reported as such
+rather than passing silently.
+
+It exists so that dropping a bad take does not mean copying a folder.
+`recordings\sync_day2` holds a mislabelled `pinch_right_take1` — its still
+shows a peace hand — and `recordings\sync_day2_clean` was a hand-made copy
+without it. `--exclude pinch_right_take1` on `sync_day2` reproduces that copy
+exactly: glove 40/59, camera 59/59, fused 52/59, and the same camera-use table
+to the frame.
+
+**Standing knowledge about a glove: `--profile`.** `--unreliable` and
+`--rail-fingers` are things the operator has to remember and retype correctly
+every run. A profile writes them down once, **per hand**, with the evidence:
+
+```json
+{
+  "name": "Reality Glove (StretchSense) worn by N Kim, September 2026",
+  "comment": "why these fingers and not others",
+  "unreliable":   {"right": ["middle", "ring", "pinky"]},
+  "rail_fingers": {"left": ["index"], "right": ["index"]}
+}
+```
+
+```powershell
+python scripts\fuse_poses.py recordings\sync_day2 --exclude pinch_right_take1 `
+    --profile profiles\reality_glove_nk_2026-09.json
+```
+
+Per hand throughout, because that is how gloves fail — on `sync_day1` it is
+the *right* glove's ring and pinky that read partly extended through poses the
+left one gets right — so `RailOverrideParams.fingers` now accepts a mapping
+`{"right": [...], "left": [...]}` as well as one list meaning both hands.
+`--unreliable` and `--rail-fingers` remain, and override the profile.
+
+A mask is a claim that some of the evidence is worthless, so it is never made
+quietly: **with a profile the report prints the fusion both ways**, ordinary
+and masked, over the same frames with the same gates and the same learned
+rails, with the camera-use table and the classifier line for each. On
+`sync_day2` with `pinch_right_take1` excluded, the shipped profile moves thumb
+camera-use from **82.8% to 99.6%** and the fused leave-one-take-out classifier
+from **52/59 to 53/59**; nothing else changes, because the mask only touches
+the thumb gate's vote. The profile also carries a `comment` the report prints
+— the shipped one records that the right *ring* is deliberately **not** on the
+rail-override list until its sweep is repeated with `finger_sweep.py`, because
+the sweep it has began with the finger already bent.
+
 ### What the report says
 
 `scripts/fuse_poses.py` leads with a **per-DOF table**: for each pose, hand
@@ -1003,6 +1137,16 @@ scripts/
   record_simultaneous.py     guided glove + camera session (shared clock);
                              coached one-hand protocol with --camera leap
   fuse_poses.py              fuse + glove/camera/fused comparison report
+                             (--exclude a take, --profile a glove)
+scripts/leap/
+  camera_view.py             live IR window with a caption, driven by a file
+  hold_test.py               hold a pose 60 s: does the glove's curl drift?
+  finger_sweep.py            sweep one finger slowly: transfer curve, lag,
+                             rail saturation, bin coverage
+src/leap_hand/
+  diagnostics.py  the arithmetic behind those two, with no I/O in it
+  live.py         the rig they share: both sensors, window, ACQUIRE gate
+profiles/         reliability profiles: per-hand unreliable / rail fingers
   selftest_sync.py           synthetic paired dataset, answer known
   compare_sensors.py         glove vs camera, same features, same classifier
   compare_to_tracker.py      camera vs the professor's tracker dataset

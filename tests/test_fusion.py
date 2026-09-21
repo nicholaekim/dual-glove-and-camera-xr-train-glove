@@ -1,4 +1,5 @@
 """Fusion maths: the invariants that make a fused hand trustworthy."""
+import json
 import math
 import time
 
@@ -555,6 +556,113 @@ def test_one_take_name_under_two_cameras_is_an_error_not_a_coin_flip(tmp_path):
     assert fuse.find_camera_take(tmp_path, "absent.jsonl", "leap") is None
 
 
+# --- leaving takes out (--exclude) and masking DOFs (--profile) ---------
+
+def test_exclude_matches_a_take_name_as_a_substring(tmp_path):
+    """`pinch_right_take1` has to catch the file that carries a timestamp."""
+    from pathlib import Path as P
+
+    fuse = _fuse_module()
+    names = ["pinch_right_take1_20260920_200113.jsonl",
+             "pinch_right_take2_20260920_200136.jsonl",
+             "fist_left_take1_20260920_195141.jsonl"]
+    paths = [P(tmp_path / n) for n in names]
+
+    kept, dropped = fuse.split_excluded(paths, ["pinch_right_take1"])
+    assert [p.name for p in dropped] == [names[0]]
+    assert [p.name for p in kept] == names[1:]
+
+    # take2 must not be caught by take1's pattern, and no pattern keeps all
+    assert fuse.split_excluded(paths, [])[1] == []
+    # several patterns, and one that matches nothing
+    kept, dropped = fuse.split_excluded(paths, ["fist_left", "nothing_here"])
+    assert [p.name for p in dropped] == [names[2]]
+
+
+def test_a_profile_is_read_per_hand(tmp_path):
+    fuse = _fuse_module()
+    path = tmp_path / "glove.json"
+    path.write_text(json.dumps({
+        "name": "a glove",
+        "comment": "why",
+        "unreliable": {"right": ["middle", "ring", "pinky"]},
+        "rail_fingers": {"right": ["index", "ring"], "left": ["index"]},
+    }), encoding="utf-8")
+
+    unreliable, rail, name, comment = fuse.load_profile(path)
+    assert unreliable == {"right": ("middle", "ring", "pinky")}
+    assert rail == {"right": ("index", "ring"), "left": ("index",)}
+    assert name == "a glove" and comment == "why"
+
+    # and it feeds RailOverrideParams directly, per hand
+    params = RailOverrideParams(fingers=rail)
+    assert params.fingers_for("right") == ("index", "ring")
+    assert params.fingers_for("left") == ("index",)
+
+
+def test_a_profile_refuses_typos_rather_than_silently_masking_nothing(tmp_path):
+    """A misspelled key would leave the mask off and say nothing about it."""
+    fuse = _fuse_module()
+
+    def profile(**body):
+        path = tmp_path / f"p{len(list(tmp_path.iterdir()))}.json"
+        path.write_text(json.dumps(body), encoding="utf-8")
+        return path
+
+    with pytest.raises(SystemExit) as e:
+        fuse.load_profile(profile(**{"rail-fingers": {"right": ["index"]}}))
+    assert "rail-fingers" in str(e.value)
+
+    with pytest.raises(SystemExit) as e:
+        fuse.load_profile(profile(unreliable={"right": ["thumbb"]}))
+    assert "thumbb" in str(e.value)
+
+    # the thumb is not a finger the rail override can act on
+    with pytest.raises(SystemExit) as e:
+        fuse.load_profile(profile(rail_fingers={"right": ["thumb"]}))
+    assert "thumb" in str(e.value)
+
+    # a list with no hand cannot say which hand it is about
+    with pytest.raises(SystemExit) as e:
+        fuse.load_profile(profile(unreliable=["ring"]))
+    assert "keyed by hand" in str(e.value)
+
+    with pytest.raises(SystemExit) as e:
+        fuse.load_profile(profile(unreliable={"both": ["ring"]}))
+    assert "'left' and 'right'" in str(e.value)
+
+    # an empty profile is legal: it masks nothing
+    assert fuse.load_profile(profile()) == ({}, {}, "", "")
+
+
+def test_the_shipped_profile_loads_and_says_why():
+    """profiles/reality_glove_nk_2026-09.json is data the report prints."""
+    from pathlib import Path as P
+
+    fuse = _fuse_module()
+    path = (P(__file__).resolve().parents[1] / "profiles"
+            / "reality_glove_nk_2026-09.json")
+    unreliable, rail, name, comment = fuse.load_profile(path)
+    assert unreliable == {"right": ("middle", "ring", "pinky")}
+    assert rail == {"left": ("index",), "right": ("index",)}
+    assert name
+    # the right ring is deliberately off until its sweep is repeated, and the
+    # file has to SAY so — that is the whole purpose of the comment field
+    assert "ring" in comment and "sweep" in comment
+
+
+def test_unreliable_flags_parse_per_hand():
+    fuse = _fuse_module()
+    assert fuse.parse_unreliable(["right:ring,pinky", "left:middle"]) == {
+        "right": ("ring", "pinky"), "left": ("middle",)}
+    for bad in (["ring,pinky"], ["right:knuckle"]):
+        with pytest.raises(SystemExit):
+            fuse.parse_unreliable(bad)
+    assert fuse.parse_rail_fingers("index, ring") == ("index", "ring")
+    with pytest.raises(SystemExit):
+        fuse.parse_rail_fingers("thumb")
+
+
 # --- the metric path does not let palm SIZE become rotation -------------
 # The glove reports the XR Trainer template hand; the camera measures the
 # real one. Kabsch over five palm points trades rotation against that size
@@ -1097,6 +1205,62 @@ def test_the_other_hand_has_its_own_run_and_its_own_rail():
     assert d_left.rejected["curl index"] == R_RAIL_NONE
 
 
+def test_rail_fingers_as_one_list_mean_both_hands():
+    """The old form. A plain sequence is every hand, as it always was."""
+    params = RailOverrideParams(fingers=("index", "ring"), enter_frames=1)
+    assert params.per_hand is False
+    assert params.fingers_for("left") == ("index", "ring")
+    assert params.fingers_for("right") == ("index", "ring")
+    assert params.fingers_for() == ("index", "ring")
+    assert params.described()["fingers"] == "index, ring (both hands)"
+
+    rails = {("right", "index"): RAIL, ("left", "index"): RAIL}
+    tracker = RailOverrideTracker(rails, params)
+    meta = facing_meta()
+    for hand in ("right", "left"):
+        assert "index" in tracker.update(hand, on_rail_curls(),
+                                         flexed_cam_curls(), meta).active
+
+
+def test_rail_fingers_can_be_named_per_hand():
+    """The new form: a finger enabled on one hand and not on the other.
+
+    This is the shape of the real evidence — a sweep establishes that THIS
+    finger of THIS glove saturates — so a profile that enabled the right
+    ring finger would be claiming something about the left one it has never
+    measured.
+    """
+    params = RailOverrideParams(fingers={"right": ("index", "ring"),
+                                         "left": ("index",)},
+                                enter_frames=1)
+    assert params.per_hand is True
+    assert params.fingers_for("right") == ("index", "ring")
+    assert params.fingers_for("left") == ("index",)
+    # order is FINGER_NAMES order, not the order they were written in
+    assert params.fingers_for() == ("index", "ring")
+    # a hand nobody wrote a line for has not been enabled
+    assert params.fingers_for("both") == ()
+    assert params.described()["fingers"] == "left: index; right: index, ring"
+
+    rails = {(hand, finger): RAIL
+             for hand in ("left", "right") for finger in ("index", "ring")}
+    tracker = RailOverrideTracker(rails, params)
+    meta = facing_meta()
+    # The glove has index AND ring pinned on their rails; the camera sees
+    # both folded, on both hands. Only the right hand's ring is enabled, so
+    # only it may be taken.
+    glove = [1.2, RAIL, 1.2, RAIL, 1.2]
+    cam = [1.2, 1.20, 1.8, 1.20, 1.8]
+    right = tracker.update("right", glove, cam, meta)
+    left = tracker.update("left", glove, cam, meta)
+    assert set(right.active) == {"index", "ring"}
+    assert set(left.active) == {"index"}
+    # and the left ring is not even listed as refused: it was never asked for
+    assert "curl ring" not in left.rejected
+    # both hands still SEE the disagreement, which is what the thumb gate reads
+    assert set(left.disputed) == {"index", "ring"}
+
+
 def test_no_override_when_the_camera_frame_is_not_trusted():
     """The override needs the same trusted frame the spread and thumb need."""
     meta_cases = {
@@ -1245,7 +1409,9 @@ def test_rail_params_are_named_parameters_and_are_reported():
     assert described["margin"] == 0.25
     assert described["enter_frames"] == 10
     assert described["exit_frames"] == 5
-    assert described["fingers"] == "index"
+    # "(both hands)" is the point: `fingers` may also be written per hand, so
+    # the line has to say which of the two forms this one is.
+    assert described["fingers"] == "index (both hands)"
     assert "index 1.75" in described["cam_open_curl"]
     assert DEFAULT_RAIL.open_curl("index") == 1.75
     assert DEFAULT_RAIL.open_curl("pinky") == 1.44
