@@ -593,6 +593,74 @@ Day-1 session with the corrected recorder (2026-09-18, 18:36 to 18:48,
   wrong. Reported as is: fusion needs per-hand, per-finger reliability
   logic; glove curl does not automatically dominate.
 
+Day-2 repeat (2026-09-20, 19:51 to 20:02, identical protocol, both gloves
+recalibrated first; `recordings/sync_day2`, `sync_day2_clean` without the
+mislabelled take)
+- 60/60 takes, 13 rejected attempts kept (hand lost; 9 left, 4 right). Pose
+  check 42 ok, 18 warn, 0 mismatch. The per-take IR still caught
+  pinch_right_take1 as a PEACE hand (operator had not changed pose); pinch
+  is warn-only by design, so it was excluded by hand (59 takes).
+- Glove stream worse: median 46 Hz per take (day 1: 60), worst gap 142 ms,
+  4 takes with gaps over 100 ms (day 1: none). Same laptop.
+- LEFT glove repeats day 1 within 0.1 on every finger and pose (one
+  operator half-curl aside). RIGHT glove worse despite recalibration: in
+  index point middle 1.96, ring 1.65, pinky 1.69 (camera 0.80 to 0.84);
+  in take order it relaxes to the open rail within the five takes
+  (middle 1.70 1.74 1.96 1.96 1.97, camera flat at 0.77 to 0.87). Fist and
+  open palm fine on both hands. Left creep again (peace pinky 0.95 to 1.28
+  over five takes, camera 0.80 to 0.94).
+- Pinch: camera index 1.21 to 1.28, gap 0.05 to 0.25; glove on rail 9/9;
+  override active 85 to 96 % of pinch frames (no take lost to the view
+  gate this time, max 48 deg), fused index 1.34 to 1.39, 0 % elsewhere.
+- Spread: glove constants again; camera open palm 21 / 17 deg (day 1
+  24 / 20).
+- Classifier: glove 40/59, camera 59/59, fused 52/59 (53 with
+  `--unreliable right:middle,ring,pinky`); day 1 was 43 / 59 / 57. The
+  fused misses are right-hand index point and peace takes where the glove's
+  middle/ring/pinky read open.
+- Diagnostics: only one of four holds and one of five sweeps were run. The
+  right-fist hold is invalid (both sensors show an open palm for 60 s: the
+  tool did not check the pose). Right ring sweep (45 Hz glove, 102 ms worst
+  gap): glove vs camera correlation 0.81; binned by camera curl the glove
+  reads 1.09 at camera 0.9 to 1.0, 1.50 at 1.0 to 1.1, 1.76 at 1.2 to 1.3,
+  1.96 at 1.4 to 1.5 and its rail from 1.5 up: the right ring saturates to
+  open once the finger is only about 40 % bent; hysteresis under 0.06.
+
+ChatGPT review of day 2 (2026-09-20), adopted
+- Wording: "XR Trainer's output for the right middle/ring/pinky drifts
+  toward the open-palm rail under sustained mixed poses", not "channels
+  lose flexion"; "all poses on the left glove" is too strong because pinch
+  fails on the left too. The ring sweep is consistent with the same
+  failure (compressed range then rail saturation) but does not prove the
+  same physical/software cause.
+- Reliability is explicit and per hand/finger: a saved profile (right:
+  middle, ring, pinky unreliable), and the report shows ordinary fusion
+  and profile-masked fusion side by side.
+- Rail override per hand and per finger: right ring probably now; middle
+  and pinky after their own sweeps. Minimum evidence per finger: repeated
+  static failure on 2+ sessions, stable camera geometry while the glove is
+  wrong, that finger's own sweep showing rail saturation.
+- Rate drop strengthens "variable transport/software pipeline", still does
+  not prove Bluetooth. Cheapest test: the same transition test with only
+  ONE glove connected; if rate and gaps recover, contention. Next: external
+  Bluetooth dongle away from USB 3, 5 GHz Wi-Fi or 2.4 GHz off.
+- Diagnostic tools: hold test must require the camera to confirm the
+  requested pose for 1 to 2 s before the clock starts and save the open-palm
+  baseline; sweep must be paced (5 s bend / 5 s straighten cycles) with
+  coverage required across intermediate curl bins; both log packet
+  counters and rates continuously.
+- Headline statements for the professor (as reworded): spread fixed in XR
+  Trainer, pose-dependent on the camera; pinch, both days, index on its
+  open value while the camera shows flexion and a small gap; curl:
+  open palm and fist repeatable on both gloves, left glove generally
+  repeatable for the non-pinch coached poses, right middle/ring/pinky
+  reproducibly under-report and drift in mixed poses across two days
+  despite recalibration; creep observed (strongest quantified evidence is
+  day 1, so "observed" not "replicated"); lag 100 to 500 ms measured in one
+  transition experiment, delivery rate 60 to 46 Hz between days. Do not
+  claim a defective glove, a Bluetooth root cause, or a general XR Trainer
+  dead zone.
+
 Rail-disagreement override, trust-based thumb vote, report changes (merged
 2026-09-18, 253 tests)
 - `RailOverrideParams`: rail learned per hand/finger as the mode of the
