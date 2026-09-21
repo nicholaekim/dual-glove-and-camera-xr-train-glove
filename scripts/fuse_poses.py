@@ -48,16 +48,32 @@ Also reports the plumbing that has to be right for any of it to mean anything:
 how many frames found a partner within the time window, and how often the
 camera was confident enough to contribute.
 
+TWO WAYS OF LEAVING EVIDENCE OUT, AND WHY THEY ARE DIFFERENT
+  --exclude names takes that should never have been recorded — a mislabelled
+            attempt, a take of the wrong pose. The take is dropped on BOTH
+            sensors and the report names it, so "which 59 of the 60" is
+            answerable from the report itself rather than from a folder
+            somebody copied.
+  --profile names DEGREES OF FREEDOM this glove is known to get wrong, per
+            hand, and masks them out of the gates' evidence. That is a much
+            stronger claim, so it is never made quietly: with a profile the
+            report prints the fusion BOTH ways — ordinary and masked — and
+            the reader can see what the mask bought.
+
 Usage:
   python scripts/fuse_poses.py                          # recordings/sync
   python scripts/fuse_poses.py recordings/sync --write  # also REPORT.txt
   python scripts/fuse_poses.py --export-csv fused.csv   # fused 21-kp CSV
   python scripts/fuse_poses.py --max-dt 0.1             # looser time matching
+  python scripts/fuse_poses.py recordings/sync_day2 --exclude pinch_right_take1
+  python scripts/fuse_poses.py recordings/sync_day2 \
+      --profile profiles/reality_glove_nk_2026-09.json
 """
 import argparse
 import csv
 import json
 from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -360,14 +376,26 @@ def dof_table(per_pose, lines):
         lines.append("")
 
 
+def camera_use_table(dof_used, dof_total, lines, indent="  "):
+    """The one table that says how much of the hand the camera supplied.
+
+    Pulled out of `gate_tables` so the reliability-profile comparison can
+    print it twice — once ungated by the profile, once with it — from the
+    same code. Two tables built two ways would be an invitation to compare
+    numbers that are not comparable.
+    """
+    for dof in GATED_DOFS:
+        n = dof_total.get(dof, 0)
+        pct = 100.0 * dof_used.get(dof, 0) / n if n else 0.0
+        lines.append(f"{indent}{dof:<16} {dof_used.get(dof, 0):>5}/{n:<5} "
+                     f"{pct:5.1f}%")
+
+
 def gate_tables(dof_used, dof_total, reasons, gates, rail_params, rails,
                 unreliable, lines):
     lines.append("Camera-use rate per gated DOF "
                  "(share of paired frames the camera actually supplied)")
-    for dof in GATED_DOFS:
-        n = dof_total.get(dof, 0)
-        pct = 100.0 * dof_used.get(dof, 0) / n if n else 0.0
-        lines.append(f"  {dof:<16} {dof_used.get(dof, 0):>5}/{n:<5} {pct:5.1f}%")
+    camera_use_table(dof_used, dof_total, lines)
     lines.append("  The four 'curl' rows are the rail-disagreement override, "
                  "and read 0% unless it is")
     lines.append("  enabled on that finger: a curl is the glove's by design "
@@ -416,8 +444,328 @@ def gate_tables(dof_used, dof_total, reasons, gates, rail_params, rails,
         lines.append("    (none — no finger sat at the top of its range "
                      "often enough to teach one)")
     for (hand, finger), value in sorted(rails.items()):
-        mark = "  <- enabled" if finger in rail_params.fingers else ""
+        # Per hand: the override can be enabled on the right ring finger and
+        # not on the left, and the table has to say which of the two this
+        # row is.
+        mark = ("  <- enabled" if finger in rail_params.fingers_for(hand)
+                else "")
         lines.append(f"    {hand:<6} {finger:<7} {value:.3f}{mark}")
+
+
+# --- what the command line asked for, as values ------------------------
+
+def parse_unreliable(specs):
+    """`['right:ring,pinky']` -> `{'right': ('ring', 'pinky')}`.
+
+    Per hand, because a glove fails per hand: on sync_day1 the RIGHT glove's
+    ring and pinky read partly extended through poses the left glove reports
+    correctly (see `fuse_skeletons`).
+    """
+    out = {}
+    for spec in specs:
+        if ":" not in spec:
+            raise SystemExit(f"--unreliable {spec}: expected HAND:FINGER[,FINGER], "
+                             "e.g. right:ring,pinky")
+        hand, _, fingers_txt = spec.partition(":")
+        picked = tuple(f.strip().lower() for f in fingers_txt.split(",")
+                       if f.strip())
+        bad = [f for f in picked if f not in FLEXION_NAMES]
+        if bad:
+            raise SystemExit(f"--unreliable {spec}: {', '.join(bad)} is not a "
+                             f"finger (choose from {', '.join(FLEXION_NAMES)})")
+        out[hand.strip().lower()] = picked
+    return out
+
+
+def parse_rail_fingers(text):
+    """`'index,ring'` -> `('index', 'ring')`, for BOTH hands."""
+    picked = tuple(f.strip().lower() for f in str(text).split(",") if f.strip())
+    bad = [f for f in picked if f not in RAIL_FINGERS]
+    if bad:
+        raise SystemExit(
+            f"--rail-fingers: {', '.join(bad)} is not a finger the rail "
+            f"override can act on (choose from {', '.join(RAIL_FINGERS)}).\n"
+            "  The thumb is not among them: its whole direction is already "
+            "the camera's when the thumb gate passes.")
+    return picked
+
+
+# Everything a profile may hold. A key outside this list is an error rather
+# than something to ignore: `rail-fingers` written for `rail_fingers` would
+# leave the override at its default and nothing in the report would say so.
+PROFILE_KEYS = ("name", "comment", "unreliable", "rail_fingers")
+
+
+def load_profile(path):
+    """A reliability profile -> (unreliable, rail_fingers, name, comment).
+
+    A profile is the operator's standing knowledge about THIS glove, written
+    down once instead of retyped as flags every run:
+
+        {
+          "name": "Reality Glove, N Kim, September 2026",
+          "comment": "why these fingers and not others",
+          "unreliable":   {"right": ["middle", "ring", "pinky"]},
+          "rail_fingers": {"right": ["index"], "left": ["index"]}
+        }
+
+    Both blocks are PER HAND, because that is how gloves fail: the same
+    garment reports the right ring finger partly extended through poses the
+    left one gets right, and a mask that covered both hands would throw away
+    the good half of the evidence.
+
+    `unreliable` names fingers whose GLOVE curl is not to be trusted on that
+    hand; they stop voting on whether the camera has the hand right.
+    `rail_fingers` names the fingers the rail-disagreement override may act
+    on. Neither is a calibration: both are claims about hardware that a
+    finger sweep is supposed to have established, which is why the file has a
+    `comment` field and why the report prints it.
+    """
+    path = Path(path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as e:
+        raise SystemExit(f"--profile {path}: {e}")
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"--profile {path}: not valid JSON ({e})")
+    if not isinstance(data, dict):
+        raise SystemExit(f"--profile {path}: expected a JSON object with the "
+                         f"keys {', '.join(PROFILE_KEYS)}")
+    unknown = sorted(k for k in data if k not in PROFILE_KEYS)
+    if unknown:
+        raise SystemExit(
+            f"--profile {path}: unknown key(s) {', '.join(unknown)}.\n"
+            f"  A profile holds {', '.join(PROFILE_KEYS)}. A misspelled key "
+            "would leave the mask off and\n  nothing would say so, so it is "
+            "an error rather than something to ignore.")
+
+    def per_hand(key, valid):
+        block = data.get(key)
+        if block is None:
+            return {}
+        if not isinstance(block, dict):
+            raise SystemExit(
+                f"--profile {path}: '{key}' must be an object keyed by hand, "
+                'e.g. {"right": ["index"]} - a bare list cannot say which '
+                "hand it is about.")
+        out = {}
+        for hand, fingers in block.items():
+            if isinstance(fingers, str):
+                fingers = fingers.split(",")
+            if not isinstance(fingers, (list, tuple)):
+                raise SystemExit(f"--profile {path}: '{key}' -> {hand} must be "
+                                 "a list of finger names")
+            picked = tuple(str(f).strip().lower() for f in fingers
+                           if str(f).strip())
+            bad = [f for f in picked if f not in valid]
+            if bad:
+                raise SystemExit(
+                    f"--profile {path}: '{key}' names {', '.join(bad)} on the "
+                    f"{hand} hand; choose from {', '.join(valid)}")
+            side = str(hand).strip().lower()
+            if side not in ("left", "right"):
+                raise SystemExit(f"--profile {path}: '{key}' is keyed by "
+                                 f"{hand!r}; the hands are 'left' and 'right'")
+            out[side] = picked
+        return out
+
+    return (per_hand("unreliable", FLEXION_NAMES),
+            per_hand("rail_fingers", RAIL_FINGERS),
+            str(data.get("name", "")).strip(),
+            str(data.get("comment", "")).strip())
+
+
+def split_excluded(paths, patterns):
+    """(kept, dropped) — dropped if any pattern appears in the file name.
+
+    A SUBSTRING and not a glob, because what is being named is a take
+    (`pinch_right_take1`) while the file it lives in carries a timestamp
+    nobody remembers (`pinch_right_take1_20260920_200113.jsonl`).
+    """
+    kept, dropped = [], []
+    for p in paths:
+        if any(pat in p.name for pat in patterns):
+            dropped.append(p)
+        else:
+            kept.append(p)
+    return kept, dropped
+
+
+@dataclass
+class FusionRun:
+    """One pass of the fusion over every loaded take, and what it produced.
+
+    Two of these exist whenever a reliability profile is given: the same
+    frames, the same gates and the same learned rails fused twice, once with
+    the profile and once without. Making a pass a VALUE rather than a pile of
+    locals inside `main` is what lets the report print both and show what the
+    profile actually bought — which is the only honest way to argue for a
+    mask that throws evidence away.
+    """
+
+    rail_params: object = None
+    unreliable: dict = field(default_factory=dict)
+    rails: dict = field(default_factory=dict)
+    glove_samples: list = field(default_factory=list)
+    cam_samples: list = field(default_factory=list)
+    fused_samples: list = field(default_factory=list)
+    fused_rows: list = field(default_factory=list)
+    per_pose: dict = field(default_factory=dict)
+    dof_used: dict = field(default_factory=lambda: defaultdict(int))
+    dof_total: dict = field(default_factory=lambda: defaultdict(int))
+    reasons: dict = field(default_factory=lambda: defaultdict(int))
+    palm_residuals: list = field(default_factory=list)
+    n_pairs: int = 0
+    n_matched: int = 0
+    n_cam_used: int = 0
+
+
+def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
+             thumb_from_camera=True, export_csv=False):
+    """Learn the rails, fuse every loaded take, collect what the report reads.
+
+    The rails are learned HERE rather than once outside, although two runs
+    over one session learn the same numbers: `learn_rails` reads
+    `RailOverrideParams`, so a run given different parameters has to be free
+    to learn different rails instead of silently inheriting another run's.
+    """
+    run = FusionRun(rail_params=rail_params, unreliable=dict(unreliable))
+    if rail_params is not None:
+        run.rails = learn_rails(
+            ((g["hand_side"], flexion_features(np.asarray(g["pts"], float)))
+             for take in loaded for g in take["glove"]),
+            rail_params)
+
+    for entry in loaded:
+        glove, cam = entry["glove"], entry["cam"]
+        source, clock = entry["source"], entry["clock"]
+        with_scale = entry["with_scale"]
+        gpath = Path(entry["name"])
+        # A fresh tracker per take. The hysteresis counts CONSECUTIVE frames,
+        # and consecutive across a take boundary is a fiction: the takes are
+        # separate recordings seconds apart, so a run built at the end of one
+        # must not still be armed at the start of the next.
+        tracker = (RailOverrideTracker(run.rails, rail_params, gates)
+                   if rail_params is not None else None)
+
+        per_hand_g = defaultdict(list)
+        per_hand_c = defaultdict(list)
+        per_hand_f = defaultdict(list)
+        pose = glove[0]["pose"]
+
+        for g, c in pair_by_time(glove, cam, max_dt=max_dt, clock=clock):
+            run.n_pairs += 1
+            hand = g["hand_side"]
+            G = np.asarray(g["pts"], dtype=float)
+            per_hand_g[hand].append(all_features(G, hand_side=hand))
+            slot = run.per_pose.setdefault(
+                (pose, hand, str(g["take"])),
+                {"glove": [], "camera": [], "fused": [], "sources": [],
+                 "paired": 0})
+            slot["glove"].append(dof_values(G, hand_side=hand))
+            if c is None:
+                rail = (tracker.update(hand, flexion_features(G))
+                        if tracker is not None else None)
+                fused, info = fuse_skeletons(G, None, min_score=min_score,
+                                             with_scale=with_scale, gates=gates,
+                                             rail=rail)
+            else:
+                run.n_matched += 1
+                slot["paired"] += 1
+                C = np.asarray(c["pts"], float)
+                per_hand_c[hand].append(all_features(C, hand_side=hand))
+                slot["camera"].append(dof_values(C, hand_side=hand))
+                meta = cam_meta_of(c, source)
+                rail = (tracker.update(hand, flexion_features(G),
+                                       flexion_features(C), meta)
+                        if tracker is not None else None)
+                fused, info = fuse_skeletons(
+                    G, c["pts"], cam_score=c.get("score", 1.0),
+                    min_score=min_score,
+                    thumb_from_camera=thumb_from_camera,
+                    with_scale=with_scale,
+                    cam_meta=meta, gates=gates, rail=rail,
+                    unreliable_fingers=unreliable.get(str(hand).lower(), ()))
+                for dof in GATED_DOFS:
+                    run.dof_total[dof] += 1
+                    if info["dof_source"][dof].startswith("camera"):
+                        run.dof_used[dof] += 1
+                for why in info["rejected"].values():
+                    run.reasons[why] += 1
+                slot["sources"].append(dict(info["dof_source"]))
+            if info["camera_used"]:
+                run.n_cam_used += 1
+            if info.get("kabsch_rmse_mm") is not None:
+                run.palm_residuals.append(info["kabsch_rmse_mm"])
+            per_hand_f[hand].append(all_features(fused, hand_side=hand))
+            slot["fused"].append(dof_values(fused, hand_side=hand))
+            if export_csv:
+                run.fused_rows.append([pose, g["take"], hand, g["wall_time"],
+                                       int(info["camera_used"])]
+                                      + [f"{v:.6f}"
+                                         for v in np.asarray(fused).ravel()])
+
+        for hand, feats in per_hand_g.items():
+            run.glove_samples.append((pose, hand, gpath.name, mean_vector(feats)))
+        for hand, feats in per_hand_c.items():
+            run.cam_samples.append((pose, hand, gpath.name, mean_vector(feats)))
+        for hand, feats in per_hand_f.items():
+            run.fused_samples.append((pose, hand, gpath.name, mean_vector(feats)))
+    return run
+
+
+def classifier_lines(run, lines):
+    """The three leave-one-TAKE-out rows, for one fusion run."""
+    loo_table(run.glove_samples, FLEXION_COLS, "glove only", lines)
+    loo_table(run.cam_samples, ALL_COLS, "camera only", lines)
+    loo_table(run.fused_samples, ALL_COLS, "fused", lines)
+
+
+def mask_text(mapping):
+    """`{'right': ('ring',)}` -> `right: ring`; empty -> `(none)`."""
+    if not mapping:
+        return "(none)"
+    return "; ".join(f"{hand}: {', '.join(fingers) or '(none)'}"
+                     for hand, fingers in sorted(mapping.items()))
+
+
+def profile_comparison(plain, masked, profile_path, name, comment, lines):
+    """Both fusions, side by side, so the profile has to earn its place.
+
+    A mask is a claim that some of the evidence is worthless, and a report
+    printing only the masked result would be unfalsifiable: the reader could
+    not see whether throwing the evidence away helped, hurt or did nothing.
+    So both runs are printed, over the same frames, with the two numbers a
+    mask is supposed to move — how much of the hand the camera supplied, and
+    how well the fused hand classifies.
+    """
+    lines.append("=" * 66)
+    lines.append(f"Reliability profile — {profile_path}")
+    if name:
+        lines.append(f"  {name}")
+    if comment:
+        lines.append(f"  {comment}")
+    lines.append(f"  {'unreliable fingers':<22} {mask_text(masked.unreliable)}")
+    rail = ("DISABLED (--no-rail-override)" if masked.rail_params is None
+            else masked.rail_params.described()["fingers"])
+    lines.append(f"  {'rail override fingers':<22} {rail}")
+    lines.append("  Same takes, same gates, same learned rails in both "
+                 "fusions below; the profile is the")
+    lines.append("  only difference. The ordinary run is what this command "
+                 "would print without")
+    lines.append("  --profile, so the gap between the two tables IS the "
+                 "profile's effect.")
+    for label, run in (("ordinary (no reliability profile)", plain),
+                       ("with reliability profile", masked)):
+        lines.append("")
+        lines.append(f"  --- {label} ---")
+        lines.append("    camera-use rate per gated DOF")
+        camera_use_table(run.dof_used, run.dof_total, lines, indent="      ")
+        lines.append("    leave-one-TAKE-out nearest centroid")
+        sub = []
+        classifier_lines(run, sub)
+        lines.extend(f"    {line}" for line in sub)
+    lines.append("")
 
 
 def main() -> None:
@@ -447,16 +795,30 @@ def main() -> None:
                    metavar="HAND:FINGER[,FINGER]",
                    help="fingers whose GLOVE curl is not to be trusted on that "
                         "hand, e.g. 'right:ring,pinky'. They are excluded from "
-                        "the thumb gate's vote. Repeatable, once per hand.")
+                        "the thumb gate's vote. Repeatable, once per hand; "
+                        "overrides a --profile entry for the same hand.")
     p.add_argument("--no-rail-override", action="store_true",
                    help="do not let the camera take a finger's curl when the "
                         "glove is pinned at full extension and the camera "
                         "sees that finger flexed (default: the override is on)")
-    p.add_argument("--rail-fingers",
-                   default=",".join(DEFAULT_RAIL.fingers),
-                   help="comma-separated fingers the rail override may act on "
-                        f"(any of {','.join(RAIL_FINGERS)}; "
-                        f"default {','.join(DEFAULT_RAIL.fingers)})")
+    p.add_argument("--rail-fingers", default=None,
+                   help="comma-separated fingers the rail override may act on, "
+                        f"on BOTH hands (any of {','.join(RAIL_FINGERS)}; "
+                        f"default {','.join(DEFAULT_RAIL.fingers_for())}). "
+                        "Overrides --profile. Per-hand lists come from a "
+                        "profile, not from here.")
+    p.add_argument("--profile", type=Path, default=None, metavar="PATH.json",
+                   help="a reliability profile: per-hand 'unreliable' and "
+                        "'rail_fingers' for this glove. The report then prints "
+                        "the fusion BOTH ways, so the profile's effect is "
+                        "visible. See profiles/.")
+    p.add_argument("--exclude", action="append", default=[],
+                   metavar="TEXT[,TEXT]",
+                   help="skip takes whose file name contains this text, on "
+                        "both the glove and the camera side, e.g. "
+                        "'pinch_right_take1'. Repeatable, and comma-separated "
+                        "lists are accepted. The excluded takes are named in "
+                        "the report header.")
     p.add_argument("--camera", choices=(AUTO,) + CAM_DIRS, default=AUTO,
                    help="which camera folder to read (default: auto — both, "
                         "and a take name in both is an error)")
@@ -475,51 +837,62 @@ def main() -> None:
             "Record them with: python scripts/record_simultaneous.py\n"
             "                  python scripts/record_simultaneous.py --camera leap")
 
-    takes = sorted(glove_dir.glob("*.jsonl"))
-    if not takes:
+    all_takes = sorted(glove_dir.glob("*.jsonl"))
+    if not all_takes:
         raise SystemExit(f"no glove recordings in {glove_dir}")
+
+    # One pattern list, applied to the glove side AND to every camera folder,
+    # so a take cannot be excluded on one sensor and quietly fused on the
+    # other. The camera file is named after the glove take, so one substring
+    # catches both — but they are matched and counted separately, because
+    # that is the claim the report header makes.
+    patterns = [t.strip() for spec in args.exclude
+                for t in str(spec).split(",") if t.strip()]
+    takes, dropped_glove = split_excluded(all_takes, patterns)
+    dropped_cam = []
+    for d in cam_dirs:
+        dropped_cam += split_excluded(sorted(d.glob("*.jsonl")), patterns)[1]
+    unmatched = [pat for pat in patterns
+                 if not any(pat in p.name for p in dropped_glove + dropped_cam)]
+    if not takes:
+        raise SystemExit(
+            f"--exclude removed every take in {glove_dir} "
+            f"({len(dropped_glove)} file(s)); nothing is left to fuse.")
 
     gates = GateParams(curl_gate=args.curl_gate,
                        view_gate_deg=args.view_gate_deg,
                        curl_agree_tol=args.curl_agree_tol)
 
-    unreliable = {}
-    for spec in args.unreliable:
-        if ":" not in spec:
-            raise SystemExit(f"--unreliable {spec}: expected HAND:FINGER[,FINGER], "
-                             "e.g. right:ring,pinky")
-        hand, _, fingers_txt = spec.partition(":")
-        picked = tuple(f.strip() for f in fingers_txt.split(",") if f.strip())
-        bad = [f for f in picked if f not in FLEXION_NAMES]
-        if bad:
-            raise SystemExit(f"--unreliable {spec}: {', '.join(bad)} is not a "
-                             f"finger (choose from {', '.join(FLEXION_NAMES)})")
-        unreliable[hand.strip().lower()] = picked
+    # --- the two masks, and where each of them came from ----------------
+    # Precedence is the same for both: an explicit flag beats the profile and
+    # the profile beats the default. The "ordinary" run below is built from
+    # the same flags with the PROFILE left out, which is what makes it an
+    # honest comparison rather than a second set of defaults.
+    cli_unreliable = parse_unreliable(args.unreliable)
+    cli_rail = (None if args.rail_fingers is None
+                else parse_rail_fingers(args.rail_fingers))
+    profile_unreliable, profile_rail, profile_name, profile_comment = (
+        load_profile(args.profile) if args.profile is not None
+        else ({}, {}, "", ""))
 
-    rail_params = None
-    if not args.no_rail_override:
-        picked = tuple(f.strip() for f in args.rail_fingers.split(",")
-                       if f.strip())
-        bad = [f for f in picked if f not in RAIL_FINGERS]
-        if bad:
-            raise SystemExit(
-                f"--rail-fingers: {', '.join(bad)} is not a finger the rail "
-                f"override can act on (choose from {', '.join(RAIL_FINGERS)}).\n"
-                "  The thumb is not among them: its whole direction is already "
-                "the camera's when the thumb gate passes.")
-        rail_params = RailOverrideParams(fingers=picked)
+    unreliable = dict(profile_unreliable)
+    unreliable.update(cli_unreliable)
 
-    glove_samples, cam_samples, fused_samples = [], [], []
-    fused_rows = []
-    n_pairs = n_matched = n_cam_used = 0
-    skipped = []
-    by_source = defaultdict(int)          # camera -> takes read from it
-    by_clock = defaultdict(int)           # pairing clock -> takes paired on it
-    palm_residuals = []                   # diagnostic only, never a gate
-    per_pose = {}                         # (pose, hand) -> the DOF table rows
-    dof_used = defaultdict(int)           # gated DOF -> frames the camera won
-    dof_total = defaultdict(int)          # gated DOF -> paired frames
-    reasons = defaultdict(int)            # rejection reason -> count
+    def rail_params_for(rail_spec):
+        return (None if args.no_rail_override
+                else RailOverrideParams(fingers=rail_spec))
+
+    if cli_rail is not None:
+        rail_spec = cli_rail
+    elif profile_rail:
+        rail_spec = profile_rail
+    else:
+        rail_spec = DEFAULT_RAIL.fingers
+    rail_params = rail_params_for(rail_spec)
+    # What this command would do with no --profile at all.
+    plain_rail_params = rail_params_for(
+        cli_rail if cli_rail is not None else DEFAULT_RAIL.fingers)
+    comparing = args.profile is not None
 
     # --- pass 1: read every take ---------------------------------------
     # The rail override has to know each finger's rail BEFORE it can fuse a
@@ -528,6 +901,9 @@ def main() -> None:
     # fusing, and the rails are learned in between, from the same frames that
     # are about to be fused.
     loaded = []
+    skipped = []
+    by_source = defaultdict(int)          # camera -> takes read from it
+    by_clock = defaultdict(int)           # pairing clock -> takes paired on it
     for gpath in takes:
         try:
             cpath = find_camera_take(args.input, gpath.name, args.camera)
@@ -554,97 +930,40 @@ def main() -> None:
                        # Metric camera, rigid fit; normalised camera, fit scale.
                        "with_scale": source != LEAP})
 
-    # --- learn the rails ------------------------------------------------
-    rails = {}
-    if rail_params is not None:
-        rails = learn_rails(
-            ((g["hand_side"], flexion_features(np.asarray(g["pts"], float)))
-             for take in loaded for g in take["glove"]),
-            rail_params)
-
     # --- pass 2: fuse ---------------------------------------------------
-    for entry in loaded:
-        glove, cam = entry["glove"], entry["cam"]
-        source, clock = entry["source"], entry["clock"]
-        with_scale = entry["with_scale"]
-        gpath = Path(entry["name"])
-        # A fresh tracker per take. The hysteresis counts CONSECUTIVE frames,
-        # and consecutive across a take boundary is a fiction: the takes are
-        # separate recordings seconds apart, so a run built at the end of one
-        # must not still be armed at the start of the next.
-        tracker = (RailOverrideTracker(rails, rail_params, gates)
-                   if rail_params is not None else None)
+    run = fuse_all(loaded, gates, rail_params, unreliable,
+                   max_dt=args.max_dt, min_score=args.min_score,
+                   thumb_from_camera=not args.no_thumb_camera,
+                   export_csv=args.export_csv is not None)
+    plain = (fuse_all(loaded, gates, plain_rail_params, cli_unreliable,
+                      max_dt=args.max_dt, min_score=args.min_score,
+                      thumb_from_camera=not args.no_thumb_camera)
+             if comparing else None)
 
-        per_hand_g = defaultdict(list)
-        per_hand_c = defaultdict(list)
-        per_hand_f = defaultdict(list)
-        pose = glove[0]["pose"]
-
-        for g, c in pair_by_time(glove, cam, max_dt=args.max_dt, clock=clock):
-            n_pairs += 1
-            hand = g["hand_side"]
-            G = np.asarray(g["pts"], dtype=float)
-            per_hand_g[hand].append(all_features(G, hand_side=hand))
-            slot = per_pose.setdefault(
-                (pose, hand, str(g["take"])),
-                {"glove": [], "camera": [], "fused": [], "sources": [],
-                 "paired": 0})
-            slot["glove"].append(dof_values(G, hand_side=hand))
-            if c is None:
-                rail = (tracker.update(hand, flexion_features(G))
-                        if tracker is not None else None)
-                fused, info = fuse_skeletons(G, None, min_score=args.min_score,
-                                             with_scale=with_scale, gates=gates,
-                                             rail=rail)
-            else:
-                n_matched += 1
-                slot["paired"] += 1
-                C = np.asarray(c["pts"], float)
-                per_hand_c[hand].append(all_features(C, hand_side=hand))
-                slot["camera"].append(dof_values(C, hand_side=hand))
-                meta = cam_meta_of(c, source)
-                rail = (tracker.update(hand, flexion_features(G),
-                                       flexion_features(C), meta)
-                        if tracker is not None else None)
-                fused, info = fuse_skeletons(
-                    G, c["pts"], cam_score=c.get("score", 1.0),
-                    min_score=args.min_score,
-                    thumb_from_camera=not args.no_thumb_camera,
-                    with_scale=with_scale,
-                    cam_meta=meta, gates=gates, rail=rail,
-                    unreliable_fingers=unreliable.get(str(hand).lower(), ()))
-                for dof in GATED_DOFS:
-                    dof_total[dof] += 1
-                    if info["dof_source"][dof].startswith("camera"):
-                        dof_used[dof] += 1
-                for why in info["rejected"].values():
-                    reasons[why] += 1
-                slot["sources"].append(dict(info["dof_source"]))
-            if info["camera_used"]:
-                n_cam_used += 1
-            if info.get("kabsch_rmse_mm") is not None:
-                palm_residuals.append(info["kabsch_rmse_mm"])
-            per_hand_f[hand].append(all_features(fused, hand_side=hand))
-            slot["fused"].append(dof_values(fused, hand_side=hand))
-            if args.export_csv is not None:
-                fused_rows.append([pose, g["take"], hand, g["wall_time"],
-                                   int(info["camera_used"])]
-                                  + [f"{v:.6f}" for v in np.asarray(fused).ravel()])
-
-        for hand, feats in per_hand_g.items():
-            glove_samples.append((pose, hand, gpath.name, mean_vector(feats)))
-        for hand, feats in per_hand_c.items():
-            cam_samples.append((pose, hand, gpath.name, mean_vector(feats)))
-        for hand, feats in per_hand_f.items():
-            fused_samples.append((pose, hand, gpath.name, mean_vector(feats)))
-
-    if not glove_samples:
+    if not run.glove_samples:
         raise SystemExit("no usable paired takes found")
 
     lines = []
     lines.append("=" * 66)
     lines.append(f"Sensor fusion report — {len(takes)} takes from {args.input}")
     lines.append("")
+    if patterns:
+        lines.append("Excluded by --exclude (a named take is read on NEITHER "
+                     "sensor)")
+        lines.append(f"  patterns                {', '.join(patterns)}")
+        for path in dropped_glove:
+            folders = [d.name for d in cam_dirs if (d / path.name).is_file()]
+            lines.append(f"    {path.name}  "
+                         f"({' + '.join(['glove'] + folders)})")
+        for path in dropped_cam:
+            if path.name not in {p.name for p in dropped_glove}:
+                lines.append(f"    {path.name}  ({path.parent.name} only — "
+                             "no glove take of that name)")
+        for pat in unmatched:
+            lines.append(f"    {pat!r} matched nothing")
+        lines.append(f"  takes left              {len(takes)} of "
+                     f"{len(all_takes)}")
+        lines.append("")
     lines.append("Camera")
     for source, n in sorted(by_source.items()):
         if source == LEAP:
@@ -663,18 +982,19 @@ def main() -> None:
                else "when each line was WRITTEN — the take has no "
                     "capture_time, so this is the best available")
         lines.append(f"  clock                   {clock} on {n} take(s): {why}")
-    lines.append(f"  glove frames            {n_pairs}")
-    lines.append(f"  matched within {args.max_dt * 1000:.0f} ms   {n_matched} "
-                 f"({100.0 * n_matched / max(n_pairs, 1):.0f}%)")
-    lines.append(f"  camera actually used    {n_cam_used} "
-                 f"({100.0 * n_cam_used / max(n_pairs, 1):.0f}%)  "
+    lines.append(f"  glove frames            {run.n_pairs}")
+    lines.append(f"  matched within {args.max_dt * 1000:.0f} ms   "
+                 f"{run.n_matched} "
+                 f"({100.0 * run.n_matched / max(run.n_pairs, 1):.0f}%)")
+    lines.append(f"  camera actually used    {run.n_cam_used} "
+                 f"({100.0 * run.n_cam_used / max(run.n_pairs, 1):.0f}%)  "
                  f"[score >= {args.min_score}]")
     if skipped:
         lines.append(f"  skipped takes           {len(skipped)}")
         for name, why in skipped:
             lines.append(f"    {name}: {why}")
-    if palm_residuals:
-        ordered = sorted(palm_residuals)
+    if run.palm_residuals:
+        ordered = sorted(run.palm_residuals)
         # NOT named `median`: that would rebind the imported function for the
         # whole of main() and make any earlier call to it an UnboundLocalError.
         median_mm = ordered[len(ordered) // 2]
@@ -689,21 +1009,23 @@ def main() -> None:
         lines.append("  which is why a large value here cannot bend a finger "
                      "direction.")
     lines.append("")
+    if comparing:
+        profile_comparison(plain, run, args.profile, profile_name,
+                           profile_comment, lines)
     lines.append("=" * 66)
-    dof_table(per_pose, lines)
-    gate_tables(dof_used, dof_total, reasons, gates, rail_params, rails,
-                unreliable, lines)
+    dof_table(run.per_pose, lines)
+    gate_tables(run.dof_used, run.dof_total, run.reasons, gates,
+                run.rail_params, run.rails, unreliable, lines)
 
     lines.append("")
     lines.append("=" * 66)
-    lines.append("Secondary metric: leave-one-TAKE-out nearest centroid")
-    loo_table(glove_samples, FLEXION_COLS, "glove only", lines)
-    loo_table(cam_samples, ALL_COLS, "camera only", lines)
-    loo_table(fused_samples, ALL_COLS, "fused", lines)
+    lines.append("Secondary metric: leave-one-TAKE-out nearest centroid"
+                 + (" (with the reliability profile)" if comparing else ""))
+    classifier_lines(run, lines)
     lines.append("")
-    n_takes = len({s[2] for s in glove_samples})
+    n_takes = len({s[2] for s in run.glove_samples})
     per_pose_takes = defaultdict(set)
-    for pose, _hand, take, _f in glove_samples:
+    for pose, _hand, take, _f in run.glove_samples:
         per_pose_takes[pose].add(take)
     if max((len(v) for v in per_pose_takes.values()), default=0) < 2:
         lines.append("  THIS NUMBER IS NOT MEANINGFUL on this session. Every "
@@ -738,8 +1060,8 @@ def main() -> None:
         with open(args.export_csv, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["pose", "take", "hand", "wall_time", "camera_used"] + COORD_COLS)
-            w.writerows(fused_rows)
-        print(f"\nwrote {args.export_csv}  ({len(fused_rows)} fused frames)")
+            w.writerows(run.fused_rows)
+        print(f"\nwrote {args.export_csv}  ({len(run.fused_rows)} fused frames)")
 
     if args.write:
         out = args.input / "REPORT.txt"

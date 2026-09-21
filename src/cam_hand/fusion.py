@@ -204,11 +204,20 @@ WHAT THE OVERRIDE DOES
 
 `fingers` defaults to ("index",) — the finger the session actually shows the
 failure on. The rest are implemented and off.
+
+It may also be written PER HAND (`{"right": ("index", "ring"), "left":
+("index",)}`), because the evidence for enabling a finger is a sweep of that
+finger on that hand and the two gloves do not fail alike: on sync_day1 it is
+the RIGHT glove's ring and pinky that read partly extended through poses the
+left glove reports correctly. A plain sequence still means both hands, so
+nothing written before the mapping existed changes. `fingers_for(hand)` is the
+only reader.
 """
 import math
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (Dict, Iterable, List, Mapping, Optional, Sequence, Tuple,
+                    Union)
 
 import numpy as np
 
@@ -329,6 +338,10 @@ R_RAIL_OFF = "glove is off its rail, so it is measuring"
 R_RAIL_EXTENDED = "camera does not see the finger flexed"
 R_RAIL_ARMING = "rail disagreement not sustained yet"
 
+# Which fingers the rail override is enabled on: one list for both hands, or
+# one list per hand. See `RailOverrideParams.fingers`.
+FingerSpec = Union[Sequence[str], Mapping[str, Sequence[str]]]
+
 
 @dataclass(frozen=True)
 class RailOverrideParams:
@@ -354,6 +367,20 @@ class RailOverrideParams:
                      enter.
     fingers          which fingers it is enabled on. Default ("index",): the
                      one finger sync_day1 actually shows the failure on.
+
+                     PER HAND, because a glove fails per hand and the
+                     evidence for enabling a finger is a sweep of THAT
+                     finger on THAT hand. Two forms are accepted:
+
+                       ("index",)                    both hands
+                       {"right": ("index", "ring"),
+                        "left":  ("index",)}         named per hand
+
+                     A plain sequence keeps meaning "both hands", so every
+                     caller and recording made before the mapping existed
+                     behaves exactly as it did. Read it through
+                     `fingers_for(hand)`, never directly: that is the one
+                     place the two forms are told apart.
     cam_open_curl    the camera's curl for a STRAIGHT finger, per finger in
                      FINGER_NAMES order. A constant on purpose — see the
                      module docstring. Read off sync_day1's open-palm frames,
@@ -371,7 +398,7 @@ class RailOverrideParams:
     margin: float = 0.25
     enter_frames: int = 10
     exit_frames: int = 5
-    fingers: Tuple[str, ...] = ("index",)
+    fingers: FingerSpec = ("index",)
     cam_open_curl: Tuple[float, ...] = (1.30, 1.75, 1.82, 1.69, 1.44)
     min_rail_share: float = 0.05
     rail_max_gap: float = 0.02
@@ -379,9 +406,41 @@ class RailOverrideParams:
     def open_curl(self, finger: str) -> float:
         return self.cam_open_curl[FINGER_NAMES.index(finger)]
 
+    def fingers_for(self, hand: Optional[str] = None) -> Tuple[str, ...]:
+        """The fingers the override may act on for `hand`.
+
+        `hand` None asks the question the report's header asks — "which
+        fingers does this configuration touch at all" — and answers it with
+        the union over every hand, in FINGER_NAMES order so two profiles that
+        name the same fingers in a different order read the same.
+
+        An unknown hand gets () from a mapping, not the mapping's first
+        entry: a hand nobody wrote a line for has not been enabled.
+        """
+        spec = self.fingers
+        if isinstance(spec, Mapping):
+            if hand is None:
+                named = {f for fs in spec.values() for f in fs}
+            else:
+                named = set(spec.get(str(hand).strip().lower(), ()))
+        else:
+            named = set(spec)
+        return tuple(f for f in FINGER_NAMES if f in named)
+
+    @property
+    def per_hand(self) -> bool:
+        """Is `fingers` written per hand, rather than once for both?"""
+        return isinstance(self.fingers, Mapping)
+
     def described(self) -> Dict[str, str]:
         d = asdict(self)
-        d["fingers"] = ", ".join(self.fingers) if self.fingers else "(none)"
+        if self.per_hand:
+            d["fingers"] = "; ".join(
+                f"{hand}: {', '.join(self.fingers_for(hand)) or '(none)'}"
+                for hand in sorted(self.fingers)) or "(none)"
+        else:
+            d["fingers"] = (", ".join(self.fingers_for()) + " (both hands)"
+                            if self.fingers_for() else "(none)")
         d["cam_open_curl"] = "  ".join(
             f"{n} {v:.2f}" for n, v in zip(FINGER_NAMES, self.cam_open_curl))
         return d
@@ -560,7 +619,10 @@ class RailOverrideTracker:
 
         active: List[str] = []
         rejected: Dict[str, str] = {}
-        for finger in self.params.fingers:
+        # Per hand: the override is enabled on the fingers whose failure has
+        # actually been measured on THIS hand, which is not in general the
+        # same list as the other hand's.
+        for finger in self.params.fingers_for(hand):
             if finger not in RAIL_FINGERS:
                 continue
             key = (hand, finger)

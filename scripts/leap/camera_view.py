@@ -22,7 +22,7 @@ import leap
 from leap import enums
 from leapc_cffi import ffi, libleapc
 
-from leap_hand.protocol import QUIT, parse_status
+from leap_hand.protocol import QUIT, image_banner, parse_status
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--hand", choices=["left", "right", "both"], default="both")
@@ -41,7 +41,13 @@ LEFT_CAMERA = 1                   # eLeapPerspectiveType_stereo_left
 COLOURS = {"left": (255, 220, 0), "right": (60, 60, 255)}      # BGR: cyan-ish left, red right (as in the repo viewers)
 
 lock = threading.Lock()
-state = {"img": None, "hands": [], "hands_t": 0.0, "fps": 0.0, "frames": 0}
+# `img_t` is when the last IR image actually arrived, and None until one has.
+# The banner at the bottom of the window is decided from it and not from the
+# reply to the policy request — see leap_hand.protocol.image_banner and every
+# still in recordings/sync_day2/stills/, which says "camera images are off"
+# over a perfectly good picture of the hand.
+state = {"img": None, "img_t": None, "images": 0,
+         "hands": [], "hands_t": 0.0, "fps": 0.0, "frames": 0}
 
 
 def image_to_numpy(image):
@@ -64,6 +70,8 @@ class Listener(leap.Listener):
             return
         with lock:
             state["img"] = img
+            state["img_t"] = time.time()       # a picture IS here, whatever
+            state["images"] += 1               # the policy reply said
 
     def on_tracking_event(self, e):
         hands = []
@@ -88,10 +96,10 @@ conn = leap.Connection(listeners=[Listener()])
 conn.connect()
 conn.set_tracking_mode(enums.TrackingMode.Desktop)
 try:
-    active = conn.set_policy_flags(flags_to_set=[enums.PolicyFlag.Images])
-    images_on = enums.PolicyFlag.Images in active
+    conn.set_policy_flags(flags_to_set=[enums.PolicyFlag.Images])
 except Exception as ex:                                   # viewer still useful without the picture
-    images_on = False; print("could not enable camera images:", ex)
+    print("could not enable camera images:", ex)
+STARTED = time.time()          # the grace period for the first image runs from here
 PTR = conn.get_connection_ptr()
 
 
@@ -158,7 +166,7 @@ def compose():
     with lock:
         img = None if state["img"] is None else state["img"].copy()
         hands = list(state["hands"]) if time.time() - state["hands_t"] < 0.25 else []
-        fps = state["fps"]; frames = state["frames"]
+        fps = state["fps"]; frames = state["frames"]; img_t = state["img_t"]
     size = 384 * SCALE
     if img is None:
         frame = np.zeros((size, size, 3), np.uint8)
@@ -212,8 +220,9 @@ def compose():
     border = (80, 255, 80) if (ok_all and seen) else (60, 60, 255)
     cv2.rectangle(frame, (0, 0), (size - 1, size - 1), border, 6)
     put(frame, f"tracking {fps:4.1f} Hz   target {LOW:.0f}-{HIGH:.0f} cm   q / Esc closes", (14, size - 16), 0.5, (200, 200, 200), 1)
-    if not images_on:
-        put(frame, "camera images are off: enable 'Allow Images' in the Ultraleap Control Panel", (14, size - 44), 0.5, (0, 190, 255), 1)
+    banner = image_banner(time.time(), img_t, STARTED)
+    if banner:
+        put(frame, banner, (14, size - 44), 0.5, (0, 190, 255), 1)
     return frame
 
 

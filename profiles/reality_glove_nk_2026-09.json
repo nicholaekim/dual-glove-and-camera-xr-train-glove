@@ -1,0 +1,11 @@
+{
+  "name": "Reality Glove (StretchSense) worn by N Kim, September 2026",
+  "comment": "Measured, not guessed. UNRELIABLE right middle/ring/pinky: through sync_day1 and sync_day2 the right glove reports those three partly extended while the camera reads them clearly curled (pinky 1.55-1.68 against the camera's 0.78-0.90, take after take, in thumbs_up and peace) - a fault in that glove's fingers, not evidence about the camera, so they are kept out of the thumb gate's vote. The left glove does not do this and is left alone. RAIL OVERRIDE index only, on both hands: the index is the one finger a slow sweep has shown leaves its rail as soon as the camera sees flexion, so the rail reading is a saturation artefact the camera may overrule. The RIGHT RING is deliberately NOT enabled although it is the next suspect: its 2026-09-20 sweep (dead_zone_right_ring) started with the finger already bent, so the open reference is broken and the sweep has to be repeated with scripts/leap/finger_sweep.py before ring goes in here. Enabling it on an un-repeated sweep would let the camera take a curl on the strength of a measurement we know is spoiled.",
+  "unreliable": {
+    "right": ["middle", "ring", "pinky"]
+  },
+  "rail_fingers": {
+    "left": ["index"],
+    "right": ["index"]
+  }
+}
