@@ -618,6 +618,7 @@ is the reference in each: it has nothing to creep and no rail to sit on.
 
 ```powershell
 python scripts\leap\hold_test.py    --hand right --pose fist
+python scripts\leap\finger_sweep.py --hand right --finger all
 python scripts\leap\finger_sweep.py --hand right --finger ring
 ```
 
@@ -645,11 +646,14 @@ and is now creeping". On `hold_drift_right_fist_20260918_190912.csv` those are
 on its open value — and reading the drift from the wrong one turns **+0.29**
 into **-0.90**.
 
-**`finger_sweep.py` — what does the glove report as one finger bends slowly?**
+**`finger_sweep.py` — what does the glove report as a finger bends slowly?**
 It refuses to start until the camera confirms an **open palm** of the expected
 hand, then runs a **paced** protocol with captions and beeps: `--cycles` (3)
 cycles of *bend the finger slowly* (`--phase`, 5 s) and *straighten slowly*
-(5 s).
+(5 s). With `--finger all` (or `--whole-hand`) the same pacing calls *close
+the whole hand slowly into a **FIST*** and *open it slowly*, and every number
+below is reported **per finger**, each binned by that finger's own camera
+curl.
 
 It reports the **transfer curve binned by CAMERA curl** — the glove's median
 in each 0.1-wide slice, separately while bending and while straightening — the
@@ -664,6 +668,29 @@ finger's shape frame by frame, so "what does the glove say when the camera
 says 1.3?" is answerable from any sweep that visited 1.3. Re-read that way,
 that file gives a clean answer: the right ring glove is back on its rail
 (1.971) from **camera curl 1.45** upward.
+
+**An isolated ring or pinky sweep is descriptive only unless the camera
+followed the finger, and the whole-hand sweep is the primary curl
+diagnostic.** Binning by the camera makes the camera the measuring axis, so a
+run whose camera curl barely moved has no axis to bin against.
+`dead_zone_right_ring_20260920_212254.csv` is exactly that: a paced, fully
+covered, 30 s isolated right-ring sweep in which the glove swung 0.86 to 1.97
+and the camera's ring curl covered **0.45**, because a gloved ring folding on
+its own is a shape the tracker does not resolve. The curve came out
+non-monotonic (1.51, 1.62, 1.65, **1.47, 1.10**, 1.97) and the tool printed a
+saturation point of 1.65 off it anyway.
+
+So before anything is binned the tool measures the **camera's own range** on
+that finger (5th to 95th percentile). Under `--min-camera-range` (**0.5**; a
+real full bend spans about 0.8 to 1.7, and the 20:04 sweep of the same finger
+covers 0.81) it prints one sentence — *camera did not follow the ring: its
+range was 0.45, need 0.50; this run is descriptive only* — prints **no**
+transfer curve and **no** saturation point, saves the CSVs anyway and exits 2.
+The fix for such a run is not a slower sweep; it is `--finger all`, where
+every finger moves through its full range, the camera resolves all of them,
+and one recording yields four or five transfer curves. The guard is applied
+per finger there too, and the **thumb** is reported on the same terms but
+cannot fail the run on its own.
 
 At the end the **coverage is checked**: at least `--min-bin` (5) samples in
 every 0.1-wide camera-curl bin between the finger's open value and its fully
@@ -681,16 +708,24 @@ is an artefact of the stream, and the counter is what says whether the packets
 never arrived or we never drained them. Both take `--mock` and `--mock-glove`
 to rehearse with no hardware.
 
-The arithmetic behind both — drift summary, binned transfer curve, coverage
-check, lag estimate, stream health — is in `src/leap_hand/diagnostics.py`,
-with no I/O in it, so `tests/test_diagnostics.py` can hand it a synthetic
-sweep with a known saturation point and a known lag and check that both come
-back. The live rig they share (both sensors, the window, the ACQUIRE gate) is
-`src/leap_hand/live.py`.
+The arithmetic behind both — drift summary, camera-range guard, binned
+transfer curve, coverage check, lag estimate, stream health — is in
+`src/leap_hand/diagnostics.py`, with no I/O in it, so
+`tests/test_diagnostics.py` can hand it a synthetic fist in which each of the
+five fingers has a *different* planted saturation point, range and lag, and
+check that all five come back. The live rig they share (both sensors, the
+window, the ACQUIRE gate) is `src/leap_hand/live.py`.
 
-Output goes to `results\diagnostics\` (`--out`), in the same CSV columns the
-scratch versions of these tools wrote, so old files and new ones are read by
-the same code.
+Output goes to `results\diagnostics\` (`--out`). The sweep's per-frame CSV is
+**long** — `t, finger, glove_curl, camera_curl, glove_on_rail, bend_fraction`,
+one row per glove frame per finger — and **all five fingers are written in
+both modes**, so an isolated sweep can be re-analysed for the fingers it was
+not about. (That is how "the tracker could not resolve this finger" is told
+apart from "the tracker had lost the hand", and it cannot be recovered later
+if only the swept column was kept.) Files written before 2026-09-20 have the
+scratch tools' narrow layout — one row per frame, no `finger` column, the
+camera column named `camera_curl_at_same_instant` — and the same quantities;
+`hold_test.py`'s CSV is unchanged.
 
 ## Results so far (102 reference frames)
 
@@ -1064,7 +1099,10 @@ from **52/59 to 53/59**; nothing else changes, because the mask only touches
 the thumb gate's vote. The profile also carries a `comment` the report prints
 — the shipped one records that the right *ring* is deliberately **not** on the
 rail-override list until its sweep is repeated with `finger_sweep.py`, because
-the sweep it has began with the finger already bent.
+the sweep it has began with the finger already bent. That repeat has now been
+attempted twice and the ring still has no clean isolated sweep: the 21:22 run
+is the one the camera did not follow. It stays off the list until a
+**whole-hand** sweep measures it.
 
 ### What the report says
 
@@ -1141,8 +1179,10 @@ scripts/
 scripts/leap/
   camera_view.py             live IR window with a caption, driven by a file
   hold_test.py               hold a pose 60 s: does the glove's curl drift?
-  finger_sweep.py            sweep one finger slowly: transfer curve, lag,
-                             rail saturation, bin coverage
+  finger_sweep.py            sweep one finger, or --finger all (the whole
+                             hand, and the primary curl diagnostic): transfer
+                             curve, lag, rail saturation per finger, guarded
+                             by the camera's own range on that finger
 src/leap_hand/
   diagnostics.py  the arithmetic behind those two, with no I/O in it
   live.py         the rig they share: both sensors, window, ACQUIRE gate
