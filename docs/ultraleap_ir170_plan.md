@@ -593,6 +593,50 @@ Day-1 session with the corrected recorder (2026-09-18, 18:36 to 18:48,
   wrong. Reported as is: fusion needs per-hand, per-finger reliability
   logic; glove curl does not automatically dominate.
 
+Hardened diagnostics, first three runs (2026-09-20, 21:22 to 21:25;
+`results/diagnostics/`)
+- Tools merged (288 tests): `scripts/leap/hold_test.py` (camera must confirm
+  the requested pose for 1.5 s before the clock starts; open-palm baseline
+  saved), `scripts/leap/finger_sweep.py` (paced 5 s bend / 5 s straighten
+  cycles, coverage check), both logging the glove packet rate per second;
+  `fuse_poses.py --exclude`, `--profile profiles/reality_glove_nk_2026-09.json`
+  (two-number report: day 2 thumb camera use 82.8 -> 99.6 %, fused 52 ->
+  53/59), rail override per hand.
+- Right fist hold, both gloves connected, glove 60 Hz: creep only +0.06 to
+  +0.09 in 50 s (day 1: +0.26 on the index); the camera itself moved -0.04
+  to -0.13 (fist tightened). Lag on the closing transition: right glove
+  about 455 ms behind the camera (day 1: 485 ms).
+- Right fist hold, only the right glove connected: the camera saw the fist
+  loosen by about 0.3 on every finger over the minute while the glove moved
+  0.02 to 0.11: the glove under-followed a slow relaxation. Stream 60 Hz in
+  both runs, so the day-2 46 Hz problem did not recur and the one-glove test
+  could not discriminate; no lost packets in any run.
+- Right ring sweep, paced: the camera did not follow an isolated ring bend
+  (camera ring 1.68 -> 1.42 -> 1.68 while the glove swung 1.97 -> 0.87),
+  correlation 0.30 (the unpaced sweep at 20:04, where other fingers probably
+  co-flexed, reached camera 0.82 with correlation 0.81). No transfer curve or
+  saturation point can be read from it.
+
+ChatGPT on the three runs (2026-09-20), adopted
+- Right-ring rail override stays off: "stable camera geometry while the
+  glove is wrong" was not met; the reliability mask stands on the static
+  evidence. Run 2 shows a different temporal response, not "sticking" as a
+  settled mechanism.
+- Whole-hand open -> fist -> open paced sweeps are the primary curl
+  diagnostic (the camera tracks that motion well and gives all four fingers
+  a reference at once); isolated sweeps only for index and thumb; the sweep
+  tool must flag a run when the camera's own range is too small; IR stills
+  are qualitative evidence only. (Being built: `--finger all`, camera-range
+  guard.)
+- Wording: "glove curl shows time-dependent lag/hysteresis relative to the
+  camera in both directions, with session-dependent magnitude (0.05 to 0.3
+  of the curl metric per minute)". Repeat the same hold at the start and end
+  of a session to test wear-time dependence.
+- Lag 455 to 485 ms on the right at a clean 60 Hz makes packet-rate limits
+  unlikely; check XR Trainer's per-hand smoothing / filtering /
+  stabilisation / prediction / latency settings and confirm left and right
+  are identical.
+
 Day-2 repeat (2026-09-20, 19:51 to 20:02, identical protocol, both gloves
 recalibrated first; `recordings/sync_day2`, `sync_day2_clean` without the
 mislabelled take)
