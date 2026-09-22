@@ -77,7 +77,8 @@ import cv2
 from cam_hand.capture import open_camera, read_frame
 from cam_hand.draw import draw_banner, draw_hand, draw_hud, label_hands
 from cam_hand.landmarks import DEFAULT_MODEL, HandTracker
-from cam_hand.recorder import CamRecorder, pose_filename, slugify
+from cam_hand.recorder import (SETTLE_PHASE, CamRecorder, pose_filename,
+                               settle_name, slugify)
 from cam_hand.recorder import finalize_pose_name as cam_finalize
 from cam_hand.recorder import hand_tag as cam_hand_tag
 
@@ -202,6 +203,44 @@ class _CaptureTimeWriter:
 
     def close(self) -> None:
         self._fh.close()
+
+
+class _PhaseWriter:
+    """The recorder's file handle, with `phase` added to each line.
+
+    Same trick as `_CaptureTimeWriter`, for the same reason: one key injected
+    where the line meets the file, rather than a second `record()` with its
+    own copy of the per-hand rate throttle. The two wrappers compose — a
+    SETTLE glove line goes through this one and then through the capture-time
+    one — and `FrameRecorder.load` ignores keys it does not know, so every
+    existing reader reads these files unchanged.
+
+    The key is there to make a settle clip self-describing. A file that says
+    `phase: "settle"` on every line cannot be mistaken for a take by anything
+    that opens it, which a naming convention alone cannot promise.
+    """
+
+    def __init__(self, fh, phase: str):
+        self._fh = fh
+        self._phase = phase
+
+    def write(self, text: str) -> int:
+        if text.strip():
+            d = json.loads(text)
+            d["phase"] = self._phase
+            text = json.dumps(d) + "\n"
+        return self._fh.write(text)
+
+    def flush(self) -> None:
+        self._fh.flush()
+
+    def close(self) -> None:
+        self._fh.close()
+
+
+def stamp_phase(recorder, phase: str) -> None:
+    """Make an already-started recorder write `phase` on every line."""
+    recorder._file = _PhaseWriter(recorder._file, phase)
 
 
 class StampedFrameRecorder(FrameRecorder):
@@ -1054,10 +1093,32 @@ class CoachedLeapSession(LeapSyncSession):
                 return reason
         return ""
 
+    def _settle_files(self, name: str):
+        """Both sides' SETTLE clip paths for a take's working name."""
+        settle = settle_name(name)
+        return self.cam_dir / settle, self.glove_dir / settle
+
+    def _drop_settle(self, name: str) -> None:
+        """Delete a settle clip whose take never happened.
+
+        An attempt that dies during the settle has no take to pair the clip
+        with, and a clip on its own is not evidence about anything: it would
+        be found by `fuse_poses.py`'s lag measurement as the transition into a
+        pose that was never recorded. Deleted rather than moved to
+        `rejected/`, which is for attempts a VERDICT was passed on — the same
+        distinction the interrupted-take branch below already makes.
+        """
+        for path in self._settle_files(name):
+            path.unlink(missing_ok=True)
+
     def _attempt(self, pose: str, take: int, duration: float,
                  attempt: int) -> Attempt:
         self._acquire(pose, attempt)
         before = self._mark()
+
+        name = pose_filename(pose, take)          # one name, two files
+        stem = name[:-len(".jsonl")]
+        still = self.stills_dir / f"{stem}.jpg"
 
         # The beep goes to a thread: this one is the capture clock now, and a
         # quarter second of blocked frame loop in the middle of a take is a
@@ -1066,16 +1127,41 @@ class CoachedLeapSession(LeapSyncSession):
         self._say(f"      NOW: {pose.replace('_', ' ').upper()}  "
                   f"({self.settle:g} s to change shape, "
                   f"hand id {self._pinned_id})")
-        lost = self._hold("SETTLE", self.settle)
+        # THE SETTLE IS RECORDED, to sibling files, and the take is not
+        # touched. This is the open-palm -> pose transition: the only moving
+        # hand a coached session produces, and therefore the only thing a
+        # glove/camera time lag can be measured on (`estimate_glove_lag`).
+        # It must not go INTO the take, because every tool downstream takes a
+        # median over a take and assumes the pose was held.
+        settle_cam = settle_glove = None
+        if self.settle > 0:
+            settle_cam = self.make_cam_recorder(pose, take)
+            settle_glove = StampedFrameRecorder(hz=self.hz, pose=pose,
+                                                take=take)
+            cam_path, glove_path = self._settle_files(name)
+            self.discard_backlog()
+            settle_cam.start(cam_path)
+            settle_glove.start(glove_path)
+            stamp_phase(settle_cam, SETTLE_PHASE)
+            stamp_phase(settle_glove, SETTLE_PHASE)
+        try:
+            lost = self._hold("SETTLE", self.settle, settle_cam, settle_glove)
+        except BaseException:
+            if settle_cam is not None:
+                settle_cam.stop()
+                settle_glove.stop()
+                self._drop_settle(name)
+            raise
+        if settle_cam is not None:
+            settle_cam.stop()
+            settle_glove.stop()
         if lost:
+            self._drop_settle(name)
             return Attempt(why=f"{lost} during the settle",
                            hand_id=self._pinned_id,
                            rejected_chirality=self.rejected_chirality - before[0],
                            second_hand=self.second_hand - before[1])
 
-        name = pose_filename(pose, take)          # one name, two files
-        stem = name[:-len(".jsonl")]
-        still = self.stills_dir / f"{stem}.jpg"
         cam_rec = self.make_cam_recorder(pose, take)
         glove_rec = StampedFrameRecorder(hz=self.hz, pose=pose, take=take)
         self._heights, self._angles, self._times = [], [], []
@@ -1096,6 +1182,7 @@ class CoachedLeapSession(LeapSyncSession):
             self._deadline = None
             (self.cam_dir / name).unlink(missing_ok=True)
             (self.glove_dir / name).unlink(missing_ok=True)
+            self._drop_settle(name)
             still.unlink(missing_ok=True)
             raise
         cam_rec.stop()
@@ -1146,6 +1233,11 @@ class CoachedLeapSession(LeapSyncSession):
 
         final = cam_finalize(self.cam_dir / name, {self.hand})
         cam_finalize(self.glove_dir / name, {self.hand})
+        # The settle clips are renamed by the same rule, so a clip is still
+        # found beside its take by name alone once the hand has been inserted.
+        for path in self._settle_files(name):
+            if path.is_file():
+                cam_finalize(path, {self.hand})
         got.file = final.name
         got.still = self._rename_still(still, final.stem)
         if (got.glove_health.get("max_gap_ms") or 0) > GLOVE_GAP_WARN_S * 1000:
@@ -1220,6 +1312,18 @@ class CoachedLeapSession(LeapSyncSession):
             dst.parent.mkdir(parents=True, exist_ok=True)
             src.replace(dst)
             moved.append(dst)
+        # The settle clip goes with its take, under the same name. It is the
+        # transition INTO a pose that was then refused, so it has to be as
+        # countable as the refusal; leaving it in the session folder would
+        # leave `fuse_poses.py` measuring a lag on the clip of a take nobody
+        # kept.
+        for folder in (self.cam_dir, self.glove_dir):
+            src = folder / settle_name(name)
+            if not src.is_file():
+                continue
+            dst = self.rejected_dir / folder.name / settle_name(target)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src.replace(dst)
         still = self.stills_dir / f"{stem}.jpg"
         still_name = ""
         if still.is_file():

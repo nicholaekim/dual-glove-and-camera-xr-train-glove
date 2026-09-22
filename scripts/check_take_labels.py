@@ -38,6 +38,7 @@ from leap_hand.pose_check import (
     check_pose,
     read_take,
 )
+from cam_hand.recorder import take_files
 from leap_hand.protocol import stream_health
 
 CAM_DIRS = ("leap", "cam")
@@ -104,7 +105,10 @@ def audit(folder: Path, camera: str, params: PoseCheckParams):
                          "  point this at a session folder holding glove/ "
                          "plus leap/ or cam/")
     out = []
-    for gpath in sorted(glove_dir.glob("*.jsonl")):
+    # `take_files` and not a glob: a coached session also holds each
+    # take's SETTLE clip as a `.settle.jsonl` sibling, and a clip of a
+    # hand CHANGING shape is not a take whose pose can be checked.
+    for gpath in take_files(glove_dir):
         cpath = camera_file(folder, gpath.name, camera)
         pose, take, hand = take_label(gpath)
         glove = read_take(gpath, hand)

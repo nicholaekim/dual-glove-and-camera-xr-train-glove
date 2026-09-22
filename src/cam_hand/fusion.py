@@ -212,10 +212,34 @@ the RIGHT glove's ring and pinky that read partly extended through poses the
 left glove reports correctly. A plain sequence still means both hands, so
 nothing written before the mapping existed changes. `fingers_for(hand)` is the
 only reader.
+
+WHEN THE TWO SENSORS ARE DESCRIBING DIFFERENT INSTANTS
+------------------------------------------------------
+Everything above assumes a paired glove frame and camera frame are two views
+of one hand at one moment. `pair_by_time` matches them on the capture clock,
+which is the best clock either sensor offers — and it is still not the instant
+the hand was in that shape on the glove side: the glove's solved hand TRAILS
+the camera, measured on this laptop at roughly 100 ms on the left hand and
+450-485 ms on the right (cross-correlated index curl over close/open
+transitions).
+
+For a HELD pose it makes no difference, and that is worth stating as a
+measurement rather than an argument: on day 1's 59 static takes, applying the
+right hand's 460 ms moves no per-take median by more than 0.01. For a MOVING
+hand it pairs a glove frame with a camera frame from a different instant, and
+every gate above then compares two different hands.
+
+So `pair_by_time` takes `glove_lag` seconds and shifts the glove's PAIRING
+stamp back by it — a glove frame stamped t describes the hand at t - lag.
+Nothing is resampled and no recorded stamp is rewritten; the shift lives
+inside the match. `estimate_glove_lag` measures it per hand with
+`leap_hand.diagnostics.estimate_lag`, and refuses to answer at all on a clip
+whose camera index curl barely moved, because a cross-correlation of two flat
+lines has a maximum and it means nothing.
 """
 import math
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import (Dict, Iterable, List, Mapping, Optional, Sequence, Tuple,
                     Union)
 
@@ -282,7 +306,16 @@ class GateParams:
                          which the glove says a finger is extended enough for
                          its abduction to be worth reading. 1.2 is the midpoint
                          between the glove's fist values (0.63-0.8) and its
-                         open-palm values (1.71-2.07).
+                         open-palm values (1.71-2.07) — ON THE TEMPLATE HAND.
+                         Curl is a LENGTH ratio, so rescaling the template's
+                         bones to a real hand (`template_fit`) moves every one
+                         of those values, and a constant tuned on the template
+                         then sits in a different place between them. It is
+                         carried across a fit by `curl_gates_from_rails`,
+                         which re-expresses it as the same fraction of each
+                         hand and finger's own learned rail; with no fit the
+                         rails are the template's and the number is exactly
+                         this one. See `fuse_skeletons`'s `curl_gates`.
     view_gate_deg        angle between the camera's palm normal and the ray
                          from the palm to the module. Small = the palm faces
                          the sensor. Open palm and pinch measure 25-45 deg in
@@ -494,6 +527,63 @@ def learn_rails(samples: Iterable[Tuple[str, Sequence[float]]],
             continue
         rails[key] = median(near)
     return rails
+
+
+def curl_gates_from_rails(gates: Optional[GateParams],
+                          template_rails: Mapping[Tuple[str, str], float],
+                          fitted_rails: Mapping[Tuple[str, str], float],
+                          hand: str) -> Optional[List[float]]:
+    """`curl_gate` for one hand, per finger, carried across a template fit.
+
+    `curl_gate` decides whether the GLOVE says a finger is extended enough for
+    its abduction to be worth reading, and it is a constant tuned on the
+    template hand's curls: 1.2, the midpoint between its fists (0.63-0.8) and
+    its open palms (1.71-2.07). Curl is a length RATIO, so fitting the
+    template's bones to a real hand multiplies every one of those numbers by
+    that finger's scale — measured on sync_day1, the index's open value goes
+    1.974 -> 1.707 — and 1.2 is then no longer the midpoint but a bar the
+    partly-extended fingers fall under. Left alone it cost 13 points of
+    camera-use on the ring finger's spread.
+
+    The fix is not a new constant. A constant retuned on one operator's fitted
+    hand would be wrong for the next operator by exactly the amount the fit
+    exists to remove. So the threshold is expressed as the same FRACTION of
+    that hand and finger's own rail — the glove's own open-palm reading for
+    it, which `learn_rails` measures from the session — and evaluated against
+    the rails the fusion is actually comparing:
+
+        gate = curl_gate * (fitted rail / template rail)
+
+    Two properties make this safe. With no fit the two rails are the same
+    number and the gate is exactly `curl_gate`, so nothing that ran before
+    behaves differently. With a fit, the threshold moves by the SAME factor
+    the finger's open value moved by, so the decision is preserved rather
+    than shifted: measured over both sessions the spread camera-use comes
+    back within half a point on index, middle and pinky and 3.6 to 6.2 points
+    BETTER on the ring, against the 13-point loss the bare constant caused.
+    It is not bit-exact, and cannot be — a bent finger's tip-to-wrist
+    distance does not scale by quite the same factor as a straight one's,
+    because the segments are rescaled by different amounts each.
+
+    A finger with no rail on this hand (never seen straight, so `learn_rails`
+    refuses to guess) keeps the constant: there is no open value to take a
+    fraction of. Returns None when there is nothing to carry, which the caller
+    passes straight through as "use the constant".
+    """
+    gates = gates or DEFAULT_GATES
+    if not template_rails or not fitted_rails:
+        return None
+    out = []
+    moved = False
+    for finger in FINGER_NAMES:
+        was = template_rails.get((hand, finger))
+        now = fitted_rails.get((hand, finger))
+        if was is None or now is None or was <= 1e-9:
+            out.append(gates.curl_gate)
+            continue
+        out.append(gates.curl_gate * float(now) / float(was))
+        moved = moved or abs(now - was) > 1e-12
+    return out if moved else None
 
 
 @dataclass(frozen=True)
@@ -959,6 +1049,7 @@ def fuse_skeletons(
     gates: Optional[GateParams] = None,
     rail: Optional[RailDecision] = None,
     unreliable_fingers: Sequence[str] = (),
+    curl_gates: Optional[Sequence[float]] = None,
 ) -> Tuple[np.ndarray, dict]:
     """Fuse one glove frame with one camera frame -> 21 points + info.
 
@@ -986,6 +1077,12 @@ def fuse_skeletons(
     per hand because gloves fail per hand: on sync_day1 the right glove's ring
     and pinky read partly extended through thumbs_up and peace while the left
     glove's do not.
+
+    `curl_gates` replaces `gates.curl_gate` per finger, in FINGER_NAMES order.
+    It exists for one caller — a glove hand whose bones have been rescaled to
+    the operator's by `template_fit`, which moves every curl the gate reads —
+    and `curl_gates_from_rails` is what builds it. None, the default, uses the
+    one constant for every finger, which is what every caller did before.
 
     Returns the fused points and an info dict: `dof_source` says where each
     camera-owned DOF actually came from, `rejected` says why the glove kept
@@ -1085,11 +1182,17 @@ def fuse_skeletons(
         disagreement = None
     info["curl_disagreement"] = disagreement
 
+    def curl_gate_for(finger: str) -> float:
+        i = FINGER_NAMES.index(finger)
+        if curl_gates is None or i >= len(curl_gates):
+            return gates.curl_gate
+        return float(curl_gates[i])
+
     def spread_verdict(finger: str) -> Optional[str]:
         """None if the camera may set this finger's azimuth, else the reason."""
         if cam_meta is None:
             return None
-        if curl_g[FINGER_NAMES.index(finger)] <= gates.curl_gate:
+        if curl_g[FINGER_NAMES.index(finger)] <= curl_gate_for(finger):
             return R_CURLED
         if view_deg is None:
             return R_NO_GEOMETRY
@@ -1227,15 +1330,46 @@ def _stamp(d: dict, clock: str) -> float:
     return float(v if v is not None else d[WALL_CLOCK])
 
 
+def _lag_of(glove_lag, hand: Optional[str]) -> float:
+    """`glove_lag` for this hand: one number, or one per hand side."""
+    if isinstance(glove_lag, Mapping):
+        return float(glove_lag.get(str(hand).strip().lower(), 0.0))
+    return float(glove_lag or 0.0)
+
+
 def pair_by_time(glove: Sequence[dict], cam: Sequence[dict],
                  max_dt: float = 0.05,
-                 clock: str = AUTO) -> List[Tuple[dict, Optional[dict]]]:
+                 clock: str = AUTO,
+                 glove_lag: Union[float, Mapping[str, float]] = 0.0
+                 ) -> List[Tuple[dict, Optional[dict]]]:
     """Match camera frames to glove frames by a shared clock, per hand.
 
     Each glove frame takes the nearest camera frame of the SAME hand within
     max_dt seconds; frames with no partner pair with None and stay
     glove-only. `clock` is "auto" (ask `pairing_clock`) or a key to force —
     see `pairing_clock` for why the choice matters.
+
+    `glove_lag` is SECONDS the glove's solved hand TRAILS the camera, and it
+    shifts the glove's pairing stamp back by that much: a glove frame stamped
+    t describes the hand at t - lag, so t - lag is the instant a camera frame
+    has to be near. Nothing is resampled and no stamp is rewritten — the
+    shift exists only inside the match, and the rows handed back are the rows
+    that were passed in.
+
+    It is measured, not assumed: `estimate_glove_lag`. On this laptop the
+    glove's solved hand trails the camera by roughly 100 ms on the left hand
+    and 450-485 ms on the right. For a HELD pose that does not matter — both
+    sensors are describing a hand that is not moving, and day 1's static takes
+    move no per-take median by more than 0.01 whether the shift is applied or
+    not. For a MOVING hand it is the difference between pairing two views of
+    one instant and pairing two different instants.
+
+    One number is one lag for every hand in these rows; a mapping
+    (`{"left": 0.10, "right": 0.46}`) is per hand side, because the two
+    gloves are separate garments on separate stretch sensors and do not
+    answer at the same speed. `max_dt` is unchanged and still measured on the
+    SHIFTED stamps, so a lag larger than the real one loses pairs rather than
+    quietly matching further apart.
     """
     if clock == AUTO:
         clock = pairing_clock(glove, cam)
@@ -1248,7 +1382,9 @@ def pair_by_time(glove: Sequence[dict], cam: Sequence[dict],
 
     out: List[Tuple[dict, Optional[dict]]] = []
     for g in sorted(glove, key=lambda d: _stamp(d, clock)):
-        t_g = _stamp(g, clock)
+        # The glove's stamp is when the SOLVED hand arrived; the hand it
+        # describes was in that shape `lag` seconds earlier.
+        t_g = _stamp(g, clock) - _lag_of(glove_lag, g.get("hand_side"))
         candidates = by_hand.get(g["hand_side"], [])
         best, best_dt = None, max_dt
         # linear scan is fine: takes are seconds long, not hours
@@ -1258,3 +1394,193 @@ def pair_by_time(glove: Sequence[dict], cam: Sequence[dict],
                 best, best_dt = c, dt
         out.append((g, best))
     return out
+
+
+# --- how far the glove trails the camera -------------------------------
+
+# The camera's index curl has to move at least this much over a clip before a
+# lag measured on it means anything. A cross-correlation of two flat lines has
+# a maximum and it is noise; on a held pose that is exactly what both traces
+# are. 0.1 of a palm length is well under the ~0.9 an open-to-fist transition
+# covers and well over the 0.01-0.03 a held pose wanders by.
+#
+# It is required of the standard deviation AND of the median absolute
+# deviation, and the second is the one that does the work. Measured on
+# sync_day1: `open_palm_right_take3` is flat at 1.77 for five seconds with one
+# 0.4 s tracking dip to 1.05 in the middle, and that single dip gives it a
+# std of 0.230 — over any threshold a real transition would need — while its
+# MAD is 0.005. A robust spread is the difference between "this clip is a
+# transition" and "this clip is a held pose with one mistracked patch in it",
+# and the same lesson is already why `diagnostics.camera_range` measures
+# between percentiles instead of min to max. For a ramp the two agree to
+# within 15 % (std = span/sqrt(12), MAD = span/4), so one threshold serves.
+MIN_LAG_CAM_STD = 0.1
+# ...and the shift has to EXPLAIN both traces. The correlation is the measure
+# of that, so it is the thing to put a floor under: on sync_day1's
+# `thumbs_up_right_take1` the camera steps from 0.89 to 1.7 halfway through
+# and stays (the known edge-on thumbs_up failure) while the glove holds 0.7,
+# which is a sustained camera move by any spread measure and correlates at
+# -0.43. A planted lag on two views of one hand correlates above 0.95.
+MIN_LAG_CORRELATION = 0.8
+
+# The two signals a lag can be read off, in the order they are tried. Both are
+# `features.flexion_features` of the two skeletons, so they are the same
+# quantity the reports print.
+LAG_SIGNAL_INDEX = "index curl"
+LAG_SIGNAL_MEDIAN = "median index..pinky curl"
+
+NOT_MEASURABLE = "not measurable"
+
+
+@dataclass(frozen=True)
+class GloveLagEstimate:
+    """How far one hand's glove trails the camera over one clip.
+
+    `seconds` is positive when the GLOVE trails, which is the direction
+    `pair_by_time`'s `glove_lag` expects. `trusted` is the only field a caller
+    should branch on: an untrusted estimate carries whatever the
+    cross-correlation happened to return and `why` says why it is not to be
+    believed, because a number with no reason beside it invites being used.
+    """
+
+    seconds: float = 0.0
+    correlation: float = 0.0
+    trusted: bool = False
+    cam_std: float = 0.0
+    cam_spread: float = 0.0
+    n_glove: int = 0
+    n_cam: int = 0
+    signal: str = ""
+    why: str = ""
+
+    @property
+    def ms(self) -> float:
+        return self.seconds * 1000.0
+
+    def described(self) -> str:
+        if not self.trusted:
+            return self.why or NOT_MEASURABLE
+        return (f"{self.ms:+.0f} ms  (r {self.correlation:.2f}, "
+                f"camera index curl std {self.cam_std:.2f} / spread "
+                f"{self.cam_spread:.2f}, {self.signal})")
+
+
+def _curl_series(rows: Sequence[dict], clock: str
+                 ) -> Tuple[List[float], List[List[float]]]:
+    """(times, curls-per-frame) for one hand's rows, in time order."""
+    ordered = sorted(rows, key=lambda d: _stamp(d, clock))
+    times = [_stamp(d, clock) for d in ordered]
+    curls = [list(flexion_features(np.asarray(d["pts"], float)))
+             for d in ordered]
+    return times, curls
+
+
+def estimate_glove_lag(glove_rows: Sequence[dict], cam_rows: Sequence[dict],
+                       clock: str = AUTO,
+                       min_cam_std: float = MIN_LAG_CAM_STD,
+                       min_correlation: float = MIN_LAG_CORRELATION,
+                       hand: Optional[str] = None) -> GloveLagEstimate:
+    """Cross-correlate the two curl traces: how far does the glove trail?
+
+    `glove_rows` and `cam_rows` are the row dicts the fusion loaders produce
+    (`pts`, `hand_side`, and the clocks) for ONE hand — pass `hand` to have
+    them filtered here instead. The arithmetic is
+    `leap_hand.diagnostics.estimate_lag`, unchanged and not reimplemented:
+    both traces are resampled onto one grid, z-scored over each candidate
+    overlap and matched on SHAPE, so the glove's different range and its
+    offset cannot influence the answer. That function is also what
+    `scripts/leap/finger_sweep.py` reports a per-finger lag with, and two
+    numbers that will be compared have to come from one implementation.
+
+    Imported inside the call on purpose: `leap_hand.protocol` imports this
+    module, so a module-level import here would be a cycle.
+
+    TRUST IS DECIDED FIRST ON THE CAMERA
+      A held pose gives two flat traces whose best shift is noise, so the
+      first test is whether the HAND MOVED, measured on the camera's index
+      curl — the sensor that is not the one under suspicion. Both its standard
+      deviation and its median absolute deviation over the clip must exceed
+      `min_cam_std`; see that constant for why the robust one is the one that
+      matters. Then the shift has to EXPLAIN the two traces
+      (`min_correlation`), and its peak has to lie strictly inside the search
+      window — a best lag sitting on `diagnostics.LAG_MIN` is a wall, not a
+      maximum. An estimate failing any of these comes back untrusted with
+      "not measurable" on it and the caller applies nothing.
+
+    TWO SIGNALS, THE BETTER FIT WINS
+      The index curl alone is the finger a close/open transition moves most.
+      The median over index..pinky is four stretch sensors instead of one, so
+      a single mistracked finger cannot carry it. Both are tried and the
+      higher correlation is kept, with `signal` saying which — the correlation
+      IS the measure of how well a shift explains the two traces, so choosing
+      on it is choosing the better-explained alignment rather than the more
+      convenient number.
+    """
+    from leap_hand.diagnostics import (LAG_MAX, LAG_MIN,  # cycle: see docstring
+                                       estimate_lag)
+
+    if hand is not None:
+        side = str(hand).strip().lower()
+        glove_rows = [r for r in glove_rows
+                      if str(r.get("hand_side", "")).lower() == side]
+        cam_rows = [r for r in cam_rows
+                    if str(r.get("hand_side", "")).lower() == side]
+    blank = GloveLagEstimate(n_glove=len(glove_rows), n_cam=len(cam_rows))
+    if len(glove_rows) < 2 or len(cam_rows) < 2:
+        return replace(blank, why=f"{NOT_MEASURABLE}: too few frames "
+                                  f"({len(glove_rows)} glove, {len(cam_rows)} "
+                                  "camera)")
+    if clock == AUTO:
+        clock = pairing_clock(glove_rows, cam_rows)
+
+    gt, g_curls = _curl_series(glove_rows, clock)
+    ct, c_curls = _curl_series(cam_rows, clock)
+    i_index = FINGER_NAMES.index("index")
+    cam_index = np.asarray([row[i_index] for row in c_curls], float)
+    cam_std = float(cam_index.std())
+    # The robust twin of that std: half the clip is within this of the middle.
+    cam_spread = float(np.median(np.abs(cam_index - np.median(cam_index))))
+    blank = replace(blank, cam_std=cam_std, cam_spread=cam_spread,
+                    n_glove=len(gt), n_cam=len(ct))
+    if cam_std <= min_cam_std or cam_spread <= min_cam_std:
+        return replace(blank, why=(
+            f"{NOT_MEASURABLE}: the camera's index curl moved by "
+            f"{cam_std:.3f} (spread {cam_spread:.3f}) over this clip, need "
+            f"both over {min_cam_std:.2f} — a held pose has no transition to "
+            "align on"))
+
+    four = [FINGER_NAMES.index(f) for f in RAIL_FINGERS]
+
+    def series(rows, which):
+        if which == LAG_SIGNAL_INDEX:
+            return [row[i_index] for row in rows]
+        return [median([row[i] for i in four]) for row in rows]
+
+    best = None
+    for which in (LAG_SIGNAL_INDEX, LAG_SIGNAL_MEDIAN):
+        got = estimate_lag(gt, series(g_curls, which),
+                           ct, series(c_curls, which))
+        if got is None:
+            continue
+        if best is None or got.correlation > best[0].correlation:
+            best = (got, which)
+    if best is None:
+        return replace(blank, why=(
+            f"{NOT_MEASURABLE}: neither curl trace moved enough for a shift "
+            "to be searched over — the glove is pinned on its rail, or the "
+            "two takes overlap for too little time"))
+    got, which = best
+    found = replace(blank, seconds=float(got.seconds),
+                    correlation=float(got.correlation), signal=which)
+    if got.correlation < min_correlation:
+        return replace(found, why=(
+            f"{NOT_MEASURABLE}: the best shift ({found.ms:+.0f} ms) explains "
+            f"the two traces at r {got.correlation:.2f}, under "
+            f"{min_correlation:.2f} — they are not two views of one moving "
+            "hand"))
+    if not (LAG_MIN < got.seconds < LAG_MAX):
+        return replace(found, why=(
+            f"{NOT_MEASURABLE}: the best shift is {found.ms:+.0f} ms, at the "
+            f"edge of the {LAG_MIN * 1000:+.0f}..{LAG_MAX * 1000:+.0f} ms "
+            "search window — that is a wall, not a peak"))
+    return replace(found, trusted=True)

@@ -1527,7 +1527,24 @@ def _started(source):
 
 
 def _takes(out_dir: Path, folder: str):
-    return sorted((out_dir / folder).glob("*.jsonl"))
+    """The TAKES in a session folder — settle clips are not takes.
+
+    `cam_hand.recorder.take_files` is the one enumeration a reader of a
+    session should use, and these tests are a reader of a session: a coached
+    take now has a `.settle.jsonl` sibling holding its open-palm -> pose
+    transition, and counting it as a take would mean every assertion about
+    "one take on each side" was really about two files.
+    """
+    from cam_hand.recorder import take_files
+
+    return take_files(out_dir / folder)
+
+
+def _settles(out_dir: Path, folder: str):
+    """...and the settle clips, which is the other half of the same question."""
+    from cam_hand.recorder import SETTLE_SUFFIX
+
+    return sorted((out_dir / folder).glob("*" + SETTLE_SUFFIX))
 
 
 def _meta(out_dir: Path) -> dict:
@@ -1701,6 +1718,130 @@ def test_the_hud_beeps_cannot_stall_the_frame_loop(tmp_path: Path,
     # and the take is still the length it was asked for, not beep-stretched
     assert 1.4 <= times[-1] - times[0] <= 1.9
     assert _meta(out_dir)["coverage"] == pytest.approx(1.0, abs=0.02)
+
+
+def test_an_accepted_take_keeps_its_settle_clip_beside_it(tmp_path: Path,
+                                                          monkeypatch):
+    """The transition into the pose is recorded, and NOT into the take.
+
+    A coached take is REC only, so every tool downstream can take a median
+    over it and mean "the held pose". That leaves the open-palm -> pose
+    transition unrecorded, and it is the only moving hand the session
+    produces — the only thing `cam_hand.fusion.estimate_glove_lag` can
+    measure the glove's time lag on. So the settle phase goes to a sibling
+    file on both sides, named after the take and stamped `phase: "settle"`,
+    and the take itself is untouched.
+    """
+    def plan(t):
+        return [("left", 7101, 5_000_000)]
+
+    _sync, out_dir = _coached_run(tmp_path, monkeypatch, plan,
+                                  ["--duration", "1", "--settle", "0.6"])
+    for folder in ("leap", "glove"):
+        takes, settles = _takes(out_dir, folder), _settles(out_dir, folder)
+        assert len(takes) == len(settles) == 1, folder
+        # same take name on both, so a clip is found beside its take by name
+        assert settles[0].name == takes[0].name.replace(".jsonl",
+                                                        ".settle.jsonl")
+        assert "_left_" in settles[0].name, "renamed with the take"
+        rows = _rows(settles[0])
+        assert rows, f"{folder} settle clip is empty"
+        assert all(r["phase"] == "settle" for r in rows)
+        assert {r["pose"] for r in rows} == {"fist"}
+        # ...and the take says nothing about a phase: it is REC and only REC
+        assert all("phase" not in r for r in _rows(takes[0]))
+    # both sides of the clip pair, and on the clock they will be paired on
+    from cam_hand.fusion import pairing_clock
+    glove = _rows(_settles(out_dir, "glove")[0])
+    cam = _rows(_settles(out_dir, "leap")[0])
+    assert pairing_clock(glove, cam) == "capture_time"
+    assert {r["source"] for r in cam} == {"leap"}
+    # the clip is the settle window, not the take: it ended before REC began
+    assert max(r["capture_time"] for r in cam) <= min(
+        r["capture_time"] for r in _rows(_takes(out_dir, "leap")[0])) + 0.05
+
+
+def test_a_rejected_attempt_takes_its_settle_clip_with_it(tmp_path: Path,
+                                                          monkeypatch):
+    """A clip whose take was refused is set aside with it, never left behind.
+
+    Same rule as the take itself: an exclusion has to stay countable, and a
+    clip left in the session folder would be measured as the transition into
+    a pose nobody kept.
+    """
+    def plan(t):
+        if 1.2 <= t < 1.55 or 1.9 <= t < 2.25 or 2.6 <= t < 2.95:
+            return []
+        return [("left", 7201, 5_000_000)]
+
+    _sync, out_dir = _coached_run(
+        tmp_path, monkeypatch, plan,
+        ["--duration", "2.5", "--settle", "0.4", "--retries", "0",
+         "--acquire-timeout", "3"])
+
+    for folder in ("leap", "glove"):
+        assert _takes(out_dir, folder) == [], "an incomplete take is not kept"
+        assert _settles(out_dir, folder) == [], "...nor is its settle clip"
+        aside = _settles(out_dir / "rejected", folder)
+        assert len(aside) == 1, f"the clip must be under rejected/{folder}"
+        assert "_attempt1" in aside[0].name
+        assert all(r["phase"] == "settle" for r in _rows(aside[0]))
+
+
+def test_an_attempt_lost_during_the_settle_leaves_no_clip(tmp_path: Path,
+                                                          monkeypatch):
+    """Nothing to pair a clip with means no clip.
+
+    The hand is acquired on one id and the tracker re-acquires it under
+    another during the settle, so the attempt is abandoned before a take file
+    is ever opened. There is no verdict on a recording to audit — the same
+    case the interrupted-take branch deletes rather than sets aside — so the
+    clip goes too, and `rejected/` stays a folder of judged attempts.
+    """
+    def plan(t):
+        if t < 1.0:
+            return [("left", 7301, int(t * 1e6))]
+        return [("left", 7302, int((t - 1.0) * 1e6))]
+
+    _sync, out_dir = _coached_run(
+        tmp_path, monkeypatch, plan,
+        ["--duration", "0.8", "--settle", "1.5", "--retries", "1"])
+
+    assert _meta(out_dir)["attempts"] == 2, "the first attempt was retried"
+    assert not (out_dir / "rejected").exists()
+    for folder in ("leap", "glove"):
+        assert len(_takes(out_dir, folder)) == 1
+        # one clip, the surviving attempt's — not two
+        assert len(_settles(out_dir, folder)) == 1
+
+
+def test_a_settle_clip_is_where_the_glove_lag_is_measured(tmp_path: Path,
+                                                          monkeypatch):
+    """End to end: the recorder writes clips, fuse_poses finds them by name.
+
+    The mock hand does not actually change shape on cue, so this is about the
+    plumbing — that the pair is discovered, loaded and offered to the
+    estimator — and not about the lag it comes back with. What the estimator
+    does with a moving hand is `tests/test_fusion.py`'s job, on a synthetic
+    pair with a planted lag.
+    """
+    def plan(t):
+        return [("left", 7401, 5_000_000)]
+
+    _sync, out_dir = _coached_run(tmp_path, monkeypatch, plan,
+                                  ["--duration", "1", "--settle", "0.6"])
+    fuse = _load_repo_script("fuse_poses")
+    clips = fuse.settle_clips(out_dir, [out_dir / "leap"])
+    assert len(clips) == 1
+    gpath, cpath = clips[0]
+    assert gpath.parent.name == "glove" and cpath.parent.name == "leap"
+    assert gpath.name == cpath.name
+    # ...and the take enumeration does not see them
+    assert len(fuse.take_files(out_dir / "glove")) == 1
+    row = fuse.lag_from_clips(
+        [(fuse.load_glove(gpath), fuse.load_cam(cpath)[0])], "left", "settle")
+    assert row.n_clips == 1
+    assert row.applied or "not measurable" in row.why
 
 
 def test_the_leap_backend_insists_on_being_told_which_hand(monkeypatch):

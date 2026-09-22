@@ -417,7 +417,11 @@ REC       3.4s left YES      23.8 cm OK       view  11 deg  glove 59.8/s
   is missing (`need: TOO LOW, turn palm to lens`), and `WRONG HAND` when the
   only thing in view is the other chirality.
 * **SETTLE** beeps, prints `NOW: FIST`, and gives `--settle` seconds (default
-  1.5) for the hand to change shape while the tracker follows it.
+  1.5) for the hand to change shape while the tracker follows it. This phase
+  **is recorded** — to `<take>.settle.jsonl` beside the take, on both sensors,
+  and never into the take, which stays REC only. It is the only moving hand
+  the session produces and so the only thing a glove/camera time lag can be
+  measured on: see "The glove's time lag".
 * **REC** records `--duration` seconds — but only if the hand id pinned at
   acquire is still on the hand. If it changed, or the hand was lost, the
   attempt says so, **both files are set aside** (see below), and the take is
@@ -1062,12 +1066,15 @@ It exists so that dropping a bad take does not mean copying a folder.
 `recordings\sync_day2` holds a mislabelled `pinch_right_take1` — its still
 shows a peace hand — and `recordings\sync_day2_clean` was a hand-made copy
 without it. `--exclude pinch_right_take1` on `sync_day2` reproduces that copy
-exactly: glove 40/59, camera 59/59, fused 52/59, and the same camera-use table
-to the frame.
+exactly — the same camera-use table to the frame and the same classifier. With
+the defaults of the day (`--profile none --glove-lag none --fit-template
+none`) that is glove 40/59, camera 59/59, fused 52/59; with today's it is
+53/59, and the two folders still agree to the frame.
 
-**Standing knowledge about a glove: `--profile`.** `--unreliable` and
-`--rail-fingers` are things the operator has to remember and retype correctly
-every run. A profile writes them down once, **per hand**, with the evidence:
+**Standing knowledge about a glove: `--profile`, on by default.**
+`--unreliable` and `--rail-fingers` are things the operator has to remember
+and retype correctly every run. A profile writes them down once, **per hand**,
+with the evidence:
 
 ```json
 {
@@ -1079,9 +1086,19 @@ every run. A profile writes them down once, **per hand**, with the evidence:
 ```
 
 ```powershell
-python scripts\fuse_poses.py recordings\sync_day2 --exclude pinch_right_take1 `
-    --profile profiles\reality_glove_nk_2026-09.json
+python scripts\fuse_poses.py recordings\sync_day2 --exclude pinch_right_take1
 ```
+
+`--profile` defaults to **`auto`**, which is `profiles\default.json` if that
+exists, else `profiles\reality_glove_nk_2026-09.json`, else nothing — and the
+report always names the file and how it was chosen. It is a default because
+the masks were measured on this hardware and were being applied only when
+somebody remembered the flag; a report that prints the fusion **both ways**
+cannot hide what the mask did. `profiles\default.json` is a copy of the NK
+profile whose comment says so in as many words: it is **this operator's glove
+pair**, and it is the file to replace for another glove or another person.
+`--profile none` fuses unmasked, and an explicit path is used as given (a
+missing one is an error, not a quiet fall back to `auto`).
 
 Per hand throughout, because that is how gloves fail — on `sync_day1` it is
 the *right* glove's ring and pinky that read partly extended through poses the
@@ -1103,6 +1120,149 @@ the sweep it has began with the finger already bent. That repeat has now been
 attempted twice and the ring still has no clean isolated sweep: the 21:22 run
 is the one the camera did not follow. It stays off the list until a
 **whole-hand** sweep measures it.
+
+### The glove's time lag
+
+The glove's *solved* hand arrives late. Measured on this laptop by
+cross-correlating the two sensors' index curl over close/open transitions, it
+trails the camera by roughly **100 ms on the left hand and 450-485 ms on the
+right** — the two gloves are separate garments on separate stretch sensors and
+do not answer at the same speed. For a **held** pose that changes nothing:
+both sensors are describing a hand that is not moving. For a **moving** hand
+it pairs a glove frame with a camera frame from a different instant, and every
+gate above is then comparing two different hands.
+
+`pair_by_time(..., glove_lag=...)` shifts the glove's **pairing stamp** back by
+the lag: a glove frame stamped *t* describes the hand at *t - lag*, so *t -
+lag* is the instant a camera frame has to be near. Nothing is resampled and no
+recorded stamp is rewritten; `--max-dt` still means what it says on the
+shifted stamps, so a lag larger than the real one loses pairs rather than
+quietly matching frames further apart.
+
+`--glove-lag` defaults to **`auto`**: per hand, `estimate_glove_lag` measures
+it from every **SETTLE clip** in the session (see below), falls back to takes
+whose camera curl moved enough, and applies the median of the trustworthy
+estimates — or **nothing at all** if there are none. An unmeasured lag is not
+a zero lag, but pairing on the raw stamps is what the pipeline did before and
+is the only honest default. `--glove-lag none` turns it off and
+`--glove-lag left:0.10,right:0.46` applies given values, which is how a lag
+gets *checked* against a session.
+
+A lag is refused unless the camera's index curl moved — both its standard
+deviation and its **median absolute deviation** over the clip above 0.1 — the
+best shift explains the two traces at *r* >= 0.8, and that shift is strictly
+inside the search window. Each of those has a session behind it. `sync_day1`'s
+`open_palm_right_take3` is flat at 1.77 for five seconds with one 0.4 s
+tracking dip: std 0.230, MAD 0.005. Its `thumbs_up_right_take1` steps from 0.89
+to 1.7 halfway through and stays there while the glove holds 0.7 — a real
+sustained camera move, correlating at **-0.43**, with its best shift pinned on
+the edge of the window. Both sessions of held poses therefore report **"not
+measurable"** on both hands and apply nothing, and every one of their 649
+per-take medians is bit-identical with the correction on.
+
+**The SETTLE clip.** A coached take is REC only, so a median over it means
+"the held pose" — which leaves the open-palm -> pose transition unrecorded,
+and that transition is the only moving hand a coached session produces.
+`record_simultaneous.py` now writes it beside each accepted take as
+`<take>.settle.jsonl`, on **both** sensors, same schema plus `phase:
+"settle"`. The take files are untouched, so nothing downstream changes
+meaning; `cam_hand.recorder.take_files` is the enumeration that leaves the
+clips out, and every tool that walks a session uses it. A clip follows its
+take: renamed with it when the take is accepted, moved to `rejected\` with
+it when the pose check refuses it, and deleted when the attempt dies during
+the settle itself — there is then no take to pair it with.
+
+**Checked on `sync_day1`** (59 held-pose takes, no settle clips): `auto`
+reports "not measurable" on both hands and moves nothing at all. A manual
+`--glove-lag right:0.46` leaves all 319 left-hand medians bit-identical and
+moves the four finger curls by at most **0.012** — but it moves the
+camera-owned angle rows by up to 6 degrees on individual right-hand takes,
+because re-pairing changes *which* camera frame each gate reads and so whether
+the camera supplies that frame's thumb or spread at all, and because the
+leading 460 ms of each right-hand take loses its partner (744 pairs of 17689).
+Lag-insensitive means the *flexion* the glove owns, not every row of the
+table.
+
+### Fitting the glove's template hand to the operator's
+
+The glove measures **angles**. It does not measure bone **lengths**: XR
+Trainer hangs every angle it solves on one fixed template skeleton, the same
+one for every wearer, so a `HandFrame` off the glove is the operator's pose on
+somebody else's hand. The camera measures the real lengths, in millimetres,
+every frame. The mismatch showed up in two numbers the report had been
+printing all along: a 3.0-3.3 mm palm-fit residual, and a fused pinch index
+curl sitting about **0.15 above the camera's** — curl is a tip-to-wrist
+distance over palm length, and the template's palm is 81 mm where the camera
+measures 96.
+
+`src/cam_hand/template_fit.py` removes it at the source. `measure_hand` takes
+the median length of every segment of the 26-joint chain — including the
+wrist-to-metacarpal and metacarpal-to-knuckle **palm** segments — over the
+camera's trusted frames of one hand, preferring the frames the camera could
+actually see: an **open** hand, decided on the camera's own curls against
+`cam_open_curl`, never on the glove's claim to be open. `fit_template`
+rescales each parent-relative joint offset to the measured length **keeping
+every rotation**, so every joint angle in the hand is bit-identical and
+forward kinematics reproduces the measured lengths exactly — there is no fit
+and therefore no residual. Measurements save and load as
+`profiles\hand_<hand>_<stamp>.json`, in millimetres per segment.
+
+`--fit-template` defaults to **`auto`**: measure per hand from the session's
+own camera frames, save it as `<input>\template_<hand>.json`, and fuse with
+the fitted glove. The **`glove` column and the glove-only classifier stay on
+the RAW template**, because that is what the glove alone gives, and the report
+says so; the fused column is the fitted glove.
+
+**One threshold had to be re-expressed.** `curl_gate` (1.2) is the midpoint
+between the glove's fists and its open palms *on the template hand*, and curl
+is a length ratio, so the fit moves every value it reads — the index's open
+value goes 1.974 to 1.707. Left as a constant it cost 13 points of camera-use
+on the ring finger's spread. It is now carried across as the same **fraction
+of that hand and finger's own learned rail** (`curl_gates_from_rails`) rather
+than retuned, because a constant retuned on one operator's fitted hand would
+be wrong for the next by exactly the amount the fit exists to remove. With no
+fit the rails are the template's and the number is exactly 1.2, so nothing
+that ran before behaves differently. Nothing else needed touching:
+`cam_open_curl` and the override's `margin` read the **camera**, the
+override's `tol` compares the glove against its own learned rail, and
+`curl_agree_tol` compares the two sensors — whose agreement is what the fit
+improves. `leap_hand.pose_check` is untouched; it reads the raw take files at
+record time, where no camera measurement exists yet.
+
+**Measured on both sessions, fit off then on** (`--camera leap`):
+
+| | day 1 off | day 1 on | day 2 off | day 2 on |
+|---|---|---|---|---|
+| fused pinch index curl minus the camera's, median over takes | +0.141 | **-0.004** | +0.139 | **-0.007** |
+| classifier, default (glove / camera / fused) | 43 / 59 / **55** | 43 / 59 / **57** | 40 / 59 / **52** | 40 / 59 / **53** |
+| classifier, with the profile | 43 / 59 / 57 | 43 / 59 / 57 | 40 / 59 / 53 | 40 / 59 / 53 |
+| camera-use, thumb | 77.4% | **93.9%** | 82.8% | **90.9%** |
+| camera-use, spread ring | 55.3% | **58.9%** | 51.1% | **57.3%** |
+| override active on pinch frames | 77.9% | 77.9% | 94.3% | 94.3% |
+| palm fit RMSE, open_palm takes | 6.5 mm | **4.3 mm** | 6.7 mm | **4.3 mm** |
+| palm fit RMSE, every paired frame | **3.0 mm** | 7.7 mm | **3.3 mm** | 7.0 mm |
+
+The thumb's camera-use rises because `curl_agree_tol` compares the two
+sensors' curls and the template bias was inflating that disagreement by about
+0.15; removing a known bias from a comparison is the point. The override's
+activation is identical frame for frame, and so is the camera-use on index,
+middle and pinky (within half a point).
+
+**The last row is the one that gets worse, and it is worth being exact about
+why.** The palm residual is a rigid 5-point fit, so it is the only number a
+hand's overall **size** reaches — and LeapC's reported size is
+pose-dependent: measured on both sessions, every segment of a closed gloved
+hand comes back about **12 % shorter** than the same segment of the open
+hand, uniformly. The camera's hand *shape* is measurable and its *size* is
+not, so no fixed skeleton can be the right size for both, and the template's
+small palm happens to sit near the closed-hand size that most of these takes
+hold. Fitting to the open-hand measurement lowers the residual on the frames
+where the camera's own measurement is self-consistent (6.5 to 4.3 mm) and
+raises it elsewhere. Nothing downstream depends on the choice: the metric path
+aligns on a basis of **unit** vectors (`palm_frame_transfer`) and every
+quantity the report prints is a ratio or an angle, so multiplying the fitted
+hand by a constant moves this residual and nothing else — which is what
+`test_the_fused_hand_does_not_care_how_big_the_fitted_hand_is` holds.
 
 ### What the report says
 
@@ -1220,6 +1380,12 @@ usable data:
 `img` is image-space pixels (`z` is MediaPipe's relative depth). `world` is
 metric-ish metres, hand-centred; everything downstream re-centres on the
 wrist. Frames are never mirrored — the preview window is, the data is not.
+
+`<take>.settle.jsonl` beside a coached take is the same schema plus `phase:
+"settle"`, and holds that take's open-palm -> pose transition rather than the
+held pose. It is not a take: enumerate a session with
+`cam_hand.recorder.take_files`, which leaves the clips out, and see "The
+glove's time lag" for what they are for.
 
 ## Repository history
 

@@ -1644,3 +1644,687 @@ def test_min_usable_fingers_is_a_named_parameter():
                               gates=GateParams(min_usable_fingers=3),
                               unreliable_fingers=("ring", "pinky"))
     assert info["dof_source"]["thumb"] == "camera"
+
+
+# --- the reliability profile applies by default -------------------------
+# The masks in profiles/ were measured on this hardware and were being applied
+# only when somebody remembered the flag. `--profile auto` is now the default,
+# and the order it resolves in is the whole of the behaviour.
+
+def _profiles(tmp_path, *names):
+    d = tmp_path / "profiles"
+    d.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (d / name).write_text(json.dumps({
+            "name": name, "rail_fingers": {"right": ["index"]}}) + "\n",
+            encoding="utf-8")
+    return d
+
+
+def test_the_default_profile_wins_and_the_nk_profile_is_the_fallback(tmp_path):
+    fuse = _fuse_module()
+    both = _profiles(tmp_path / "a", "default.json",
+                     "reality_glove_nk_2026-09.json")
+    path, how = fuse.resolve_profile("auto", both)
+    assert path == both / "default.json"
+    assert "auto" in how and "default.json" in str(how)
+
+    only_nk = _profiles(tmp_path / "b", "reality_glove_nk_2026-09.json")
+    path, _how = fuse.resolve_profile("auto", only_nk)
+    assert path == only_nk / "reality_glove_nk_2026-09.json"
+
+    empty = tmp_path / "c" / "profiles"
+    empty.mkdir(parents=True)
+    path, how = fuse.resolve_profile("auto", empty)
+    assert path is None and "none" in how
+
+
+def test_profile_none_disables_it_even_when_a_default_is_sitting_there(tmp_path):
+    """A mask has to be refusable, and refusing it must not need a file move."""
+    fuse = _fuse_module()
+    d = _profiles(tmp_path, "default.json")
+    path, how = fuse.resolve_profile("none", d)
+    assert path is None and "none" in how
+
+
+def test_an_explicit_profile_path_beats_the_default(tmp_path):
+    """Asking for a named profile and silently getting a different one is the
+    one failure worse than stopping, so a path is taken as given."""
+    fuse = _fuse_module()
+    d = _profiles(tmp_path, "default.json")
+    other = tmp_path / "other.json"
+    other.write_text('{"name": "other"}\n', encoding="utf-8")
+    path, how = fuse.resolve_profile(str(other), d)
+    assert path == other and "command line" in how
+
+
+def test_the_shipped_default_profile_is_the_nk_pair_and_says_to_replace_it():
+    """profiles/default.json is a claim about ONE operator's two gloves."""
+    fuse = _fuse_module()
+    path, how = fuse.resolve_profile("auto")
+    assert path is not None and path.name == "default.json", how
+    unreliable, rail, name, comment = fuse.load_profile(path)
+    assert unreliable == {"right": ("middle", "ring", "pinky")}
+    assert rail == {"left": ("index",), "right": ("index",)}
+    assert "N Kim" in name
+    low = comment.lower()
+    assert "replace" in low and "another glove" in low
+    # ...and it carries the same pair of masks as the NK profile, so turning
+    # the default on cannot quietly be a different claim
+    nk = path.with_name("reality_glove_nk_2026-09.json")
+    assert fuse.load_profile(nk)[:2] == (unreliable, rail)
+
+
+# --- the glove's time lag -----------------------------------------------
+
+def curled_hand(curl=0.0, spread_deg=0.0):
+    """A synthetic right hand whose fingers really FOLD, not just tilt.
+
+    `make_hand`'s `curl` turns a whole finger about its knuckle by one angle,
+    which changes its DIRECTION but barely its tip-to-wrist distance: index
+    curl runs 1.79 to 1.56 over its entire range. That is what the spread
+    tests want, and it is useless for anything that reads the curl METRIC.
+    Here each bone in turn takes another `curl * 60` degrees, so the chain
+    rolls up and `flexion_features` sweeps 1.79 down to 0.85 — a real
+    open-to-fist range for a lag or a template fit to be measured over.
+    """
+    pts = np.zeros((21, 3))
+    knuckle_x = {"thumb": -0.035, "index": -0.02, "middle": 0.0,
+                 "ring": 0.02, "pinky": 0.038}
+    knuckle_y = {"thumb": 0.03, "index": 0.085, "middle": 0.09,
+                 "ring": 0.085, "pinky": 0.075}
+    fan = {"thumb": -2.0, "index": -1.0, "middle": 0.0, "ring": 1.0,
+           "pinky": 2.0}
+    bone = 0.025
+    for finger, chain in FINGER_CHAINS.items():
+        pts[chain[0]] = np.array([knuckle_x[finger], knuckle_y[finger], 0.0])
+        a = math.radians(spread_deg * fan[finger])
+        c = math.radians(curl * 60.0)
+        for k in range(1, 4):
+            ck = c * k
+            step = np.array([math.sin(a) * math.cos(ck),
+                             math.cos(a) * math.cos(ck),
+                             -math.sin(ck)]) * bone
+            pts[chain[k]] = pts[chain[k - 1]] + step
+    return pts
+
+
+def _closing_hand(t, seconds=3.0):
+    """Curl over time: open, closed, open again — one settle transition."""
+    return 0.5 * (1.0 - math.cos(2.0 * math.pi * max(0.0, t) / seconds))
+
+
+def _lag_streams(lag, seconds=4.0, cam_hz=90.0, glove_hz=60.0,
+                 hand="right", moving=True):
+    """One moving hand seen by both sensors, the GLOVE's stamps `lag` late.
+
+    A camera frame stamped t shows the hand at t. A glove frame stamped t
+    shows it at t - lag, which is what "the solved hand arrives late" means:
+    the stamp is when the packet landed, the shape is where the hand was.
+    """
+    def shape(t):
+        return _closing_hand(t) if moving else 0.35
+
+    cam = [{"hand_side": hand, "capture_time": i / cam_hz,
+            "wall_time": i / cam_hz, "score": 1.0,
+            "pts": curled_hand(curl=shape(i / cam_hz))}
+           for i in range(int(seconds * cam_hz))]
+    glove = [{"hand_side": hand, "capture_time": i / glove_hz,
+              "wall_time": i / glove_hz,
+              "pts": curled_hand(curl=shape(i / glove_hz - lag))}
+             for i in range(int(seconds * glove_hz))]
+    return glove, cam
+
+
+def _pairing_errors(glove, cam, lag_true, glove_lag):
+    """How far apart in time the two frames of each pair really are.
+
+    Not the difference between the STAMPS — that is what the matcher
+    minimises — but between the instants the two frames DESCRIBE: a camera
+    frame stamped t describes t, a glove frame stamped t describes t - lag.
+
+    The first `glove_lag` seconds of glove frames are left out. Their shifted
+    stamp lands before the camera's first frame, so the nearest camera frame
+    is the first one and the pair is already as close as it can be — an edge
+    of the clip, not a property of the correction. On a real settle clip that
+    edge is the tail of the acquire phase, which nothing fuses.
+    """
+    t0 = min(c["capture_time"] for c in cam)
+    out = []
+    for g, c in pair_by_time(glove, cam, max_dt=0.05, clock="capture_time",
+                             glove_lag=glove_lag):
+        if c is None or g["capture_time"] - glove_lag < t0:
+            continue
+        out.append(abs((g["capture_time"] - lag_true) - c["capture_time"]))
+    return sorted(out)
+
+
+def test_a_planted_glove_lag_is_recovered_and_fixes_the_pairing():
+    """300 ms of glove delay, measured back to within 20 ms, and undone."""
+    from cam_hand.fusion import estimate_glove_lag
+
+    glove, cam = _lag_streams(0.300)
+    got = estimate_glove_lag(glove, cam, hand="right")
+    assert got.trusted, got.why
+    assert got.seconds == pytest.approx(0.300, abs=0.020)
+    assert got.correlation > 0.95
+    assert got.cam_std > 0.1 and got.cam_spread > 0.1
+
+    # uncorrected, every pair is two views of instants 300 ms apart
+    before = _pairing_errors(glove, cam, 0.300, 0.0)
+    assert before[len(before) // 2] == pytest.approx(0.300, abs=0.01)
+    # corrected by the MEASURED lag, they describe the same instant: half a
+    # camera frame at 90 Hz is 5.6 ms, and the estimate's own 5 ms grid is the
+    # rest of it
+    after = _pairing_errors(glove, cam, 0.300, got.seconds)
+    assert after[-1] < 0.010, after[-1]
+    # Every glove frame whose shifted stamp is inside the camera's span keeps
+    # a partner. The ones that lose theirs are the leading edge — shifted back
+    # past the camera's first frame by more than max_dt — and losing them is
+    # the point: max_dt still means what it says on the shifted stamps, so a
+    # lag larger than the real one drops pairs instead of quietly matching
+    # frames further apart.
+    t0 = min(c["capture_time"] for c in cam)
+    lost = [g for g, c in pair_by_time(glove, cam, max_dt=0.05,
+                                       clock="capture_time",
+                                       glove_lag=got.seconds) if c is None]
+    assert lost, "a 300 ms shift must cost the frames before the clip started"
+    assert all(g["capture_time"] - got.seconds < t0 for g in lost)
+
+
+def test_a_held_pose_is_not_measurable_and_nothing_is_applied():
+    """Two flat traces have a best shift and it means nothing."""
+    from cam_hand.fusion import NOT_MEASURABLE, estimate_glove_lag
+
+    glove, cam = _lag_streams(0.300, moving=False)
+    got = estimate_glove_lag(glove, cam, hand="right")
+    assert not got.trusted
+    assert NOT_MEASURABLE in got.why
+    assert got.cam_std < 0.1
+    assert got.described() == got.why
+
+
+def test_a_clip_the_glove_did_not_follow_is_not_measurable():
+    """A camera that moves alone is a tracking artefact, not a lag.
+
+    sync_day1's thumbs_up_right_take1: the camera's index steps from 0.89 to
+    1.7 halfway through the take and stays there while the glove holds 0.7.
+    That is a sustained camera move by any spread measure, and the shift that
+    best lines the two traces up explains nothing about them.
+    """
+    from cam_hand.fusion import NOT_MEASURABLE, estimate_glove_lag
+
+    glove, cam = _lag_streams(0.0, moving=False)
+    for i, row in enumerate(cam):
+        if i > len(cam) // 2:                  # the camera alone changes shape
+            row["pts"] = curled_hand(curl=0.95)
+    got = estimate_glove_lag(glove, cam, hand="right")
+    assert not got.trusted and NOT_MEASURABLE in got.why
+
+
+def test_the_lag_shifts_the_matching_only_and_only_for_its_own_hand():
+    """Per hand, because the two gloves are separate garments.
+
+    Measured on this laptop: about 100 ms on the left hand and 450-485 ms on
+    the right.
+    """
+    glove_r, cam_r = _lag_streams(0.0, seconds=2.0, hand="right")
+    glove_l, cam_l = _lag_streams(0.0, seconds=2.0, hand="left")
+    glove, cam = glove_r + glove_l, cam_r + cam_l
+
+    plain = pair_by_time(glove, cam, max_dt=0.05, clock="capture_time")
+    shifted = pair_by_time(glove, cam, max_dt=0.05, clock="capture_time",
+                           glove_lag={"right": 0.30})
+    # the rows handed back are the rows passed in: nothing is resampled and no
+    # recorded stamp is rewritten, the shift lives inside the match
+    assert [g["capture_time"] for g, _c in plain] == [
+        g["capture_time"] for g, _c in shifted]
+    for (g, a), (_g2, b) in zip(plain, shifted):
+        if g["hand_side"] == "left":
+            assert a is b, "the left hand was not named and must not move"
+        elif a is not None and b is not None and g["capture_time"] >= 0.30:
+            assert (b["capture_time"]
+                    == pytest.approx(g["capture_time"] - 0.30, abs=0.01))
+    # a scalar is one lag for every hand, which is the documented simple case
+    both = pair_by_time(glove, cam, max_dt=0.05, clock="capture_time",
+                        glove_lag=0.30)
+    for g, c in both:
+        if c is not None and g["capture_time"] >= 0.30:
+            assert (c["capture_time"]
+                    == pytest.approx(g["capture_time"] - 0.30, abs=0.01))
+
+
+def test_a_lag_larger_than_the_window_loses_pairs_rather_than_faking_them():
+    """max_dt still means what it says, measured on the shifted stamps."""
+    glove, cam = _lag_streams(0.0, seconds=2.0)
+    matched = [c for _g, c in pair_by_time(glove, cam, max_dt=0.05,
+                                           clock="capture_time",
+                                           glove_lag=5.0) if c is not None]
+    assert matched == []
+
+
+# --- fitting the glove's template hand to the operator's own -------------
+# The glove measures ANGLES and hangs them on one fixed template skeleton; the
+# camera measures the real bone lengths in millimetres. Everything here is
+# about taking the second and keeping the first.
+
+def _glove_frame(spread_deg=0.0, curl=0.0, hand="right"):
+    """A real HandFrame off the synthetic 26-joint hand, with real rotations.
+
+    Identity quaternions would make `absolute_to_relative` plain differences
+    and would not test that a rescale leaves the ROTATIONS alone, so the whole
+    hand is turned first: every joint then carries a non-trivial
+    parent-relative quaternion, exactly as a glove frame does.
+    """
+    from xr_hand.joints import HandFrame
+    from xr_hand.kinematics import absolute_to_relative, mat3_to_quat
+
+    abs26 = np.asarray(_curled26(spread_deg, curl), float)
+    th = math.radians(29.0)
+    R = np.array([[math.cos(th), 0.0, math.sin(th)],
+                  [0.0, 1.0, 0.0],
+                  [-math.sin(th), 0.0, math.cos(th)]])
+    abs26 = (R @ abs26.T).T
+    quats = [list(mat3_to_quat(R))] * len(abs26)
+    return HandFrame(timestamp=0.0, packet_counter=0, hand_side=hand,
+                     frame_id=0, status=0,
+                     joints=absolute_to_relative([list(p) for p in abs26],
+                                                 quats))
+
+
+def _curled26(spread_deg=0.0, curl=0.0, origin=(0.0, 0.25, 0.0)):
+    """`_hand26`, but off `curled_hand` — a chain that folds, not one that tilts.
+
+    Same placement of the five metacarpals the 21-point layout has no room
+    for. Bone lengths are identical to `_hand26`'s at every curl, because a
+    bone is a bone: only the angles differ.
+    """
+    from xr_hand.joints import JOINT_INDEX
+    from xr_hand.keypoints21 import MP21_TO_OPENXR
+
+    pts21 = curled_hand(curl=curl, spread_deg=spread_deg)
+    abs26 = [None] * 26
+    for k, (_mp, xr) in enumerate(MP21_TO_OPENXR):
+        abs26[JOINT_INDEX[xr]] = np.asarray(pts21[k], float)
+    wrist = abs26[JOINT_INDEX["WRIST"]]
+    for finger in ("INDEX", "MIDDLE", "RING", "LITTLE"):
+        knuckle = abs26[JOINT_INDEX[f"{finger}_PROXIMAL"]]
+        abs26[JOINT_INDEX[f"{finger}_METACARPAL"]] = wrist + 0.5 * (knuckle - wrist)
+    abs26[JOINT_INDEX["PALM"]] = wrist + 0.5 * (
+        abs26[JOINT_INDEX["MIDDLE_PROXIMAL"]] - wrist)
+    o = np.asarray(origin, float)
+    return [list(p + o) for p in abs26]
+
+
+def _operators_hand(curl=0.0, palm=1.2, finger=0.8):
+    """A 26-joint hand with DIFFERENT PROPORTIONS from the template's.
+
+    The whole hand is scaled by `palm` — which no ratio can see — and then
+    each finger's three phalanges are pulled in toward their knuckle by
+    `finger`, keeping every direction. So the curl metric, a tip-to-wrist
+    distance over the palm length, reads `finger / palm` of the template's on
+    the same hand shape. That is the template mismatch this module exists for,
+    in one number: on sync_day1 it is about 0.89 on the index.
+    """
+    from xr_hand.joints import JOINT_INDEX
+
+    pts = np.asarray(_curled26(0.0, curl), float) * palm
+    for name in ("THUMB", "INDEX", "MIDDLE", "RING", "LITTLE"):
+        chain = [JOINT_INDEX[f"{name}_{part}"] for part in
+                 (("METACARPAL", "PROXIMAL", "DISTAL", "TIP") if name == "THUMB"
+                  else ("PROXIMAL", "INTERMEDIATE", "DISTAL", "TIP"))]
+        knuckle = pts[chain[0]].copy()
+        for j in chain[1:]:
+            pts[j] = knuckle + finger * (pts[j] - knuckle)
+    return pts.tolist()
+
+
+def _cam_rows(scale=1.0, n=40, curl=0.0, hand="right", abs26=None):
+    """Camera rows the way `fuse_poses.load_leap_cam` builds them.
+
+    `scale` multiplies the whole hand, which is how an operator of a different
+    size looks to the camera — and `measure_hand` has to come back with the
+    scaled lengths rather than the template's.
+    """
+    if abs26 is None:
+        abs26 = (np.asarray(_curled26(0.0, curl), float) * scale).tolist()
+    return [{"hand_side": hand, "capture_time": i / 90.0,
+             "wall_time": i / 90.0, "score": 1.0,
+             "visible_time_us": 5_000_000, "hand_id_stable": True,
+             "palm_abs": [0.0, 0.25, 0.0], "palm_normal_abs": [0.0, 0.0, -1.0],
+             "abs26": abs26}
+            for i in range(n)]
+
+
+def _fk_lengths(frame):
+    """Every segment of a HandFrame by FORWARD KINEMATICS, not off the offsets.
+
+    The offsets are what `fit_template` writes; FK is what everything
+    downstream reads. Measuring the second is what makes "the chain is still
+    valid" a claim about the hand rather than about the bookkeeping.
+    """
+    from cam_hand.template_fit import SEGMENTS, segment_name
+    from xr_hand.kinematics import forward_kinematics
+
+    world = np.asarray(forward_kinematics(frame), float)
+    return {segment_name(a, b): float(np.linalg.norm(world[b] - world[a]))
+            for a, b in SEGMENTS}
+
+
+def _quats(frame):
+    """Every joint's parent-relative rotation — the hand's joint angles."""
+    return [(j.qx, j.qy, j.qz, j.qw) for j in frame.joints]
+
+
+def _cam21(abs26):
+    from xr_hand.keypoints21 import MP21_TO_OPENXR_IDX
+
+    return np.asarray([np.asarray(abs26, float)[i]
+                       for i in MP21_TO_OPENXR_IDX], float)
+
+
+def test_measure_hand_reads_the_cameras_own_bone_lengths():
+    from cam_hand.template_fit import SEGMENTS, measure_hand, segment_name
+
+    rows = _cam_rows(scale=1.13)
+    m = measure_hand(rows, hand="right")
+    assert m is not None
+    assert m.hand == "right" and m.n_frames == len(rows)
+    assert m.n_segments == len(SEGMENTS), "every segment of the 26-joint chain"
+    # including the wrist-to-knuckle palm segments, which the 21-point layout
+    # has no place for and which the palm fit is residual on
+    assert segment_name(1, 6) in m.lengths            # WRIST -> INDEX_METACARPAL
+    truth = _fk_lengths(_glove_frame())
+    for name, got in m.lengths.items():
+        assert got == pytest.approx(1.13 * truth[name], rel=1e-6), name
+    # a still hand measures with no spread at all, and it is reported in mm
+    assert m.spread_mm == pytest.approx(0.0, abs=1e-6)
+    assert m.to_json()["units"] == "mm"
+    assert m.to_json()["lengths_mm"][segment_name(1, 6)] == pytest.approx(
+        1000.0 * m.lengths[segment_name(1, 6)], abs=1e-3)
+
+
+def test_measure_hand_prefers_the_frames_the_camera_could_see():
+    """Open frames when there are any, every trusted frame otherwise.
+
+    A closed hand is self-occluded and the tracker INFERS the joints it cannot
+    see, so its lengths are a solver's opinion. Which frames are open is
+    decided on the CAMERA's own curls against `cam_open_curl` — a geometric
+    fact about a straight finger — never on the glove's claim to be open,
+    which is the claim the rail override exists because it cannot be trusted.
+    """
+    from cam_hand.template_fit import measure_hand, merge_measurements
+
+    open_rows = _cam_rows(scale=1.0, n=30, curl=0.0)
+    closed_rows = _cam_rows(scale=0.85, n=300, curl=0.9)
+    both = measure_hand(open_rows + closed_rows, hand="right")
+    assert both.from_open and both.n_frames == 30, (
+        "300 closed frames must not outvote 30 the camera could see")
+    truth = _fk_lengths(_glove_frame())
+    for name, got in both.lengths.items():
+        assert got == pytest.approx(truth[name], rel=1e-6), name
+
+    only_closed = measure_hand(closed_rows, hand="right")
+    assert not only_closed.from_open and only_closed.n_frames == 300
+
+    # ...and the same rule over a SESSION read take by take: one open take
+    # beats twenty closed ones, because "open when available" is a decision
+    # about the session and not about each take. Measured on sync_day1's right
+    # hand, letting the closed takes into the median put the index at 0.86 of
+    # the template against 0.94 from the open ones.
+    per_take = [measure_hand(closed_rows, hand="right") for _ in range(20)]
+    per_take.append(measure_hand(open_rows, hand="right"))
+    merged = merge_measurements(per_take)
+    assert merged.from_open and "1 of 21" in merged.source
+    for name, got in merged.lengths.items():
+        assert got == pytest.approx(truth[name], rel=1e-6), name
+
+
+def test_measure_hand_needs_the_cameras_26_metric_joints():
+    """A MediaPipe frame cannot measure a hand and does not pretend to."""
+    from cam_hand.template_fit import measure_hand
+
+    rows = _cam_rows()
+    for r in rows:
+        r.pop("abs26")
+    assert measure_hand(rows, hand="right") is None
+    assert measure_hand([], hand="right") is None
+    # nor can the other hand's frames measure this one
+    assert measure_hand(_cam_rows(hand="left"), hand="right") is None
+
+
+def test_measure_hand_uses_only_the_frames_the_gates_trust():
+    """The same frame-level trust the fusion gates use, for the same reason."""
+    from cam_hand.template_fit import measure_hand
+
+    rows = _cam_rows(scale=1.2, n=20)
+    for r in rows:
+        r["visible_time_us"] = 1_000          # a hand just picked up
+    assert measure_hand(rows, hand="right") is None
+    good = _cam_rows(scale=1.2, n=20)
+    assert measure_hand(rows + good, hand="right").n_frames == 20
+
+
+def test_a_fitted_frame_has_the_measured_lengths_and_the_gloves_angles():
+    """The whole of the fit: lengths change and nothing else does.
+
+    FK of the fitted frame reproduces the measured lengths EXACTLY — there is
+    no least-squares step and so no residual — and every joint's
+    parent-relative rotation is bit-identical, so every joint ANGLE in the
+    hand is still the glove's.
+    """
+    from cam_hand.template_fit import fit_template, measure_hand
+
+    frame = _glove_frame(spread_deg=12.0, curl=0.4)
+    m = measure_hand(_cam_rows(scale=1.09), hand="right")
+    fitted = fit_template(frame, m)
+
+    got = _fk_lengths(fitted)
+    for name, want in m.lengths.items():
+        assert got[name] == pytest.approx(want, abs=1e-12), name
+    assert _quats(fitted) == _quats(frame), "not one rotation may move"
+    assert fitted is not frame
+    assert frame.joints[7].x != pytest.approx(fitted.joints[7].x), (
+        "the frame passed in must not be mutated")
+    # the template was 9 % smaller, so every bone grew by exactly that
+    was = _fk_lengths(frame)
+    for name, now in got.items():
+        assert now / was[name] == pytest.approx(1.09, rel=1e-6), name
+    # a list of frames in, a list out
+    assert len(fit_template([frame, frame], m)) == 2
+    # and with nothing measured, nothing happens
+    assert fit_template(frame, None) is frame
+
+
+def test_a_segment_the_measurement_does_not_name_keeps_the_template():
+    """A partial measurement is usable rather than fatal."""
+    from dataclasses import replace as dc_replace
+
+    from cam_hand.template_fit import (fit_template, measure_hand,
+                                       segment_name)
+
+    frame = _glove_frame(curl=0.3)
+    m = measure_hand(_cam_rows(scale=1.2), hand="right")
+    tip = segment_name(24, 25)                     # LITTLE_DISTAL -> TIP
+    partial = dc_replace(m, lengths={k: v for k, v in m.lengths.items()
+                                     if k != tip})
+    got = _fk_lengths(fit_template(frame, partial))
+    assert got[tip] == pytest.approx(_fk_lengths(frame)[tip], abs=1e-12)
+    assert got[segment_name(1, 6)] == pytest.approx(m.lengths[segment_name(1, 6)],
+                                                    abs=1e-12)
+
+
+def test_a_fit_moves_the_curl_metric_onto_the_cameras():
+    """Why any of this exists: curl is a LENGTH ratio.
+
+    The template's index is longer per palm length than this operator's, so
+    the glove's curl reads high and the fused pinch index sat about 0.15 above
+    the camera's. With the template's bones rescaled to the camera's, the two
+    read the same number for the same hand shape.
+    """
+    from cam_hand.features import flexion_features
+    from cam_hand.template_fit import fit_template, measure_hand
+    from xr_hand.keypoints21 import frame_to_keypoints21
+
+    # the operator's hand: a longer palm on shorter fingers, which is what
+    # makes the template's curl read high — on sync_day1 the glove's palm is
+    # 81 mm against the camera's 96
+    camera = np.asarray(_operators_hand(curl=0.35), float)
+    frame = _glove_frame(curl=0.35)
+    m = measure_hand(_cam_rows(abs26=camera.tolist()), hand="right")
+    raw = np.asarray(frame_to_keypoints21(frame), float)
+    fit = np.asarray(frame_to_keypoints21(fit_template(frame, m)), float)
+    want = flexion_features(_cam21(camera))
+    for i in range(1, 5):
+        before = abs(flexion_features(raw)[i] - want[i])
+        after = abs(flexion_features(fit)[i] - want[i])
+        assert before > 0.05, "the template must disagree to start with"
+        # the fitted hand has the camera's lengths and the glove's angles, and
+        # the two hands were posed alike, so it IS the camera's hand
+        assert after < 1e-9, (i, before, after)
+
+
+def test_the_fused_hand_does_not_care_how_big_the_fitted_hand_is():
+    """Only one number in the whole report moves with the fit's overall SIZE.
+
+    The metric path aligns on a basis of UNIT vectors (`palm_frame_transfer`)
+    and every quantity the report prints is a ratio or an angle. So
+    multiplying the fitted hand by a constant leaves the fused hand's shape,
+    its curls and its spreads exactly where they were, and moves only the
+    palm-fit residual — a diagnostic nothing acts on. That is what makes the
+    fit's overall size a reporting decision, and it matters, because LeapC's
+    reported hand size shrinks about 12 % on a closed gloved hand it cannot
+    see.
+    """
+    from dataclasses import replace as dc_replace
+
+    from cam_hand.features import all_features
+    from cam_hand.template_fit import fit_template, measure_hand
+    from xr_hand.keypoints21 import frame_to_keypoints21
+
+    frame = _glove_frame(curl=0.5)
+    cam = curled_hand(curl=0.1, spread_deg=20.0)
+    m = measure_hand(_cam_rows(scale=1.1, curl=0.0), hand="right")
+    bigger = dc_replace(m, lengths={k: v * 1.4 for k, v in m.lengths.items()})
+
+    a, info_a = fuse_skeletons(frame_to_keypoints21(fit_template(frame, m)),
+                               cam, with_scale=False)
+    b, info_b = fuse_skeletons(
+        frame_to_keypoints21(fit_template(frame, bigger)), cam,
+        with_scale=False)
+    assert np.allclose(np.asarray(b), np.asarray(a) * 1.4, atol=1e-12)
+    assert all_features(a, hand_side="right") == pytest.approx(
+        all_features(b, hand_side="right"), abs=1e-9)
+    # ...and the residual is the one thing that did move
+    assert info_b["kabsch_rmse_mm"] > info_a["kabsch_rmse_mm"] + 1.0
+
+
+def test_a_measurement_survives_a_round_trip_through_json(tmp_path):
+    from cam_hand.template_fit import (load_measurement, measure_hand,
+                                       measurement_filename)
+
+    m = measure_hand(_cam_rows(scale=0.94, hand="left"), hand="left")
+    path = tmp_path / measurement_filename("left", "20260921_120000")
+    assert path.name == "hand_left_20260921_120000.json"
+    m.save(path)
+    back = load_measurement(path)
+    assert back.hand == "left" and back.n_frames == m.n_frames
+    assert back.from_open == m.from_open
+    # the file is in MILLIMETRES to four decimals — 0.1 micrometres, an order
+    # of magnitude finer than the micrometre the camera's own recordings are
+    # rounded to (`leap_hand.recorder._round`)
+    for name, want in m.lengths.items():
+        assert back.lengths[name] == pytest.approx(want, abs=1e-7), name
+    assert str(path) in back.source
+
+
+def test_a_measurement_of_an_unknown_segment_is_refused(tmp_path):
+    """A misspelled segment would leave that bone at the template's length
+    and nothing would say so, so it is an error rather than a skip."""
+    from cam_hand.template_fit import load_measurement
+
+    path = tmp_path / "hand_left_bad.json"
+    path.write_text(json.dumps({
+        "hand": "left", "units": "mm",
+        "lengths_mm": {"WRIST->INDEX_KNUCKLE": 21.0}}), encoding="utf-8")
+    with pytest.raises(ValueError) as e:
+        load_measurement(path)
+    assert "WRIST->INDEX_KNUCKLE" in str(e.value)
+
+    path.write_text(json.dumps({"hand": "left"}), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_measurement(path)
+
+
+def test_the_spread_gate_is_carried_across_a_fit_by_the_learned_rail():
+    """`curl_gate` is a constant tuned on the TEMPLATE hand's curls.
+
+    Fitting multiplies every curl by that finger's own scale, so the constant
+    is no longer the midpoint between the glove's fists and its open palms. It
+    is re-expressed as the same FRACTION of that hand and finger's learned
+    rail — its glove open-palm value — rather than retuned, because a new
+    constant would be tuned on one operator's fitted hand and wrong for the
+    next by exactly the amount the fit removes.
+    """
+    from cam_hand.fusion import FINGER_NAMES, curl_gates_from_rails
+
+    gates = GateParams(curl_gate=1.2)
+    four = ("index", "middle", "ring", "pinky")
+    template = {("right", f): 2.0 for f in four}
+    fitted = {("right", f): 1.7 for f in four}
+
+    # no fit: the two rail sets are the same numbers, so there is nothing to
+    # carry and the caller is told to use the constant
+    assert curl_gates_from_rails(gates, template, template, "right") is None
+    assert curl_gates_from_rails(gates, {}, fitted, "right") is None
+
+    carried = curl_gates_from_rails(gates, template, fitted, "right")
+    for finger in four:
+        assert carried[FINGER_NAMES.index(finger)] == pytest.approx(
+            1.2 * 1.7 / 2.0)
+    # the thumb has no rail on this hand, so it keeps the constant: there is
+    # no open value to take a fraction of
+    assert carried[FINGER_NAMES.index("thumb")] == pytest.approx(1.2)
+    # a hand nobody learned a rail for has nothing to carry either, and
+    # None is how the caller is told to use the constant
+    assert curl_gates_from_rails(gates, template, fitted, "left") is None
+
+
+def test_the_carried_gate_asks_the_same_question_of_a_fitted_finger():
+    """A finger at one real extension is gated the same either side of a fit.
+
+    sync_day1's index: the fit moved its open value 1.974 -> 1.707, a factor
+    of 0.865, so the threshold goes 1.20 -> 1.04 and a fitted curl is compared
+    against it exactly as the template curl was against 1.20. Left alone, the
+    bare constant changed its mind about every finger between the two.
+    """
+    from cam_hand.fusion import FINGER_NAMES, curl_gates_from_rails
+
+    gates = GateParams(curl_gate=1.2)
+    scale = 1.707 / 1.974
+    carried = curl_gates_from_rails(gates, {("right", "index"): 1.974},
+                                    {("right", "index"): 1.707}, "right")
+    gate = carried[FINGER_NAMES.index("index")]
+    assert gate == pytest.approx(1.2 * scale, abs=1e-9)
+    assert gate == pytest.approx(1.038, abs=0.002)
+
+    cam = curled_hand(curl=0.1, spread_deg=22.0)
+    meta = facing_meta(view_deg=20.0)
+    for template_curl in (0.70, 1.10, 1.25, 1.30, 1.97):
+        curls = [1.43, template_curl, 2.07, 1.97, 1.71]
+        _f, before = fuse_skeletons(hand_with_curls(curls), cam,
+                                    with_scale=False, cam_meta=meta,
+                                    gates=gates)
+        curls[1] = template_curl * scale
+        _f, after = fuse_skeletons(hand_with_curls(curls), cam,
+                                   with_scale=False, cam_meta=meta,
+                                   gates=gates, curl_gates=carried)
+        assert (before["rejected"].get("spread index")
+                == after["rejected"].get("spread index")), template_curl
+        # ...which the bare constant does not manage on the two in between
+        _f, bare = fuse_skeletons(hand_with_curls(curls), cam,
+                                  with_scale=False, cam_meta=meta,
+                                  gates=gates)
+        if 1.2 < template_curl < 1.2 / scale:
+            assert (bare["rejected"].get("spread index")
+                    != before["rejected"].get("spread index"))
