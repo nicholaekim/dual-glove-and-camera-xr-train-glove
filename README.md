@@ -890,19 +890,61 @@ opinion of itself:
   camera's palm normal and the ray from the palm to the module, which is the
   origin of leap space).
 - **thumb** — only when the viewing-angle gate passes **and** the camera
-  agrees with the glove about the other fingers: median absolute curl
-  disagreement below `curl_agree_tol` = 0.35. A camera that has the fingers
-  wrong has the hand's orientation wrong, and orientation error moves the
-  thumb most of all. `thumbs_up` measures 0.88 and is refused; on the first
-  session it was also edge-on at 70-78 degrees, so it failed twice over.
+  agrees with the glove about the other fingers: median absolute **flexion
+  fraction** disagreement below `agree_tol_frac` = 0.20. A camera that has the
+  fingers wrong has the hand's orientation wrong, and orientation error moves
+  the thumb most of all. `thumbs_up` is refused; on the first session it was
+  also edge-on at 70-78 degrees, so it failed twice over.
+
+  **The two sensors do not share a scale, so the comparison is normalised.**
+  This gate used to threshold the *raw* median |glove curl − camera curl| at
+  `curl_agree_tol` = 0.35. Curl is dimensionless, but the glove's straight
+  index reads 1.97 on the *template* hand where the camera's reads 1.75 on the
+  operator's, so a fixed raw distance means a different amount of disagreement
+  depending on which hand the glove value came off — and `--fit-template`
+  changes exactly that. Measured on `sync_day1`, the raw gate's thumb
+  camera-use went **77.4% → 93.9%** when the fit was switched on. Some of that
+  was the fit measuring a real hand; most of it was the threshold quietly
+  getting looser, and a number that moves when the units move cannot tell the
+  two apart.
+
+  Each finger's curl is therefore put on **its own sensor's, hand's and
+  finger's** learned endpoints first:
+
+  ```
+  frac = (open - curl) / (open - flexed)         clipped to [-0.2, 1.2]
+  ```
+
+  0 is that sensor's straight finger, 1 its most flexed, and the median
+  |frac_glove − frac_camera| is what `agree_tol_frac` thresholds. Both ends are
+  learned per session, per hand, per finger, per sensor, with no pose labels:
+  the glove's `open` is the finger's learned **rail** (already measured for the
+  rail override, and always on the hand actually being fused); the camera's is
+  the median over the session's open-palm-*like* frames — every one of
+  index..pinky above `cam_open_curl − margin`, the camera's own geometric test
+  — falling back to the 98th percentile when there are fewer than 20 of them;
+  and both `flexed` ends are that sensor's 2nd percentile over the session. The
+  report prints all of them.
+
+  A finger whose range is too small to normalise — below `min_glove_span` = 0.4
+  or `min_cam_span` = 0.3 — is **dropped from the vote for that run** and named
+  in the report, because a fraction over a range nobody measured is noise
+  divided by noise. (Neither session drops a voting finger; the closest is the
+  right pinky's fitted glove span of 0.44.)
+
+  0.20 was chosen so that the change of units is not also a change of
+  strictness: it reproduces the raw gate's verdict on the **unfitted**
+  `sync_day1` to within 0.1 of a point. What it then shows is that the fit was
+  worth almost none of that 16-point jump — see *Fitting the template* below.
 
   **Who is allowed to vote.** Not all four — only fingers whose *glove* curl
   is a measurement. A finger is excluded when it is **disputed** (on its rail
   *while the camera reads it flexed*), when the **rail override has already
-  taken it** (the loser of one argument does not judge the next), or when it
-  is named **`--unreliable`**. Below `min_usable_fingers` = 2 survivors the
-  glove casts no veto and the camera's own geometry decides — failing toward
-  the sensor that still has evidence.
+  taken it** (the loser of one argument does not judge the next), when it is
+  named **`--unreliable`**, or when it **could not be normalised** (above).
+  Below `min_usable_fingers` = 2 survivors the glove casts no veto and the
+  camera's own geometry decides — failing toward the sensor that still has
+  evidence.
 
   Being on the rail is **not** on its own a reason to exclude a finger, and a
   first version of this rule that did exclude every railed finger was wrong.
@@ -932,6 +974,12 @@ opinion of itself:
   | `open_palm` right | 96.5% | 98.4% | 98.5% |
   | **all poses, both hands** | **77.1%** | **77.4%** | **85.5%** |
 
+  (Measured on the **raw** tolerance, before the vote was normalised, and left
+  as measured: it is what the rule was argued from. The normalised gate puts
+  the ungated total at 77.3% — within 0.1 of a point — and moves the
+  right-hand cells by a few points each; the shipped profile's masks are what
+  still carry that column, and they are unchanged.)
+
   and the fused leave-one-take-out classifier goes 56/59 to **57/59**. The
   rule alone barely moves the total — it fires only where the two sensors
   actually contradict each other — and it is `--unreliable` that pays, which
@@ -950,9 +998,10 @@ joints, so they cannot corroborate it, and LeapC reports `confidence` as a
 constant 1.0.
 
 Every threshold is a named field of `fusion.GateParams`, overridable on the
-command line (`--curl-gate`, `--view-gate-deg`, `--curl-agree-tol`) and
-printed in every report. They are **empirical starting points read off one
-session**, not calibrated constants.
+command line (`--curl-gate`, `--view-gate-deg`, `--agree-tol-frac`,
+`--curl-agree-tol`) and printed in every report, along with the learned
+endpoints the flexion fractions are taken on. They are **empirical starting
+points read off one session**, not calibrated constants.
 
 No frame is ever dropped: a frame that fails every gate is the glove
 skeleton, unchanged. `fuse_skeletons` returns, per frame, `dof_source` (which
@@ -1068,8 +1117,10 @@ shows a peace hand — and `recordings\sync_day2_clean` was a hand-made copy
 without it. `--exclude pinch_right_take1` on `sync_day2` reproduces that copy
 exactly — the same camera-use table to the frame and the same classifier. With
 the defaults of the day (`--profile none --glove-lag none --fit-template
-none`) that is glove 40/59, camera 59/59, fused 52/59; with today's it is
-53/59, and the two folders still agree to the frame.
+none`) that is glove 40/59, camera 59/59, fused **51**/59 — it read 52/59
+before the thumb vote was normalised — and with today's defaults it is
+**53**/59. The two folders still agree to the frame either way, which is the
+claim being made.
 
 **Standing knowledge about a glove: `--profile`, on by default.**
 `--unreliable` and `--rail-fingers` are things the operator has to remember
@@ -1110,10 +1161,10 @@ A mask is a claim that some of the evidence is worthless, so it is never made
 quietly: **with a profile the report prints the fusion both ways**, ordinary
 and masked, over the same frames with the same gates and the same learned
 rails, with the camera-use table and the classifier line for each. On
-`sync_day2` with `pinch_right_take1` excluded, the shipped profile moves thumb
-camera-use from **82.8% to 99.6%** and the fused leave-one-take-out classifier
-from **52/59 to 53/59**; nothing else changes, because the mask only touches
-the thumb gate's vote. The profile also carries a `comment` the report prints
+`sync_day2` with `pinch_right_take1` excluded, and on today's defaults, the
+shipped profile moves thumb camera-use from **81.7% to 99.5%** and the fused
+leave-one-take-out classifier from **51/59 to 53/59**; nothing else changes,
+because the mask only touches the thumb gate's vote. The profile also carries a `comment` the report prints
 — the shipped one records that the right *ring* is deliberately **not** on the
 rail-override list until its sweep is repeated with `finger_sweep.py`, because
 the sweep it has began with the finger already bent. That repeat has now been
@@ -1147,6 +1198,20 @@ a zero lag, but pairing on the raw stamps is what the pipeline did before and
 is the only honest default. `--glove-lag none` turns it off and
 `--glove-lag left:0.10,right:0.46` applies given values, which is how a lag
 gets *checked* against a session.
+
+**A measured lag is only applied when several clips agree.** One trustworthy
+estimate is a real measurement of *one* transition with nothing to check it
+against, and a cross-correlation can find a real peak that is the wrong peak —
+a hand that closes and opens twice has a second maximum a whole cycle away,
+and the shift is then a lie about every frame of the session rather than about
+that clip. So `auto` needs at least `MIN_LAG_CLIPS` = **2** trustworthy
+estimates agreeing to within `MAX_LAG_MAD` = **60 ms** (median absolute
+deviation, so one outlier cannot veto the rest). 60 ms is well under the 100 /
+460 ms the two gloves measure on this laptop and comfortably over a 90 Hz
+camera frame plus a 60 Hz glove frame. Short of that the report prints every
+estimate, the median, the MAD and the reason, and applies **nothing**. A value
+given on the command line is applied exactly as given — that is what it is
+for.
 
 A lag is refused unless the camera's index curl moved — both its standard
 deviation and its **median absolute deviation** over the clip above 0.1 — the
@@ -1198,14 +1263,30 @@ measures 96.
 `src/cam_hand/template_fit.py` removes it at the source. `measure_hand` takes
 the median length of every segment of the 26-joint chain — including the
 wrist-to-metacarpal and metacarpal-to-knuckle **palm** segments — over the
-camera's trusted frames of one hand, preferring the frames the camera could
-actually see: an **open** hand, decided on the camera's own curls against
-`cam_open_curl`, never on the glove's claim to be open. `fit_template`
-rescales each parent-relative joint offset to the measured length **keeping
-every rotation**, so every joint angle in the hand is bit-identical and
-forward kinematics reproduces the measured lengths exactly — there is no fit
-and therefore no residual. Measurements save and load as
-`profiles\hand_<hand>_<stamp>.json`, in millimetres per segment.
+camera's trusted frames of one hand, using **only** the frames the camera
+could actually see whole: an **open** hand, decided on the camera's own curls
+against `cam_open_curl`, never on the glove's claim to be open and never on a
+pose label (the curl test is the stricter of the two, and it works on a
+session with no labels). `fit_template` rescales each parent-relative joint
+offset to the measured length **keeping every rotation**, so every joint angle
+in the hand is bit-identical and forward kinematics reproduces the measured
+lengths exactly — there is no fit and therefore no residual. Measurements save
+and load as `profiles\hand_<hand>_<stamp>.json`, in millimetres per segment.
+
+**It is one fixed calibration per hand per session, and it can be refused.** A
+hand's bones do not change between takes, so a per-pose or per-frame fit would
+be fitting the tracker's pose-dependent reconstruction error rather than the
+hand. `measure_hand` runs per take only so that `merge_measurements` can take
+a **median across takes** — one badly-tracked take does not decide — and the
+result is then applied unchanged to every frame of the session. A take with
+fewer than `MIN_OPEN_FRAMES` = 20 open frames measures nothing, and a hand
+whose takes together hold fewer than `MIN_FIT_FRAMES` = **200** is **refused**
+(`fit_refusal`): the report names the hand and the reason and that hand fuses
+**unfitted**. There is no longer a fallback to "every trusted frame" — a
+closed gloved hand is self-occluded, so its lengths are the tracker's guess at
+joints it could not see, and rescaling the template onto that guess would then
+apply it to the whole session. `sync_day1` clears the floor by an order of
+magnitude (2482 open frames on the left, 2204 on the right).
 
 `--fit-template` defaults to **`auto`**: measure per hand from the session's
 own camera frames, save it as `<input>\template_<hand>.json`, and fuse with
@@ -1222,46 +1303,80 @@ of that hand and finger's own learned rail** (`curl_gates_from_rails`) rather
 than retuned, because a constant retuned on one operator's fitted hand would
 be wrong for the next by exactly the amount the fit exists to remove. With no
 fit the rails are the template's and the number is exactly 1.2, so nothing
-that ran before behaves differently. Nothing else needed touching:
-`cam_open_curl` and the override's `margin` read the **camera**, the
-override's `tol` compares the glove against its own learned rail, and
-`curl_agree_tol` compares the two sensors — whose agreement is what the fit
-improves. `leap_hand.pose_check` is untouched; it reads the raw take files at
-record time, where no camera measurement exists yet.
+that ran before behaves differently. The **thumb vote** needed the same
+treatment for the same reason and now runs on flexion fractions
+(`agree_tol_frac`, above). Nothing else did: `cam_open_curl` and the
+override's `margin` read the **camera**, and the override's `tol` compares the
+glove against its own learned rail. `leap_hand.pose_check` is untouched; it
+reads the raw take files at record time, where no camera measurement exists
+yet.
 
-**Measured on both sessions, fit off then on** (`--camera leap`):
+**Measured on both sessions, fit off then on** (`--camera leap`, thumb vote on
+flexion fractions):
 
 | | day 1 off | day 1 on | day 2 off | day 2 on |
 |---|---|---|---|---|
 | fused pinch index curl minus the camera's, median over takes | +0.141 | **-0.004** | +0.139 | **-0.007** |
-| classifier, default (glove / camera / fused) | 43 / 59 / **55** | 43 / 59 / **57** | 40 / 59 / **52** | 40 / 59 / **53** |
-| classifier, with the profile | 43 / 59 / 57 | 43 / 59 / 57 | 40 / 59 / 53 | 40 / 59 / 53 |
-| camera-use, thumb | 77.4% | **93.9%** | 82.8% | **90.9%** |
+| classifier, default (glove / camera / fused) | 43 / 59 / 55 | 43 / 59 / 55 | 40 / 59 / 51 | 40 / 59 / 51 |
+| classifier, with the profile | 43 / 59 / **57** | 43 / 59 / **57** | 40 / 59 / **53** | 40 / 59 / **53** |
+| camera-use, thumb | 77.3% | 77.5% | 80.8% | 81.7% |
 | camera-use, spread ring | 55.3% | **58.9%** | 51.1% | **57.3%** |
 | override active on pinch frames | 77.9% | 77.9% | 94.3% | 94.3% |
 | palm fit RMSE, open_palm takes | 6.5 mm | **4.3 mm** | 6.7 mm | **4.3 mm** |
 | palm fit RMSE, every paired frame | **3.0 mm** | 7.7 mm | **3.3 mm** | 7.0 mm |
 
-The thumb's camera-use rises because `curl_agree_tol` compares the two
-sensors' curls and the template bias was inflating that disagreement by about
-0.15; removing a known bias from a comparison is the point. The override's
-activation is identical frame for frame, and so is the camera-use on index,
-middle and pinky (within half a point).
+**What the fit is worth, once the gate stops moving with it.** The thumb's
+camera-use used to jump 16 points when the fit was switched on. On the
+normalised gate it moves by 0.2 of a point on day 1 and 0.9 on day 2, which is
+the honest answer: almost all of that jump was the raw tolerance getting
+looser, not the camera getting better. Per pose, ordinary run, thumb
+camera-use before and after the fit:
 
-**The last row is the one that gets worse, and it is worth being exact about
-why.** The palm residual is a rigid 5-point fit, so it is the only number a
-hand's overall **size** reaches — and LeapC's reported size is
-pose-dependent: measured on both sessions, every segment of a closed gloved
-hand comes back about **12 % shorter** than the same segment of the open
-hand, uniformly. The camera's hand *shape* is measurable and its *size* is
-not, so no fixed skeleton can be the right size for both, and the template's
-small palm happens to sit near the closed-hand size that most of these takes
-hold. Fitting to the open-hand measurement lowers the residual on the frames
-where the camera's own measurement is self-consistent (6.5 to 4.3 mm) and
-raises it elsewhere. Nothing downstream depends on the choice: the metric path
-aligns on a basis of **unit** vectors (`palm_frame_transfer`) and every
-quantity the report prints is a ratio or an angle, so multiplying the fitted
-hand by a constant moves this residual and nothing else — which is what
+| pose | old gate, day 1 | new gate, day 1 | old gate, day 2 | new gate, day 2 |
+|---|---|---|---|---|
+| fist | 97.9 → 99.7 | 95.4 → 96.1 | 98.3 → 95.8 | 90.0 → 89.7 |
+| index_point | 62.6 → **89.3** | 56.3 → 55.7 | 62.0 → 63.6 | 60.7 → 60.7 |
+| open_palm | 99.2 → 99.1 | 99.0 → 99.0 | 99.0 → 99.1 | 98.8 → 98.8 |
+| peace | 65.8 → **99.2** | 72.3 → 72.4 | 90.6 → 96.7 | 77.7 → 77.8 |
+| pinch | 83.7 → 83.7 | 83.7 → 83.7 | 98.7 → 98.7 | 98.7 → 98.7 |
+| thumbs_up | 57.0 → **92.8** | 59.2 → 59.8 | 50.5 → **94.5** | 62.3 → **68.2** |
+| all | 77.4 → **93.9** | 77.3 → 77.5 | 82.8 → **90.9** | 80.8 → 81.7 |
+
+The one pose that still moves is day 2's **right-hand `thumbs_up`** (28.9 →
+40.0). Its fraction-disagreement distribution sits *on* the threshold — median
+0.220 unfitted against 0.211 fitted, 25th percentile 0.196 against 0.185, gate
+0.20 — so the population straddles the line and a 0.009 shift carries 11 % of
+the frames across it. The shift is small; the pose is at the decision boundary.
+It is also the hand the shipped profile masks (`right: middle, ring, pinky`),
+and with the profile in force that pose reads 99 % either way, which is why the
+headline classifier numbers are unchanged.
+
+**What the fit is NOT evidence for.** After fitting, the fused pinch index
+agrees with the camera's to within a few thousandths (row 1). That is **not an
+independent validation of the camera**: the fused finger is built from the
+camera's bone directions, and the lengths it is built on were measured by the
+same camera, so the agreement restates the fit's arithmetic. It says the fit
+removed the template's scale error from that number, and nothing about whether
+the camera had the finger right. Checking that needs a sensor the camera did
+not produce.
+
+**The palm-residual row is the one that gets worse, and it is worth being
+exact about why.** The palm residual is a rigid 5-point fit, so it is the only
+number a hand's overall **size** reaches — and the size the *tracker* reports
+is pose-dependent: measured on both sessions, every segment of a closed gloved
+hand comes back about **12 % shorter** than the same segment of the open hand,
+uniformly. That is **pose-dependent scale variation in the tracker's
+reconstructed skeleton**, not a hand that changes size: a closed hand is
+self-occluded, the solver infers the joints it cannot see, and it infers them
+short. The camera's hand *shape* is measurable and its *size* is not, so no
+fixed skeleton can be right for both, and the template's small palm happens to
+sit near the closed-hand size that most of these takes hold. Fitting to the
+open-hand measurement lowers the residual on the frames where the camera's own
+measurement is self-consistent (6.5 to 4.3 mm) and raises it elsewhere.
+Nothing downstream depends on the choice: the metric path aligns on a basis of
+**unit** vectors (`palm_frame_transfer`) and every quantity the report prints
+is a ratio or an angle, so multiplying the fitted hand by a constant moves this
+residual and nothing else — which is what
 `test_the_fused_hand_does_not_care_how_big_the_fitted_hand_is` holds.
 
 ### What the report says
@@ -1287,8 +1402,11 @@ None of this touches the classifier's features. Those come from
 `features.spread_features`, whose `thumb-index` entry is the tip-to-tip *gap*,
 not the base angle; the base angle was only ever a report row, so dropping it
 leaves every before/after comparison valid. Under it are the
-camera-use rate per gated DOF, every rejection reason with its count, and the
-thresholds in force.
+camera-use rate per gated DOF, every rejection reason with its count, the
+thresholds in force, and the **flexion-fraction endpoints** — `open`, `flexed`
+and `span` for every hand, finger and sensor, plus how each `open` was found
+and any finger the guard dropped. A gate on a normalised quantity is only
+checkable if the normalisation is printed beside it.
 
 The leave-one-out classifier is below that, as a **secondary** metric, and it
 is now leave-one-**TAKE**-out: holding out one *sample* left the other hand of
