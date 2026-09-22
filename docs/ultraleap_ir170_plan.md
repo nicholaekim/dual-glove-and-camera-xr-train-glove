@@ -593,6 +593,42 @@ Day-1 session with the corrected recorder (2026-09-18, 18:36 to 18:48,
   wrong. Reported as is: fusion needs per-hand, per-finger reliability
   logic; glove curl does not automatically dominate.
 
+Fusion improvements 1 to 3 (merged 2026-09-21, 328 tests): profile by
+default, glove lag correction, template fit
+- `profiles/default.json` (this operator's glove pair) is applied
+  automatically; `--profile none` turns it off; the report always shows the
+  ordinary and the profile-masked fusion side by side.
+- Lag: the coached recorder now saves each take's 1.5 s open-palm -> pose
+  transition as `<take>.settle.jsonl` (take files stay hold-only).
+  `fuse_poses.py --glove-lag auto` estimates the glove's lag per hand from
+  those clips (index-curl cross-correlation; needs camera motion, r > 0.8,
+  consistent estimates) and shifts the glove's pairing stamps back by it;
+  on held poses it reports "not measurable" and applies nothing. A forced
+  0.46 s shift on day 1 moves glove-owned curl medians by at most 0.012 but
+  camera-owned angle rows by up to 6 deg on single held takes (re-pairing),
+  so the shift is only ever applied from a measurement.
+- Template fit: bone and palm lengths are measured per hand from the
+  session's camera frames (open palm preferred), the glove's template is
+  rescaled to them keeping every rotation (`cam_hand/template_fit.py`,
+  `--fit-template auto`, measurement saved as `<input>/template_<hand>.json`).
+  Results, day 1 / day 2: fused pinch index curl minus camera +0.141 /
+  +0.139 -> -0.004 / -0.007; thumb camera use 77.4 -> 93.9 % / 82.8 ->
+  90.9 % (the glove's curls now sit on the camera's scale, so the
+  disagreement vote passes); spread ring +3.6 / +6.2 points; override
+  activation identical; fused classifier 55 -> 57/59 and 52 -> 53/59
+  (glove and camera unchanged); palm fit on open-palm takes 6.5 / 6.7 ->
+  4.3 / 4.3 mm. `curl_gate` is now the same fraction of each finger's
+  learned open value (identical without a fit).
+- Finding about the camera: LeapC returns every segment of the CLOSED
+  gloved hand about 12 % shorter than the open hand, uniformly, both hands,
+  both sessions. The camera's hand shape is consistent, its absolute size
+  is not; so the all-frame palm RMSE rises 3.0 / 3.3 -> 7.7 / 7.0 mm after
+  fitting to the open hand. Nothing downstream uses it (alignment is by
+  palm basis and wrist; every reported quantity is a ratio or an angle).
+  Scale factors on day 2: left thumb 1.18, index 0.95, middle 1.00, ring
+  0.96, pinky 0.96; right thumb 1.17, index 0.91, middle 0.90, ring 0.87,
+  pinky 0.88 (fitted over template).
+
 Hardened diagnostics, first three runs (2026-09-20, 21:22 to 21:25;
 `results/diagnostics/`)
 - Tools merged (288 tests): `scripts/leap/hold_test.py` (camera must confirm
