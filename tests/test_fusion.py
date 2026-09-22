@@ -1080,6 +1080,8 @@ def test_an_ungated_mediapipe_frame_is_fused_exactly_as_before():
 def test_gate_thresholds_are_named_parameters_and_are_reported():
     described = DEFAULT_GATES.described()
     assert described == {"curl_gate": 1.2, "view_gate_deg": 50.0,
+                         "agree_tol_frac": 0.20, "min_glove_span": 0.4,
+                         "min_cam_span": 0.3,
                          "curl_agree_tol": 0.35, "min_visible_time_us": 300_000,
                          "hand_id_settle_s": 0.25, "field_half_angle_deg": 45.0,
                          "min_usable_fingers": 2}
@@ -1646,6 +1648,286 @@ def test_min_usable_fingers_is_a_named_parameter():
     assert info["dof_source"]["thumb"] == "camera"
 
 
+# --- what the vote is held ON: one scale for two sensors ----------------
+# The vote used to threshold a RAW median |glove curl - camera curl| at 0.35.
+# Curl is dimensionless but the two sensors do not put a hand on the same part
+# of that axis, and `template_fit` moved the glove's end of it: the thumb's
+# camera-use went 77 -> 94 % on sync_day1 partly because a fixed raw tolerance
+# had quietly become a looser one. These cover the fix and the two things it
+# has to survive — a real disagreement, and a template fit.
+
+FINGER_ORDER = ["thumb", "index", "middle", "ring", "pinky"]
+
+# sync_day1's camera, near enough: its straight finger reads lower than the
+# glove template's and its fist reads about the same, so the two sensors span
+# different parts of the curl axis.
+OPEN_CAM_CURLS = [1.30, 1.75, 1.82, 1.69, 1.44]
+FIST_CAM_CURLS = [0.90, 0.60, 0.58, 0.58, 0.62]
+
+# A camera that is an affine image of the glove — a different zero and a
+# different unit, and nothing else. Every flexion fraction is then identical
+# by construction, which is the property the normalisation is for.
+CAM_FROM_GLOVE = (0.65, 0.30)
+
+
+def _affine(curls, a_b=CAM_FROM_GLOVE):
+    a, b = a_b
+    return [a * c + b for c in curls]
+
+
+def _session_scale(glove_rows, cam_rows, rails, hand="right", gates=None):
+    """`learn_flexion_scale` over one hand's frames -> that hand's HandScale."""
+    from cam_hand.fusion import learn_flexion_scale
+
+    return learn_flexion_scale([(hand, c) for c in glove_rows],
+                               [(hand, c) for c in cam_rows],
+                               rails, gates=gates).for_hand(hand)
+
+
+def _session(glove_open, glove_fist, cam_open, cam_fist, n=100):
+    """n open frames and n fist frames on both sensors, plus the glove rails.
+
+    The endpoints are learned from exactly this: the glove's open end is the
+    rail `learn_rails` would find, its flexed end is the 2nd percentile, and
+    the camera's open end is the median over the frames IT reads as open.
+    """
+    glove = [list(glove_open)] * n + [list(glove_fist)] * n
+    cam = [list(cam_open)] * n + [list(cam_fist)] * n
+    rails = {("right", f): v for f, v in zip(FINGER_ORDER, glove_open)}
+    return glove, cam, rails
+
+
+def _affine_session(n=100):
+    return _session(OPEN_GLOVE_CURLS, FIST_GLOVE_CURLS,
+                    _affine(OPEN_GLOVE_CURLS), _affine(FIST_GLOVE_CURLS), n)
+
+
+def test_two_sensors_on_different_scales_give_the_same_fraction():
+    """The point of normalising: one hand, two rulers, one answer.
+
+    The camera here is an affine image of the glove, which is what a template
+    hand worn on a real one produces. Every fraction matches to floating
+    point, so the vote sees no disagreement at all; the raw curls differ by up
+    to 0.42.
+    """
+    from cam_hand.fusion import FRAC_MAX, FRAC_MIN, SENSOR_CAMERA, SENSOR_GLOVE
+
+    glove, cam, rails = _affine_session()
+    scale = _session_scale(glove, cam, rails)
+
+    for finger in SPREAD_FINGERS:
+        assert scale.normalisable(finger)
+        i = FINGER_ORDER.index(finger)
+        g_end = scale.endpoints(SENSOR_GLOVE, finger)
+        c_end = scale.endpoints(SENSOR_CAMERA, finger)
+        # each sensor's own endpoints, and they are not the same numbers
+        assert g_end.open == pytest.approx(OPEN_GLOVE_CURLS[i])
+        assert g_end.flexed == pytest.approx(FIST_GLOVE_CURLS[i])
+        assert c_end.open == pytest.approx(_affine(OPEN_GLOVE_CURLS)[i])
+        assert c_end.flexed == pytest.approx(_affine(FIST_GLOVE_CURLS)[i])
+        assert abs(g_end.open - c_end.open) > 0.25
+        assert abs(g_end.span - c_end.span) > 0.25
+        # ...and the same fraction everywhere in between, including the ends
+        for x in np.linspace(FIST_GLOVE_CURLS[i], OPEN_GLOVE_CURLS[i], 7):
+            assert scale.fraction(SENSOR_GLOVE, finger, x) == pytest.approx(
+                scale.fraction(SENSOR_CAMERA, finger, _affine([x])[0]),
+                abs=1e-12)
+
+    assert scale.disagreement(SPREAD_FINGERS, OPEN_GLOVE_CURLS,
+                              _affine(OPEN_GLOVE_CURLS)) == pytest.approx(
+        0.0, abs=1e-12)
+    # a curl outside the learned range is clipped, not unbounded
+    assert scale.fraction(SENSOR_GLOVE, "index", -5.0) == FRAC_MAX
+    assert scale.fraction(SENSOR_GLOVE, "index", 99.0) == FRAC_MIN
+
+
+def test_the_normalised_gate_admits_a_thumb_the_raw_one_vetoed():
+    """Same frame, same hand, two questions — and only one of them is fair.
+
+    Both sensors are looking at one open hand; they disagree by 0.39 of a palm
+    length because their scales differ, which the raw gate reads as the camera
+    having the fingers wrong and the fraction gate reads as perfect agreement.
+    """
+    glove, cam, rails = _affine_session()
+    scale = _session_scale(glove, cam, rails)
+    g_hand = hand_with_curls(OPEN_GLOVE_CURLS)
+    c_hand = hand_with_curls(_affine(OPEN_GLOVE_CURLS))
+    meta = facing_meta(view_deg=40.0)
+
+    _f, raw_info = fuse_skeletons(g_hand, c_hand, with_scale=False,
+                                  cam_meta=meta)
+    assert raw_info["curl_disagreement"] > DEFAULT_GATES.curl_agree_tol
+    assert raw_info["rejected"]["thumb"] == R_DISAGREE
+    assert raw_info["flex_disagreement"] is None, "no endpoints, no fraction"
+
+    _f, info = fuse_skeletons(g_hand, c_hand, with_scale=False, cam_meta=meta,
+                              scale=scale)
+    assert info["flex_disagreement"] == pytest.approx(0.0, abs=1e-9)
+    assert info["dof_source"]["thumb"] == "camera", info["rejected"]
+    # the raw number is still reported, it just no longer decides
+    assert info["curl_disagreement"] == raw_info["curl_disagreement"]
+
+
+def test_a_camera_that_really_has_the_fingers_wrong_is_still_refused():
+    """Normalising must not turn the gate off: thumbs_up still loses.
+
+    The glove has the four fingers curled and the camera, looking at an
+    edge-on hand, reports them nearly straight. That is not a difference of
+    scale, and no choice of endpoints can make it one.
+    """
+    glove, cam, rails = _session(OPEN_GLOVE_CURLS, FIST_GLOVE_CURLS,
+                                 OPEN_CAM_CURLS, FIST_CAM_CURLS)
+    scale = _session_scale(glove, cam, rails)
+    _f, info = fuse_skeletons(hand_with_curls(THUMBSUP_GLOVE_CURLS),
+                              hand_with_curls(THUMBSUP_CAM_CURLS),
+                              with_scale=False,
+                              cam_meta=facing_meta(view_deg=40.0), scale=scale)
+    assert info["flex_disagreement"] > DEFAULT_GATES.agree_tol_frac
+    assert info["rejected"]["thumb"] == R_DISAGREE
+
+
+# sync_day1's pinch, as the two sensors report it: the glove is on its rails
+# (its own open palm, to the last digit) while the camera watches the fingers
+# fold a little. The raw gap is 0.42 — over the old tolerance — and in
+# fraction terms the two are 0.16 apart, which is agreement.
+FIT_PROBE_GLOVE = list(OPEN_GLOVE_CURLS)
+FIT_PROBE_CAM = [1.28, 1.56, 1.64, 1.52, 1.30]
+
+
+def test_a_fitted_and_an_unfitted_run_ask_the_same_question():
+    """The review's complaint, reproduced and then fixed.
+
+    A template fit multiplies every glove curl by that finger's scale. The RAW
+    disagreement is multiplied with it, so a fixed raw tolerance is a
+    different strictness before and after — here it flips the verdict on a
+    frame nothing else about changed. Both of the glove's endpoints scale by
+    the same factor, so the FRACTION does not move at all and the verdict is
+    the same.
+    """
+    from cam_hand.fusion import SENSOR_CAMERA, SENSOR_GLOVE
+
+    s = 0.87                       # about what sync_day1's fit does to a curl
+    glove, cam, rails = _session(OPEN_GLOVE_CURLS, FIST_GLOVE_CURLS,
+                                 OPEN_CAM_CURLS, FIST_CAM_CURLS)
+    fit_glove = [[s * c for c in row] for row in glove]
+    fit_rails = {k: s * v for k, v in rails.items()}
+
+    plain = _session_scale(glove, cam, rails)
+    fitted = _session_scale(fit_glove, cam, fit_rails)
+
+    for finger in SPREAD_FINGERS:
+        i = FINGER_ORDER.index(finger)
+        # the camera never moved, so its endpoints are bit-identical
+        assert (fitted.endpoints(SENSOR_CAMERA, finger)
+                == plain.endpoints(SENSOR_CAMERA, finger))
+        was = plain.endpoints(SENSOR_GLOVE, finger)
+        now = fitted.endpoints(SENSOR_GLOVE, finger)
+        assert now.open == pytest.approx(s * was.open)
+        assert now.flexed == pytest.approx(s * was.flexed)
+        assert now.span == pytest.approx(s * was.span)
+        # ...so a curl and its fitted self land on the same fraction, and not
+        # only at the two ends where both are 0 and 1 by construction
+        for x in np.linspace(FIST_GLOVE_CURLS[i], OPEN_GLOVE_CURLS[i], 7):
+            want = plain.fraction(SENSOR_GLOVE, finger, x)
+            assert fitted.fraction(SENSOR_GLOVE, finger, s * x) == (
+                pytest.approx(want, abs=1e-12))
+        assert 0.05 < plain.fraction(SENSOR_GLOVE, finger, 1.35) < 0.95
+
+    meta = facing_meta(view_deg=40.0)
+    c_hand = hand_with_curls(FIT_PROBE_CAM)
+
+    def verdict(curls, **kw):
+        _f, info = fuse_skeletons(hand_with_curls(curls), c_hand,
+                                  with_scale=False, cam_meta=meta, **kw)
+        return info
+
+    fit_probe = [s * c for c in FIT_PROBE_GLOVE]
+
+    # the RAW gate: the same hand fused unfitted and fitted gets two answers
+    before = verdict(FIT_PROBE_GLOVE)
+    after = verdict(fit_probe)
+    assert before["curl_disagreement"] > DEFAULT_GATES.curl_agree_tol
+    assert after["curl_disagreement"] < DEFAULT_GATES.curl_agree_tol
+    assert before["rejected"]["thumb"] == R_DISAGREE
+    assert after["dof_source"]["thumb"] == "camera"
+
+    # the NORMALISED gate: one answer, and the two numbers agree to 1e-12
+    before = verdict(FIT_PROBE_GLOVE, scale=plain)
+    after = verdict(fit_probe, scale=fitted)
+    assert 0.05 < before["flex_disagreement"] < DEFAULT_GATES.agree_tol_frac
+    assert before["flex_disagreement"] == pytest.approx(
+        after["flex_disagreement"], abs=1e-12)
+    assert (before["dof_source"]["thumb"]
+            == after["dof_source"]["thumb"] == "camera")
+
+
+def test_a_finger_with_no_measured_range_is_dropped_from_the_vote():
+    """A fraction over a range nobody measured is noise divided by noise.
+
+    The guard is per sensor and per finger: a glove finger that never left its
+    rail has no span to divide by, and neither has a camera finger the session
+    never saw move. Either way that finger stops voting and the report says
+    which and why — it is not a finger the vote is neutral about.
+    """
+    from cam_hand.fusion import N_CAM_SPAN, N_GLOVE_SPAN, N_NO_RAIL
+
+    glove, cam, rails = _affine_session()
+    i_pinky = FINGER_ORDER.index("pinky")
+
+    # the pinky's GLOVE curl never moves off its rail
+    stuck = [list(row) for row in glove]
+    for row in stuck:
+        row[i_pinky] = OPEN_GLOVE_CURLS[i_pinky]
+    scale = _session_scale(stuck, cam, rails)
+    assert not scale.normalisable("pinky")
+    assert N_GLOVE_SPAN in scale.dropped["pinky"]
+    assert all(scale.normalisable(f) for f in ("index", "middle", "ring"))
+
+    # ...and the same finger on the CAMERA
+    flat = [list(row) for row in cam]
+    for row in flat:
+        row[i_pinky] = _affine(OPEN_GLOVE_CURLS)[i_pinky]
+    assert N_CAM_SPAN in _session_scale(glove, flat, rails).dropped["pinky"]
+
+    # a finger `learn_rails` refused to teach has no open endpoint at all
+    scale = _session_scale(glove, cam,
+                           {k: v for k, v in rails.items()
+                            if k != ("right", "pinky")})
+    assert scale.dropped["pinky"] == N_NO_RAIL
+
+    # and the vote is held over what is left, with the drop recorded
+    g_hand = hand_with_curls(OPEN_GLOVE_CURLS)
+    c_hand = hand_with_curls(_affine(OPEN_GLOVE_CURLS))
+    meta = facing_meta(view_deg=40.0)
+    _f, info = fuse_skeletons(g_hand, c_hand, with_scale=False, cam_meta=meta,
+                              scale=scale)
+    assert info["thumb_vote_fingers"] == ["index", "middle", "ring"]
+    assert set(info["thumb_vote_dropped"]) == {"pinky"}
+
+    # with nothing left to normalise, nobody votes and the geometry decides —
+    # the same failure mode as every finger being disputed
+    bare = _session_scale(glove, cam, {})
+    _f, info = fuse_skeletons(g_hand, c_hand, with_scale=False, cam_meta=meta,
+                              scale=bare)
+    assert info["thumb_vote_fingers"] == []
+    assert info["flex_disagreement"] is None
+    assert info["dof_source"]["thumb"] == "camera"
+    _f, info = fuse_skeletons(g_hand, c_hand, with_scale=False, scale=bare,
+                              cam_meta=facing_meta(view_deg=75.0))
+    assert info["rejected"]["thumb"] == R_VIEW, "the geometry still bites"
+
+
+def test_the_guard_thresholds_are_named_parameters():
+    """Every span in this session is over 0.9 on the glove and 0.6 on the
+    camera, so demanding more of either drops every voting finger."""
+    glove, cam, rails = _affine_session()
+    assert _session_scale(glove, cam, rails).dropped == {}
+    for strict in (GateParams(min_glove_span=1.5),
+                   GateParams(min_cam_span=1.5)):
+        dropped = _session_scale(glove, cam, rails, gates=strict).dropped
+        assert set(dropped) >= set(SPREAD_FINGERS)
+
+
 # --- the reliability profile applies by default -------------------------
 # The masks in profiles/ were measured on this hardware and were being applied
 # only when somebody remembered the flag. `--profile auto` is now the default,
@@ -1903,6 +2185,84 @@ def test_a_lag_larger_than_the_window_loses_pairs_rather_than_faking_them():
     assert matched == []
 
 
+# --- a lag is applied only when several clips agree ---------------------
+# `estimate_glove_lag` already refuses a clip whose camera did not move and a
+# shift that does not explain the two traces, so one trustworthy estimate is a
+# real measurement — of ONE transition, with nothing to check it against. A
+# cross-correlation peak can be real and still be the wrong peak, and the
+# shift is then a lie about every frame of the session rather than about that
+# clip. The cheapest check there is, is another clip.
+
+def _clip(lag, cam_hz=90.0, glove_hz=60.0):
+    """One (glove rows, camera rows) clip with `lag` seconds planted in it."""
+    return _lag_streams(lag, cam_hz=cam_hz, glove_hz=glove_hz)
+
+
+def test_one_trustworthy_clip_is_measured_and_not_applied():
+    """A measurement with nothing to corroborate it is reported, not used."""
+    fuse = _fuse_module()
+    row = fuse.lag_from_clips([_clip(0.300)], "right", "settle")
+    assert row.n_clips == 1 and row.n_trusted == 1
+    assert len(row.estimates) == 1
+    assert row.estimates[0] == pytest.approx(0.300, abs=0.02)
+    assert not row.applied, "one clip is not agreement"
+    assert fuse.NOT_CORROBORATED in row.why
+    assert str(fuse.MIN_LAG_CLIPS) in row.why
+    # ...and the estimate it refused is printed, because "not corroborated" is
+    # only checkable if the number is there
+    assert "estimates" in row.described() and "nothing applied" in row.described()
+    assert f"{row.estimates[0] * 1000.0:+.0f}" in row.described()
+
+
+def test_two_clips_that_agree_are_applied_and_two_that_do_not_are_not():
+    """The rule, both ways round, on clips with a planted lag."""
+    fuse = _fuse_module()
+
+    agree = [_clip(0.300), _clip(0.300, cam_hz=120.0, glove_hz=50.0)]
+    row = fuse.lag_from_clips(agree, "right", "settle")
+    assert row.n_trusted == 2 and row.applied
+    assert row.seconds == pytest.approx(0.300, abs=0.02)
+    assert row.mad <= fuse.MAX_LAG_MAD
+    assert "APPLIED" in row.described() and "MAD" in row.described()
+
+    # two clips that measured two different lags: the median of them is not a
+    # lag, it is the middle of a disagreement
+    disagree = [_clip(0.100), _clip(0.400)]
+    row = fuse.lag_from_clips(disagree, "right", "settle")
+    assert row.n_trusted == 2 and not row.applied
+    assert fuse.NOT_AGREED in row.why
+    assert row.mad > fuse.MAX_LAG_MAD
+    assert sorted(row.estimates) == list(row.estimates)
+    assert "nothing applied" in row.described()
+
+    # the two thresholds are parameters, not constants baked into the rule
+    assert fuse.lag_from_clips(agree, "right", "settle", min_clips=3).applied \
+        is False
+    assert fuse.lag_from_clips(disagree, "right", "settle",
+                               max_mad=0.5).applied
+
+
+def test_a_hand_with_no_agreed_estimate_has_nothing_applied():
+    """End to end through `glove_lag_of`: the mapping stays empty."""
+    from pathlib import Path
+
+    fuse = _fuse_module()
+    glove, cam = _clip(0.300)
+    loaded = [{"glove": glove, "cam": cam}]
+    rows, applied = fuse.glove_lag_of(fuse.LAG_AUTO, Path("nowhere"), [],
+                                      loaded)
+    assert applied is None, "one take is one clip, so nothing is corroborated"
+    assert not rows["right"].applied
+    assert rows["right"].n_trusted == 1
+
+    # a lag GIVEN on the command line is applied as given — that is what it is
+    # for, and checking a lag against a session needs it to actually run
+    rows, applied = fuse.glove_lag_of({"right": 0.46}, Path("nowhere"), [],
+                                      loaded)
+    assert applied == {"right": 0.46}
+    assert rows["right"].applied and "as given" in rows["right"].described()
+
+
 # --- fitting the glove's template hand to the operator's own -------------
 # The glove measures ANGLES and hangs them on one fixed template skeleton; the
 # camera measures the real bone lengths in millimetres. Everything here is
@@ -2044,14 +2404,19 @@ def test_measure_hand_reads_the_cameras_own_bone_lengths():
         1000.0 * m.lengths[segment_name(1, 6)], abs=1e-3)
 
 
-def test_measure_hand_prefers_the_frames_the_camera_could_see():
-    """Open frames when there are any, every trusted frame otherwise.
+def test_measure_hand_uses_open_frames_only_and_has_no_fallback():
+    """Open frames, or no measurement at all.
 
     A closed hand is self-occluded and the tracker INFERS the joints it cannot
     see, so its lengths are a solver's opinion. Which frames are open is
     decided on the CAMERA's own curls against `cam_open_curl` — a geometric
     fact about a straight finger — never on the glove's claim to be open,
     which is the claim the rail override exists because it cannot be trusted.
+
+    There used to be a fallback to every trusted frame. It is gone: a
+    measurement silently swapped for a guess is worse than no measurement,
+    because the guess is then rescaled onto the template and used for the
+    whole session.
     """
     from cam_hand.template_fit import measure_hand, merge_measurements
 
@@ -2064,20 +2429,98 @@ def test_measure_hand_prefers_the_frames_the_camera_could_see():
     for name, got in both.lengths.items():
         assert got == pytest.approx(truth[name], rel=1e-6), name
 
-    only_closed = measure_hand(closed_rows, hand="right")
-    assert not only_closed.from_open and only_closed.n_frames == 300
+    # 300 frames of a hand the camera could not see whole measure NOTHING,
+    # however many of them there are
+    assert measure_hand(closed_rows, hand="right") is None
+    # ...and one open frame short of the floor is still nothing
+    assert measure_hand(_cam_rows(n=19, curl=0.0), hand="right") is None
+    assert measure_hand(_cam_rows(n=20, curl=0.0), hand="right").n_frames == 20
 
-    # ...and the same rule over a SESSION read take by take: one open take
-    # beats twenty closed ones, because "open when available" is a decision
-    # about the session and not about each take. Measured on sync_day1's right
-    # hand, letting the closed takes into the median put the index at 0.86 of
-    # the template against 0.94 from the open ones.
+    # ...and over a SESSION read take by take: the closed takes contribute no
+    # part at all, so the median is the open take's. Measured on sync_day1's
+    # right hand, letting closed takes into the median put the index at 0.86
+    # of the template against 0.94 from the open ones.
     per_take = [measure_hand(closed_rows, hand="right") for _ in range(20)]
+    assert per_take == [None] * 20
     per_take.append(measure_hand(open_rows, hand="right"))
     merged = merge_measurements(per_take)
-    assert merged.from_open and "1 of 21" in merged.source
+    assert merged.from_open and merged.n_frames == 30
     for name, got in merged.lengths.items():
         assert got == pytest.approx(truth[name], rel=1e-6), name
+
+
+def test_a_hand_without_enough_open_frames_is_refused_and_fuses_unfitted():
+    """The session-level half of the rule, with a printable reason.
+
+    `measure_hand` refuses a TAKE with too few open frames; `fit_refusal`
+    refuses a HAND whose takes together do not add up to enough of them. Both
+    refusals end the same way — that hand fuses on the raw template — and the
+    report has to be able to say which hand and why.
+    """
+    from cam_hand.template_fit import (MIN_FIT_FRAMES, fit_refusal,
+                                       measure_hand, merge_measurements)
+
+    def session(n_takes):
+        parts = [measure_hand(_cam_rows(scale=1.1, n=30, curl=0.0),
+                              hand="right") for _ in range(n_takes)]
+        return merge_measurements(parts)
+
+    assert fit_refusal(None)
+    assert "open-palm" in fit_refusal(None)
+
+    thin = session(5)                       # 150 open frames
+    assert thin.n_frames == 150
+    why = fit_refusal(thin)
+    assert why and str(MIN_FIT_FRAMES) in why and "150" in why
+
+    thick = session(9)                      # 270
+    assert thick.n_frames == 270
+    assert fit_refusal(thick) == "", "a real session clears this by miles"
+
+    # a measurement LOADED from a file written before open frames were
+    # required says so, and is refused on that alone
+    from dataclasses import replace
+    assert fit_refusal(replace(thick, from_open=False))
+
+
+def test_the_fit_is_one_calibration_per_hand_and_not_per_pose(tmp_path):
+    """One measurement per hand for the whole session, refusal included.
+
+    A hand's bones do not change between takes, so a per-pose or per-frame fit
+    would be fitting the tracker's pose-dependent reconstruction error rather
+    than the hand. `measure_hand` runs per take only so the median across
+    takes can be robust; what reaches the fusion is one number per segment per
+    hand.
+    """
+    from cam_hand.template_fit import measure_hand
+
+    fuse = _fuse_module()
+    loaded = [{"glove": [{"hand_side": "right", "frame": _glove_frame()}
+                         for _ in range(4)]} for _pose in range(6)]
+
+    def parts(n_takes):
+        return [measure_hand(_cam_rows(scale=1.1, n=30, curl=0.0),
+                             hand="right") for _ in range(n_takes)]
+
+    got, scales, saved, refused = fuse.fit_measurements(
+        "auto", {"right": parts(9)}, loaded, tmp_path)
+    assert set(got) == {"right"} and not refused
+    assert len(saved) == 1, "one saved measurement, not one per take"
+    assert set(scales) == {"right"}
+    # every glove row of every pose carries the SAME fitted hand
+    fitted = {tuple(np.asarray(r["fit_pts"], float).round(12).ravel())
+              for entry in loaded for r in entry["glove"]}
+    assert len(fitted) == 1
+
+    for entry in loaded:
+        for row in entry["glove"]:
+            row.pop("fit_pts")
+    got, _s, _saved, refused = fuse.fit_measurements(
+        "auto", {"right": parts(3)}, loaded, tmp_path)
+    assert got == {} and set(refused) == {"right"}
+    assert "90" in refused["right"], refused
+    assert all("fit_pts" not in r for e in loaded for r in e["glove"]), (
+        "a refused hand is fused on the raw template")
 
 
 def test_measure_hand_needs_the_cameras_26_metric_joints():
@@ -2161,6 +2604,11 @@ def test_a_fit_moves_the_curl_metric_onto_the_cameras():
     the glove's curl reads high and the fused pinch index sat about 0.15 above
     the camera's. With the template's bones rescaled to the camera's, the two
     read the same number for the same hand shape.
+
+    The measurement is taken on the OPEN hand and applied to a POSED one,
+    which is the whole point of measuring once per session: a bone is the same
+    length in either, and the open hand is the one the camera saw whole. The
+    two synthetic hands here agree on every segment to 4e-17.
     """
     from cam_hand.features import flexion_features
     from cam_hand.template_fit import fit_template, measure_hand
@@ -2171,7 +2619,7 @@ def test_a_fit_moves_the_curl_metric_onto_the_cameras():
     # 81 mm against the camera's 96
     camera = np.asarray(_operators_hand(curl=0.35), float)
     frame = _glove_frame(curl=0.35)
-    m = measure_hand(_cam_rows(abs26=camera.tolist()), hand="right")
+    m = measure_hand(_cam_rows(abs26=_operators_hand(curl=0.0)), hand="right")
     raw = np.asarray(frame_to_keypoints21(frame), float)
     fit = np.asarray(frame_to_keypoints21(fit_template(frame, m)), float)
     want = flexion_features(_cam21(camera))

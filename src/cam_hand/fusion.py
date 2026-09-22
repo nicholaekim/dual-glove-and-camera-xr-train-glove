@@ -92,7 +92,9 @@ come from the tracker's own opinion of itself:
                 its proximal bone points at the camera) and the palm is
                 turned toward the module.
   thumb         only when the palm is turned toward the module AND the camera
-                agrees with the glove about the other fingers. A camera that
+                agrees with the glove about the other fingers, measured as a
+                FLEXION FRACTION on each sensor's own endpoints — see "THE
+                TWO SENSORS DO NOT SHARE A SCALE" below. A camera that
                 has the fingers wrong has the hand's orientation wrong, and
                 the thumb is the DOF that orientation error moves the most.
                 This is what rejects thumbs_up and admits pinch.
@@ -118,6 +120,61 @@ one of them is printed in the report so a later session can move it.
 No frame is ever dropped. A frame that fails every gate is the glove skeleton,
 unchanged, which is exactly what the pipeline produced before the camera
 existed.
+
+THE TWO SENSORS DO NOT SHARE A SCALE, SO THE THUMB VOTE IS NORMALISED
+---------------------------------------------------------------------
+The thumb gate asks whether the two sensors agree about index..little, and
+the first version of it thresholded the median |glove curl - camera curl| at
+a raw 0.35. Curl is tip-to-wrist over palm length, which is dimensionless —
+but the two sensors do not put a hand on the same part of that axis. The
+glove's straight index reads 1.97 on the TEMPLATE hand and its fist reads
+0.63; the camera's straight index reads 1.75 on the operator's and its fist
+0.55. A fixed distance between those two numbers means a different amount of
+DISAGREEMENT depending on which glove hand the value came off, and
+`template_fit` changed exactly that: rescaling the template's bones moved
+every glove curl by a few per cent, the raw gap shrank with them, and the
+thumb's camera-use jumped from 77 % to 94 % on sync_day1. Some of that was
+the fit measuring a real hand; some of it was a threshold quietly getting
+looser. A number that moves when the units move cannot tell the two apart.
+
+So each finger's curl is first put on ITS OWN SENSOR's, HAND's and FINGER's
+endpoints, as a flexion fraction:
+
+    frac = (open - curl) / (open - flexed)          clipped to [-0.2, 1.2]
+
+0 is that sensor's straight finger, 1 is that sensor's most flexed, and the
+median |frac_glove - frac_camera| is what `agree_tol_frac` thresholds. Both
+ends are LEARNED from the session, per hand, per finger, per sensor, with no
+pose labels anywhere:
+
+  glove open    the finger's learned rail (`learn_rails`) — the glove's own
+                bit-exact full-extension constant, which is already measured
+                for the override and is by construction on the hand being
+                fused, template or fitted.
+  camera open   the median camera curl over the session's open-palm-LIKE
+                frames — every finger reading above `cam_open_curl - margin`,
+                the same label-free test `template_fit` measures a hand on —
+                falling back to the 98th percentile of that finger's camera
+                curl when the session holds too few of them.
+  flexed        the 2nd percentile of that finger's curl over the session, on
+                each sensor separately. A percentile and not the minimum, for
+                the same reason `diagnostics.camera_range` uses one: a single
+                mistracked frame is not the bottom of a sensor's range.
+
+A finger whose range on either sensor is too small to normalise — below
+`min_glove_span` or `min_cam_span` — is not put on a fraction at all and is
+DROPPED from the vote for that run, and the report says which and why. A
+session in which a finger never straightened teaches no endpoints, and
+dividing by that would turn measurement noise into a full-scale
+disagreement.
+
+What this buys is comparability: the camera's endpoints are identical in a
+fitted and an unfitted run (fitting does not touch the camera) and the
+glove's move by exactly the factor its curls moved by, so the fraction is
+very nearly invariant and the two runs' camera-use can be compared. The raw
+tolerance survives only as the fallback for a caller with no learned
+endpoints to hand (`curl_agree_tol`), and `scripts/fuse_poses.py` always has
+them.
 
 WHEN THE GLOVE IS WRONG: THE RAIL-DISAGREEMENT OVERRIDE
 -------------------------------------------------------
@@ -321,9 +378,36 @@ class GateParams:
                          the sensor. Open palm and pinch measure 25-45 deg in
                          that session; the edge-on thumbs_up hand measures
                          70-78, so 50 separates them.
-    curl_agree_tol       median absolute curl disagreement across index..little
-                         below which the camera may also supply the thumb.
-                         pinch measures 0.24-0.28, thumbs_up 0.88.
+    agree_tol_frac       median absolute FLEXION-FRACTION disagreement across
+                         index..little below which the camera may also supply
+                         the thumb. This is the gate that actually runs
+                         whenever learned endpoints are available; see "THE
+                         TWO SENSORS DO NOT SHARE A SCALE" in the module
+                         docstring for why a raw curl difference could not be
+                         compared across a template fit. 0.20 is the value
+                         that reproduces the raw gate's verdict on the
+                         UNFITTED sync_day1 — thumb camera-use 77.4 % raw,
+                         77.3 % normalised — chosen so that the change of
+                         units is not also a change of strictness. On the
+                         FITTED sync_day1 the same tolerance gives 77.5 %,
+                         against the raw gate's 93.9 %: that 16-point jump
+                         was the gate getting looser, not the camera getting
+                         better.
+    min_glove_span       a finger whose glove curl range (rail minus its 2nd
+                         percentile) is below this cannot be put on a
+                         fraction and is dropped from the thumb vote. 0.4 on
+                         the glove's template scale: sync_day1's smallest
+                         real span is the pinky's 1.71 - 0.66 = 1.05, and a
+                         finger that never left its rail measures ~0.
+    min_cam_span         the same for the camera, 0.3 — lower because the
+                         camera's straight finger reads lower than the
+                         template's and its fist about the same, so every
+                         camera span is the smaller of the two.
+    curl_agree_tol       the RAW median absolute curl disagreement, used only
+                         when no learned endpoints were passed. Kept because
+                         a caller with one frame and no session behind it has
+                         nothing to normalise with; pinch measures 0.24-0.28
+                         on it, thumbs_up 0.88.
     min_visible_time_us  how long LeapC must have held this hand. 300 ms is
                          about 27 frames at 90 Hz: past the re-acquisition
                          transient, still well inside a 5 s take.
@@ -342,6 +426,9 @@ class GateParams:
     """
     curl_gate: float = 1.2
     view_gate_deg: float = 50.0
+    agree_tol_frac: float = 0.20
+    min_glove_span: float = 0.4
+    min_cam_span: float = 0.3
     curl_agree_tol: float = 0.35
     min_visible_time_us: int = 300_000
     hand_id_settle_s: float = 0.25
@@ -364,6 +451,13 @@ R_NO_GEOMETRY = "no palm geometry to measure the view from"
 R_VIEW = "palm turned away from the camera"
 R_CURLED = "glove says the finger is curled"
 R_DISAGREE = "camera disagrees with the glove about the fingers"
+
+# Why a finger could not be put on a flexion fraction, and so does not vote.
+N_NO_RAIL = "no glove rail learned, so there is no open endpoint"
+N_GLOVE_SPAN = "the glove's curl range is too small to normalise"
+N_CAM_SPAN = "the camera's curl range is too small to normalise"
+N_NO_FRAMES = "no {sensor} frames of this hand to learn endpoints from"
+R_NOT_NORMALISED = "no finger could be put on a flexion fraction"
 
 # Rail-override reasons: why a finger's curl stayed the glove's.
 R_RAIL_NONE = "no rail learned for this finger"
@@ -584,6 +678,245 @@ def curl_gates_from_rails(gates: Optional[GateParams],
         out.append(gates.curl_gate * float(now) / float(was))
         moved = moved or abs(now - was) > 1e-12
     return out if moved else None
+
+
+# --- one scale both sensors can be compared on -------------------------
+
+SENSOR_GLOVE = "glove"
+SENSOR_CAMERA = "camera"
+SENSORS = (SENSOR_GLOVE, SENSOR_CAMERA)
+
+# A fraction is clipped rather than left to run away: a curl a little past
+# either learned endpoint is a finger at the end of its range, not a finger
+# three times more flexed than the session ever saw. The band is deliberately
+# wider than [0, 1] so that "slightly past the rail" stays distinguishable
+# from "exactly on it".
+FRAC_MIN = -0.2
+FRAC_MAX = 1.2
+
+# The flexed endpoint is a percentile and not the minimum, for the reason
+# `diagnostics.camera_range` uses one: a single mistracked frame is not the
+# bottom of a sensor's range. The camera's open fallback is its mirror.
+FLEXED_PERCENTILE = 2.0
+OPEN_PERCENTILE = 98.0
+# Below this many open-palm-like frames in a session the camera's open
+# reference is that percentile instead of a median over them. 20 frames is
+# about a fifth of a second of Leap tracking — the same floor
+# `template_fit.MIN_OPEN_FRAMES` uses for the same question.
+MIN_OPEN_REF_FRAMES = 20
+
+
+def _percentile(values: Sequence[float], pct: float) -> float:
+    return float(np.percentile(np.asarray(list(values), float), pct))
+
+
+@dataclass(frozen=True)
+class Endpoints:
+    """One sensor's straight and most-flexed readings for one finger.
+
+    `open` and `flexed` are curls — tip-to-wrist over palm length — on THIS
+    sensor's own hand, so the pair is a ruler with that sensor's units baked
+    in. `fraction` is what makes two such rulers comparable.
+    """
+
+    open: float = 0.0
+    flexed: float = 0.0
+    n: int = 0
+    how: str = ""
+
+    @property
+    def span(self) -> float:
+        return float(self.open) - float(self.flexed)
+
+    def fraction(self, curl: float) -> float:
+        """Where `curl` sits between the two ends: 0 straight, 1 fully flexed."""
+        span = self.span
+        if span <= 1e-9:
+            return 0.0
+        frac = (float(self.open) - float(curl)) / span
+        return max(FRAC_MIN, min(FRAC_MAX, frac))
+
+    def described(self) -> str:
+        return (f"open {self.open:5.3f}  flexed {self.flexed:5.3f}  span "
+                f"{self.span:5.3f}  {self.how}")
+
+
+@dataclass(frozen=True)
+class HandScale:
+    """One hand's endpoints on both sensors — what `fuse_skeletons` is given.
+
+    Per hand rather than per session because `fuse_skeletons` is a pure
+    function of one frame and deliberately does not know which hand it is
+    looking at: the caller already selects the per-hand `unreliable_fingers`
+    the same way.
+
+    `dropped` names the fingers the guard refused to normalise and why. A
+    dropped finger is not a finger the vote is neutral about — it is one the
+    vote must not count, because the fraction it would contribute is a
+    division by a range that was never measured.
+    """
+
+    hand: str = ""
+    ends: Mapping[Tuple[str, str], Endpoints] = field(default_factory=dict)
+    dropped: Mapping[str, str] = field(default_factory=dict)
+
+    def endpoints(self, sensor: str, finger: str) -> Optional[Endpoints]:
+        return self.ends.get((sensor, finger))
+
+    def normalisable(self, finger: str) -> bool:
+        return (finger not in self.dropped
+                and all((s, finger) in self.ends for s in SENSORS))
+
+    def fraction(self, sensor: str, finger: str,
+                 curl: float) -> Optional[float]:
+        got = self.ends.get((sensor, finger))
+        return None if got is None else got.fraction(curl)
+
+    def disagreement(self, fingers: Sequence[str],
+                     curl_glove: Sequence[float],
+                     curl_cam: Sequence[float]) -> Optional[float]:
+        """Median |frac_glove - frac_camera| over `fingers`, or None.
+
+        Every finger passed must be normalisable; the caller has already
+        dropped the ones that are not, and silently skipping them here would
+        let a vote be held over a set nobody reported.
+        """
+        gaps = []
+        for finger in fingers:
+            i = FINGER_NAMES.index(finger)
+            g = self.fraction(SENSOR_GLOVE, finger, curl_glove[i])
+            c = self.fraction(SENSOR_CAMERA, finger, curl_cam[i])
+            if g is None or c is None:
+                continue
+            gaps.append(abs(g - c))
+        return median(gaps) if gaps else None
+
+
+@dataclass(frozen=True)
+class FlexionScale:
+    """Every hand's endpoints, learned once per fusion run.
+
+    Held as a value so a run can be handed one and the report can print it;
+    `for_hand` is the only reader `fuse_skeletons` needs.
+    """
+
+    hands: Mapping[str, HandScale] = field(default_factory=dict)
+
+    def for_hand(self, hand: Optional[str]) -> Optional[HandScale]:
+        return self.hands.get(str(hand).strip().lower())
+
+    def __bool__(self) -> bool:
+        return bool(self.hands)
+
+
+def learn_flexion_scale(
+        glove_samples: Iterable[Tuple[str, Sequence[float]]],
+        cam_samples: Iterable[Tuple[str, Sequence[float]]],
+        rails: Mapping[Tuple[str, str], float],
+        gates: Optional[GateParams] = None,
+        rail_params: Optional[RailOverrideParams] = None,
+        min_open_frames: int = MIN_OPEN_REF_FRAMES) -> FlexionScale:
+    """Learn each hand and finger's endpoints on both sensors.
+
+    `glove_samples` and `cam_samples` are (hand_side, curls) per frame, curls
+    in FINGER_NAMES order — `features.flexion_features` of whichever skeleton
+    is about to be fused, which on the glove side means the FITTED hand when
+    a fit is in force. The two streams do not have to be paired or even the
+    same length: an endpoint is a fact about a sensor over a session, not
+    about a frame, and pairing would only shrink the sample.
+
+    LABEL-FREE, and that is the whole design. Nothing here asks the glove
+    whether a frame is open — the glove saying "open" is the claim the rail
+    override exists because it cannot be trusted — and nothing asks for a
+    pose label, so a session recorded without one is measured the same way.
+
+      glove open     the learned rail. It is already the glove's own
+                     full-extension constant for this hand and finger, and it
+                     is measured on the same hand the fusion compares against
+                     it. A finger with no rail is dropped: `learn_rails`
+                     refuses to guess one for a finger the session never
+                     showed straight, and so does this.
+      camera open    the median over the session's open-palm-LIKE frames —
+                     every one of index..little reading above
+                     `cam_open_curl - margin`, the camera's own geometric
+                     test — or the 98th percentile of that finger's curl when
+                     there are fewer than `min_open_frames` of them.
+      flexed         the 2nd percentile of that finger's curl on that sensor.
+
+    A finger whose span comes out under `min_glove_span` / `min_cam_span` is
+    recorded in `dropped` with the reason, not silently normalised by a
+    number that is mostly noise.
+    """
+    gates = gates or DEFAULT_GATES
+    rail_params = rail_params or DEFAULT_RAIL
+
+    g_curls: Dict[str, Dict[str, List[float]]] = defaultdict(
+        lambda: defaultdict(list))
+    for hand, curls in glove_samples:
+        side = str(hand).strip().lower()
+        for finger, c in zip(FINGER_NAMES, curls):
+            g_curls[side][finger].append(float(c))
+
+    c_rows: Dict[str, List[List[float]]] = defaultdict(list)
+    for hand, curls in cam_samples:
+        c_rows[str(hand).strip().lower()].append([float(c) for c in curls])
+
+    hands: Dict[str, HandScale] = {}
+    for side in sorted(set(g_curls) | set(c_rows)):
+        ends: Dict[Tuple[str, str], Endpoints] = {}
+        dropped: Dict[str, str] = {}
+        rows = c_rows.get(side, [])
+        # The camera's own open-hand frames, by the same test `template_fit`
+        # picks a measurement's frames with.
+        open_rows = [r for r in rows
+                     if all(r[FINGER_NAMES.index(f)]
+                            >= rail_params.open_curl(f) - rail_params.margin
+                            for f in RAIL_FINGERS)]
+        from_open = len(open_rows) >= min_open_frames
+
+        for finger in FINGER_NAMES:
+            i = FINGER_NAMES.index(finger)
+            glove_vals = g_curls.get(side, {}).get(finger, [])
+            rail = rails.get((side, finger))
+            if not glove_vals:
+                dropped[finger] = N_NO_FRAMES.format(sensor=SENSOR_GLOVE)
+            elif rail is None:
+                dropped[finger] = N_NO_RAIL
+            else:
+                got = Endpoints(
+                    open=float(rail),
+                    flexed=_percentile(glove_vals, FLEXED_PERCENTILE),
+                    n=len(glove_vals),
+                    how=f"rail / p{FLEXED_PERCENTILE:.0f} of "
+                        f"{len(glove_vals)} frames")
+                ends[(SENSOR_GLOVE, finger)] = got
+                if got.span < gates.min_glove_span:
+                    dropped[finger] = (f"{N_GLOVE_SPAN} "
+                                       f"({got.span:.2f} < "
+                                       f"{gates.min_glove_span:.2f})")
+
+            cam_vals = [r[i] for r in rows]
+            if not cam_vals:
+                dropped.setdefault(finger,
+                                   N_NO_FRAMES.format(sensor=SENSOR_CAMERA))
+                continue
+            if from_open:
+                open_c = median([r[i] for r in open_rows])
+                how = f"median of {len(open_rows)} open-palm-like frames"
+            else:
+                open_c = _percentile(cam_vals, OPEN_PERCENTILE)
+                how = (f"p{OPEN_PERCENTILE:.0f} ({len(open_rows)} "
+                       f"open-palm-like frames, need {min_open_frames})")
+            got = Endpoints(
+                open=float(open_c),
+                flexed=_percentile(cam_vals, FLEXED_PERCENTILE),
+                n=len(cam_vals), how=how)
+            ends[(SENSOR_CAMERA, finger)] = got
+            if got.span < gates.min_cam_span:
+                dropped.setdefault(finger, f"{N_CAM_SPAN} ({got.span:.2f} < "
+                                           f"{gates.min_cam_span:.2f})")
+        hands[side] = HandScale(hand=side, ends=ends, dropped=dropped)
+    return FlexionScale(hands=hands)
 
 
 @dataclass(frozen=True)
@@ -1020,8 +1353,9 @@ def _blank_info(with_scale: bool) -> dict:
             "frame_reasons": [],
             "rail_override": [],
             "thumb_vote_fingers": [],
+            "thumb_vote_dropped": {},
             "view_angle_deg": None, "field_angle_deg": None,
-            "curl_disagreement": None}
+            "curl_disagreement": None, "flex_disagreement": None}
 
 
 def _reject_all(info: dict, reason: str, rail_dofs: Sequence[str] = ()) -> dict:
@@ -1050,6 +1384,7 @@ def fuse_skeletons(
     rail: Optional[RailDecision] = None,
     unreliable_fingers: Sequence[str] = (),
     curl_gates: Optional[Sequence[float]] = None,
+    scale: Optional[HandScale] = None,
 ) -> Tuple[np.ndarray, dict]:
     """Fuse one glove frame with one camera frame -> 21 points + info.
 
@@ -1083,6 +1418,14 @@ def fuse_skeletons(
     the operator's by `template_fit`, which moves every curl the gate reads —
     and `curl_gates_from_rails` is what builds it. None, the default, uses the
     one constant for every finger, which is what every caller did before.
+
+    `scale` is THIS hand's learned flexion endpoints (`learn_flexion_scale`,
+    then `FlexionScale.for_hand`). With it the thumb vote is held on flexion
+    FRACTIONS against `gates.agree_tol_frac`, which is the comparison that
+    survives a template fit; fingers it could not normalise drop out of the
+    vote and are listed in `info["thumb_vote_dropped"]`. Without it the vote
+    falls back to raw curls against `gates.curl_agree_tol` — a caller with
+    one frame and no session behind it has no endpoints to normalise with.
 
     Returns the fused points and an info dict: `dof_source` says where each
     camera-owned DOF actually came from, `rejected` says why the glove kept
@@ -1167,12 +1510,31 @@ def fuse_skeletons(
     #                 fault in that glove's fingers rather than evidence about
     #                 the camera.
     #
+    #   unnormalisable with `scale` in hand, a finger whose curl range on
+    #                 either sensor was too small to learn endpoints from.
+    #                 See `learn_flexion_scale`.
+    #
+    # What the survivors are compared ON is a flexion FRACTION on each
+    # sensor's own endpoints, not a raw curl difference: the glove's curls
+    # live on the template hand (or on the fitted one) and the camera's on the
+    # operator's, so a fixed raw tolerance means different things in a fitted
+    # and an unfitted run. See the module docstring.
+    #
     # Below `min_usable_fingers` the glove has no opinion worth acting on, so
     # it casts no veto at all and the camera's own geometry — visibility, id
     # continuity, central field, viewing angle — is left to decide. That is a
     # deliberate choice to fail toward the sensor that still has evidence.
     excluded = set(rail.disputed) | set(rail.active) | set(unreliable_fingers)
     usable = [f for f in SPREAD_FINGERS if f not in excluded]
+    # ...and a fourth exclusion when the vote is held on fractions: a finger
+    # whose range on either sensor was too small to learn endpoints from
+    # cannot be put on one, and a fraction over an unmeasured range is noise
+    # divided by noise. Recorded, not silently skipped.
+    if scale is not None:
+        dropped = {f: scale.dropped.get(f, R_NOT_NORMALISED)
+                   for f in usable if not scale.normalisable(f)}
+        info["thumb_vote_dropped"] = dropped
+        usable = [f for f in usable if f not in dropped]
     info["thumb_vote_fingers"] = list(usable)
     if usable:
         disagreement = median([abs(curl_g[FINGER_NAMES.index(f)]
@@ -1181,6 +1543,12 @@ def fuse_skeletons(
     else:
         disagreement = None
     info["curl_disagreement"] = disagreement
+    # The number the gate actually reads when endpoints are available. Kept
+    # beside the raw one rather than replacing it, so a report can print both
+    # and a reader can see the change of units for what it is.
+    flex_disagreement = (None if scale is None or not usable
+                         else scale.disagreement(usable, curl_g, curl_c))
+    info["flex_disagreement"] = flex_disagreement
 
     def curl_gate_for(finger: str) -> float:
         i = FINGER_NAMES.index(finger)
@@ -1209,6 +1577,10 @@ def fuse_skeletons(
             return R_VIEW
         # too few fingers still measuring to hold a vote: no veto
         if len(usable) < gates.min_usable_fingers:
+            return None
+        if flex_disagreement is not None:
+            if flex_disagreement >= gates.agree_tol_frac:
+                return R_DISAGREE
             return None
         if disagreement >= gates.curl_agree_tol:
             return R_DISAGREE

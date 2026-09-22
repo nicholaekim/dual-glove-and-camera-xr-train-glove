@@ -1841,7 +1841,13 @@ def test_a_settle_clip_is_where_the_glove_lag_is_measured(tmp_path: Path,
     row = fuse.lag_from_clips(
         [(fuse.load_glove(gpath), fuse.load_cam(cpath)[0])], "left", "settle")
     assert row.n_clips == 1
-    assert row.applied or "not measurable" in row.why
+    # One clip can never be applied, whatever it measures: a lag needs at
+    # least `MIN_LAG_CLIPS` estimates that agree. So this is either not
+    # measurable at all (the mock hand is static) or measured and refused for
+    # want of a second opinion — and it is applied in neither case.
+    assert not row.applied
+    assert ("not measurable" in row.why
+            or fuse.NOT_CORROBORATED in row.why), row.why
 
 
 def test_the_leap_backend_insists_on_being_told_which_hand(monkeypatch):

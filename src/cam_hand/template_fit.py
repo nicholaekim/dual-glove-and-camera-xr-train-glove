@@ -68,17 +68,37 @@ THE CURL METRIC MOVES, AND THE THRESHOLDS THAT READ IT HAVE TO FOLLOW
     fitting, so it is still the constant it was; the report prints the fitted
     open and fist values it is being asked to separate.
 
-THE MEASUREMENT IS TAKEN ON OPEN FRAMES WHEN THERE ARE ANY
+THE MEASUREMENT IS TAKEN ON OPEN FRAMES, OR IT IS NOT TAKEN AT ALL
   A bone is the same length in every pose, so in principle any frame will do.
   In practice a closed hand is self-occluded and the tracker INFERS the joints
   it cannot see, so its lengths are a solver's opinion. An open hand is the
   one shape both cameras see whole. Which frames are open is decided on the
   CAMERA's own curls against `RailOverrideParams.cam_open_curl` — a geometric
   fact about a straight finger, not the glove's claim about one — so the
-  selection cannot be poisoned by the sensor under suspicion. If too few open
-  frames exist the measurement falls back to every trusted frame and says so
-  (`from_open`), because a measurement whose provenance is not printed is a
-  constant with extra steps.
+  selection cannot be poisoned by the sensor under suspicion. (A session that
+  carries pose labels names those frames a second way, `open_palm`; the curl
+  test is used anyway, because it is the one that works on a session with no
+  labels and it is the stricter of the two — a badly tracked open_palm frame
+  fails it.)
+
+  There used to be a fallback: too few open frames and the measurement was
+  taken over every trusted frame instead, saying so in `from_open`. It is
+  gone. A fallback that silently swaps a measurement for a guess is worse
+  than no measurement, because the fitted hand is then the tracker's opinion
+  of a finger it could not see, rescaled onto the template and used for the
+  rest of the session. `measure_hand` now returns None below
+  `MIN_OPEN_FRAMES` open frames in a take, and `fit_refusal` refuses the
+  whole hand below `MIN_FIT_FRAMES` over the session. The caller reports the
+  refusal and fuses UNFITTED, which is a pipeline that still works.
+
+  THE FIT IS ONE PER SESSION PER HAND, AND NEVER PER POSE OR PER FRAME.
+  A hand's bones do not change between takes, so a per-pose fit would be
+  fitting the tracker's pose-dependent reconstruction error rather than the
+  hand — and that error is real and large (see the report's legend: a closed
+  gloved hand comes back about 12 % shorter). `measure_hand` runs per take
+  only so that `merge_measurements` can take a MEDIAN across takes, which is
+  what stops one badly-tracked take deciding the answer; the median is then
+  applied unchanged to every frame of the session.
 """
 import json
 import math
@@ -134,11 +154,17 @@ for _finger, _chain in (("thumb", ("THUMB_METACARPAL", "THUMB_PROXIMAL",
 # rail override's `margin`, and for the same reason: it is the distance that
 # separates sync_day1's genuinely straight fingers from its pinched ones.
 OPEN_MARGIN = DEFAULT_RAIL.margin
-# Fewer open frames than this and the measurement falls back to every trusted
-# frame. 20 frames is about a fifth of a second of Leap tracking — enough for
-# a median to mean something, few enough that any real open-palm take clears
-# it many times over.
+# Fewer open frames than this in a TAKE and that take measures nothing. 20
+# frames is about a fifth of a second of Leap tracking — enough for a median
+# to mean something, few enough that any real open-palm take clears it many
+# times over. There is no fallback to closed frames: see the module docstring.
 MIN_OPEN_FRAMES = 20
+# ...and fewer than this over the whole SESSION, once the takes are merged,
+# and the hand is not fitted at all. Roughly two seconds of open hand in
+# front of the tracker: sync_day1 has 2482 on the left and 2204 on the right,
+# so a real session clears it by an order of magnitude and a session that
+# does not is one where nobody held an open palm up.
+MIN_FIT_FRAMES = 200
 
 
 @dataclass(frozen=True)
@@ -154,10 +180,12 @@ class HandMeasurement:
               measurement's own error bar: a segment whose length wanders by
               a millimetre frame to frame was not really measured.
     n_frames  how many frames the medians are over
-    from_open how they were chosen: True = the camera's own open-hand frames,
-              False = every trusted frame, because there were not enough open
-              ones. Carried rather than inferred, so a report can print the
-              provenance of the numbers it is about to rescale a hand with.
+    from_open how they were chosen. `measure_hand` only ever produces True
+              now — there is no longer a fallback to closed frames — but the
+              field stays because a measurement LOADED from a file written
+              before that may say False, and a report has to be able to print
+              the provenance of the numbers it is about to rescale a hand
+              with. `fit_refusal` is what refuses a False one.
     """
 
     hand: str = ""
@@ -291,8 +319,12 @@ def measure_hand(cam_rows: Sequence[Mapping], hand: Optional[str] = None,
     the ones the palm fit is residual on, so leaving them out would fit the
     fingers of a hand whose palm was still the template's.
 
-    Returns None when no frame carries a usable `abs26`: a camera that cannot
-    measure a hand has not measured one, and the caller fuses unfitted.
+    Returns None when no frame carries a usable `abs26`, and ALSO when fewer
+    than `min_open_frames` of the trusted frames are open ones. A camera that
+    cannot measure a hand has not measured one, and the caller fuses
+    unfitted; there is no fallback to the closed frames, whose lengths are
+    the tracker's guess at joints it could not see (see the module
+    docstring).
     """
     side = None if hand is None else str(hand).strip().lower()
     trusted: List[Mapping] = []
@@ -317,9 +349,9 @@ def measure_hand(cam_rows: Sequence[Mapping], hand: Optional[str] = None,
     if not trusted:
         return None
 
-    open_frames = [p for p in trusted if _is_open(p, open_margin)]
-    from_open = len(open_frames) >= min_open_frames
-    used = open_frames if from_open else trusted
+    used = [p for p in trusted if _is_open(p, open_margin)]
+    if len(used) < min_open_frames:
+        return None
 
     lengths: Dict[str, float] = {}
     spreads: Dict[str, float] = {}
@@ -334,8 +366,30 @@ def measure_hand(cam_rows: Sequence[Mapping], hand: Optional[str] = None,
     if not lengths:
         return None
     return HandMeasurement(hand=side or "", lengths=lengths, spreads=spreads,
-                           n_frames=len(used), from_open=from_open,
-                           source=source)
+                           n_frames=len(used), from_open=True, source=source)
+
+
+def fit_refusal(measurement: Optional[HandMeasurement],
+                min_frames: int = MIN_FIT_FRAMES) -> str:
+    """Why this hand must be fused UNFITTED, or "" if it may be fitted.
+
+    The session-level half of the open-frames rule: `measure_hand` refuses a
+    TAKE with too few open frames, this refuses a HAND whose takes together
+    do not add up to enough of them. A reason string rather than a bare
+    False, because the report has to say which hand was refused and why —
+    "fitted" and "not fitted" are different pipelines and a reader comparing
+    two sessions needs to know which one produced each number.
+    """
+    if measurement is None or not measurement.lengths:
+        return (f"no take of this hand holds {MIN_OPEN_FRAMES} open-palm "
+                "frames the camera saw whole")
+    if not measurement.from_open:
+        return ("the measurement was not taken on open-palm frames (a file "
+                "written before that was required)")
+    if measurement.n_frames < min_frames:
+        return (f"only {measurement.n_frames} open-palm frame(s) over the "
+                f"session, need {min_frames}")
+    return ""
 
 
 def merge_measurements(parts: Iterable[HandMeasurement]
@@ -347,12 +401,12 @@ def merge_measurements(parts: Iterable[HandMeasurement]
     sensitive to one badly-tracked take than pooling every frame would be,
     which would let the longest take decide.
 
-    The takes measured on OPEN frames win outright whenever there are any.
-    "Use open frames when available, else all" is a decision about the SESSION
-    and not about each take: a fist take has no open frame in it, falls back to
-    its own self-occluded ones, and hands back lengths that are the tracker's
-    guess at a finger it could not see. Measured on sync_day1's right hand,
-    letting those takes into the median put the index at 0.86 of the template
+    Every part `measure_hand` produces is now an open-frames measurement, so
+    on a freshly measured session this is simply the median over the takes
+    that had an open hand in them. The `from_open` filter survives for parts
+    LOADED from a file written before the fallback was removed: those takes
+    never win over an open one. Measured on sync_day1's right hand, letting
+    self-occluded takes into the median put the index at 0.86 of the template
     against 0.94 from the open takes alone — an 8 % error in the one number
     this whole module exists to get right.
     """
