@@ -593,6 +593,40 @@ Day-1 session with the corrected recorder (2026-09-18, 18:36 to 18:48,
   wrong. Reported as is: fusion needs per-hand, per-finger reliability
   logic; glove curl does not automatically dominate.
 
+What XR Train's own files show (2026-09-22, read from the local install:
+`AppData/LocalLow/StretchSense/XR Train/Player*.log`, the registry
+PlayerPrefs and strings in `StretchSense.CompanionApp.Runtime.dll`)
+- XR Train logs the glove's own data gaps: "High delta times detected"
+  appears 26 times in the previous session (43 gap values, median 0.48 s,
+  largest 3.3 and 3.9 s) and twice in today's. The dropouts therefore
+  happen before XR Train's OSC output, on the glove or BLE side.
+- The runtime contains exponential-weight and rolling-average smoothing of
+  the sensor values (`SmoothCapacitancesWithExponentialWeights`,
+  `SmoothRollingAverage`, `_smoothingFactor`, `_smoothingBufferSize`), with
+  no user setting in this build. A plausible source of the 100 to 485 ms
+  lag; the per-hand difference is unexplained.
+- Feature flags at startup: Pinch = False, FingerSplay = False,
+  PinkyTouch = False, EarlyAccess = False, Internal = False. The runtime
+  holds a finger-splay model ("Cannot train Splay because the FingerSplay
+  feature flag is off", "Splay Model Post Processing") and a pinch feature
+  ("The Pinch feature is not enabled in this build"), behind an INTERNAL
+  SETTINGS panel that this build hides. The articulation manager also
+  lists "Advanced", "Splay" and "Basic Splay" calibration sets beyond
+  "Basic". So spread and pinch may be obtainable from StretchSense as a
+  build or licence option; worth asking.
+- Raw capacitances: the shared StretchSense plugin defines the OSC address
+  `/v1/animation/capacitances/all` and the message "Enable Open SDK
+  animation/slider/all in Hand Engine Settings", i.e. the raw stream belongs
+  to StretchSense's Hand Engine product, not to XR Train's settings (which
+  is why the user found no capacitance option). The glove's own
+  configuration protobuf has `bleOutputFrequency`, `imuPollingFrequency`
+  and `LowLatency` fields, not exposed in XR Train's UI.
+- PlayerPrefs hold only sensitivities, paired gloves and window state: no
+  per-hand smoothing or filter setting exists for the user to check.
+- Batch runner for the 21 professor frames: `scripts/leap/record_prof_frames.py
+  --reference "..\xr trainer\xr trainer poses"` (hand taken from each
+  frame's file, resumable, `--dry-run`).
+
 ChatGPT review of improvements 1 to 3 (2026-09-22) and the follow-up
 (merged the same day, 339 tests)
 - Review: keep the template fit but only as one fixed per-session

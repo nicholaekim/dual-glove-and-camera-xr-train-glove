@@ -1550,3 +1550,5 @@ glove's time lag" for what they are for.
   with the mirrored-refit test in `compare_to_tracker.py`.
 - `selftest_sync.py` numbers are a plumbing and logic check, not evidence
   about real hardware.
+
+**The professor's 21 frames in one batch.** `scripts/leap/record_prof_frames.py --reference "..\xr trainer\xr trainer poses"` runs `record_frame.py` for every `frame_<id>_NA` folder in order, using the hand named in each frame's file, skipping frames that already have output (`--redo` to repeat, `--only 153624,156023` for a subset, `--all` for every frame, `--dry-run` to list the commands).
