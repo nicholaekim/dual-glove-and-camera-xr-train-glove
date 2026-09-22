@@ -593,6 +593,36 @@ Day-1 session with the corrected recorder (2026-09-18, 18:36 to 18:48,
   wrong. Reported as is: fusion needs per-hand, per-finger reliability
   logic; glove curl does not automatically dominate.
 
+ChatGPT review of improvements 1 to 3 (2026-09-22) and the follow-up
+(merged the same day, 339 tests)
+- Review: keep the template fit but only as one fixed per-session
+  calibration from well-observed open-palm frames (never per pose or
+  frame); the 12 % effect is "pose-dependent scale variation in the
+  tracker's reconstructed skeleton", not the hand changing size, and the
+  fitted pinch agreement is not an independent validation of the camera.
+  Lag: a per-hand constant shift is a sound first-order correction, applied
+  only to pairing, only when several clips agree; it cannot correct creep.
+  The disagreement gate compared curls on two different scales, so the
+  77 -> 94 % thumb-use gain was partly a gate-calibration effect: compare
+  normalised flexion fractions instead. Report all three as pipeline
+  improvements, not as proof of accuracy.
+- Follow-up: the thumb vote now thresholds the median |flexion fraction
+  difference| at 0.20, each sensor / hand / finger on its own learned open
+  and flexed endpoints (glove open = rail, camera open = median of
+  open-palm-like frames, flexed = 2nd percentile; span guard 0.4 / 0.3,
+  never triggered on real data). With that, fitted and unfitted runs ask
+  the same question: thumb camera use day 1 77.3 % unfitted vs 77.5 %
+  fitted (old gate: 77.4 -> 93.9), day 2 80.8 vs 81.7 (old: 82.8 -> 90.9);
+  the one real residual is day-2 right thumbs up, whose disagreement sits
+  on the gate (median 0.22 vs 0.21). Headline fused classifier unchanged
+  and now identical fitted or not: 57/59 (day 1), 53/59 (day 2) with the
+  profile; the ordinary run costs one take (55, 51). The fit's genuine
+  effects remain: pinch index offset +0.14 -> 0.00, open-palm palm fit
+  6.5 -> 4.3 mm.
+- Lag is applied only with at least two trustworthy clips agreeing within
+  60 ms MAD. Template fit refuses a hand with fewer than 200 open-palm
+  frames and fuses it on the raw template.
+
 Fusion improvements 1 to 3 (merged 2026-09-21, 328 tests): profile by
 default, glove lag correction, template fit
 - `profiles/default.json` (this operator's glove pair) is applied
