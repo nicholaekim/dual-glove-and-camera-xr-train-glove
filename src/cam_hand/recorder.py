@@ -56,6 +56,50 @@ def finalize_pose_name(path: Path, hands: set) -> Path:
         return path
 
 
+# --- the SETTLE sibling of a take -------------------------------------------
+# A coached take is REC only: `<pose>_<hand>_take<N>_<stamp>.jsonl` holds the
+# held pose and nothing else, which is what every tool in this repo assumes
+# when it takes a median over a take. The open-palm -> pose TRANSITION is the
+# one thing a held pose cannot show, and it is the only thing a time-lag
+# measurement can be made on, so the coached session writes it BESIDE the take
+# under this suffix rather than into it.
+#
+# The name lives here, next to the take's own naming, because two sides have to
+# agree about it: `scripts/record_simultaneous.py` writes these files,
+# `scripts/fuse_poses.py` looks for them, and everything that enumerates a
+# session's takes has to leave them out — which is what `take_files` is for.
+SETTLE_SUFFIX = ".settle.jsonl"
+SETTLE_PHASE = "settle"
+_JSONL = ".jsonl"
+
+
+def settle_name(take_name) -> str:
+    """`fist_left_take1_x.jsonl` -> `fist_left_take1_x.settle.jsonl`."""
+    name = str(getattr(take_name, "name", take_name))
+    if name.endswith(SETTLE_SUFFIX):
+        return name
+    if name.endswith(_JSONL):
+        name = name[:-len(_JSONL)]
+    return name + SETTLE_SUFFIX
+
+
+def is_settle_file(path) -> bool:
+    """Is this the SETTLE sibling of a take, rather than a take?"""
+    return str(getattr(path, "name", path)).endswith(SETTLE_SUFFIX)
+
+
+def take_files(folder) -> list:
+    """Every TAKE in a session folder, sorted; SETTLE siblings excluded.
+
+    The one enumeration a reader of a session should use. A plain
+    `glob("*.jsonl")` also returns the settle clips, and a settle clip read as
+    a take would put 1.5 s of a hand CHANGING shape into a table of medians
+    over a held pose — the one meaning this suffix exists to keep out of them.
+    """
+    return sorted(p for p in Path(folder).glob("*" + _JSONL)
+                  if not is_settle_file(p))
+
+
 class CamRecorder:
     def __init__(self, hz: Optional[float] = None, pose: Optional[str] = None,
                  take: Optional[int] = None):

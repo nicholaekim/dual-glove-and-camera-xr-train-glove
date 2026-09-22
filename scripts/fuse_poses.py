@@ -56,9 +56,32 @@ TWO WAYS OF LEAVING EVIDENCE OUT, AND WHY THEY ARE DIFFERENT
             somebody copied.
   --profile names DEGREES OF FREEDOM this glove is known to get wrong, per
             hand, and masks them out of the gates' evidence. That is a much
-            stronger claim, so it is never made quietly: with a profile the
-            report prints the fusion BOTH ways — ordinary and masked — and
-            the reader can see what the mask bought.
+            stronger claim, so it is never made quietly: the report prints
+            the fusion BOTH ways — ordinary and masked — and the reader can
+            see what the mask bought. It defaults to `auto`, which applies
+            `profiles/default.json` if it exists and the NK profile
+            otherwise, because a mask that had to be remembered as a flag was
+            a mask that mostly did not get applied. `--profile none` fuses
+            unmasked.
+
+THREE THINGS THIS REPORT CORRECTS FOR, EACH MEASURED AND EACH REFUSABLE
+  --profile       the glove's known-bad fingers, above. Default `auto`.
+  --glove-lag     the glove's solved hand TRAILS the camera — roughly 100 ms
+                  on the left hand and 450-485 ms on the right, on this
+                  laptop. Default `auto`: measured per hand from the SETTLE
+                  clips the coached recorder writes beside each take, else
+                  from takes whose camera curl moved enough, and applied only
+                  where a trustworthy estimate exists. A session of held
+                  poses reports "not measurable" and nothing is applied,
+                  which is the right answer: a held pose is lag-insensitive.
+  --fit-template  the glove reports XR TRAINER'S TEMPLATE HAND, whose bones
+                  are not the operator's; the camera measures the real ones
+                  in millimetres. Default `auto`: measure per hand from this
+                  session's own camera frames, save the measurement beside
+                  the report, and fuse with the template rescaled to it —
+                  every rotation kept, so only the lengths change. The
+                  `glove` column and the glove-only classifier stay on the
+                  RAW template, because that is what the glove alone gives.
 
 Usage:
   python scripts/fuse_poses.py                          # recordings/sync
@@ -66,8 +89,9 @@ Usage:
   python scripts/fuse_poses.py --export-csv fused.csv   # fused 21-kp CSV
   python scripts/fuse_poses.py --max-dt 0.1             # looser time matching
   python scripts/fuse_poses.py recordings/sync_day2 --exclude pinch_right_take1
-  python scripts/fuse_poses.py recordings/sync_day2 \
-      --profile profiles/reality_glove_nk_2026-09.json
+  python scripts/fuse_poses.py recordings/sync_day1 --profile none \
+      --glove-lag none --fit-template none             # the 2026-09-20 report
+  python scripts/fuse_poses.py recordings/sync --glove-lag left:0.10,right:0.46
 """
 import argparse
 import csv
@@ -100,19 +124,30 @@ from cam_hand.fusion import (
     DEFAULT_GATES,
     DEFAULT_RAIL,
     GATED_DOFS,
+    NOT_MEASURABLE,
     RAIL_FINGERS,
     SRC_RAIL,
     GateParams,
     RailOverrideParams,
     RailOverrideTracker,
+    curl_gates_from_rails,
+    estimate_glove_lag,
     flag_hand_id_stability,
     fuse_skeletons,
     learn_rails,
     pair_by_time,
     pairing_clock,
+    palm_fit_rmse_mm,
 )
 from cam_hand.landmarks import MP21_NAMES
-from cam_hand.recorder import CamRecorder
+from cam_hand.recorder import SETTLE_SUFFIX, CamRecorder, take_files
+from cam_hand.template_fit import (
+    finger_scales,
+    fit_template,
+    load_measurement,
+    measure_hand,
+    merge_measurements,
+)
 
 from xr_hand.keypoints21 import MP21_TO_OPENXR_IDX, frame_to_keypoints21
 from xr_hand.recorder import FrameRecorder
@@ -124,6 +159,35 @@ MEDIAPIPE = "mediapipe"
 # Where record_simultaneous puts each backend's camera takes. Both are read.
 CAM_DIRS = ("cam", LEAP)
 
+# --- where a reliability profile comes from when nobody names one ------
+#
+# Resolved against the REPO's profiles/ folder rather than the working
+# directory: `python scripts\fuse_poses.py` is run from wherever the operator
+# happens to be, and a default that silently depends on that is a default that
+# silently stops applying.
+PROFILES_DIR = Path(__file__).resolve().parent.parent / "profiles"
+PROFILE_AUTO = "auto"
+PROFILE_NONE = "none"
+# In order. `default.json` is the operator's own glove pair, copied there so
+# that swapping gloves or operators is one file to replace rather than a flag
+# to remember; the NK profile is the fallback so that a checkout without a
+# default.json still gets the masks that were measured on this hardware.
+PROFILE_ORDER = ("default.json", "reality_glove_nk_2026-09.json")
+
+# --- --glove-lag ------------------------------------------------------
+LAG_AUTO = "auto"
+LAG_NONE = "none"
+
+# --- --fit-template ---------------------------------------------------
+FIT_AUTO = "auto"
+FIT_NONE = "none"
+# The pose whose frames the camera has actually measured a hand on, rather
+# than inferred one: nothing is occluded on an open palm.
+OPEN_POSE = "open_palm"
+# Where `auto` leaves the measurement it took: beside the report, in the
+# session it was measured from, because that is the session it describes.
+FIT_FILE = "template_{hand}.json"
+
 
 def load_glove(path: Path):
     """Glove JSONL -> dicts with the clocks, hand_side, pose, take, pts (21x3 m).
@@ -131,6 +195,11 @@ def load_glove(path: Path):
     `capture_time` — when the OSC packet arrived, if the file has it — is
     carried through, because that is the clock `pair_by_time` prefers.
     Recordings made before it existed simply do not have the key.
+
+    `frame` is the parsed `HandFrame` itself, kept because `--fit-template`
+    rescales the glove's parent-relative joint OFFSETS and then re-runs the
+    forward kinematics: the 21 points here are the template's, and there is
+    no way back from them to the offsets they came from.
     """
     with open(path, "r", encoding="utf-8") as f:
         labels = [json.loads(line) for line in f if line.strip()]
@@ -142,6 +211,7 @@ def load_glove(path: Path):
             "hand_side": frame.hand_side,
             "pose": d.get("pose", ""),
             "take": d.get("take", ""),
+            "frame": frame,
             "pts": frame_to_keypoints21(frame),
         })
     return out
@@ -209,6 +279,12 @@ def load_leap_cam(path: Path):
             "visible_time_us": d.get("visible_time_us"),
             "palm_abs": d.get("palm_abs"),
             "palm_normal_abs": normal,
+            # The camera's RAW 26 joint positions in camera space, which is
+            # what a BONE LENGTH has to be read off: `pts` has dropped the
+            # metacarpals, and `template_fit.measure_hand` measures the whole
+            # 26-joint chain. Dropped again by `measure_take` as soon as the
+            # medians are in hand — see there for why.
+            "abs26": abs26,
             "pts": frame_to_keypoints21(frame),
         })
     return out
@@ -575,6 +651,258 @@ def load_profile(path):
             str(data.get("comment", "")).strip())
 
 
+def resolve_profile(spec, profiles_dir=None):
+    """`--profile`'s value -> (path or None, how it was chosen).
+
+    A profile is standing knowledge about THE GLOVE IN THE ROOM, and the
+    measured masks for this hardware were sitting in `profiles/` being applied
+    only when somebody remembered the flag. So the default is `auto`:
+
+      profiles/default.json                    if it exists — the operator's
+                                               own pair, the file to replace
+                                               when the glove or the wearer
+                                               changes
+      profiles/reality_glove_nk_2026-09.json   else, if it exists — the
+                                               profile these gates were
+                                               measured against
+      nothing                                  else
+
+    `none` turns it off, and an explicit path is used as given (a missing one
+    is an error from `load_profile`, not a silent fall back to auto — asking
+    for a named profile and getting a different one is worse than stopping).
+
+    The report always names the file and this string, because "which mask was
+    applied" must be answerable from the report rather than from the command
+    line somebody typed.
+    """
+    profiles_dir = Path(profiles_dir or PROFILES_DIR)
+    text = str(spec).strip()
+    if text.lower() == PROFILE_NONE:
+        return None, "none (--profile none)"
+    if text.lower() == PROFILE_AUTO:
+        for name in PROFILE_ORDER:
+            candidate = profiles_dir / name
+            if candidate.is_file():
+                return candidate, f"auto -> {candidate}"
+        return None, (f"auto -> none: neither {' nor '.join(PROFILE_ORDER)} "
+                      f"is in {profiles_dir}")
+    return Path(text), "named on the command line"
+
+
+def parse_glove_lag(text):
+    """`--glove-lag`'s value -> "auto", "none", or `{'right': 0.46}`.
+
+    Per hand, because the two gloves are separate garments on separate
+    stretch sensors: measured on this laptop the left hand's solved hand
+    trails the camera by about 100 ms and the right hand's by 450-485 ms.
+    """
+    raw = str(text).strip()
+    if raw.lower() in (LAG_AUTO, LAG_NONE):
+        return raw.lower()
+    out = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise SystemExit(
+                f"--glove-lag {text}: expected {LAG_NONE}, {LAG_AUTO}, or "
+                "HAND:SECONDS[,HAND:SECONDS], e.g. 'left:0.10,right:0.46'")
+        hand, _, value = part.partition(":")
+        side = hand.strip().lower()
+        if side not in ("left", "right"):
+            raise SystemExit(f"--glove-lag {text}: {hand!r} is not a hand; "
+                             "the hands are 'left' and 'right'")
+        try:
+            out[side] = float(value)
+        except ValueError:
+            raise SystemExit(f"--glove-lag {text}: {value!r} is not a number "
+                             "of seconds")
+    if not out:
+        raise SystemExit(f"--glove-lag {text}: nothing to apply")
+    return out
+
+
+@dataclass
+class LagRow:
+    """One hand's glove lag: what was measured, from what, and what was used.
+
+    `applied` is separate from `seconds` on purpose. A lag that was measured
+    and a lag that was USED are different claims, and the report has to be
+    able to say "0.46 s on the right, from 12 clips, applied" and also "not
+    measurable, nothing applied" without the reader having to work out which
+    from a single number.
+    """
+
+    hand: str
+    seconds: float = 0.0
+    applied: bool = False
+    n_clips: int = 0
+    n_trusted: int = 0
+    source: str = ""
+    why: str = ""
+
+    def described(self) -> str:
+        if self.source == "given":
+            return f"{self.seconds * 1000.0:+.0f} ms as given, APPLIED"
+        if self.applied:
+            return (f"{self.seconds * 1000.0:+.0f} ms from {self.n_trusted} of "
+                    f"{self.n_clips} {self.source} clip(s), APPLIED")
+        return (f"{self.why or NOT_MEASURABLE} "
+                f"({self.n_trusted} of {self.n_clips} {self.source} clip(s) "
+                "measurable), nothing applied")
+
+
+def settle_clips(input_dir: Path, cam_dirs):
+    """Every `<take>.settle.jsonl` pair in a session: (glove path, cam path).
+
+    The settle clip is the open-palm -> pose TRANSITION the coached recorder
+    writes beside each accepted take (`cam_hand.recorder.SETTLE_SUFFIX`). It
+    is the only thing in a coached session that MOVES, so it is the only thing
+    a lag can be measured on; the takes themselves are held poses, and two
+    flat traces have no alignment.
+    """
+    out = []
+    glove_dir = input_dir / "glove"
+    if not glove_dir.is_dir():
+        return out
+    for gpath in sorted(glove_dir.glob("*" + SETTLE_SUFFIX)):
+        for d in cam_dirs:
+            cpath = d / gpath.name
+            if cpath.is_file():
+                out.append((gpath, cpath))
+                break
+    return out
+
+
+def lag_from_clips(clips, hand: str, source: str) -> LagRow:
+    """The median trustworthy lag over several clips, for one hand.
+
+    `clips` is (glove rows, camera rows) per clip, already loaded. The median
+    and not the mean: one clip in which the tracker lost the hand mid-
+    transition produces a lag that is not wrong by a little.
+    """
+    row = LagRow(hand=hand, source=source, n_clips=len(clips))
+    measured, refused = [], []
+    for glove, cam in clips:
+        got = estimate_glove_lag(glove, cam, hand=hand)
+        if got.trusted:
+            measured.append(got.seconds)
+        elif got.n_glove and got.n_cam:
+            refused.append(got)
+    row.n_trusted = len(measured)
+    if not measured:
+        # The reason printed is the BEST candidate's, not the last clip's: a
+        # session of 59 takes refuses most of them for having no frames of
+        # this hand at all, and that says nothing about why the hand it does
+        # have was not measurable. The best candidate is the clip whose camera
+        # moved the most.
+        best = max(refused, key=lambda e: e.cam_spread, default=None)
+        row.why = (best.why if best is not None
+                   else f"{NOT_MEASURABLE}: no clip holds this hand")
+        return row
+    row.seconds = float(median(measured))
+    row.applied = True
+    return row
+
+
+def glove_lag_of(spec, input_dir: Path, cam_dirs, loaded):
+    """`(per-hand LagRow, the mapping pair_by_time gets)` for this session.
+
+    AUTO measures, per hand, from the SETTLE clips first — that is what they
+    are written for — and falls back to the takes for a hand that has no
+    trustworthy settle estimate, because a session recorded before the clips
+    existed may still hold a take the hand moved during. A hand with no
+    trustworthy estimate anywhere gets NOTHING applied: an unmeasured lag is
+    not a zero lag, but pairing on the raw stamps is what the pipeline did
+    before and is the only honest default.
+
+    A manual value is applied exactly as given, and the report says so. The
+    point of allowing it is to be able to CHECK a lag against a session
+    (`--glove-lag right:0.46` on day 1's static takes moves nothing, which is
+    what proves the shift is harmless on held poses).
+    """
+    hands = sorted({r["hand_side"] for entry in loaded for r in entry["glove"]})
+    if spec == LAG_NONE:
+        return {}, None
+    if isinstance(spec, dict):
+        rows = {h: LagRow(hand=h, seconds=v, applied=True, source="given")
+                for h, v in spec.items()}
+        return rows, dict(spec)
+
+    clips = []
+    for gpath, cpath in settle_clips(input_dir, cam_dirs):
+        glove = load_glove(gpath)
+        cam, _source = load_cam(cpath)
+        if glove and cam:
+            clips.append((glove, cam))
+    takes = [(entry["glove"], entry["cam"]) for entry in loaded]
+
+    rows, applied = {}, {}
+    for hand in hands:
+        row = lag_from_clips(clips, hand, "settle") if clips else None
+        if row is None or not row.applied:
+            # No settle clip, or none of this hand's clips moved enough: the
+            # takes are the only other thing there is to measure on.
+            fallback = lag_from_clips(takes, hand, "take")
+            row = fallback if fallback.applied or row is None else row
+        rows[hand] = row
+        if row.applied:
+            applied[hand] = row.seconds
+    return rows, (applied or None)
+
+
+def fit_measurements(spec, measure_parts, loaded, input_dir: Path):
+    """Measure (or load) each hand, put it on the template, and report both.
+
+    Returns `(measurements, per-finger scales, saved files)`. The fitted 21
+    points are written onto each glove row as `fit_pts`, so `fuse_all` has one
+    thing to read and the raw template stays beside it untouched — the report
+    needs both, and recomputing either later would mean keeping the
+    measurement and the forward kinematics alive in two places.
+    """
+    if spec.lower() == FIT_NONE:
+        return {}, {}, []
+
+    measurements = {}
+    saved = []
+    hands = sorted({r["hand_side"] for entry in loaded for r in entry["glove"]})
+    if spec.lower() == FIT_AUTO:
+        for hand, parts in measure_parts.items():
+            merged = merge_measurements(parts)
+            if merged is not None:
+                measurements[hand] = merged
+        for hand, m in sorted(measurements.items()):
+            saved.append(m.save(input_dir / FIT_FILE.format(hand=hand)))
+    else:
+        try:
+            loaded_m = load_measurement(spec)
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            raise SystemExit(f"--fit-template {spec}: {e}")
+        # A measurement names the hand it was taken from. With no hand named
+        # it is applied to both, which is the only reading of a file that
+        # does not say — and a measurement of the WRONG hand would be a
+        # mirrored skeleton's lengths, so the file gets to decide, not us.
+        named = [loaded_m.hand] if loaded_m.hand else hands
+        for hand in named:
+            measurements[hand] = loaded_m
+
+    if not measurements:
+        return {}, {}, saved
+
+    scales = {}
+    for entry in loaded:
+        for row in entry["glove"]:
+            m = measurements.get(row["hand_side"])
+            if m is None:
+                continue
+            fitted_frame = fit_template(row["frame"], m)
+            row["fit_pts"] = frame_to_keypoints21(fitted_frame)
+            if row["hand_side"] not in scales:
+                scales[row["hand_side"]] = finger_scales(row["frame"], m)
+    return measurements, scales, saved
+
+
 def split_excluded(paths, patterns):
     """(kept, dropped) — dropped if any pattern appears in the file name.
 
@@ -615,26 +943,87 @@ class FusionRun:
     dof_total: dict = field(default_factory=lambda: defaultdict(int))
     reasons: dict = field(default_factory=lambda: defaultdict(int))
     palm_residuals: list = field(default_factory=list)
+    # The same residual measured against the RAW template hand, collected only
+    # when a fit is in force: it is the before of the fit's before/after, and
+    # with no fit it would be the same list twice.
+    palm_residuals_raw: list = field(default_factory=list)
+    # (pose, raw, fitted) per metric-camera frame. Per POSE because the
+    # camera's reported hand SIZE is pose-dependent — LeapC shrinks a closed
+    # gloved hand it cannot see by about 12 % — so one median over a session
+    # of mostly-closed poses hides which way the fit moved the frames where
+    # the camera had actually measured the hand.
+    palm_pose: list = field(default_factory=list)
+    # Per (hand, finger): the glove curl actually fused, lowest and highest.
+    # What `curl_gate` and the learned rails have to keep separating after a
+    # fit has moved every curl by a few hundredths.
+    curl_range: dict = field(default_factory=dict)
+    # Per hand: the spread gate's per-finger curl threshold, carried across a
+    # template fit by `curl_gates_from_rails`. Empty with no fit, where the
+    # one constant is the threshold.
+    curl_gates: dict = field(default_factory=dict)
     n_pairs: int = 0
     n_matched: int = 0
     n_cam_used: int = 0
 
 
+def glove_pts(row, fitted: bool):
+    """The glove points to FUSE with: the fitted hand, or the raw template.
+
+    One reader, so "which hand went into the fusion" is decided in one place.
+    The report's `glove` column and the glove-only classifier deliberately do
+    NOT come through here — they are the raw template, because that is what a
+    glove-only pipeline produces.
+    """
+    if fitted and row.get("fit_pts") is not None:
+        return row["fit_pts"]
+    return row["pts"]
+
+
 def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
-             thumb_from_camera=True, export_csv=False):
+             thumb_from_camera=True, export_csv=False, glove_lag=None,
+             fitted=False):
     """Learn the rails, fuse every loaded take, collect what the report reads.
 
     The rails are learned HERE rather than once outside, although two runs
     over one session learn the same numbers: `learn_rails` reads
     `RailOverrideParams`, so a run given different parameters has to be free
     to learn different rails instead of silently inheriting another run's.
+
+    With `fitted` the rails are learned on the FITTED glove's curls, which is
+    not a detail: the override compares a frame's curl against the rail, and a
+    rail learned on the template while the comparison is made on the fitted
+    hand would be a float-equality test between two different hands and would
+    never match. Same reason `curl_range` is collected on the fused input —
+    `curl_gate` has to go on separating fists from open palms after the fit
+    moved both.
     """
     run = FusionRun(rail_params=rail_params, unreliable=dict(unreliable))
     if rail_params is not None:
         run.rails = learn_rails(
-            ((g["hand_side"], flexion_features(np.asarray(g["pts"], float)))
+            ((g["hand_side"],
+              flexion_features(np.asarray(glove_pts(g, fitted), float)))
              for take in loaded for g in take["glove"]),
             rail_params)
+    # `curl_gate` is a constant tuned on the TEMPLATE hand's curls, and the fit
+    # moves every one of them. Learning the rails on both hands — the template
+    # and the fitted one — is what lets the gate be carried across by the same
+    # factor, so the fit provably changes no gate decision. Learned with
+    # `DEFAULT_RAIL` rather than `rail_params` because this is not the
+    # override: --no-rail-override switches off who may take a curl, not
+    # whether the spread gate knows where a straight finger reads.
+    if fitted:
+        rail_for_gates = rail_params or DEFAULT_RAIL
+        template_rails = learn_rails(
+            ((g["hand_side"], flexion_features(np.asarray(g["pts"], float)))
+             for take in loaded for g in take["glove"]), rail_for_gates)
+        fitted_rails = learn_rails(
+            ((g["hand_side"],
+              flexion_features(np.asarray(glove_pts(g, True), float)))
+             for take in loaded for g in take["glove"]), rail_for_gates)
+        run.curl_gates = {
+            hand: curl_gates_from_rails(gates, template_rails, fitted_rails,
+                                        hand)
+            for hand in {h for h, _f in template_rails}}
 
     for entry in loaded:
         glove, cam = entry["glove"], entry["cam"]
@@ -653,18 +1042,29 @@ def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
         per_hand_f = defaultdict(list)
         pose = glove[0]["pose"]
 
-        for g, c in pair_by_time(glove, cam, max_dt=max_dt, clock=clock):
+        for g, c in pair_by_time(glove, cam, max_dt=max_dt, clock=clock,
+                                 glove_lag=glove_lag or 0.0):
             run.n_pairs += 1
             hand = g["hand_side"]
-            G = np.asarray(g["pts"], dtype=float)
-            per_hand_g[hand].append(all_features(G, hand_side=hand))
+            # RAW is what the glove alone gives and is what the `glove` column
+            # and the glove-only classifier report; G is what is FUSED, which
+            # is the fitted hand when a fit is in force. They are the same
+            # array when it is not.
+            raw = np.asarray(g["pts"], dtype=float)
+            G = np.asarray(glove_pts(g, fitted), dtype=float)
+            per_hand_g[hand].append(all_features(raw, hand_side=hand))
             slot = run.per_pose.setdefault(
                 (pose, hand, str(g["take"])),
                 {"glove": [], "camera": [], "fused": [], "sources": [],
                  "paired": 0})
-            slot["glove"].append(dof_values(G, hand_side=hand))
+            slot["glove"].append(dof_values(raw, hand_side=hand))
+            curls_g = flexion_features(G)
+            for finger, value in zip(FLEXION_NAMES, curls_g):
+                lo, hi = run.curl_range.get((hand, finger), (value, value))
+                run.curl_range[(hand, finger)] = (min(lo, value),
+                                                  max(hi, value))
             if c is None:
-                rail = (tracker.update(hand, flexion_features(G))
+                rail = (tracker.update(hand, curls_g)
                         if tracker is not None else None)
                 fused, info = fuse_skeletons(G, None, min_score=min_score,
                                              with_scale=with_scale, gates=gates,
@@ -676,7 +1076,7 @@ def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
                 per_hand_c[hand].append(all_features(C, hand_side=hand))
                 slot["camera"].append(dof_values(C, hand_side=hand))
                 meta = cam_meta_of(c, source)
-                rail = (tracker.update(hand, flexion_features(G),
+                rail = (tracker.update(hand, curls_g,
                                        flexion_features(C), meta)
                         if tracker is not None else None)
                 fused, info = fuse_skeletons(
@@ -685,7 +1085,8 @@ def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
                     thumb_from_camera=thumb_from_camera,
                     with_scale=with_scale,
                     cam_meta=meta, gates=gates, rail=rail,
-                    unreliable_fingers=unreliable.get(str(hand).lower(), ()))
+                    unreliable_fingers=unreliable.get(str(hand).lower(), ()),
+                    curl_gates=run.curl_gates.get(hand))
                 for dof in GATED_DOFS:
                     run.dof_total[dof] += 1
                     if info["dof_source"][dof].startswith("camera"):
@@ -693,6 +1094,16 @@ def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
                 for why in info["rejected"].values():
                     run.reasons[why] += 1
                 slot["sources"].append(dict(info["dof_source"]))
+                # The fit's before: the same residual against the template
+                # hand that went in unfitted. Measured here and not inside
+                # `fuse_skeletons`, which only ever sees one of the two.
+                if not with_scale and info.get("kabsch_rmse_mm") is not None:
+                    before = (palm_fit_rmse_mm(raw, C) if fitted
+                              else info["kabsch_rmse_mm"])
+                    if fitted:
+                        run.palm_residuals_raw.append(before)
+                    run.palm_pose.append((pose, before,
+                                          info["kabsch_rmse_mm"]))
             if info["camera_used"]:
                 run.n_cam_used += 1
             if info.get("kabsch_rmse_mm") is not None:
@@ -729,7 +1140,164 @@ def mask_text(mapping):
                      for hand, fingers in sorted(mapping.items()))
 
 
-def profile_comparison(plain, masked, profile_path, name, comment, lines):
+def lag_lines(spec, rows, lines):
+    """Per hand: the glove's measured lag, where it came from, and if it ran."""
+    lines.append("Glove time lag (the glove's SOLVED hand trails the camera; "
+                 "the pairing stamp is")
+    lines.append("  shifted back by it, so a glove frame stamped t is matched "
+                 "against the camera at")
+    lines.append("  t - lag. Measured by cross-correlating the curl traces, "
+                 "never assumed.)")
+    if spec == LAG_NONE:
+        lines.append("  --glove-lag none: the two streams are paired on their "
+                     "raw stamps")
+        return
+    how = ("auto — measured from this session" if spec == LAG_AUTO
+           else "given on the command line")
+    lines.append(f"  {'source':<22} {how}")
+    if not rows:
+        lines.append("  (no hand had any camera frames to measure against)")
+    for hand in sorted(rows):
+        lines.append(f"  {hand:<22} {rows[hand].described()}")
+    lines.append("  A HELD pose is lag-insensitive — both sensors describe a "
+                 "hand that is not moving —")
+    lines.append("  so a session of held poses reports 'not measurable' and "
+                 "applies nothing, which is")
+    lines.append("  the right answer rather than a missing feature. The "
+                 "transition a lag CAN be measured")
+    lines.append("  on is the coached recorder's SETTLE clip, written beside "
+                 "each take as")
+    lines.append(f"  <take>{SETTLE_SUFFIX}.")
+    lines.append("")
+
+
+def fit_lines(spec, measurements, scales, run, gates, lines):
+    """What the template fit measured, changed, and left alone."""
+    lines.append("Template fit (the glove reports XR Trainer's TEMPLATE hand; "
+                 "the camera measures the")
+    lines.append("  operator's real bones. Each parent-relative joint offset "
+                 "is rescaled to the measured")
+    lines.append("  length, every rotation kept, so the joint ANGLES are "
+                 "untouched and only the lengths")
+    lines.append("  change.)")
+    if spec == FIT_NONE:
+        lines.append("  --fit-template none: the glove's template hand is "
+                     "fused as recorded")
+        lines.append("")
+        return
+    how = ("auto — measured from this session's own camera frames"
+           if spec == FIT_AUTO else f"loaded from {spec}")
+    lines.append(f"  {'source':<22} {how}")
+    if not measurements:
+        lines.append("  NOT APPLIED: no camera frame in this session carries "
+                     "26 metric joints to measure")
+        lines.append("  a hand from (a MediaPipe take has 21 normalised "
+                     "landmarks and no metacarpals).")
+        lines.append("")
+        return
+    for hand in sorted(measurements):
+        m = measurements[hand]
+        frames = ("open-hand frames" if m.from_open
+                  else "frames (too few open ones; every trusted frame)")
+        lines.append(f"  {hand:<22} {m.n_frames} {frames}, "
+                     f"{m.n_segments} segments, typical spread "
+                     f"{m.spread_mm:.2f} mm")
+        per_finger = scales.get(hand) or {}
+        lines.append("    scale per finger     "
+                     + "  ".join(
+                         f"{f} {v:.3f}" if v is not None else f"{f} -"
+                         for f, v in per_finger.items()))
+        # The gate that reads a glove curl, against the fitted values it now
+        # has to separate, and the threshold it is being separated by.
+        # Printed rather than asserted: if a fit ever moves the two ends onto
+        # the same side of it, the report says so before anything else does.
+        carried = run.curl_gates.get(hand)
+        for finger in RAIL_FINGERS:
+            got = run.curl_range.get((hand, finger))
+            if got is None:
+                continue
+            lo, hi = got
+            gate = (gates.curl_gate if carried is None
+                    else carried[FLEXION_NAMES.index(finger)])
+            verdict = ("separates" if lo < gate < hi
+                       else "DOES NOT SEPARATE — see the template-fit notes")
+            lines.append(f"    curl {finger:<15} fitted {lo:.2f} (most "
+                         f"curled) .. {hi:.2f} (straightest); "
+                         f"curl_gate {gate:.2f} {verdict}")
+    if run.palm_pose:
+        groups = [("every paired frame", None), ("open_palm takes", OPEN_POSE)]
+        for label, pose in groups:
+            rows = [(b, a) for p, b, a in run.palm_pose
+                    if pose is None or p == pose]
+            if not rows:
+                continue
+            before = sorted(b for b, _a in rows)
+            after = sorted(a for _b, a in rows)
+            lines.append(f"    palm fit RMSE, {label:<19} median "
+                         f"{before[len(before) // 2]:.1f} -> "
+                         f"{after[len(after) // 2]:.1f} mm, worst "
+                         f"{before[-1]:.1f} -> {after[-1]:.1f} mm")
+        lines.append("  The palm residual is a rigid 5-point fit, so it is "
+                     "the one number a hand's overall")
+        lines.append("  SIZE reaches — and LeapC's reported size is "
+                     "pose-dependent: measured on both sessions,")
+        lines.append("  every segment of a closed gloved hand comes back "
+                     "about 12 % shorter than the same")
+        lines.append("  segment of the open hand, uniformly, so the SHAPE is "
+                     "measurable and the SIZE is not.")
+        lines.append("  The fit therefore lowers this residual on the "
+                     "open-hand frames (where the camera's own")
+        lines.append("  measurement is self-consistent) and raises it on the "
+                     "closed ones, and no fixed skeleton")
+        lines.append("  can be the right size for both. Nothing downstream "
+                     "depends on the choice: the metric")
+        lines.append("  path aligns on a basis of UNIT vectors "
+                     "(`palm_frame_transfer`) and every reported quantity")
+        lines.append("  is a ratio or an angle, so multiplying the fitted "
+                     "hand by a constant changes this")
+        lines.append("  residual and nothing else in the report.")
+    if any(v is not None for v in run.curl_gates.values()):
+        lines.append("  curl_gate is the ONE threshold the fit moves: it is a "
+                     "constant tuned on the template's")
+        lines.append(f"  curls ({gates.curl_gate:.2f}, the midpoint between "
+                     "the glove's fists and its open palms), and curl")
+        lines.append("  is a LENGTH ratio. It is carried across as the same "
+                     "FRACTION of that hand and finger's")
+        lines.append("  own learned rail — its glove open-palm value — rather "
+                     "than retuned to a new constant,")
+        lines.append("  which would be tuned on one operator's fitted hand "
+                     "and wrong for the next by exactly")
+        lines.append("  the amount the fit removes. The threshold then moves "
+                     "by the same factor the finger's own")
+        lines.append("  open value moved by, so the camera-use table comes "
+                     "back within half a point on index,")
+        lines.append("  middle and pinky and several points BETTER on the "
+                     "ring — against the 13-point loss the")
+        lines.append("  bare constant cost. Nothing else needed "
+                     "re-expressing:")
+        lines.append("  cam_open_curl and the override's margin read the "
+                     "CAMERA, the override's tol compares the")
+        lines.append("  glove against its own learned rail, and "
+                     "curl_agree_tol compares the two sensors — whose")
+        lines.append("  agreement is what the fit improves rather than "
+                     "displaces.")
+    lines.append("  The 'glove' column of the table above and the 'glove "
+                 "only' classifier row stay on the")
+    lines.append("  RAW template hand: that is what the glove ALONE gives, "
+                 "and a fitted number there")
+    lines.append("  would quote a result the glove cannot produce without a "
+                 "camera. The FUSED column is")
+    lines.append("  the fitted glove. The rails are learned on the fitted "
+                 "curls too, because that is what")
+    lines.append("  the override compares against them. "
+                 "`leap_hand.pose_check` is untouched: it reads the raw")
+    lines.append("  take files at record time, where no camera measurement "
+                 "exists yet.")
+    lines.append("")
+
+
+def profile_comparison(plain, masked, profile_path, name, comment, lines,
+                       how=""):
     """Both fusions, side by side, so the profile has to earn its place.
 
     A mask is a claim that some of the evidence is worthless, and a report
@@ -738,9 +1306,16 @@ def profile_comparison(plain, masked, profile_path, name, comment, lines):
     So both runs are printed, over the same frames, with the two numbers a
     mask is supposed to move — how much of the hand the camera supplied, and
     how well the fused hand classifies.
+
+    `how` says how this file came to be the one applied — a profile that
+    applies BY DEFAULT has to be as visible in the report as one somebody
+    typed, or the next reader will be comparing masked numbers against
+    unmasked ones without knowing it.
     """
     lines.append("=" * 66)
     lines.append(f"Reliability profile — {profile_path}")
+    if how:
+        lines.append(f"  chosen by: {how}")
     if name:
         lines.append(f"  {name}")
     if comment:
@@ -807,11 +1382,31 @@ def main() -> None:
                         f"default {','.join(DEFAULT_RAIL.fingers_for())}). "
                         "Overrides --profile. Per-hand lists come from a "
                         "profile, not from here.")
-    p.add_argument("--profile", type=Path, default=None, metavar="PATH.json",
+    p.add_argument("--profile", default=PROFILE_AUTO,
+                   metavar="{auto,none,PATH.json}",
                    help="a reliability profile: per-hand 'unreliable' and "
                         "'rail_fingers' for this glove. The report then prints "
                         "the fusion BOTH ways, so the profile's effect is "
-                        "visible. See profiles/.")
+                        f"visible. Default {PROFILE_AUTO}: "
+                        f"{' then '.join('profiles/' + n for n in PROFILE_ORDER)}"
+                        f", whichever exists first. '{PROFILE_NONE}' fuses "
+                        "unmasked. See profiles/.")
+    p.add_argument("--glove-lag", default=LAG_AUTO,
+                   metavar="{none,auto,left:SEC[,right:SEC]}",
+                   help="seconds the glove's solved hand TRAILS the camera; "
+                        "the glove's pairing stamp is shifted back by it. "
+                        f"Default {LAG_AUTO}: measured per hand from this "
+                        "session's SETTLE clips, else from takes whose camera "
+                        "curl moved enough, and applied only where a "
+                        "trustworthy estimate exists.")
+    p.add_argument("--fit-template", default=FIT_AUTO,
+                   metavar="{auto,none,PATH.json}",
+                   help="rescale the glove's TEMPLATE bone lengths to the "
+                        "operator's, as the camera measures them, keeping "
+                        f"every rotation. Default {FIT_AUTO}: measured per "
+                        "hand from this session's own camera frames and saved "
+                        f"as <input>/{FIT_FILE.format(hand='<hand>')}. A path "
+                        "loads a saved measurement instead.")
     p.add_argument("--exclude", action="append", default=[],
                    metavar="TEXT[,TEXT]",
                    help="skip takes whose file name contains this text, on "
@@ -837,7 +1432,12 @@ def main() -> None:
             "Record them with: python scripts/record_simultaneous.py\n"
             "                  python scripts/record_simultaneous.py --camera leap")
 
-    all_takes = sorted(glove_dir.glob("*.jsonl"))
+    # `take_files` and not a plain glob: a session also holds each take's
+    # SETTLE clip as a `.settle.jsonl` sibling, and a 1.5 s clip of a hand
+    # CHANGING shape read as a take would put a transition into a table of
+    # medians over held poses. The clips are found separately, by name, for
+    # the lag measurement and nothing else.
+    all_takes = take_files(glove_dir)
     if not all_takes:
         raise SystemExit(f"no glove recordings in {glove_dir}")
 
@@ -851,7 +1451,7 @@ def main() -> None:
     takes, dropped_glove = split_excluded(all_takes, patterns)
     dropped_cam = []
     for d in cam_dirs:
-        dropped_cam += split_excluded(sorted(d.glob("*.jsonl")), patterns)[1]
+        dropped_cam += split_excluded(take_files(d), patterns)[1]
     unmatched = [pat for pat in patterns
                  if not any(pat in p.name for p in dropped_glove + dropped_cam)]
     if not takes:
@@ -871,8 +1471,9 @@ def main() -> None:
     cli_unreliable = parse_unreliable(args.unreliable)
     cli_rail = (None if args.rail_fingers is None
                 else parse_rail_fingers(args.rail_fingers))
+    profile_path, profile_how = resolve_profile(args.profile)
     profile_unreliable, profile_rail, profile_name, profile_comment = (
-        load_profile(args.profile) if args.profile is not None
+        load_profile(profile_path) if profile_path is not None
         else ({}, {}, "", ""))
 
     unreliable = dict(profile_unreliable)
@@ -892,7 +1493,9 @@ def main() -> None:
     # What this command would do with no --profile at all.
     plain_rail_params = rail_params_for(
         cli_rail if cli_rail is not None else DEFAULT_RAIL.fingers)
-    comparing = args.profile is not None
+    comparing = profile_path is not None
+    lag_spec = parse_glove_lag(args.glove_lag)
+    fit_spec = str(args.fit_template).strip()
 
     # --- pass 1: read every take ---------------------------------------
     # The rail override has to know each finger's rail BEFORE it can fuse a
@@ -904,6 +1507,7 @@ def main() -> None:
     skipped = []
     by_source = defaultdict(int)          # camera -> takes read from it
     by_clock = defaultdict(int)           # pairing clock -> takes paired on it
+    measure_parts = defaultdict(list)     # hand -> per-take HandMeasurement
     for gpath in takes:
         try:
             cpath = find_camera_take(args.input, gpath.name, args.camera)
@@ -925,19 +1529,43 @@ def main() -> None:
         # Needs the whole take at once: "did the id change 0.25 s ago" is a
         # question about the frames around this one, not about this one.
         flag_hand_id_stability(cam, gates, clock=clock)
+        # Measure the hand from THIS take, then drop the raw 26-joint arrays.
+        # Per take because a take is a self-contained measurement of the hand
+        # and the median over takes is not at the mercy of the longest one;
+        # dropped because keeping 26 positions on every frame of a 59-take
+        # session is a hundred megabytes of numbers whose medians are already
+        # in hand.
+        if fit_spec.lower() == FIT_AUTO:
+            for side in sorted({r["hand_side"] for r in cam}):
+                got = measure_hand(cam, hand=side, gates=gates,
+                                   source=gpath.name)
+                if got is not None:
+                    measure_parts[side].append(got)
+        for r in cam:
+            r.pop("abs26", None)
         loaded.append({"name": gpath.name, "glove": glove, "cam": cam,
                        "source": source, "clock": clock,
                        # Metric camera, rigid fit; normalised camera, fit scale.
                        "with_scale": source != LEAP})
 
+    # --- the glove's time lag, per hand ---------------------------------
+    lag_rows, glove_lag = glove_lag_of(lag_spec, args.input, cam_dirs, loaded)
+
+    # --- the operator's hand, put on the glove's template ----------------
+    measurements, scales, saved_measurements = fit_measurements(
+        fit_spec, measure_parts, loaded, args.input)
+    fitted = bool(measurements)
+
     # --- pass 2: fuse ---------------------------------------------------
     run = fuse_all(loaded, gates, rail_params, unreliable,
                    max_dt=args.max_dt, min_score=args.min_score,
                    thumb_from_camera=not args.no_thumb_camera,
-                   export_csv=args.export_csv is not None)
+                   export_csv=args.export_csv is not None,
+                   glove_lag=glove_lag, fitted=fitted)
     plain = (fuse_all(loaded, gates, plain_rail_params, cli_unreliable,
                       max_dt=args.max_dt, min_score=args.min_score,
-                      thumb_from_camera=not args.no_thumb_camera)
+                      thumb_from_camera=not args.no_thumb_camera,
+                      glove_lag=glove_lag, fitted=fitted)
              if comparing else None)
 
     if not run.glove_samples:
@@ -1001,7 +1629,8 @@ def main() -> None:
         lines.append("")
         lines.append("Palm agreement (diagnostic — nothing is rejected on it)")
         lines.append(f"  median {median_mm:.1f} mm, worst {ordered[-1]:.1f} mm  "
-                     "RMSE of a rigid 5-point palm fit")
+                     "RMSE of a rigid 5-point palm fit"
+                     + (" of the FITTED glove hand" if fitted else ""))
         lines.append("  This is the glove's TEMPLATE hand against the real "
                      "one, not a tracking error. It is")
         lines.append("  reported because it is what Phase 5 would measure; "
@@ -1009,9 +1638,23 @@ def main() -> None:
         lines.append("  which is why a large value here cannot bend a finger "
                      "direction.")
     lines.append("")
+    lag_lines(lag_spec, lag_rows, lines)
+    fit_lines(fit_spec, measurements, scales, run, gates, lines)
+    for path in saved_measurements:
+        lines.append(f"  measurement saved       {path}")
+    if saved_measurements:
+        lines.append("")
     if comparing:
-        profile_comparison(plain, run, args.profile, profile_name,
-                           profile_comment, lines)
+        profile_comparison(plain, run, profile_path, profile_name,
+                           profile_comment, lines, how=profile_how)
+    else:
+        lines.append("Reliability profile — none in force "
+                     f"({profile_how})")
+        lines.append("  Nothing is masked out of the gates' evidence, and the "
+                     "single fusion below is the")
+        lines.append("  ordinary one. With a profile the report prints the "
+                     "fusion BOTH ways instead.")
+        lines.append("")
     lines.append("=" * 66)
     dof_table(run.per_pose, lines)
     gate_tables(run.dof_used, run.dof_total, run.reasons, gates,
