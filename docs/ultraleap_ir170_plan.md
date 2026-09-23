@@ -633,9 +633,18 @@ in a fresh ChatGPT chat in the project, its corrections adopted)
   2 and applied to day 1, cross 57/59 (profile 57/59), own 55/59. Day 2's
   remaining miss is pinch_right_take1 (read as peace); day 1's two misses
   are the pinch takes (glove index on its rail, read as open palm).
-  Default stays off until a second operator or glove pair shows the same,
-  and a frozen warm-up fit is what runs live. `own` is not enough: the
-  fault is cross-talk between channels, not a per-finger gain and offset.
+  Default stays off. Reviewer wording adopted: the error is not explained
+  by a single offset, and the other channels' state improves the
+  correction, which is consistent with channel cross-talk or a
+  pose-dependent calibration error (`own` also recovers day 2 when fitted
+  on day 1, so this is not proof of cross-talk; that needs one finger
+  moved with its neighbours held still). The reviewer no longer asks for
+  a second operator before enabling it for this glove and operator; the
+  decisive test is a prospective frozen-calibration session (the live
+  warm-up fits the model, it is frozen, a new session that played no part
+  in development is scored), plus no reliable finger getting materially
+  worse, a bypass when live inputs fall outside the fitted range, and the
+  same benefit after don/doff. Other gloves or operators start from off.
 - Glove lag from the profile (`glove_lag_s`: left 0.10, right 0.47 s,
   from the finger sweeps; used only when the session's own clips cannot
   measure one; `--glove-lag none` still applies nothing). No measurable

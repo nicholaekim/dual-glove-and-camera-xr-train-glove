@@ -1882,8 +1882,8 @@ def recal_lines(recal, params, lines):
     lines.append("  the model neither learns from nor corrects a finger on its "
                  "own rail; that dispute is")
     lines.append("  the rail override's. A railed NEIGHBOUR is still an input: "
-                 "saturation is real")
-    lines.append("  cross-talk evidence.")
+                 "its saturation is still")
+    lines.append("  information about the hand's state.")
     if recal.cross_session:
         lines.append("  CROSS-SESSION: fitted on every trusted frame of")
         lines.append(f"    {recal.source}")
@@ -1991,16 +1991,26 @@ def recal_lines(recal, params, lines):
     lines.append("")
     lines.append("  OFF BY DEFAULT, and staying off on this evidence: one "
                  "operator, two sessions of held")
-    lines.append("  poses. Switching it on would take (1) a second operator or "
-                 "glove pair where `cross`,")
-    lines.append("  held out by take, is at least as good as the profile "
-                 "baseline on the classifier AND")
-    lines.append("  the held-out residual, (2) a session held out as a WHOLE "
-                 "(fit on one day, apply to")
-    lines.append("  another), since a live run cannot see its own takes, and "
-                 "(3) a warm-up that fits the")
-    lines.append("  model before the session and freezes it, so what runs live "
-                 "is what was evaluated.")
+    lines.append("  poses. What the numbers support: the error is not "
+                 "explained by a single offset,")
+    lines.append("  and the other channels' state improves the correction, "
+                 "which is consistent with")
+    lines.append("  channel cross-talk OR a pose-dependent calibration error "
+                 "(`own` also recovers day 2,")
+    lines.append("  so this is not proof of cross-talk; that needs one finger "
+                 "moved with its neighbours")
+    lines.append("  held still). Switching it on for THIS glove and operator "
+                 "would take, decisively, a")
+    lines.append("  prospective frozen-calibration session: the live warm-up "
+                 "fits the model, it is frozen,")
+    lines.append("  and a new session that played no part in development is "
+                 "scored; plus no finger that")
+    lines.append("  was reliable becoming materially worse, a gate that "
+                 "bypasses the model when the live")
+    lines.append("  inputs fall outside the fitted range, and the same "
+                 "benefit after the glove is taken")
+    lines.append("  off and put back on. Any other glove or operator starts "
+                 "from off.")
     lines.append("")
 
 

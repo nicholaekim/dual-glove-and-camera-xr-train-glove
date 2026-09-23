@@ -2270,8 +2270,9 @@ class GloveRecalibration:
       - a finger on its rail on a frame is not corrected on that frame: a
         rail dispute belongs to the rail override, not to a calibration.
     The OTHER fingers' readings stay valid INPUTS whether or not they are on
-    their rails: a saturated neighbour is real cross-talk evidence. A finger
-    with no learned rail is always off it, as everywhere else in this module.
+    their rails: a saturated neighbour is still information about the hand's
+    state. A finger with no learned rail is always off it, as everywhere
+    else in this module.
 
     `observe` collects rows tagged with a group (a take index); `model(hand,
     exclude=k)` fits on every group but k and caches it, which is how the
