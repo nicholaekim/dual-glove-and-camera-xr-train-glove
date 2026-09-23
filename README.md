@@ -86,6 +86,21 @@ The glove misses exactly the spread- and opposition-defined poses. That
 proves the code does what it claims on data whose answer is known; it does
 **not** prove a real glove and webcam behave this way. A real session does.
 
+## Demo
+
+`scripts/demo.py` shows the glove, camera and fused hands side by side in one
+window, with per-finger badges saying which sensor supplied each curl and
+spread, the rail override, and a pose guess. Replay a recorded session (no
+hardware) or run it live:
+
+```powershell
+python scripts\demo.py --replay recordings\sync_day2
+python scripts\demo.py --live
+```
+
+The runbook for showing it (what to plug in, what to point at, the limits to
+say out loud) is `docs/demo.md`.
+
 ## Daily use — glove
 
 Needs XR Trainer streaming to `127.0.0.1:9002`, glove connected and calibrated.

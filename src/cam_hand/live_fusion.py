@@ -1078,6 +1078,14 @@ class FusedFrame:
     dof_source   per gated DOF, which sensor supplied it this frame
     rail_active  fingers whose curl the rail override gave to the camera
     corrections  per finger, the curl change the drift anchor made
+    glove_in     the glove points this step fused (the fitted hand when a
+                 template fit is in force, before any drift-anchor change)
+    cam_in       the paired camera frame's points, or None when unpaired
+
+    `glove_in` and `cam_in` are the step's two inputs, kept so a viewer
+    (`scripts/demo.py`) can draw the glove, camera and fused hands of one
+    step side by side without pairing again. They are not written by
+    `to_json` and play no part in comparing frames.
     """
 
     t_glove: float
@@ -1088,6 +1096,10 @@ class FusedFrame:
     camera_used: bool
     rail_active: Tuple[str, ...] = ()
     corrections: Dict[str, float] = field(default_factory=dict)
+    glove_in: Optional[np.ndarray] = field(default=None, repr=False,
+                                           compare=False)
+    cam_in: Optional[np.ndarray] = field(default=None, repr=False,
+                                         compare=False)
 
     def to_json(self) -> dict:
         return {
@@ -1223,6 +1235,8 @@ class LiveFusion:
         self._forget_after_camera_loss(hand, t_glove)
         c = self.buffer.nearest(hand, t, self.max_dt)
         G = self.glove_points(g)
+        glove_in = G
+        C = None
         curls_g = flexion_features(G)
         hand_scale = self.scale.for_hand(hand)
         tracker = self.trackers.get(hand)
@@ -1284,7 +1298,9 @@ class LiveFusion:
             dof_source=dict(info["dof_source"]),
             camera_used=bool(info["camera_used"]),
             rail_active=tuple(rail.active) if rail is not None else (),
-            corrections={k: float(v) for k, v in moved.items()})
+            corrections={k: float(v) for k, v in moved.items()},
+            glove_in=glove_in,
+            cam_in=C)
 
     def summary_lines(self) -> List[str]:
         """The end-of-run report: per hand, how much was paired, how often
