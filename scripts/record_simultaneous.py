@@ -70,7 +70,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import cv2
 
@@ -89,6 +89,7 @@ from leap_hand.protocol import (
     DEFAULT_BAND,
     DEFAULT_RETRIES,
     DEFAULT_SETTLE,
+    STILL_UNKNOWN,
     WRONG_POSE,
     AsyncBeeper,
     Hud,
@@ -100,7 +101,10 @@ from leap_hand.protocol import (
     median,
     parse_band,
     pose_label,
+    move_still,
     read_hand,
+    skipped_still_path,
+    still_status,
     stream_health,
     view_caption,
 )
@@ -773,6 +777,8 @@ class Attempt:
     # ended up if it was rejected. Both relative to the session folder.
     still: str = ""
     rejected_to: str = ""
+    # Why there is no still, when there is none (see `still_status`).
+    still_missing: str = ""
 
 
 @dataclass
@@ -1184,6 +1190,7 @@ class CoachedLeapSession(LeapSyncSession):
             (self.glove_dir / name).unlink(missing_ok=True)
             self._drop_settle(name)
             still.unlink(missing_ok=True)
+            skipped_still_path(still).unlink(missing_ok=True)
             raise
         cam_rec.stop()
         glove_rec.stop()
@@ -1191,6 +1198,7 @@ class CoachedLeapSession(LeapSyncSession):
         self._deadline = None
         t1 = time.time()
 
+        still_name, still_missing = still_status(still)
         got = Attempt(
             hand_id=self._pinned_id,
             coverage=coverage(self._times, t0, min(t1, t0 + duration)),
@@ -1199,7 +1207,8 @@ class CoachedLeapSession(LeapSyncSession):
             median_view_deg=median(self._angles),
             rejected_chirality=self.rejected_chirality - before[0],
             second_hand=self.second_hand - before[1],
-            still=still.name if still.is_file() else "",
+            still=still_name or "",
+            still_missing=still_missing or "",
         )
         # Read the glove file back rather than counting frames: `glove_frames`
         # cannot tell a steady stream from one that stopped for three seconds
@@ -1239,7 +1248,7 @@ class CoachedLeapSession(LeapSyncSession):
             if path.is_file():
                 cam_finalize(path, {self.hand})
         got.file = final.name
-        got.still = self._rename_still(still, final.stem)
+        got.still, got.still_missing = self._rename_still(still, final.stem)
         if (got.glove_health.get("max_gap_ms") or 0) > GLOVE_GAP_WARN_S * 1000:
             self._say(f"      ! the glove stream stopped for "
                       f"{got.glove_health['max_gap_ms']:.0f} ms during this "
@@ -1324,13 +1333,11 @@ class CoachedLeapSession(LeapSyncSession):
             dst = self.rejected_dir / folder.name / settle_name(target)
             dst.parent.mkdir(parents=True, exist_ok=True)
             src.replace(dst)
-        still = self.stills_dir / f"{stem}.jpg"
-        still_name = ""
-        if still.is_file():
-            dst = self.rejected_dir / STILLS / f"{target}.jpg"
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            still.replace(dst)
-            still_name = dst.name
+        still = self.rejected_dir / STILLS / f"{target}.jpg"
+        move_still(self.stills_dir / f"{stem}.jpg", still)
+        still_name, missing = still_status(still)
+        still_name = still_name or ""
+        got.still_missing = missing or ""
         if not moved:
             return ""
         meta = self.rejected_dir / self.cam_dir.name / f"{target}.meta.json"
@@ -1341,13 +1348,16 @@ class CoachedLeapSession(LeapSyncSession):
         return str(Path(REJECTED) / self.cam_dir.name / f"{target}.jsonl")
 
     @staticmethod
-    def _rename_still(still: Path, final_stem: str) -> str:
-        """Keep the still's name matched to the take's, as the pair is."""
-        if not still.is_file():
-            return ""
+    def _rename_still(still: Path, final_stem: str) -> Tuple[str, str]:
+        """Keep the still's name matched to the take's, as the pair is.
+
+        (the still's new name, "") or ("", why there is none). The viewer's
+        note for a still it skipped is renamed by the same rule, so the
+        reason stays findable beside the take."""
         final = still.with_name(f"{final_stem}.jpg")
-        still.replace(final)
-        return final.name
+        move_still(still, final)
+        name, missing = still_status(final)
+        return name or "", missing or ""
 
     # --- one take --------------------------------------------------------
     def run_take(self, pose: str, take: int, n_takes: int, pose_idx: int,
@@ -1429,11 +1439,16 @@ class CoachedLeapSession(LeapSyncSession):
             "glove_gaps_over_100ms": health.get("gaps_over"),
             "pose_check": (got.check.as_dict() if got.check is not None
                            else None),
-            # Relative to the session folder, and it never leaves it: a still
-            # of the IR image has the operator in it.
+            # Relative to the session folder, and it never leaves it: the crop
+            # reduces the still to the hand and a margin, which can still
+            # catch part of a face held near the hand, so it stays out of git.
             "still": (str((Path(STILLS) if accepted
                            else Path(REJECTED) / STILLS) / still)
                       if still else None),
+            # With no still: "no_tracked_hand" when the viewer skipped it on
+            # purpose, "unknown" when nothing says why (a crash, no viewer).
+            "still_missing_reason": (None if still
+                                     else got.still_missing or STILL_UNKNOWN),
             "file": file,
         }
 

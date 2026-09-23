@@ -476,8 +476,14 @@ camera window saves the frame it is composing — IR image, fitted skeleton,
 caption — to `recordings\sync\stills\<take>.jpg` (and to `rejected\stills\`
 with a refused attempt), through a `snap=<path>` line in the status file it
 is already driven by. It is the only record of a take that does not come from
-the two sensors that judge it. `recordings\` is git-ignored and the stills
-have the operator in them, so they never go anywhere else.
+the two sensors that judge it. The still is cropped to the tracked hand,
+which reduces what it shows to the hand and a margin around it, but a hand
+held near the face can still include part of it, so `recordings\` stays
+git-ignored and the stills never go anywhere else. With no hand tracked at
+that moment the window writes no JPEG, only `<take>.skipped.txt`, and the
+take's meta.json then has `"still": null` with
+`"still_missing_reason": "no_tracked_hand"`; `"unknown"` there means neither
+file exists (a viewer crash, or `--no-view`).
 
 **The glove is recorded at full rate** with `--camera leap` (`--hz` still
 throttles it explicitly, and the webcam backend still defaults to 5 Hz). At
@@ -1423,6 +1429,84 @@ classifier sees one gesture as two — this was a real bug, caught by the
 self-test showing `pinch` failing on right hands and `relaxed` on left.
 `cam_hand.features` takes `hand_side` and flips the normal for left hands.
 
+### Live fusion
+
+`scripts/fuse_live.py` runs the same fusion on the live streams, one glove
+frame at a time, while the glove is being worn. Nothing in it decides
+anything new: the rail override, the drift anchor, the template fit, the
+learned rails and endpoints and `fuse_skeletons` are the offline pieces, run
+in `fuse_all`'s order by `cam_hand/live_fusion.py`.
+
+```powershell
+python scripts\fuse_live.py --replay recordings\sync_day2  # check first
+python scripts\fuse_live.py --hand right --out runs\live_right.jsonl
+python scripts\fuse_live.py --osc-out 127.0.0.1:9010      # to a renderer
+python scripts\fuse_live.py --mock-glove --mock-leap --no-view --seconds 10
+```
+
+**Warm-up, about six seconds.** With XR Trainer streaming to port 9002 and
+the hand 18 to 28 cm over the module, follow the beeps and the camera
+window's caption: **OPEN PALM flat to the camera** (`--warmup-open`, 3 s),
+then **FIST** (`--warmup-fist`, 3 s). The open palm gives the glove's rails,
+the camera's open reference and, with `--fit-template auto` (the default),
+the frames the operator's bone lengths are measured on; the fist gives both
+sensors' flexed ends. What was learned is printed: rails and endpoints per
+finger, the fit or why it was refused (too few trusted open-palm frames; that
+hand is then fused on the raw template), and each hand's glove lag and where
+it came from. With `--out`, a fitted hand's measurement is also saved beside
+the output as `template_<hand>.json`, the file `fuse_poses.py` writes, so a
+later run can reuse it with `--fit-template PATH`. A hand is not fused at all,
+and the program stops with exit code 2 saying which and why, when its open
+palm was not seen by both sensors, or when the fist did not separate from the
+open palm: an index span under `min_glove_span` (0.40) on the glove or
+`min_cam_span` (0.30) on the camera.
+
+**The warm-up is an initial calibration, not the offline learning.**
+`fuse_poses.py` learns its rails and endpoints label-free over a whole
+session of poses; six seconds of one open palm and one fist is a far smaller
+sample, taken once. Before trusting live output:
+
+1. **Replay a recorded session** with `--replay DIR`. Every take goes through
+   the live path at full speed, with what `fuse_poses.py` learns from that
+   session handed to it in place of a warm-up, and is compared with
+   `fuse_all` frame by frame: frames, paired frames, the largest fused-point
+   difference and the `dof_source` mismatches, per take. Everything must
+   agree (exit 0; exit 3 if not). On `recordings/sync_day2` all 60 takes
+   agree exactly, with the drift anchor off and on.
+2. **Repeat the warm-up** across glove don/doff and across days, and compare
+   the rails and endpoints it prints. A number that moves between two
+   warm-ups of the same hand is a number the gates should not be trusted on.
+3. **Check the lag's sign** with one deliberate open-to-fist movement: the
+   glove's curls on the HUD must follow the camera by about the profile's
+   lag (0.10 s left, 0.47 s right), never lead it.
+
+**Pairing.** Each glove frame is paired with the buffered camera frame
+nearest to its arrival time minus that hand's glove lag, within `--max-dt`
+(0.05 s). The lag is the reliability profile's measured `glove_lag_s` (0.10 s
+left, 0.47 s right in `profiles/default.json`) unless `--glove-lag` gives
+one; a hand with no profile lag gets none, and the startup lines say so.
+Because the glove trails the camera, the camera frame it wants has always
+arrived already, so the lag costs no waiting.
+
+**The drift anchor is experimental and off** (`--drift-anchor on` to try
+it). On, it also forgets what it learned whenever a hand's camera has been
+stale for more than a second, because the hand can come back in any pose.
+
+**Outputs**, one per glove frame of each fused hand:
+
+- `--out PATH.jsonl`: `t_glove`, `t_cam` (null when unpaired), `hand`, the 21
+  fused points (wrist-centred metres, MediaPipe-21 order), `dof_source` per
+  gated DOF, `camera_used`, `rail_active` and the drift anchor's
+  `corrections` (curl change per finger).
+- `--osc-out HOST:PORT`: `/fused/<hand>/keypoints21` (63 floats, the same
+  points) and `/fused/<hand>/sources` (one `"dof=source"` string per gated
+  DOF).
+- The terminal: a HUD line every 0.25 s per hand (fused curls, how many
+  spreads and whether the thumb came from the camera, override fingers,
+  anchor corrections, glove rate, camera fresh or stale) and, on Ctrl-C or
+  after `--seconds`, a summary of camera use per DOF, rejection reasons and
+  what the drift anchor learned.
+
 ## Layout
 
 ```
@@ -1441,6 +1525,7 @@ src/cam_hand/
   features.py     flexion (5) + spread (6) features, LOO nearest-centroid
   align.py        Umeyama/Kabsch rigid alignment (reflections excluded)
   fusion.py       DOF-split glove+camera fusion, wall-clock frame pairing
+  live_fusion.py  the same fusion live: camera buffer, warm-up, outputs
   prof_format.py  reader for the tracker's keypoint text files
 scripts/
   live_view.py               live webcam skeleton
@@ -1454,6 +1539,9 @@ scripts/
                              coached one-hand protocol with --camera leap
   fuse_poses.py              fuse + glove/camera/fused comparison report
                              (--exclude a take, --profile a glove)
+  fuse_live.py               the same fusion live, after a 6 s warm-up
+                             (--out JSONL, --osc-out HOST:PORT); --replay
+                             checks it against fuse_poses on a session
 scripts/leap/
   camera_view.py             live IR window with a caption, driven by a file
   hold_test.py               hold a pose 60 s: does the glove's curl drift?

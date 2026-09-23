@@ -45,6 +45,7 @@ import math
 import re
 from pathlib import Path
 import threading
+import time
 from dataclasses import dataclass
 from queue import Queue
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -694,6 +695,117 @@ def image_banner(now: float, last_image_time: Optional[float],
     return f"camera images stopped {now - last_image_time:.0f} s ago"
 
 
+# --- the per-take still --------------------------------------------------------
+def hand_crop_box(points: Sequence[Sequence[float]], size: int,
+                  margin: float = 0.35, min_side: int = 192
+                  ) -> Optional[Tuple[int, int, int, int]]:
+    """The part of the camera frame to keep as a take's still, or None.
+
+    The window is a square `size` pixels on a side, and the IR camera looks up
+    past the hand at whoever is holding it, so a still of the whole frame has
+    the operator's face in it. Those stills had to be cropped by hand before
+    anyone else could see them. This box is what the viewer crops to instead.
+    It reduces what the still shows to the hand and a margin around it; a
+    hand held near the face can still bring part of the face into the box,
+    which is one reason the stills stay out of git.
+
+    `points` are the (x, y) pixels of the tracked hand in the frame the still
+    is cut from. Points outside the frame are ignored (that part of the hand
+    is not in the picture). The box around the rest grows on every side by
+    `margin` times its larger side, so the fingertips are not at the edge,
+    and is made at least `min_side` wide and tall around its centre, so a
+    small or distant hand still gives a still that can be read. A box that
+    runs off the frame is slid back inside it before it is cut to the frame,
+    so a hand near the edge keeps a full-size still whenever the frame is big
+    enough for one.
+
+    Returns (x0, y0, x1, y1) with x1 and y1 exclusive, ready for
+    `image[y0:y1, x0:x1]`, or None when no point is inside the frame: with no
+    hand to crop to, the caller writes no still rather than the whole frame.
+    """
+    inside = [(float(p[0]), float(p[1])) for p in points
+              if 0 <= p[0] < size and 0 <= p[1] < size]
+    if not inside or size <= 0:
+        return None
+    xs = [p[0] for p in inside]
+    ys = [p[1] for p in inside]
+    lo = [min(xs), min(ys)]
+    hi = [max(xs) + 1.0, max(ys) + 1.0]          # a pixel covers [x, x + 1)
+    pad = margin * max(hi[0] - lo[0], hi[1] - lo[1])
+    box = []
+    for a in range(2):
+        a0, a1 = lo[a] - pad, hi[a] + pad
+        if a1 - a0 < min_side:
+            mid = (a0 + a1) / 2.0
+            a0, a1 = mid - min_side / 2.0, mid + min_side / 2.0
+        a0, a1 = math.floor(a0), math.ceil(a1)
+        if a0 < 0:                               # slide back inside...
+            a0, a1 = 0, a1 - a0
+        if a1 > size:
+            a0, a1 = a0 - (a1 - size), size
+        box.append((max(0, a0), min(size, a1)))  # ...and cut what still sticks out
+    (x0, x1), (y0, y1) = box
+    return int(x0), int(y0), int(x1), int(y1)
+
+
+# Why a take has no still. Written into its meta.json as
+# `still_missing_reason`, so a still the viewer skipped on purpose can be told
+# apart from one that is missing because something failed.
+NO_TRACKED_HAND = "no_tracked_hand"   # the viewer saw no hand, and wrote a note
+STILL_UNKNOWN = "unknown"             # no still and no note: the viewer crashed,
+                                      # was never started (--no-view, mocks), or
+                                      # was never asked before the take ended
+SKIPPED_SUFFIX = ".skipped.txt"
+
+
+def skipped_still_path(still_path) -> Path:
+    """Where the viewer leaves its note for a still it chose not to write:
+    `<stem>.skipped.txt`, beside where the JPEG would have been."""
+    p = Path(still_path)
+    return p.with_name(p.stem + SKIPPED_SUFFIX)
+
+
+def skipped_still_text(reason: str, when: float) -> str:
+    """The note's contents: the reason, then when the still was asked for."""
+    local = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(when))
+    return f"still_missing_reason={reason}\ntime={when:.3f}  ({local})\n"
+
+
+def still_status(still_path) -> Tuple[Optional[str], Optional[str]]:
+    """(the still's file name, None) when the JPEG is there, otherwise
+    (None, why it is not).
+
+    The why is the reason in the viewer's note when there is one (normally
+    NO_TRACKED_HAND), and STILL_UNKNOWN when there is no note either, or the
+    note cannot be read: nothing on disk says the still was skipped on
+    purpose, so it is treated as missing for a reason nobody recorded.
+    """
+    p = Path(still_path)
+    if p.is_file():
+        return p.name, None
+    note = skipped_still_path(p)
+    try:
+        text = note.read_text(encoding="utf-8")
+    except OSError:
+        return None, STILL_UNKNOWN
+    for line in text.splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() == "still_missing_reason" and value.strip():
+            return None, value.strip()
+    return None, STILL_UNKNOWN
+
+
+def move_still(src, dst) -> None:
+    """Move a take's still, and the viewer's note if it left one instead, to
+    the name `dst`. The note follows the same renaming rule as the JPEG so
+    `still_status(dst)` still finds it. Nothing to move, nothing created."""
+    src, dst = Path(src), Path(dst)
+    for a, b in ((src, dst), (skipped_still_path(src), skipped_still_path(dst))):
+        if a.is_file():
+            b.parent.mkdir(parents=True, exist_ok=True)
+            a.replace(b)
+
+
 # --- stream health -----------------------------------------------------------
 def stream_health(times: Sequence[float], t0: Optional[float] = None,
                   t1: Optional[float] = None,
@@ -864,6 +976,12 @@ class CameraView:
 
     def snapshot(self, path):
         """Ask the window to save its next composed frame to `path`, once.
+
+        The viewer crops the still to the tracked hand, which reduces what it
+        shows to the hand and a margin around it; a hand held near the face
+        can still include part of the face, so the file stays out of git with
+        the rest of `recordings/`. With no hand tracked at that moment it
+        writes no JPEG, only a `<stem>.skipped.txt` note (see `still_status`).
 
         The take's own evidence: the IR image, the fitted skeleton and the
         caption that was on screen, as one JPEG, so a verdict about which

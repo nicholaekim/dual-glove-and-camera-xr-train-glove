@@ -11,8 +11,13 @@ Usage:
   python camera_view.py                      # free-running viewer, q or Esc to close
   python camera_view.py --hand left          # only judge the left hand
   python camera_view.py --band 18,28         # target height band in cm
+  python camera_view.py --still full         # per-take stills of the whole frame
 
 Other scripts start it for you and feed it a caption through --status-file.
+The still a recorder asks for there (`snap=<path>`) is cropped to the tracked
+hand, which reduces what it shows to the hand and a margin around it (a hand
+held near the face can still include part of it). With no hand tracked it
+writes a `<stem>.skipped.txt` note instead of the JPEG.
 """
 import argparse, math, os, sys, threading, time
 
@@ -22,7 +27,8 @@ import leap
 from leap import enums
 from leapc_cffi import ffi, libleapc
 
-from leap_hand.protocol import QUIT, image_banner, parse_status
+from leap_hand.protocol import (NO_TRACKED_HAND, QUIT, hand_crop_box, image_banner, parse_status,
+                                skipped_still_path, skipped_still_text)
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--hand", choices=["left", "right", "both"], default="both")
@@ -30,7 +36,10 @@ ap.add_argument("--band", default="18,28", help="target palm height in cm: LOW,H
 ap.add_argument("--status-file", default=None, help="text file whose first line is shown as a caption; '__quit__' closes the viewer")
 ap.add_argument("--parent-pid", type=int, default=0, help="close when this process exits (set by scripts that launch the viewer)")
 ap.add_argument("--seconds", type=float, default=0.0, help="close by itself after this long (0 = never)")
-ap.add_argument("--snapshot", default=None, help="save the last composed frame here on exit (testing)")
+ap.add_argument("--snapshot", default=None, help="save the last composed frame here on exit, whole and annotated (testing)")
+ap.add_argument("--still", choices=["hand", "full"], default="hand",
+                help="per-take stills asked for through the status file: cropped to the tracked hand "
+                     "(default; nothing is written with no hand tracked) or the whole annotated frame")
 ap.add_argument("--no-window", action="store_true", help="do not open a window (testing)")
 args = ap.parse_args()
 LOW, HIGH = (float(v) for v in args.band.split(","))
@@ -46,8 +55,12 @@ lock = threading.Lock()
 # reply to the policy request — see leap_hand.protocol.image_banner and every
 # still in recordings/sync_day2/stills/, which says "camera images are off"
 # over a perfectly good picture of the hand.
+# `px` is the tracked hands' pixels in the unmirrored frame the last compose()
+# drew, and `px_t` the time of the tracking event they came from.
 state = {"img": None, "img_t": None, "images": 0,
-         "hands": [], "hands_t": 0.0, "fps": 0.0, "frames": 0}
+         "hands": [], "hands_t": 0.0, "fps": 0.0, "frames": 0,
+         "px": [], "px_t": 0.0}
+HANDS_FRESH_S = 0.25              # older tracking than this is drawn as no hand
 
 
 def image_to_numpy(image):
@@ -163,9 +176,12 @@ def read_caption():
 
 
 def compose():
+    """(annotated frame, plain frame): both mirrored with the skeleton drawn;
+    the plain one has no text and no border, for cropping a still from."""
     with lock:
         img = None if state["img"] is None else state["img"].copy()
-        hands = list(state["hands"]) if time.time() - state["hands_t"] < 0.25 else []
+        hands_t = state["hands_t"]
+        hands = list(state["hands"]) if time.time() - hands_t < HANDS_FRESH_S else []
         fps = state["fps"]; frames = state["frames"]; img_t = state["img_t"]
     size = 384 * SCALE
     if img is None:
@@ -178,13 +194,17 @@ def compose():
     c = to_px((0.0, 220.0, 0.0))
     if c:
         cv2.circle(frame, c, 70, (90, 90, 90), 1, cv2.LINE_AA); cv2.drawMarker(frame, c, (90, 90, 90), cv2.MARKER_CROSS, 16, 1)
+    px = []                                                              # the hand, not the elbow
     for h in hands:
         col = COLOURS[h["side"]]
         w = to_px(h["wrist"]); e = to_px(h["elbow"])
+        if w:
+            px.append(w)
         if w and e:
             cv2.line(frame, e, w, col, 2, cv2.LINE_AA)
         for chain in h["chains"]:
             pts = [to_px(p) for p in chain]
+            px.extend(p for p in pts if p)
             if w and pts[0]:
                 cv2.line(frame, w, pts[0], col, 1, cv2.LINE_AA)
             for a, b in zip(pts, pts[1:]):
@@ -193,7 +213,10 @@ def compose():
             for p in pts:
                 if p:
                     cv2.circle(frame, p, 3, (255, 255, 255), -1, cv2.LINE_AA)
+    with lock:
+        state["px"] = px; state["px_t"] = hands_t
     frame = cv2.flip(frame, 1)                                           # mirror: your left hand on the left
+    plain = frame.copy()
     # ---- text, after the flip so it reads normally
     wanted = [args.hand] if args.hand != "both" else ["left", "right"]
     seen = {h["side"]: h for h in hands}
@@ -223,7 +246,30 @@ def compose():
     banner = image_banner(time.time(), img_t, STARTED)
     if banner:
         put(frame, banner, (14, size - 44), 0.5, (0, 190, 255), 1)
-    return frame
+    return frame, plain
+
+
+def hand_still(plain, caption):
+    """The plain frame cropped to the hand tracked right now, with the caption
+    on it, or None when no hand is tracked. The whole frame is never the
+    fallback: it has the operator in it."""
+    with lock:
+        px = list(state["px"]); px_t = state["px_t"]
+    if not px or time.time() - px_t >= HANDS_FRESH_S:
+        return None
+    size = plain.shape[1]
+    box = hand_crop_box([(size - 1 - x, y) for x, y in px], size)       # mirrored, as the picture is
+    if box is None:
+        return None
+    x0, y0, x1, y1 = box
+    crop = plain[y0:y1, x0:x1].copy()
+    if caption and caption != QUIT:
+        room = crop.shape[1] - 16
+        width = cv2.getTextSize(caption, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 5)[0][0] or 1
+        scale = max(0.3, min(0.75, room / width))
+        thick = 2 if scale >= 0.6 else 1
+        put(crop, caption, (8, 8 + int(24 * scale)), scale, (0, 255, 255), thick)
+    return crop
 
 
 WIN = "Ultraleap camera view"
@@ -233,20 +279,31 @@ if not args.no_window:
         cv2.setWindowProperty(WIN, cv2.WND_PROP_TOPMOST, 1)
     except Exception:
         pass
-t0 = time.time(); last = None; snapped = None
+t0 = time.time(); last = None; last_plain = None; snapped = None
 try:
     while True:
-        last = compose()
+        last, last_plain = compose()
         # One still per take, requested by the recorder through `snap=<path>`:
         # the independent evidence of what the hand was actually doing, taken
         # while it was doing it. Written once per path and never overwritten —
         # a repeated path is a status file that has not changed, not a new ask.
+        # Cropped to the tracked hand (--still hand), because the whole frame
+        # has the operator in it. With no hand tracked at that moment no JPEG
+        # is written, only a note saying so, which the recorder copies into
+        # the take's meta.json: a still skipped on purpose is then not
+        # mistaken for one lost to a crash.
         caption_now, want_snap = read_status()
         if want_snap and want_snap != snapped:
             snapped = want_snap
+            still = last if args.still == "full" else hand_still(last_plain, caption_now)
             try:
                 os.makedirs(os.path.dirname(want_snap) or ".", exist_ok=True)
-                cv2.imwrite(want_snap, last)
+                if still is None:
+                    with open(skipped_still_path(want_snap), "w", encoding="utf-8") as fh:
+                        fh.write(skipped_still_text(NO_TRACKED_HAND, time.time()))
+                    print(f"still skipped, no hand tracked: {want_snap}")
+                else:
+                    cv2.imwrite(want_snap, still)
             except Exception as ex:
                 print("could not write the snapshot:", ex)
         if not args.no_window:
