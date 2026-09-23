@@ -593,6 +593,83 @@ Day-1 session with the corrected recorder (2026-09-18, 18:36 to 18:48,
   wrong. Reported as is: fusion needs per-hand, per-finger reliability
   logic; glove curl does not automatically dominate.
 
+Five code fixes and what they measured (2026-09-23; 392 tests; reviewed
+in a fresh ChatGPT chat in the project, its corrections adopted)
+- Camera drift anchor (`DriftAnchor`, `--drift-anchor`, default OFF,
+  experimental). A complementary filter: the residual camera fraction minus
+  glove fraction, learned on trusted frames only (view under 50 deg, stable
+  id, off rail, not disputed), median over 5 s, applied to every frame by
+  bending the glove finger. Done properly (gates read the uncorrected
+  curls, `gate_curls`) it gains at most one take per day: day 1 57 -> 57 or
+  58 of 59, day 2 53 -> 53 or 54 of 60, and the day 1 gain was an artifact
+  of a knuckle-only bend. Per pose, the right hand's median residual spans
+  0.4 to 1.05 fraction units (right middle: -0.19 in fist, +0.86 in index
+  point) while the change within a 5 s take is 0.02 to 0.10. Reviewer
+  wording adopted: pose dependence dominates the glove's error over the
+  timescale of these takes; creep may coexist. The anchor now resets at
+  every take boundary and per hand (`reset(hand)`), keeps constant memory,
+  and the bend is spread over the three joints (50/30/20).
+- Camera-referenced glove recalibration (`GloveRecalibration`,
+  `--recalibrate own|cross`, default OFF). Per hand, camera fraction of
+  finger i = a_i + sum_j b_ij * glove fraction j over all five glove
+  fractions (`cross`) or its own only (`own`), ridge on standardised inputs
+  (lambda 0.01), trusted frames only. Rail rule: a finger's own railed
+  readings neither teach nor get corrected (a rail means anything from
+  straight to flexed; that dispute is the rail override's), while railed
+  neighbours stay valid inputs. Without the rule the index was poisoned by
+  pinch (open palm residual 0.01 -> 0.26). Evaluated leave-one-take-out for
+  the calibration, then the usual take-level classifier:
+    day 1: ordinary 55, profile 57, profile + own 57, profile + cross 57 / 59
+    day 2: ordinary 51, profile 53, profile + own 59, profile + cross 59 / 60
+  Held-out residual (median |camera - glove fraction|), cross: right pinky
+  .245 -> .044 (day 1), .400 -> .062 (day 2); right ring .087 -> .026,
+  .195 -> .093; right middle .027 -> .015, .068 -> .041; left middle the
+  only finger slightly worse. Per pose (right hand, cross, day 2):
+  index_point middle .86 -> .05, pinky .83 -> .25; peace ring .46 -> .16,
+  pinky .66 -> .14; thumbs_up pinky .46 -> .10; open palm and pinch
+  untouched (railed). Whole-session hold-out (`--recalibrate-from DIR`,
+  coefficients carry, endpoints re-learned on the applied session): fitted
+  on day 1 and applied to day 2, cross 59/60 (profile 53/60); fitted on day
+  2 and applied to day 1, cross 57/59 (profile 57/59), own 55/59. Day 2's
+  remaining miss is pinch_right_take1 (read as peace); day 1's two misses
+  are the pinch takes (glove index on its rail, read as open palm).
+  Default stays off until a second operator or glove pair shows the same,
+  and a frozen warm-up fit is what runs live. `own` is not enough: the
+  fault is cross-talk between channels, not a per-finger gain and offset.
+- Glove lag from the profile (`glove_lag_s`: left 0.10, right 0.47 s,
+  from the finger sweeps; used only when the session's own clips cannot
+  measure one; `--glove-lag none` still applies nothing). No measurable
+  classifier effect in these held-pose tests; about 5 % fewer paired frames
+  at take edges because a glove frame stamped in the first 0.47 s of a take
+  describes the hand before the camera recording began. Not an intrinsic
+  glove constant: transport and software latency can change with machine
+  load or XR Train version.
+- Rail override on all four fingers (`--rail-fingers`, evaluation only):
+  no classifier row changes on either day; middle never fires, ring 6
+  frames (day 2), pinky 5 frames (day 1) and 906 frames, 6 % (day 2).
+  Profile stays index only. Pinky is the next candidate: needs a repeated
+  sweep and an override precision count (when the rail fires, how often is
+  the camera's flex actually right).
+- IR stills cropped to the tracked hand (`camera_view.py --still hand`,
+  default): the projected skeleton's box, 35 % margin, at least 192 px,
+  slid inside the frame; no hand tracked, no file, and a
+  `<stem>.skipped.txt` note gives the reason, which the recorder writes to
+  meta.json as `still_missing_reason` (`unknown` when there is neither).
+  Reduces what the still shows; a hand held near the face can still include
+  part of it; the file stays out of git.
+- Live fusion (`scripts/fuse_live.py`, `src/cam_hand/live_fusion.py`):
+  6 s coached warm-up (open palm 3 s, fist 3 s) learns rails, endpoints and
+  the template measurement (an initial calibration, not the offline
+  learning over a session); refuses a hand whose open/fist separation is
+  under the gate minimums; pairs each glove frame with the camera frame at
+  t minus the profile's lag within 50 ms; runs `fuse_all`'s per-frame
+  sequence; outputs JSONL and OSC (`/fused/<hand>/keypoints21`, 63 floats).
+  Replay equivalence (`--replay recordings/sync_day2`): all 60 takes agree
+  with the offline fusion, largest point difference 0, no source
+  mismatches, same paired counts. Before trusting a live run: replay a
+  recorded session, repeat the warm-up across don/doff and days, check the
+  lag sign with one open-to-fist movement.
+
 What XR Train's own files show (2026-09-22, read from the local install:
 `AppData/LocalLow/StretchSense/XR Train/Player*.log`, the registry
 PlayerPrefs and strings in `StretchSense.CompanionApp.Runtime.dll`)
