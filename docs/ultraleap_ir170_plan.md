@@ -593,6 +593,35 @@ Day-1 session with the corrected recorder (2026-09-18, 18:36 to 18:48,
   wrong. Reported as is: fusion needs per-hand, per-finger reliability
   logic; glove curl does not automatically dominate.
 
+The professor's 21 poses, recorded with the camera (2026-09-23, main
+dc6821f, 397 tests)
+- All 21 `_NA` frames recorded bare-handed (left hand) with
+  `scripts/leap/record_prof_frames.py --seconds 3 --prep 3`; keypoint files
+  in his format under `recordings/leap/prof_frames/` and copied into each
+  `frame_<id>_NA/camera_recording_LEFT/` plus a hand-in folder
+  `xr trainer\camera poses for professor 2026-09-23\` (README, table, CSV).
+- Scored with the new `scripts/leap/compare_prof_frames.py` (Umeyama on the
+  wrist and knuckles, error over all 21 landmarks, mirrored refit as in
+  `compare_to_tracker.py`): median 17.6 units after the better fit (22.3
+  direct), solved scale median 1.01 (0.79 to 1.34), so his units are
+  millimetres at this hand size. Worst landmarks: fingertips and thumb.
+- Chirality: the operator used the left hand throughout; the Ultraleap
+  labelled it "right" in 20 of 21 frames and his tracker labelled the same
+  arm "right" in 10 of 21 (153624 right, 156023 left, same arm and chair).
+  The mirrored fit wins exactly when the labels differ, so a mislabel is a
+  mirror image and the files cannot tell the physical hand. Both trackers
+  are unreliable on handedness for hanging or edge-on hands.
+- Frame 204909 re-recorded once (39 -> 19). Frame 252114 (peace, edge-on)
+  stays poor after two attempts (index tip 96 off): the camera assigns the
+  extended fingers to the wrong chains from that angle.
+- Tool fixes on the way: the runner's done-check looked inside the frame
+  folder while the keypoint file is written next to it (re-recorded 8
+  frames for nothing); `--hand left` dropped every frame of the second run
+  because the tracker's label was "right", so the runner now passes no hand
+  filter by default, `write_prof_file` keeps the majority-label block, and
+  `--rewrite` regenerates the keypoint files from the newest take without
+  recording. `record_frame.py` opens the reference photo on screen.
+
 Five code fixes and what they measured (2026-09-23; 392 tests; reviewed
 in a fresh ChatGPT chat in the project, its corrections adopted)
 - Camera drift anchor (`DriftAnchor`, `--drift-anchor`, default OFF,
