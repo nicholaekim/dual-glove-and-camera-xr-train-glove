@@ -589,7 +589,7 @@ def test_a_profile_is_read_per_hand(tmp_path):
         "rail_fingers": {"right": ["index", "ring"], "left": ["index"]},
     }), encoding="utf-8")
 
-    unreliable, rail, name, comment = fuse.load_profile(path)
+    unreliable, rail, name, comment, _lag = fuse.load_profile(path)
     assert unreliable == {"right": ("middle", "ring", "pinky")}
     assert rail == {"right": ("index", "ring"), "left": ("index",)}
     assert name == "a glove" and comment == "why"
@@ -632,7 +632,7 @@ def test_a_profile_refuses_typos_rather_than_silently_masking_nothing(tmp_path):
     assert "'left' and 'right'" in str(e.value)
 
     # an empty profile is legal: it masks nothing
-    assert fuse.load_profile(profile()) == ({}, {}, "", "")
+    assert fuse.load_profile(profile()) == ({}, {}, "", "", {})
 
 
 def test_the_shipped_profile_loads_and_says_why():
@@ -642,7 +642,7 @@ def test_the_shipped_profile_loads_and_says_why():
     fuse = _fuse_module()
     path = (P(__file__).resolve().parents[1] / "profiles"
             / "reality_glove_nk_2026-09.json")
-    unreliable, rail, name, comment = fuse.load_profile(path)
+    unreliable, rail, name, comment, _lag = fuse.load_profile(path)
     assert unreliable == {"right": ("middle", "ring", "pinky")}
     assert rail == {"left": ("index",), "right": ("index",)}
     assert name
@@ -1985,7 +1985,7 @@ def test_the_shipped_default_profile_is_the_nk_pair_and_says_to_replace_it():
     fuse = _fuse_module()
     path, how = fuse.resolve_profile("auto")
     assert path is not None and path.name == "default.json", how
-    unreliable, rail, name, comment = fuse.load_profile(path)
+    unreliable, rail, name, comment, _lag = fuse.load_profile(path)
     assert unreliable == {"right": ("middle", "ring", "pinky")}
     assert rail == {"left": ("index",), "right": ("index",)}
     assert "N Kim" in name
@@ -2261,6 +2261,112 @@ def test_a_hand_with_no_agreed_estimate_has_nothing_applied():
                                       loaded)
     assert applied == {"right": 0.46}
     assert rows["right"].applied and "as given" in rows["right"].described()
+
+
+# --- the profile's lag, for a hand the session cannot measure ------------
+
+def test_a_profile_carries_a_glove_lag_per_hand(tmp_path):
+    fuse = _fuse_module()
+
+    def profile(**body):
+        path = tmp_path / f"p{len(list(tmp_path.iterdir()))}.json"
+        path.write_text(json.dumps(body), encoding="utf-8")
+        return path
+
+    *_rest, lag = fuse.load_profile(profile(
+        glove_lag_s={"Left": 0.10, "right": 0.47}))
+    assert lag == {"left": 0.10, "right": 0.47}
+    assert fuse.load_profile(profile(glove_lag_s={"right": 0}))[4] == {
+        "right": 0.0}
+
+    # one number cannot say which glove it was measured on
+    with pytest.raises(SystemExit) as e:
+        fuse.load_profile(profile(glove_lag_s=0.47))
+    assert "keyed by" in str(e.value)
+    with pytest.raises(SystemExit) as e:
+        fuse.load_profile(profile(glove_lag_s={"both": 0.47}))
+    assert "'left' and 'right'" in str(e.value)
+    # the glove trails the camera; it never leads it
+    for bad in (-0.1, "0.47", True, None, float("inf")):
+        with pytest.raises(SystemExit) as e:
+            fuse.load_profile(profile(glove_lag_s={"right": bad}))
+        assert "non-negative number of seconds" in str(e.value)
+
+
+def test_the_shipped_profiles_carry_the_swept_lag_and_say_where_from():
+    from pathlib import Path as P
+
+    fuse = _fuse_module()
+    folder = P(__file__).resolve().parents[1] / "profiles"
+    for name in ("default.json", "reality_glove_nk_2026-09.json"):
+        _u, _r, _n, comment, lag = fuse.load_profile(folder / name)
+        assert lag == {"left": pytest.approx(0.10), "right": pytest.approx(0.47)}
+        assert "2026-09-18/20" in comment and "sweep" in comment
+        assert "cannot measure" in comment
+
+
+def test_the_profile_lag_is_used_only_when_the_session_cannot_measure_one():
+    from pathlib import Path
+
+    fuse = _fuse_module()
+    swept = {"left": 0.10, "right": 0.47}
+
+    # a held pose: nothing measurable, so the profile's number is applied and
+    # the row still says what the session measured
+    glove, cam = _lag_streams(0.300, moving=False)
+    held = [{"glove": glove, "cam": cam}]
+    rows, applied = fuse.glove_lag_of(fuse.LAG_AUTO, Path("nowhere"), [],
+                                      held, profile_lag=swept)
+    assert applied == {"right": 0.47}, "only hands the session holds"
+    row = rows["right"]
+    assert row.applied and row.source == fuse.PROFILE_LAG
+    assert row.measured is not None and not row.measured.applied
+    text = row.described()
+    assert "not measurable" in text and "reliability profile" in text
+    assert "0.470 s" in text
+
+    # one clip is not corroborated either, and the refusal is kept beside it
+    rows, applied = fuse.glove_lag_of(fuse.LAG_AUTO, Path("nowhere"), [],
+                                      [{"glove": _clip(0.3)[0],
+                                        "cam": _clip(0.3)[1]}],
+                                      profile_lag=swept)
+    assert applied == {"right": 0.47}
+    assert fuse.NOT_CORROBORATED in rows["right"].described()
+
+    # two agreeing takes ARE a measurement, and a measurement beats the profile
+    agree = [dict(zip(("glove", "cam"), _clip(0.300))),
+             dict(zip(("glove", "cam"),
+                      _clip(0.300, cam_hz=120.0, glove_hz=50.0)))]
+    rows, applied = fuse.glove_lag_of(fuse.LAG_AUTO, Path("nowhere"), [],
+                                      agree, profile_lag=swept)
+    assert rows["right"].source == "take" and rows["right"].applied
+    assert applied["right"] == pytest.approx(0.300, abs=0.02)
+
+    # a value given on the command line beats the profile, and `none` or no
+    # profile at all applies nothing
+    rows, applied = fuse.glove_lag_of({"right": 0.2}, Path("nowhere"), [],
+                                      held, profile_lag=swept)
+    assert applied == {"right": 0.2} and rows["right"].source == "given"
+    assert fuse.glove_lag_of(fuse.LAG_NONE, Path("nowhere"), [], held,
+                             profile_lag=swept) == ({}, None)
+    rows, applied = fuse.glove_lag_of(fuse.LAG_AUTO, Path("nowhere"), [],
+                                      held, profile_lag=None)
+    assert applied is None and not rows["right"].applied
+
+
+def test_the_report_names_where_the_applied_lag_came_from():
+    from pathlib import Path
+
+    fuse = _fuse_module()
+    glove, cam = _lag_streams(0.300, moving=False)
+    rows, _applied = fuse.glove_lag_of(fuse.LAG_AUTO, Path("nowhere"), [],
+                                       [{"glove": glove, "cam": cam}],
+                                       profile_lag={"right": 0.47})
+    lines = []
+    fuse.lag_lines(fuse.LAG_AUTO, rows, lines)
+    right = next(line for line in lines if line.strip().startswith("right"))
+    assert "takes: not measurable" in right
+    assert "APPLIED 0.470 s" in right and "reliability profile" in right
 
 
 # --- fitting the glove's template hand to the operator's own -------------

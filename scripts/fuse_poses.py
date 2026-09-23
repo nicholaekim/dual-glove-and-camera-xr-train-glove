@@ -64,16 +64,34 @@ TWO WAYS OF LEAVING EVIDENCE OUT, AND WHY THEY ARE DIFFERENT
             a mask that mostly did not get applied. `--profile none` fuses
             unmasked.
 
-THREE THINGS THIS REPORT CORRECTS FOR, EACH MEASURED AND EACH REFUSABLE
+WHAT THIS REPORT CORRECTS FOR, EACH MEASURED AND EACH REFUSABLE
   --profile       the glove's known-bad fingers, above. Default `auto`.
   --glove-lag     the glove's solved hand TRAILS the camera — roughly 100 ms
                   on the left hand and 450-485 ms on the right, on this
                   laptop. Default `auto`: measured per hand from the SETTLE
                   clips the coached recorder writes beside each take, else
                   from takes whose camera curl moved enough, and applied only
-                  where a trustworthy estimate exists. A session of held
-                  poses reports "not measurable" and nothing is applied,
-                  which is the right answer: a held pose is lag-insensitive.
+                  where a trustworthy estimate exists. A hand the session
+                  cannot measure (a session of held poses reports "not
+                  measurable") gets the reliability profile's `glove_lag_s`
+                  for that hand, measured on this laptop's finger sweeps and
+                  applied as a fallback, not an intrinsic glove constant
+                  (transport and software latency can change with machine
+                  load or XR Trainer version), and nothing at all with no
+                  profile. The report says which.
+  --drift-anchor  EXPERIMENTAL, default off. Built for creep (a held glove
+                  finger drifts 0.05 to 0.26 curl per minute): the residual
+                  between the camera and the glove, learned on frames the
+                  camera can be trusted on, taken out of the glove. On
+                  sync_day1 and sync_day2 the glove's error turned out to be
+                  mostly POSE-dependent, so the anchor is reset at every take
+                  (fusion.py, `DriftAnchor`).
+  --recalibrate   camera-referenced recalibration, default off: each
+                  finger's camera flexion fraction as a ridge regression on
+                  the glove's fractions ('own': its own; 'cross': all five),
+                  fitted on trusted frames and evaluated LEAVE-ONE-TAKE-OUT
+                  (fusion.py, `GloveRecalibration`). One of the two at a
+                  time; the report prints the fusion with and without it.
   --fit-template  the glove reports XR TRAINER'S TEMPLATE HAND, whose bones
                   are not the operator's; the camera measures the real ones
                   in millimetres. Default `auto`: measure per hand from this
@@ -92,10 +110,12 @@ Usage:
   python scripts/fuse_poses.py recordings/sync_day1 --profile none \
       --glove-lag none --fit-template none             # the 2026-09-20 report
   python scripts/fuse_poses.py recordings/sync --glove-lag left:0.10,right:0.46
+  python scripts/fuse_poses.py recordings/sync_day1 --recalibrate cross
 """
 import argparse
 import csv
 import json
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -121,6 +141,7 @@ from cam_hand.features import (
 from cam_hand.fusion import (
     AUTO,
     CAMERA_DOFS,
+    DEFAULT_ANCHOR,
     DEFAULT_GATES,
     DEFAULT_RAIL,
     GATED_DOFS,
@@ -129,7 +150,12 @@ from cam_hand.fusion import (
     SENSORS,
     SPREAD_FINGERS,
     SRC_RAIL,
+    DriftAnchor,
+    DriftAnchorParams,
     GateParams,
+    GloveRecalibration,
+    RECAL_VARIANTS,
+    RecalibrationParams,
     RailOverrideParams,
     RailOverrideTracker,
     curl_gates_from_rails,
@@ -206,6 +232,9 @@ MIN_LAG_CLIPS = 2
 MAX_LAG_MAD = 0.060
 NOT_CORROBORATED = "not corroborated"
 NOT_AGREED = "estimates do not agree"
+# LagRow.source for a lag taken from the reliability profile's `glove_lag_s`
+# because the session could not measure one.
+PROFILE_LAG = "profile"
 
 # --- --fit-template ---------------------------------------------------
 FIT_AUTO = "auto"
@@ -664,11 +693,11 @@ def parse_rail_fingers(text):
 # Everything a profile may hold. A key outside this list is an error rather
 # than something to ignore: `rail-fingers` written for `rail_fingers` would
 # leave the override at its default and nothing in the report would say so.
-PROFILE_KEYS = ("name", "comment", "unreliable", "rail_fingers")
+PROFILE_KEYS = ("name", "comment", "unreliable", "rail_fingers", "glove_lag_s")
 
 
 def load_profile(path):
-    """A reliability profile -> (unreliable, rail_fingers, name, comment).
+    """A profile -> (unreliable, rail_fingers, name, comment, glove_lag_s).
 
     A profile is the operator's standing knowledge about THIS glove, written
     down once instead of retyped as flags every run:
@@ -677,10 +706,11 @@ def load_profile(path):
           "name": "Reality Glove, N Kim, September 2026",
           "comment": "why these fingers and not others",
           "unreliable":   {"right": ["middle", "ring", "pinky"]},
-          "rail_fingers": {"right": ["index"], "left": ["index"]}
+          "rail_fingers": {"right": ["index"], "left": ["index"]},
+          "glove_lag_s":  {"left": 0.10, "right": 0.47}
         }
 
-    Both blocks are PER HAND, because that is how gloves fail: the same
+    Every block is PER HAND, because that is how gloves fail: the same
     garment reports the right ring finger partly extended through poses the
     left one gets right, and a mask that covered both hands would throw away
     the good half of the evidence.
@@ -691,6 +721,14 @@ def load_profile(path):
     on. Neither is a calibration: both are claims about hardware that a
     finger sweep is supposed to have established, which is why the file has a
     `comment` field and why the report prints it.
+
+    `glove_lag_s` is seconds that hand's solved glove hand trails the camera,
+    as measured on finger sweeps. It is a FALLBACK: `glove_lag_of` uses it
+    only for a hand the session's own clips could not measure, and the
+    report says when it did. It is per hand for the same reason the lag is
+    (about 100 ms on the left glove, 455 to 485 ms on the right, on this
+    laptop), and a negative value is refused: it would pair a glove frame
+    with a camera frame from its future.
     """
     path = Path(path)
     try:
@@ -740,10 +778,38 @@ def load_profile(path):
             out[side] = picked
         return out
 
+    def lag_block():
+        block = data.get("glove_lag_s")
+        if block is None:
+            return {}
+        if not isinstance(block, dict):
+            raise SystemExit(
+                f"--profile {path}: 'glove_lag_s' must be an object keyed by "
+                'hand, e.g. {"left": 0.10, "right": 0.47} - one number cannot '
+                "say which glove it was measured on.")
+        out = {}
+        for hand, value in block.items():
+            side = str(hand).strip().lower()
+            if side not in ("left", "right"):
+                raise SystemExit(f"--profile {path}: 'glove_lag_s' is keyed "
+                                 f"by {hand!r}; the hands are 'left' and "
+                                 "'right'")
+            # bool is an int to Python, and `true` is not a number of seconds
+            if (isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value)) or float(value) < 0.0):
+                raise SystemExit(
+                    f"--profile {path}: 'glove_lag_s' -> {hand} is "
+                    f"{value!r}; it must be a non-negative number of seconds "
+                    "(the glove trails the camera, it never leads it)")
+            out[side] = float(value)
+        return out
+
     return (per_hand("unreliable", FLEXION_NAMES),
             per_hand("rail_fingers", RAIL_FINGERS),
             str(data.get("name", "")).strip(),
-            str(data.get("comment", "")).strip())
+            str(data.get("comment", "")).strip(),
+            lag_block())
 
 
 def resolve_profile(spec, profiles_dir=None):
@@ -842,6 +908,10 @@ class LagRow:
     # how much and about what.
     estimates: tuple = ()
     mad: float = 0.0
+    # For source "profile" only: the session's own measurement, which could
+    # not be applied and is why the profile's value was. Kept so the report
+    # states both facts, not just the number that ran.
+    measured: object = None
 
     def _estimates_text(self) -> str:
         if not self.estimates:
@@ -850,16 +920,26 @@ class LagRow:
                 + ", ".join(f"{s * 1000.0:+.0f}" for s in self.estimates)
                 + f" ms, MAD {self.mad * 1000.0:.0f} ms")
 
+    def refusal(self) -> str:
+        """Why a measured lag was not applied, with what was measured."""
+        return (f"{self.why or NOT_MEASURABLE} "
+                f"({self.n_trusted} of {self.n_clips} {self.source} clip(s) "
+                f"measurable{self._estimates_text()})")
+
     def described(self) -> str:
         if self.source == "given":
             return f"{self.seconds * 1000.0:+.0f} ms as given, APPLIED"
+        if self.source == PROFILE_LAG:
+            before = (f"{self.measured.source}s: {self.measured.refusal()}; "
+                      if self.measured is not None else "")
+            return (f"{before}APPLIED {self.seconds:.3f} s "
+                    f"({self.seconds * 1000.0:+.0f} ms) from the reliability "
+                    "profile's glove_lag_s, as a fallback")
         if self.applied:
             return (f"{self.seconds * 1000.0:+.0f} ms from {self.n_trusted} of "
                     f"{self.n_clips} {self.source} clip(s), MAD "
                     f"{self.mad * 1000.0:.0f} ms, APPLIED")
-        return (f"{self.why or NOT_MEASURABLE} "
-                f"({self.n_trusted} of {self.n_clips} {self.source} clip(s) "
-                f"measurable{self._estimates_text()}), nothing applied")
+        return f"{self.refusal()}, nothing applied"
 
 
 def settle_clips(input_dir: Path, cam_dirs):
@@ -943,23 +1023,33 @@ def lag_from_clips(clips, hand: str, source: str,
     return row
 
 
-def glove_lag_of(spec, input_dir: Path, cam_dirs, loaded):
+def glove_lag_of(spec, input_dir: Path, cam_dirs, loaded, profile_lag=None):
     """`(per-hand LagRow, the mapping pair_by_time gets)` for this session.
 
     AUTO measures, per hand, from the SETTLE clips first — that is what they
     are written for — and falls back to the takes for a hand that has no
     APPLICABLE settle estimate, because a session recorded before the clips
-    existed may still hold a take the hand moved during. A hand with no
-    applicable estimate anywhere gets NOTHING applied: an unmeasured lag is
-    not a zero lag, but pairing on the raw stamps is what the pipeline did
-    before and is the only honest default. "Applicable" is stricter than
-    "trustworthy" — see `lag_from_clips`: several clips have to agree before
-    a measured lag is used at all.
+    existed may still hold a take the hand moved during. "Applicable" is
+    stricter than "trustworthy" — see `lag_from_clips`: several clips have
+    to agree before a measured lag is used at all.
 
-    A manual value is applied exactly as given, and the report says so. The
-    point of allowing it is to be able to CHECK a lag against a session
-    (`--glove-lag right:0.46` on day 1's static takes moves nothing, which is
-    what proves the shift is harmless on held poses).
+    A hand with no applicable estimate anywhere gets `profile_lag[hand]`, the
+    reliability profile's `glove_lag_s`, if the profile has one: a lag
+    measured on this laptop's finger sweeps is a better guess than none, and
+    a session of held poses can never measure its own. It is a fallback, not
+    an intrinsic glove constant: transport and software latency can change
+    with machine load or XR Trainer version. The row keeps the
+    session's refused measurement beside the profile's number, so the report
+    says both. With no profile value either, NOTHING is applied: an
+    unmeasured lag is not a zero lag, but pairing on the raw stamps is what
+    the pipeline did before and is the only honest default.
+
+    A manual value is applied exactly as given, and the report says so; it
+    beats the profile, as a flag beats a profile everywhere else. The point
+    of allowing it is to be able to CHECK a lag against a session
+    (`--glove-lag right:0.46` on day 1's static takes had no measurable
+    classifier effect in those held-pose tests). `none` applies nothing,
+    profile or not.
     """
     hands = sorted({r["hand_side"] for entry in loaded for r in entry["glove"]})
     if spec == LAG_NONE:
@@ -985,13 +1075,17 @@ def glove_lag_of(spec, input_dir: Path, cam_dirs, loaded):
             # takes are the only other thing there is to measure on.
             fallback = lag_from_clips(takes, hand, "take")
             row = fallback if fallback.applied or row is None else row
+        if not row.applied and hand in (profile_lag or {}):
+            row = LagRow(hand=hand, seconds=float(profile_lag[hand]),
+                         applied=True, source=PROFILE_LAG, measured=row)
         rows[hand] = row
         if row.applied:
             applied[hand] = row.seconds
     return rows, (applied or None)
 
 
-def fit_measurements(spec, measure_parts, loaded, input_dir: Path):
+def fit_measurements(spec, measure_parts, loaded, input_dir: Path,
+                     save=True):
     """Measure (or load) each hand, put it on the template, and report both.
 
     Returns `(measurements, per-finger scales, saved files, refusals)`. The
@@ -1007,6 +1101,9 @@ def fit_measurements(spec, measure_parts, loaded, input_dir: Path):
     the raw template. A fit measured on frames the tracker had to infer would
     be the tracker's guess rescaled onto the template and then used for the
     whole session.
+
+    `save` False measures without writing the `template_<hand>.json` files,
+    for a session that is only being READ (`--recalibrate-from`).
     """
     if spec.lower() == FIT_NONE:
         return {}, {}, [], {}
@@ -1024,7 +1121,8 @@ def fit_measurements(spec, measure_parts, loaded, input_dir: Path):
                 continue
             measurements[hand] = merged
         for hand, m in sorted(measurements.items()):
-            saved.append(m.save(input_dir / FIT_FILE.format(hand=hand)))
+            if save:
+                saved.append(m.save(input_dir / FIT_FILE.format(hand=hand)))
     else:
         try:
             loaded_m = load_measurement(spec)
@@ -1120,6 +1218,12 @@ class FusionRun:
     # template fit by `curl_gates_from_rails`. Empty with no fit, where the
     # one constant is the threshold.
     curl_gates: dict = field(default_factory=dict)
+    # The run's `DriftAnchor`, or None when the anchor was off. Held on the
+    # run because its counters ARE the report's drift-anchor table.
+    anchor: object = None
+    # The run's `GloveRecalibration` (its fitted models, held-out residuals
+    # and counters), or None when it was off.
+    recal: object = None
     n_pairs: int = 0
     n_matched: int = 0
     n_cam_used: int = 0
@@ -1138,9 +1242,95 @@ def glove_pts(row, fitted: bool):
     return row["pts"]
 
 
+def glove_stamp(row, clock, glove_lag=None):
+    """A glove row's time as `pair_by_time` matches it: its stamp on `clock`
+    (wall_time if it lacks that one), shifted back by its hand's lag.
+
+    The drift anchor keeps time with this, so "seconds since the last
+    trusted frame" is measured on the same clock the pairing used.
+    """
+    value = row.get(clock)
+    t = float(value if value is not None else row["wall_time"])
+    if isinstance(glove_lag, dict):
+        return t - float(glove_lag.get(str(row.get("hand_side")).lower(), 0.0))
+    return t - float(glove_lag or 0.0)
+
+
+def session_scale(loaded, gates, rail_params, fitted):
+    """The rails and flexion endpoints one session's frames teach.
+
+    Read off the curls the fusion is about to compare, both sensors, once:
+    the rails, the spread gate's per-finger thresholds and the thumb vote's
+    endpoints all come from them, and computing them separately would be
+    separate chances for one of them to be taken off a different hand.
+    `--no-rail-override` switches off who may TAKE a curl, not whether the
+    gates know where a straight finger reads, so the rails are learned
+    either way (with `DEFAULT_RAIL` when `rail_params` is None). The
+    endpoints are the glove's rail and 2nd percentile on the hand actually
+    being fused and the camera's open reference and 2nd percentile on the
+    same session's frames, which is what makes a fitted and an unfitted run
+    comparable (fusion.py).
+
+    Returns `(rails, FlexionScale, glove_curls)`.
+    """
+    glove_curls = [(g["hand_side"],
+                    flexion_features(np.asarray(glove_pts(g, fitted), float)))
+                   for take in loaded for g in take["glove"]]
+    cam_curls = [(c["hand_side"], flexion_features(np.asarray(c["pts"], float)))
+                 for take in loaded for c in take["cam"]]
+    rail_for_gates = rail_params or DEFAULT_RAIL
+    rails = learn_rails(glove_curls, rail_for_gates)
+    scale = learn_flexion_scale(glove_curls, cam_curls, rails, gates=gates,
+                                rail_params=rail_for_gates)
+    return rails, scale, glove_curls
+
+
+def session_pairs(loaded, max_dt, glove_lag):
+    """Every take's (glove row, camera row or None) pairs, once."""
+    return [pair_by_time(entry["glove"], entry["cam"], max_dt=max_dt,
+                         clock=entry["clock"], glove_lag=glove_lag or 0.0)
+            for entry in loaded]
+
+
+def observe_trusted(recal, loaded, pairs, fitted, scale):
+    """Hand every trusted paired frame of a session to `recal`, take k as
+    group k, the glove UNCORRECTED."""
+    for k, entry in enumerate(loaded):
+        for g, c in pairs[k]:
+            if c is None:
+                continue
+            hand = g["hand_side"]
+            recal.observe(
+                k, hand,
+                flexion_features(np.asarray(glove_pts(g, fitted), float)),
+                flexion_features(np.asarray(c["pts"], float)),
+                cam_meta_of(c, entry["source"]), scale.for_hand(hand))
+
+
+def recalibration_from_session(loaded, gates, rail_params, recalibrate,
+                               max_dt, glove_lag=None, fitted=False,
+                               source=""):
+    """A `GloveRecalibration` fitted on ANOTHER session, for `fuse_all`'s
+    `recal_from`.
+
+    The session is read exactly as the main one is (the caller has already
+    applied its own lag and template fit), and its trusted frames are taken
+    on ITS OWN rails and endpoints: a coefficient maps glove fraction to
+    camera fraction, and a fraction only means something on the ruler of
+    the session it was measured in.
+    """
+    rails, scale, _curls = session_scale(loaded, gates, rail_params, fitted)
+    recal = GloveRecalibration(recalibrate, gates, rails=rails,
+                               rail_tol=(rail_params or DEFAULT_RAIL).tol,
+                               source=source)
+    observe_trusted(recal, loaded, session_pairs(loaded, max_dt, glove_lag),
+                    fitted, scale)
+    return recal
+
+
 def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
              thumb_from_camera=True, export_csv=False, glove_lag=None,
-             fitted=False):
+             fitted=False, anchor=None, recalibrate=None, recal_from=None):
     """Learn the rails, fuse every loaded take, collect what the report reads.
 
     The rails are learned HERE rather than once outside, although two runs
@@ -1155,30 +1345,47 @@ def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
     never match. Same reason `curl_range` is collected on the fused input —
     `curl_gate` has to go on separating fists from open palms after the fit
     moved both.
+
+    Two optional corrections of the glove's curl, one at a time, both
+    changing only what is FUSED: the rails, the endpoints, the rail tracker,
+    what the corrections learn from and every gate inside `fuse_skeletons`
+    (through its `gate_curls`) keep reading the glove's UNCORRECTED curls.
+    With both None nothing here changes.
+
+      anchor       `DriftAnchorParams`: the EXPERIMENTAL drift anchor. One
+                   `DriftAnchor` for the run's counters, RESET at every take
+                   boundary, because the glove's error depends on the pose
+                   and an offset learned in one take is wrong in the next.
+      recalibrate  `RecalibrationParams`: `GloveRecalibration`, evaluated
+                   LEAVE-ONE-TAKE-OUT. Every trusted frame of the session is
+                   collected first; take k is then corrected by a model
+                   fitted on the trusted frames of every OTHER take, so no
+                   take is corrected by a model that saw it, and the
+                   classifier's own leave-one-take-out then runs on those
+                   fused samples as usual. The endpoints and rails the
+                   fractions are taken on stay session-learned, label-free,
+                   as a live warm-up would learn them.
+      recal_from   a `GloveRecalibration` fitted on ANOTHER session
+                   (`recalibration_from_session`). Its models, fitted on all
+                   of that session's trusted frames, correct every take of
+                   this one on THIS session's endpoints and rails, and there
+                   is no leave-one-take-out: nothing here was in the fit.
     """
+    if anchor is not None and recalibrate is not None:
+        raise ValueError("the drift anchor and the recalibration both correct "
+                         "the glove's curl from the camera; use one")
+    if recal_from is not None and recalibrate is None:
+        raise ValueError("recal_from needs recalibrate: the parameters the "
+                         "other session's model was fitted with")
     run = FusionRun(rail_params=rail_params, unreliable=dict(unreliable))
-    # The curls the fusion is about to compare, both sensors, once. The rails,
-    # the spread gate's per-finger thresholds and the thumb vote's endpoints
-    # are all read off them, and computing them separately three times would
-    # be three chances for one of the three to be taken off a different hand.
-    glove_curls = [(g["hand_side"],
-                    flexion_features(np.asarray(glove_pts(g, fitted), float)))
-                   for take in loaded for g in take["glove"]]
-    cam_curls = [(c["hand_side"], flexion_features(np.asarray(c["pts"], float)))
-                 for take in loaded for c in take["cam"]]
-    # `--no-rail-override` switches off who may TAKE a curl, not whether the
-    # gates know where a straight finger reads, so the rails the thumb vote's
-    # open endpoint is built from are learned either way.
+    drift = DriftAnchor(anchor) if anchor is not None else None
+    run.anchor = drift
+    # The rails and endpoints this session teaches (`session_scale`).
     rail_for_gates = rail_params or DEFAULT_RAIL
-    gate_rails = learn_rails(glove_curls, rail_for_gates)
+    gate_rails, run.scale, _glove_curls = session_scale(loaded, gates,
+                                                        rail_params, fitted)
     if rail_params is not None:
         run.rails = gate_rails
-    # Endpoints for the thumb vote's flexion fractions: the glove's rail and
-    # 2nd percentile on the hand actually being fused, the camera's open
-    # reference and 2nd percentile on the same session's camera frames. This
-    # is what makes a fitted and an unfitted run comparable — see fusion.py.
-    run.scale = learn_flexion_scale(glove_curls, cam_curls, gate_rails,
-                                    gates=gates, rail_params=rail_for_gates)
     # `curl_gate` is a constant tuned on the TEMPLATE hand's curls, and the fit
     # moves every one of them. Learning the rails on both hands — the template
     # and the fitted one — is what lets the gate be carried across by the same
@@ -1200,7 +1407,30 @@ def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
                                         hand)
             for hand in {h for h, _f in template_rails}}
 
-    for entry in loaded:
+    # The anchor's rails: the ones the gates learned, which exist even when
+    # the override is off, and the tolerance they were learned with.
+    anchor_rails = gate_rails
+    anchor_tol = rail_for_gates.tol
+
+    # The pairs, once per take: the recalibration needs every take's trusted
+    # frames before it can fuse the first one, and pairing twice would be
+    # the slowest part of the run done for nothing.
+    pairs = session_pairs(loaded, max_dt, glove_lag)
+    recal = None
+    if recalibrate is not None:
+        # This session's trusted frames, rails and endpoints, always: they
+        # are what is scored and corrected. Only the MODELS come from
+        # `recal_from` when it is given.
+        recal = GloveRecalibration(recalibrate, gates, rails=anchor_rails,
+                                   rail_tol=anchor_tol, fitted_on=recal_from,
+                                   source=(recal_from.source
+                                           if recal_from is not None else ""))
+        observe_trusted(recal, loaded, pairs, fitted, run.scale)
+        recal.evaluate({k: entry["glove"][0]["pose"]
+                        for k, entry in enumerate(loaded)})
+    run.recal = recal
+
+    for k, entry in enumerate(loaded):
         glove, cam = entry["glove"], entry["cam"]
         source, clock = entry["source"], entry["clock"]
         with_scale = entry["with_scale"]
@@ -1211,14 +1441,17 @@ def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
         # must not still be armed at the start of the next.
         tracker = (RailOverrideTracker(run.rails, rail_params, gates)
                    if rail_params is not None else None)
+        # ...and a fresh anchor window, for a stronger reason: the glove's
+        # error depends on the pose, and the next take is another pose.
+        if drift is not None:
+            drift.reset()
 
         per_hand_g = defaultdict(list)
         per_hand_c = defaultdict(list)
         per_hand_f = defaultdict(list)
         pose = glove[0]["pose"]
 
-        for g, c in pair_by_time(glove, cam, max_dt=max_dt, clock=clock,
-                                 glove_lag=glove_lag or 0.0):
+        for g, c in pairs[k]:
             run.n_pairs += 1
             hand = g["hand_side"]
             # RAW is what the glove alone gives and is what the `glove` column
@@ -1238,9 +1471,20 @@ def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
                 lo, hi = run.curl_range.get((hand, finger), (value, value))
                 run.curl_range[(hand, finger)] = (min(lo, value),
                                                   max(hi, value))
+            hand_scale = run.scale.for_hand(hand)
+            t = glove_stamp(g, clock, glove_lag) if drift is not None else 0.0
             if c is None:
                 rail = (tracker.update(hand, curls_g)
                         if tracker is not None else None)
+                # No camera, but both corrections still apply: the anchor's
+                # offset from earlier frames of this take, the recalibration
+                # because it maps the GLOVE alone.
+                if drift is not None:
+                    G, _moved = drift.apply(hand, t, G, curls_g, hand_scale)
+                if recal is not None:
+                    G, _moved = recal.apply(
+                        hand, k, G, curls_g, hand_scale,
+                        skip=rail.active if rail is not None else ())
                 fused, info = fuse_skeletons(G, None, min_score=min_score,
                                              with_scale=with_scale, gates=gates,
                                              rail=rail)
@@ -1251,9 +1495,24 @@ def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
                 per_hand_c[hand].append(all_features(C, hand_side=hand))
                 slot["camera"].append(dof_values(C, hand_side=hand))
                 meta = cam_meta_of(c, source)
-                rail = (tracker.update(hand, curls_g,
-                                       flexion_features(C), meta)
+                curls_c = flexion_features(C)
+                rail = (tracker.update(hand, curls_g, curls_c, meta)
                         if tracker is not None else None)
+                moved = {}
+                if drift is not None:
+                    # Learn from the UNCORRECTED glove, then correct it.
+                    drift.learn(hand, t, curls_g, curls_c, meta, hand_scale,
+                                anchor_rails, anchor_tol,
+                                disputed=(rail.disputed if rail is not None
+                                          else ()),
+                                gates=gates)
+                    G, moved = drift.apply(hand, t, G, curls_g, hand_scale)
+                if recal is not None:
+                    # The model that never saw this take; never a finger
+                    # the rail override owns this frame.
+                    G, moved = recal.apply(
+                        hand, k, G, curls_g, hand_scale,
+                        skip=rail.active if rail is not None else ())
                 fused, info = fuse_skeletons(
                     G, c["pts"], cam_score=c.get("score", 1.0),
                     min_score=min_score,
@@ -1262,7 +1521,10 @@ def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
                     cam_meta=meta, gates=gates, rail=rail,
                     unreliable_fingers=unreliable.get(str(hand).lower(), ()),
                     curl_gates=run.curl_gates.get(hand),
-                    scale=run.scale.for_hand(hand))
+                    scale=hand_scale,
+                    # A correction bent the fused fingers; the gates still
+                    # decide on what the glove measured.
+                    gate_curls=curls_g if moved else None)
                 for dof in GATED_DOFS:
                     run.dof_total[dof] += 1
                     if info["dof_source"][dof].startswith("camera"):
@@ -1328,7 +1590,8 @@ def lag_lines(spec, rows, lines):
         lines.append("  --glove-lag none: the two streams are paired on their "
                      "raw stamps")
         return
-    how = ("auto — measured from this session" if spec == LAG_AUTO
+    how = ("auto — measured from this session, else the reliability "
+           "profile's glove_lag_s" if spec == LAG_AUTO
            else "given on the command line")
     lines.append(f"  {'source':<22} {how}")
     if not rows:
@@ -1342,19 +1605,27 @@ def lag_lines(spec, rows, lines):
     lines.append("  transition with nothing to check it against, and a "
                  "cross-correlation can find a real")
     lines.append("  peak that is the wrong one. Short of that the estimates "
-                 "are printed and NOTHING is")
-    lines.append("  applied. A value given on the command line is applied as "
-                 "given — that is what it is")
-    lines.append("  for, and the report says 'as given'.")
-    lines.append("  A HELD pose is lag-insensitive — both sensors describe a "
-                 "hand that is not moving —")
-    lines.append("  so a session of held poses reports 'not measurable' and "
-                 "applies nothing, which is")
-    lines.append("  the right answer rather than a missing feature. The "
-                 "transition a lag CAN be measured")
-    lines.append("  on is the coached recorder's SETTLE clip, written beside "
-                 "each take as")
-    lines.append(f"  <take>{SETTLE_SUFFIX}.")
+                 "are printed, and the hand gets")
+    lines.append("  the reliability profile's glove_lag_s instead or, with no "
+                 "profile value, NOTHING.")
+    lines.append("  The profile's lag was measured on this laptop's finger "
+                 "sweeps and is applied as a")
+    lines.append("  fallback, not an intrinsic glove constant: transport and "
+                 "software latency can change")
+    lines.append("  with machine load or XR Trainer version. A value given on "
+                 "the command line is applied")
+    lines.append("  as given and beats the profile; the report says 'as "
+                 "given'.")
+    lines.append("  A session of held poses reports 'not measurable': both "
+                 "sensors describe a hand that")
+    lines.append("  is not moving, so there is no transition to align on. "
+                 "Applying the profile's lag had")
+    lines.append("  no measurable classifier effect in these held-pose tests "
+                 "(sync_day1, sync_day2); it")
+    lines.append("  matters for a MOVING hand. The transition a lag CAN be "
+                 "measured on is the coached")
+    lines.append("  recorder's SETTLE clip, written beside each take as "
+                 f"<take>{SETTLE_SUFFIX}.")
     lines.append("")
 
 
@@ -1524,8 +1795,231 @@ def fit_lines(spec, measurements, scales, run, gates, lines, refusals=None):
     lines.append("")
 
 
+def anchor_lines(anchor, params, lines):
+    """The drift anchor: what it is, its parameters, and what it did."""
+    lines.append("=" * 66)
+    if params is None or anchor is None:
+        lines.append("Camera drift anchor: off (EXPERIMENTAL; --drift-anchor on "
+                     "to try it)")
+        lines.append("")
+        return
+    lines.append("Camera drift anchor: on (EXPERIMENTAL; off by default)")
+    lines.append("  Learns the residual (camera flexion fraction minus glove "
+                 "flexion fraction, each on its")
+    lines.append("  own endpoints) on TRUSTED frames only: the frame gates "
+                 "pass, the palm faces the module,")
+    lines.append("  the finger is not disputed and the glove is off its rail. "
+                 "Its median over the last")
+    lines.append("  window_s seconds, less the deadband, is applied to the "
+                 "glove on every frame of the take.")
+    lines.append("  Built for creep (0.05 to 0.26 curl per minute on a held "
+                 "finger), but on sync_day1 and")
+    lines.append("  sync_day2 POSE DEPENDENCE dominates the glove's error over "
+                 "the timescale of these takes:")
+    lines.append("  creep may coexist, but an offset learned in one pose is "
+                 "wrong in the next. So the")
+    lines.append("  anchor is RESET at every take boundary (a live caller must "
+                 "reset it whenever the hand")
+    lines.append("  is lost). It changes only what is FUSED: the 'glove' "
+                 "column, the glove-only")
+    lines.append("  classifier, the rails, the rail override, the endpoints and "
+                 "every gate still read the")
+    lines.append("  UNCORRECTED glove.")
+    lines.append("  " + "  ".join(f"{k} {v}" for k, v in
+                                  params.described().items()))
+    lines.append("")
+    lines.append(f"  {'hand':<6} {'finger':<7} {'learned':>8}  "
+                 f"{'median offset':>13} {'(curl)':>7}  {'in force':>8} "
+                 f"{'corrected':>9}  {'mean|d|':>7} {'max|d|':>7}")
+    rows = anchor.summary()
+    if not rows:
+        lines.append("  (no finger had a trusted frame to learn from)")
+    for r in rows:
+        off = ("            -" if r["median_offset"] is None
+               else f"{r['median_offset']:+13.3f}")
+        off_c = ("      -" if r["median_offset_curl"] is None
+                 else f"{r['median_offset_curl']:+7.3f}")
+        lines.append(f"  {r['hand']:<6} {r['finger']:<7} {r['learned']:>8}  "
+                     f"{off} {off_c}  {r['in_force']:>8} "
+                     f"{r['corrected']:>9}  {r['mean_abs']:7.3f} "
+                     f"{r['max_abs']:7.3f}")
+    lines.append("  learned: trusted frames the residual was taken on. "
+                 "median offset: over the frames")
+    lines.append("  an offset was in force, BEFORE the deadband, in fraction "
+                 "units (positive = the camera")
+    lines.append("  sees the finger more flexed than the glove does) and in "
+                 "glove curl units (offset x")
+    lines.append("  the glove's span). corrected: frames the finger was "
+                 "actually moved; mean|d| and")
+    lines.append("  max|d| are that move, in curl units.")
+    lines.append("")
+
+
+def _median_or_none(values):
+    return median(values) if values else None
+
+
+def recal_lines(recal, params, lines):
+    """The camera-referenced recalibration: how it was fitted and evaluated,
+    its coefficients, and the held-out residual it left."""
+    lines.append("=" * 66)
+    if params is None or recal is None:
+        lines.append("Glove recalibration (camera-referenced): off "
+                     "(--recalibrate own|cross to try it)")
+        lines.append("")
+        return
+    lines.append(f"Glove recalibration (camera-referenced): {params.variant}")
+    lines.append("  Per hand, each finger's CAMERA flexion fraction as a ridge "
+                 "regression on the glove's")
+    lines.append("  fractions: " + ("its own glove fraction only (own)."
+                                   if params.variant == "own" else
+                                   "all five glove fractions, thumb included "
+                                   "(cross)."))
+    lines.append("  Fitted on TRUSTED frames only (the frame gates pass and "
+                 "the palm faces the module).")
+    lines.append("  Railed readings are ambiguous (the sensor is against its "
+                 "stop, straight or flexed), so")
+    lines.append("  the model neither learns from nor corrects a finger on its "
+                 "own rail; that dispute is")
+    lines.append("  the rail override's. A railed NEIGHBOUR is still an input: "
+                 "saturation is real")
+    lines.append("  cross-talk evidence.")
+    if recal.cross_session:
+        lines.append("  CROSS-SESSION: fitted on every trusted frame of")
+        lines.append(f"    {recal.source}")
+        lines.append("  and applied to every take of THIS session, on this "
+                     "session's own endpoints and")
+        lines.append("  rails, as a live warm-up would deploy it: the "
+                     "coefficients carry, the endpoints are")
+        lines.append("  re-learned. No leave-one-take-out: nothing in this "
+                     "session was in the fit.")
+    else:
+        lines.append("  Evaluated LEAVE-ONE-TAKE-OUT: each take is corrected "
+                     "by a model fitted on every OTHER")
+        lines.append("  take's trusted frames, and the classifier's own "
+                     "leave-one-take-out runs on those fused")
+        lines.append("  samples, so no take is corrected by a model that saw "
+                     "it. The endpoints and rails the")
+        lines.append("  fractions are taken on stay SESSION-learned, "
+                     "label-free, as a live warm-up would learn")
+        lines.append("  them (--recalibrate-from DIR fits on another session "
+                     "instead).")
+    lines.append("  A corrected finger is bent to the prediction "
+                 "(clipped to [0, 1]); a finger the")
+    lines.append("  rail override owns is never touched, and every gate reads "
+                 "the uncorrected glove.")
+    lines.append("  " + "  ".join(f"{k} {v}" for k, v in
+                                  params.described().items()))
+    for hand in recal.hands():
+        full = recal.model(hand)
+        lines.append("")
+        if recal.cross_session:
+            lines.append(f"  {hand}: model fitted on "
+                         f"{recal.fitted_on.n_frames(hand)} trusted frames of "
+                         f"the source session; {recal.n_frames(hand)} "
+                         "trusted frames scored here")
+        else:
+            lines.append(f"  {hand}: {recal.n_frames(hand)} trusted frames "
+                         "(each held-out model uses these minus its own "
+                         "take's)")
+        if full.refused:
+            lines.append(f"    no model: {full.refused}")
+            continue
+        lines.append("    coefficients of the model fitted on every take"
+                     + (" of the source session" if recal.cross_session
+                        else "") + ", fraction units:")
+        lines.append("    " + f"{'finger':<8}" + "".join(
+            f"{f:>8}" for f in FLEXION_NAMES) + f"{'bias':>8}")
+        for finger in RAIL_FINGERS:
+            got = full.coef.get(finger)
+            if got is None:
+                lines.append(f"    {finger:<8} (not fitted)")
+                continue
+            bias, weights = got
+            lines.append("    " + f"{finger:<8}" + "".join(
+                f"{weights[f]:8.3f}" if f in weights else f"{'-':>8}"
+                for f in FLEXION_NAMES) + f"{bias:8.3f}")
+
+    lines.append("")
+    what = "Cross-session" if recal.cross_session else "Held-out"
+    lines.append(f"  {what} residual, median |camera fraction - glove "
+                 "fraction| on this session's trusted")
+    lines.append("  frames, before -> after (after = the prediction of a "
+                 "model that never saw the frame,")
+    lines.append("  clipped to [0, 1]):")
+    lines.append(f"    {'hand':<6} {'finger':<7} {'frames':>7} {'railed':>7} "
+                 f"{'before':>7} {'after':>7}   {'corrected':>9} "
+                 f"{'mean|d|':>8}")
+    pooled = defaultdict(lambda: ([], []))
+    poses = defaultdict(set)
+    for (hand, pose, finger), (b, a) in recal.residuals.items():
+        pooled[(hand, finger)][0].extend(b)
+        pooled[(hand, finger)][1].extend(a)
+        poses[hand].add(pose)
+    for hand in recal.hands():
+        for finger in RAIL_FINGERS:
+            b, a = pooled.get((hand, finger), ([], []))
+            if not b:
+                continue
+            n_corr = recal.corrected.get((hand, finger), 0)
+            mean_d = (recal.sum_abs.get((hand, finger), 0.0) / n_corr
+                      if n_corr else 0.0)
+            lines.append(f"    {hand:<6} {finger:<7} {len(b):>7} "
+                         f"{recal.railed.get((hand, finger), 0):>7} "
+                         f"{median(b):7.3f} {median(a):7.3f}   "
+                         f"{n_corr:>9} {mean_d:8.3f}")
+    lines.append("    railed: trusted frames with the glove on that finger's "
+                 "own rail; they teach its")
+    lines.append("    model nothing and are left uncorrected (after = before). "
+                 "corrected: frames the")
+    lines.append("    finger was actually moved (every frame of the take, "
+                 "camera or not); mean|d| is")
+    lines.append("    that move in glove curl units.")
+    lines.append("")
+    lines.append("  The same, per pose (before -> after, per finger):")
+    for hand in recal.hands():
+        lines.append(f"    {hand:<6} {'pose':<12}"
+                     + "".join(f"{f:>15}" for f in RAIL_FINGERS))
+        for pose in sorted(poses[hand]):
+            cells = []
+            for finger in RAIL_FINGERS:
+                b, a = recal.residuals.get((hand, pose, finger), ([], []))
+                cells.append(f"{median(b):.2f} -> {median(a):.2f}"
+                             if b else "-")
+            lines.append(f"    {'':<6} {pose:<12}"
+                         + "".join(f"{c:>15}" for c in cells))
+    lines.append("")
+    lines.append("  OFF BY DEFAULT, and staying off on this evidence: one "
+                 "operator, two sessions of held")
+    lines.append("  poses. Switching it on would take (1) a second operator or "
+                 "glove pair where `cross`,")
+    lines.append("  held out by take, is at least as good as the profile "
+                 "baseline on the classifier AND")
+    lines.append("  the held-out residual, (2) a session held out as a WHOLE "
+                 "(fit on one day, apply to")
+    lines.append("  another), since a live run cannot see its own takes, and "
+                 "(3) a warm-up that fits the")
+    lines.append("  model before the session and freezes it, so what runs live "
+                 "is what was evaluated.")
+    lines.append("")
+
+
+def run_tables(labelled, lines):
+    """Camera use and the classifier rows, for each (label, run) given."""
+    for label, run in labelled:
+        lines.append("")
+        lines.append(f"  --- {label} ---")
+        lines.append("    camera-use rate per gated DOF")
+        camera_use_table(run.dof_used, run.dof_total, lines, indent="      ")
+        lines.append("    leave-one-TAKE-out nearest centroid")
+        sub = []
+        classifier_lines(run, sub)
+        lines.extend(f"    {line}" for line in sub)
+    lines.append("")
+
+
 def profile_comparison(plain, masked, profile_path, name, comment, lines,
-                       how=""):
+                       how="", corrected=None, correction=""):
     """Both fusions, side by side, so the profile has to earn its place.
 
     A mask is a claim that some of the evidence is worthless, and a report
@@ -1539,6 +2033,11 @@ def profile_comparison(plain, masked, profile_path, name, comment, lines,
     applies BY DEFAULT has to be as visible in the report as one somebody
     typed, or the next reader will be comparing masked numbers against
     unmasked ones without knowing it.
+
+    `corrected` is a third run, the profile plus a curl correction named by
+    `correction` (the drift anchor or the recalibration). It is printed as
+    its own run rather than folded into the second, so neither the profile
+    nor the correction can take credit for the other's effect.
     """
     lines.append("=" * 66)
     lines.append(f"Reliability profile — {profile_path}")
@@ -1552,23 +2051,83 @@ def profile_comparison(plain, masked, profile_path, name, comment, lines,
     rail = ("DISABLED (--no-rail-override)" if masked.rail_params is None
             else masked.rail_params.described()["fingers"])
     lines.append(f"  {'rail override fingers':<22} {rail}")
-    lines.append("  Same takes, same gates, same learned rails in both "
-                 "fusions below; the profile is the")
-    lines.append("  only difference. The ordinary run is what this command "
-                 "would print without")
-    lines.append("  --profile, so the gap between the two tables IS the "
-                 "profile's effect.")
-    for label, run in (("ordinary (no reliability profile)", plain),
-                       ("with reliability profile", masked)):
-        lines.append("")
-        lines.append(f"  --- {label} ---")
-        lines.append("    camera-use rate per gated DOF")
-        camera_use_table(run.dof_used, run.dof_total, lines, indent="      ")
-        lines.append("    leave-one-TAKE-out nearest centroid")
-        sub = []
-        classifier_lines(run, sub)
-        lines.extend(f"    {line}" for line in sub)
-    lines.append("")
+    labelled = [("ordinary (no reliability profile)", plain),
+                ("with reliability profile", masked)]
+    if corrected is None:
+        lines.append("  Same takes, same gates, same learned rails in both "
+                     "fusions below; the profile is the")
+        lines.append("  only difference. The ordinary run is what this command "
+                     "would print without")
+        lines.append("  --profile, so the gap between the two tables IS the "
+                     "profile's effect.")
+    else:
+        labelled.append((f"with reliability profile + {correction}",
+                         corrected))
+        lines.append("  Same takes, same gates, same learned rails in all "
+                     "three fusions below. The first")
+        lines.append("  two differ only by the profile (the ordinary run is "
+                     "what --profile none prints);")
+        lines.append(f"  the third adds the {correction} to the second, so the "
+                     "gap between the last")
+        lines.append("  two tables IS its effect.")
+    run_tables(labelled, lines)
+
+
+def read_session(input_dir: Path, takes, camera, gates, measure=True):
+    """Read every take of a session, ready to fuse.
+
+    Returns `(loaded, skipped, by_source, by_clock, measure_parts)`: the
+    loaded takes, the ones that could not be read and why, how many came
+    from each camera and paired on each clock, and per hand the per-take
+    `HandMeasurement`s the template fit merges (only with `measure`). Used
+    for the main session and, with `--recalibrate-from`, for the session the
+    recalibration is fitted on, so both are read the same way.
+    """
+    loaded = []
+    skipped = []
+    by_source = defaultdict(int)          # camera -> takes read from it
+    by_clock = defaultdict(int)           # pairing clock -> takes paired on it
+    measure_parts = defaultdict(list)     # hand -> per-take HandMeasurement
+    for gpath in takes:
+        try:
+            cpath = find_camera_take(input_dir, gpath.name, camera)
+        except AmbiguousTake as e:
+            raise SystemExit(f"\n{e}\n")
+        if cpath is None:
+            skipped.append((gpath.name, "no matching camera file"))
+            continue
+        glove = load_glove(gpath)
+        cam, source = load_cam(cpath)
+        if not glove or not cam:
+            skipped.append((gpath.name, "one side is empty"))
+            continue
+        by_source[source] += 1
+        # Per take, because one session can hold takes recorded before
+        # capture_time existed alongside takes recorded after.
+        clock = pairing_clock(glove, cam)
+        by_clock[clock] += 1
+        # Needs the whole take at once: "did the id change 0.25 s ago" is a
+        # question about the frames around this one, not about this one.
+        flag_hand_id_stability(cam, gates, clock=clock)
+        # Measure the hand from THIS take, then drop the raw 26-joint arrays.
+        # Per take because a take is a self-contained measurement of the hand
+        # and the median over takes is not at the mercy of the longest one;
+        # dropped because keeping 26 positions on every frame of a 59-take
+        # session is a hundred megabytes of numbers whose medians are already
+        # in hand.
+        if measure:
+            for side in sorted({r["hand_side"] for r in cam}):
+                got = measure_hand(cam, hand=side, gates=gates,
+                                   source=gpath.name)
+                if got is not None:
+                    measure_parts[side].append(got)
+        for r in cam:
+            r.pop("abs26", None)
+        loaded.append({"name": gpath.name, "glove": glove, "cam": cam,
+                       "source": source, "clock": clock,
+                       # Metric camera, rigid fit; normalised camera, fit scale.
+                       "with_scale": source != LEAP})
+    return loaded, skipped, by_source, by_clock, measure_parts
 
 
 def main() -> None:
@@ -1633,8 +2192,48 @@ def main() -> None:
                         "the glove's pairing stamp is shifted back by it. "
                         f"Default {LAG_AUTO}: measured per hand from this "
                         "session's SETTLE clips, else from takes whose camera "
-                        "curl moved enough, and applied only where a "
-                        "trustworthy estimate exists.")
+                        "curl moved enough, and applied only where several "
+                        "agree; a hand with no applicable estimate gets the "
+                        "reliability profile's glove_lag_s, if it has one. "
+                        "A value given here beats the profile; "
+                        f"'{LAG_NONE}' applies nothing.")
+    p.add_argument("--drift-anchor", choices=("on", "off"), default="off",
+                   help="EXPERIMENTAL: learn the glove's residual from the "
+                        "camera on trusted frames and take its recent median "
+                        "out of the glove, reset at every take (default off: "
+                        "the glove's error on these sessions is mostly "
+                        "pose-dependent, which a running offset gets wrong). "
+                        "The report then prints the fusion with and without "
+                        "it.")
+    p.add_argument("--recalibrate", choices=("off",) + RECAL_VARIANTS,
+                   default="off",
+                   help="camera-referenced glove recalibration: each "
+                        "finger's camera flexion fraction as a ridge "
+                        "regression on its own glove fraction ('own') or on "
+                        "all five ('cross'), fitted on trusted frames and "
+                        "evaluated leave-one-take-out (default off). Not "
+                        "together with --drift-anchor on.")
+    p.add_argument("--recalibrate-from", type=Path, default=None,
+                   metavar="DIR",
+                   help="fit the --recalibrate model on THAT session's "
+                        "trusted frames (read, lag-shifted, template-fitted "
+                        "and endpoint-learned exactly as this one is) and "
+                        "apply it to every take of this session on this "
+                        "session's own endpoints and rails: a whole-session "
+                        "hold-out, as a live warm-up would deploy it.")
+    p.add_argument("--anchor-window", type=float,
+                   default=DEFAULT_ANCHOR.window_s,
+                   help="seconds of trusted frames the drift offset is the "
+                        f"median over (default {DEFAULT_ANCHOR.window_s})")
+    p.add_argument("--anchor-hold", type=float, default=DEFAULT_ANCHOR.hold_s,
+                   help="seconds after its last trusted frame a learned "
+                        "offset is still applied (default "
+                        f"{DEFAULT_ANCHOR.hold_s})")
+    p.add_argument("--anchor-deadband", type=float,
+                   default=DEFAULT_ANCHOR.deadband,
+                   help="flexion-fraction offset below which nothing is "
+                        "corrected; larger offsets are shrunk by it "
+                        f"(default {DEFAULT_ANCHOR.deadband})")
     p.add_argument("--fit-template", default=FIT_AUTO,
                    metavar="{auto,none,PATH.json}",
                    help="rescale the glove's TEMPLATE bone lengths to the "
@@ -1709,9 +2308,9 @@ def main() -> None:
     cli_rail = (None if args.rail_fingers is None
                 else parse_rail_fingers(args.rail_fingers))
     profile_path, profile_how = resolve_profile(args.profile)
-    profile_unreliable, profile_rail, profile_name, profile_comment = (
-        load_profile(profile_path) if profile_path is not None
-        else ({}, {}, "", ""))
+    (profile_unreliable, profile_rail, profile_name, profile_comment,
+     profile_lag) = (load_profile(profile_path) if profile_path is not None
+                     else ({}, {}, "", "", {}))
 
     unreliable = dict(profile_unreliable)
     unreliable.update(cli_unreliable)
@@ -1733,6 +2332,27 @@ def main() -> None:
     comparing = profile_path is not None
     lag_spec = parse_glove_lag(args.glove_lag)
     fit_spec = str(args.fit_template).strip()
+    anchor_params = (DriftAnchorParams(window_s=args.anchor_window,
+                                       hold_s=args.anchor_hold,
+                                       deadband=args.anchor_deadband)
+                     if args.drift_anchor == "on" else None)
+    recal_params = (RecalibrationParams(variant=args.recalibrate)
+                    if args.recalibrate != "off" else None)
+    if anchor_params is not None and recal_params is not None:
+        raise SystemExit(
+            "--drift-anchor on and --recalibrate both correct the glove's curl "
+            "from the camera,\n  and applied together each would be judged on "
+            "the other's work. Choose one.")
+    if args.recalibrate_from is not None and recal_params is None:
+        raise SystemExit("--recalibrate-from needs --recalibrate own or cross: "
+                         "it names the session the model is fitted on.")
+    # The one curl correction in force, if any, and how the report names it.
+    correction = ("drift anchor" if anchor_params is not None
+                  else f"recalibration ({recal_params.variant})"
+                  if recal_params is not None else "")
+    if args.recalibrate_from is not None:
+        correction = (f"recalibration ({recal_params.variant}, fitted on "
+                      f"{args.recalibrate_from.name})")
 
     # --- pass 1: read every take ---------------------------------------
     # The rail override has to know each finger's rail BEFORE it can fuse a
@@ -1740,70 +2360,75 @@ def main() -> None:
     # nothing but fists never shows one. So the reading is separated from the
     # fusing, and the rails are learned in between, from the same frames that
     # are about to be fused.
-    loaded = []
-    skipped = []
-    by_source = defaultdict(int)          # camera -> takes read from it
-    by_clock = defaultdict(int)           # pairing clock -> takes paired on it
-    measure_parts = defaultdict(list)     # hand -> per-take HandMeasurement
-    for gpath in takes:
-        try:
-            cpath = find_camera_take(args.input, gpath.name, args.camera)
-        except AmbiguousTake as e:
-            raise SystemExit(f"\n{e}\n")
-        if cpath is None:
-            skipped.append((gpath.name, "no matching camera file"))
-            continue
-        glove = load_glove(gpath)
-        cam, source = load_cam(cpath)
-        if not glove or not cam:
-            skipped.append((gpath.name, "one side is empty"))
-            continue
-        by_source[source] += 1
-        # Per take, because one session can hold takes recorded before
-        # capture_time existed alongside takes recorded after.
-        clock = pairing_clock(glove, cam)
-        by_clock[clock] += 1
-        # Needs the whole take at once: "did the id change 0.25 s ago" is a
-        # question about the frames around this one, not about this one.
-        flag_hand_id_stability(cam, gates, clock=clock)
-        # Measure the hand from THIS take, then drop the raw 26-joint arrays.
-        # Per take because a take is a self-contained measurement of the hand
-        # and the median over takes is not at the mercy of the longest one;
-        # dropped because keeping 26 positions on every frame of a 59-take
-        # session is a hundred megabytes of numbers whose medians are already
-        # in hand.
-        if fit_spec.lower() == FIT_AUTO:
-            for side in sorted({r["hand_side"] for r in cam}):
-                got = measure_hand(cam, hand=side, gates=gates,
-                                   source=gpath.name)
-                if got is not None:
-                    measure_parts[side].append(got)
-        for r in cam:
-            r.pop("abs26", None)
-        loaded.append({"name": gpath.name, "glove": glove, "cam": cam,
-                       "source": source, "clock": clock,
-                       # Metric camera, rigid fit; normalised camera, fit scale.
-                       "with_scale": source != LEAP})
+    loaded, skipped, by_source, by_clock, measure_parts = read_session(
+        args.input, takes, args.camera, gates,
+        measure=fit_spec.lower() == FIT_AUTO)
 
     # --- the glove's time lag, per hand ---------------------------------
-    lag_rows, glove_lag = glove_lag_of(lag_spec, args.input, cam_dirs, loaded)
+    # The profile's lag is a fallback for a hand this session cannot measure,
+    # so it is handed in rather than merged here: only `glove_lag_of` knows
+    # which hands those are.
+    lag_rows, glove_lag = glove_lag_of(lag_spec, args.input, cam_dirs, loaded,
+                                       profile_lag=profile_lag)
 
     # --- the operator's hand, put on the glove's template ----------------
     measurements, scales, saved_measurements, fit_refusals = fit_measurements(
         fit_spec, measure_parts, loaded, args.input)
     fitted = bool(measurements)
 
+    # --- the session the recalibration is fitted on, when it is another ----
+    # Read exactly as this one: its own takes, its own lag (with the same
+    # profile fallback), its own template fit (measured, not saved: that
+    # folder is only being read), and inside `recalibration_from_session`
+    # its own rails and endpoints.
+    recal_source = None
+    if args.recalibrate_from is not None:
+        src = args.recalibrate_from
+        src_cam_dirs = [src / d for d in wanted if (src / d).is_dir()]
+        src_takes = (take_files(src / "glove") if (src / "glove").is_dir()
+                     else [])
+        if not src_takes or not src_cam_dirs:
+            raise SystemExit(
+                f"--recalibrate-from {src}: expected {src / 'glove'} with "
+                "takes in it and one of "
+                + " or ".join(str(src / d) for d in wanted))
+        src_loaded, _skip, _bs, _bc, src_parts = read_session(
+            src, src_takes, args.camera, gates,
+            measure=fit_spec.lower() == FIT_AUTO)
+        _rows, src_lag = glove_lag_of(lag_spec, src, src_cam_dirs, src_loaded,
+                                      profile_lag=profile_lag)
+        src_meas, _sc, _sv, _sr = fit_measurements(
+            fit_spec, src_parts, src_loaded, src, save=False)
+        lag_txt = (", ".join(f"{h} {v * 1000.0:+.0f} ms"
+                             for h, v in sorted(src_lag.items()))
+                   if src_lag else "none")
+        recal_source = recalibration_from_session(
+            src_loaded, gates, rail_params, recal_params,
+            max_dt=args.max_dt, glove_lag=src_lag, fitted=bool(src_meas),
+            source=(f"{src} ({len(src_loaded)} takes; lag {lag_txt}; "
+                    f"template fit {', '.join(sorted(src_meas)) or 'none'})"))
+
     # --- pass 2: fuse ---------------------------------------------------
+    # `run` is everything in force: the profile (if any) and the curl
+    # correction (if one is on). `plain` is neither, and `run_profile` is the
+    # profile alone, so each one's effect is one table's difference.
     run = fuse_all(loaded, gates, rail_params, unreliable,
                    max_dt=args.max_dt, min_score=args.min_score,
                    thumb_from_camera=not args.no_thumb_camera,
                    export_csv=args.export_csv is not None,
-                   glove_lag=glove_lag, fitted=fitted)
+                   glove_lag=glove_lag, fitted=fitted, anchor=anchor_params,
+                   recalibrate=recal_params, recal_from=recal_source)
+    correcting = bool(correction)
     plain = (fuse_all(loaded, gates, plain_rail_params, cli_unreliable,
                       max_dt=args.max_dt, min_score=args.min_score,
                       thumb_from_camera=not args.no_thumb_camera,
                       glove_lag=glove_lag, fitted=fitted)
-             if comparing else None)
+             if comparing or correcting else None)
+    run_profile = (fuse_all(loaded, gates, rail_params, unreliable,
+                            max_dt=args.max_dt, min_score=args.min_score,
+                            thumb_from_camera=not args.no_thumb_camera,
+                            glove_lag=glove_lag, fitted=fitted)
+                   if comparing and correcting else None)
 
     if not run.glove_samples:
         raise SystemExit("no usable paired takes found")
@@ -1882,9 +2507,23 @@ def main() -> None:
         lines.append(f"  measurement saved       {path}")
     if saved_measurements:
         lines.append("")
+    anchor_lines(run.anchor, anchor_params, lines)
+    recal_lines(run.recal, recal_params, lines)
     if comparing:
-        profile_comparison(plain, run, profile_path, profile_name,
-                           profile_comment, lines, how=profile_how)
+        profile_comparison(plain, run_profile if correcting else run,
+                           profile_path, profile_name, profile_comment, lines,
+                           how=profile_how,
+                           corrected=run if correcting else None,
+                           correction=correction)
+    elif correcting:
+        lines.append("=" * 66)
+        lines.append("Reliability profile — none in force "
+                     f"({profile_how})")
+        lines.append(f"  Nothing is masked out of the gates' evidence. The "
+                     f"{correction} is on, so the")
+        lines.append("  fusion is printed both ways, and the gap between the "
+                     "two tables IS its effect.")
+        run_tables([("ordinary", plain), (f"with {correction}", run)], lines)
     else:
         lines.append("Reliability profile — none in force "
                      f"({profile_how})")
@@ -1901,8 +2540,10 @@ def main() -> None:
 
     lines.append("")
     lines.append("=" * 66)
+    in_force = [what for what, on in (("the reliability profile", comparing),
+                                      (f"the {correction}", correcting)) if on]
     lines.append("Secondary metric: leave-one-TAKE-out nearest centroid"
-                 + (" (with the reliability profile)" if comparing else ""))
+                 + (f" (with {' + '.join(in_force)})" if in_force else ""))
     classifier_lines(run, lines)
     lines.append("")
     n_takes = len({s[2] for s in run.glove_samples})

@@ -293,12 +293,38 @@ inside the match. `estimate_glove_lag` measures it per hand with
 `leap_hand.diagnostics.estimate_lag`, and refuses to answer at all on a clip
 whose camera index curl barely moved, because a cross-correlation of two flat
 lines has a maximum and it means nothing.
+
+WHEN THE GLOVE'S CURL IS WRONG IN A WAY THE CAMERA CAN SEE
+----------------------------------------------------------
+Everything above takes the glove's curl as it comes. Two corrections use the
+camera to fix it, both off by default, both changing only what is FUSED: the
+gates go on deciding from the glove's uncorrected curls (`fuse_skeletons`'s
+`gate_curls`), so a finger that was corrected is not thereby refused the
+camera's spread. Both bend a finger with `bend_finger_to_curl`, which shares
+the bend between the three joints and keeps every bone its length.
+
+`DriftAnchor` (EXPERIMENTAL) was built for creep: a held glove finger drifts
+by 0.05 to 0.26 curl per minute. On frames the camera can be trusted it
+records the residual between the two sensors' flexion FRACTIONS and applies
+its recent median to the glove on every frame. Measured on sync_day1 and
+sync_day2, though, the glove's error over these takes is dominated by POSE:
+per-pose medians of that residual span up to a whole flexion range while it
+moves by a few hundredths within a take. An offset learned in one pose is
+wrong in the next, so the anchor is reset at every take boundary and must be
+reset whenever the hand is lost.
+
+`GloveRecalibration` models that pose dependence directly: per hand, each
+finger's camera fraction as a ridge regression on the glove's fractions,
+either the finger's own (`own`) or all five (`cross`, which can learn that a
+glove channel also answers to its neighbour). It is fitted on trusted
+camera frames, and evaluated so that no take is corrected by a model that
+saw it.
 """
 import math
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import asdict, dataclass, field, replace
-from typing import (Dict, Iterable, List, Mapping, Optional, Sequence, Tuple,
-                    Union)
+from typing import (Deque, Dict, Iterable, List, Mapping, Optional, Sequence,
+                    Tuple, Union)
 
 import numpy as np
 
@@ -1385,6 +1411,7 @@ def fuse_skeletons(
     unreliable_fingers: Sequence[str] = (),
     curl_gates: Optional[Sequence[float]] = None,
     scale: Optional[HandScale] = None,
+    gate_curls: Optional[Sequence[float]] = None,
 ) -> Tuple[np.ndarray, dict]:
     """Fuse one glove frame with one camera frame -> 21 points + info.
 
@@ -1426,6 +1453,19 @@ def fuse_skeletons(
     vote and are listed in `info["thumb_vote_dropped"]`. Without it the vote
     falls back to raw curls against `gates.curl_agree_tol` — a caller with
     one frame and no session behind it has no endpoints to normalise with.
+
+    `gate_curls` are the glove curls every curl-based DECISION in here reads,
+    in FINGER_NAMES order: the spread gate's "is this finger curled" and the
+    thumb vote's glove fractions and disagreement. None, the default, reads
+    them off `glove_pts`, which is what every caller did before. It exists
+    for the drift anchor (`DriftAnchor`), which bends the finger that is
+    FUSED and must not change what the gates know about the glove: a gate
+    that read the bent finger would refuse the camera's spread on exactly
+    the frames the anchor had just fixed (measured on sync_day1 and
+    sync_day2, the spread camera-use rates fell by 3 to 15 points with the
+    anchor on). So the anchor's caller passes the UNCORRECTED curls here and
+    the corrected points as `glove_pts`: the gates decide on what the glove
+    measured, and the fused hand carries the anchor's correction.
 
     Returns the fused points and an info dict: `dof_source` says where each
     camera-owned DOF actually came from, `rejected` says why the glove kept
@@ -1471,7 +1511,11 @@ def fuse_skeletons(
             _reject_all(info, frame_reasons[0], rail_dofs)
             return G, info              # glove skeleton, unchanged
 
-    curl_g = flexion_features(G)
+    # What the gates below know about the glove: its own curls, or the ones
+    # the caller says it measured (see `gate_curls`). Every curl-based
+    # decision reads `curl_g` and nothing else.
+    curl_g = (flexion_features(G) if gate_curls is None
+              else [float(v) for v in gate_curls])
     curl_c = flexion_features(C_in)      # a ratio, so alignment cannot change it
 
     # Who is allowed to vote on whether the camera has this hand right.
@@ -1658,6 +1702,835 @@ def fuse_skeletons(
     info["camera_used"] = bool(info["fingers_adjusted"])
     fused = fused - fused[WRIST]
     return fused, info
+
+
+# --- bending a glove finger to a curl ----------------------------------
+
+# How one bend is shared between the finger's three joints: the whole distal
+# chain turns about the knuckle by half of it, the part beyond the PIP by a
+# further 30 %, the part beyond the DIP by the last 20 %. A real finger
+# flexes at all three, and putting the whole bend at the knuckle (as this did
+# at first) left a folded finger with a proximal bone pointing nearly
+# straight out of the palm: the spread transfer then read that bone's
+# azimuth off a direction with almost no in-plane component, and on
+# sync_day1's pinch_right_take1 it produced 44 and 59 degree spreads.
+BEND_SHARES = (0.5, 0.3, 0.2)
+
+# The range of the ONE angle parameter, the bend summed over the three
+# joints, in degrees. Positive folds the finger toward the palm. +240 puts
+# 120 at the knuckle, 72 at the PIP and 48 at the DIP, enough to carry an
+# open finger into a fist; -60 opens a finger the glove reads too FLEXED past
+# its current line by 30 / 18 / 12. The search prefers the smallest bend that
+# reaches the target, so neither end is visited unless the target needs it.
+BEND_MIN_DEG = -60.0
+BEND_MAX_DEG = 240.0
+# The one-degree grid the search starts from; it contains t = 0 exactly.
+_BEND_GRID = np.radians(np.arange(BEND_MIN_DEG, BEND_MAX_DEG + 0.5, 1.0))
+
+
+def _palmar_sign(pts: np.ndarray, normal: np.ndarray) -> float:
+    """+1 if the palm faces along `normal`, -1 if it faces the other way.
+
+    `palm_frame`'s normal is built from the knuckles, so it points out of the
+    palm on one hand and out of the back of the other (see
+    `features.palm_normal`). The skeleton says which: fingers fold toward the
+    palm, so the four fingertips sit on the palm side of the knuckles. The
+    glove's template does this even on an open palm (every fingertip 0.04 to
+    0.12 of its reach toward the palm on sync_day1, on both hands, the sign
+    flipping with the hand), so the sum is a reliable vote without being told
+    the hand. A perfectly flat hand has no vote and gets +1, the right hand's
+    answer.
+    """
+    lean = 0.0
+    for finger in RAIL_FINGERS:
+        chain = FINGER_CHAINS[finger]
+        lean += float(np.dot(pts[chain[-1]] - pts[chain[0]], normal))
+    return -1.0 if lean < -1e-12 else 1.0
+
+
+def _turn(vec: np.ndarray, axis: np.ndarray, angles: np.ndarray) -> np.ndarray:
+    """`vec` rotated about unit `axis` by each of `angles` (radians), (m, 3)."""
+    c = np.cos(angles)[:, None]
+    s = np.sin(angles)[:, None]
+    return (vec[None, :] * c + np.cross(axis, vec)[None, :] * s
+            + axis[None, :] * float(axis @ vec) * (1.0 - c))
+
+
+def bend_finger_to_curl(pts21: Sequence[Sequence[float]], finger: str,
+                        target_curl: float) -> np.ndarray:
+    """Fold one finger until its curl reads `target_curl`.
+
+    The bend is shared between the three joints (`BEND_SHARES`): the PIP,
+    DIP and tip turn RIGIDLY about the knuckle by half of one angle t, the
+    DIP and tip then about the PIP by a further 0.3 t, and the tip about the
+    DIP by the last 0.2 t, all around the palm frame's across-the-palm axis
+    and signed so a positive t folds toward the palm and so toward the wrist.
+    Every step is a rotation about a joint, so every bone keeps its length,
+    the invariant the rest of this module rests on. Nothing else moves: the
+    knuckle belongs to the palm, the palm length is wrist to middle knuckle,
+    and so every other finger's curl is untouched.
+
+    Because the three rotations share one axis they compose by adding
+    angles, so the bone from knuckle to PIP has turned by 0.5 t, the next
+    by 0.8 t and the last by t: the tip is a closed-form function of t and
+    the search is a bounded one over t alone. t is sampled every degree over
+    [BEND_MIN_DEG, BEND_MAX_DEG]; of the crossings of the target the one
+    nearest t = 0 is taken, since the glove's own pose is the best guess at
+    the rest of the finger, and it is refined on a hundredth-of-a-degree grid
+    and interpolated, which lands within 1e-6 of the target. A target no t
+    in the range reaches gets the reachable curl nearest it.
+
+    Pure: `pts21` is not modified and a new array is returned.
+    """
+    P = np.array(pts21, dtype=float)
+    chain = FINGER_CHAINS[finger]
+    wrist = P[WRIST]
+    palm = float(np.linalg.norm(P[MIDDLE_MCP] - wrist))
+    if palm <= 1e-12:
+        return P
+    n, x, _y = palm_frame(P)
+    palmar = _palmar_sign(P, n) * n
+    # A positive rotation about cross(x, palmar) carries the direction down
+    # the palm (x) toward the palm side, which is the fold a flexing finger
+    # makes.
+    axis = _unit(np.cross(x, palmar))
+    knuckle = P[chain[0]].copy()
+    bones = np.array([P[chain[k + 1]] - P[chain[k]] for k in range(3)])
+    turns = np.cumsum(BEND_SHARES)            # 0.5, 0.8, 1.0 of t per bone
+    target = float(target_curl)
+    # Rodrigues, split once: each bone is its part along the axis (which no
+    # rotation about it moves), plus cos and sin of its own angle times two
+    # fixed vectors. The tip for many t is then two matrix products.
+    along = bones @ axis
+    fixed = knuckle - wrist + along.sum() * axis
+    cos_part = bones - along[:, None] * axis[None, :]
+    sin_part = np.cross(axis[None, :], bones)
+
+    def curls(t: np.ndarray) -> np.ndarray:
+        ang = t[:, None] * turns[None, :]
+        rel = fixed + np.cos(ang) @ cos_part + np.sin(ang) @ sin_part
+        return np.sqrt(np.einsum("ij,ij->i", rel, rel)) / palm
+
+    lo, hi = math.radians(BEND_MIN_DEG), math.radians(BEND_MAX_DEG)
+    coarse = _BEND_GRID
+    err = curls(coarse) - target
+    brackets = np.nonzero((err[:-1] == 0.0) | (err[:-1] * err[1:] < 0.0))[0]
+    if len(brackets):
+        near = np.minimum(np.abs(coarse[brackets]), np.abs(coarse[brackets + 1]))
+        k = int(brackets[int(np.argmin(near))])
+        fine = np.linspace(coarse[k], coarse[k + 1], 101)
+        e = curls(fine) - target
+        j = int(np.nonzero((e[:-1] == 0.0) | (e[:-1] * e[1:] <= 0.0))[0][0])
+        span = e[j] - e[j + 1]
+        angle = float(fine[j] + (fine[j + 1] - fine[j])
+                      * (e[j] / span if span != 0.0 else 0.0))
+    else:
+        # Nearest reachable: the smallest error, and of equal errors the
+        # smallest bend (lexsort's LAST key is its primary one).
+        k = int(np.lexsort((np.abs(coarse), np.abs(err)))[0])
+        fine = np.linspace(max(lo, coarse[k] - math.radians(1.0)),
+                           min(hi, coarse[k] + math.radians(1.0)), 201)
+        e = np.abs(curls(fine) - target)
+        angle = (float(coarse[k]) if abs(err[k]) <= float(e.min())
+                 else float(fine[int(np.argmin(e))]))
+    if angle == 0.0:
+        return P
+    point = knuckle
+    for k, (bone, share) in enumerate(zip(bones, turns)):
+        point = point + _turn(bone, axis, np.array([share * angle]))[0]
+        P[chain[k + 1]] = point
+    return P
+
+
+# --- the camera anchors the glove's slow drift (experimental) ----------
+
+def camera_trusted(cam_meta: Optional[dict],
+                   gates: Optional[GateParams] = None) -> bool:
+    """May this camera frame's curls be used as a REFERENCE for the glove?
+
+    `frame_trust` passes AND the palm faces the module within the view gate.
+    An edge-on hand is the camera inferring fingers it cannot see (the
+    thumbs_up failure), and a confident wrong curl there is not a reference.
+    A frame with no capture facts (MediaPipe) cannot be judged and is not
+    trusted. Shared by `DriftAnchor` and `GloveRecalibration`, so the two
+    learn from exactly the same frames.
+    """
+    if cam_meta is None:
+        return False
+    gates = gates or DEFAULT_GATES
+    ok, _reasons, metrics = frame_trust(cam_meta, gates)
+    view = metrics["view_angle_deg"]
+    return bool(ok and view is not None and view < gates.view_gate_deg)
+
+
+@dataclass(frozen=True)
+class DriftAnchorParams:
+    """Thresholds for the camera drift anchor. EXPERIMENTAL, off by default.
+
+    Measured on sync_day1 and sync_day2, POSE DEPENDENCE dominates the
+    glove's error over the timescale of these takes: the median residual
+    per pose spans 0.4 to 1.05 flexion fractions on the right hand (right
+    middle -0.19 in fist, +0.86 in index_point on day 2), while the change
+    within a take, first second against last, is 0.02 to 0.10. Creep may
+    coexist with it, but an offset learned in one pose is wrong in the next:
+    carried across takes it folded the extended fingers of
+    peace_right_take2 into a pinch. So `fuse_all` resets the anchor at every
+    take boundary, and a live caller must reset it whenever the hand is lost
+    (`DriftAnchor.reset`). `GloveRecalibration` models the pose dependence
+    itself.
+
+    window_s    the offset is the median residual over the trusted frames
+                within this many seconds before the NEWEST trusted frame.
+                5 s still holds up to 300 frames at 60 Hz, so a few
+                mistracked ones cannot move a median, and is short against
+                a creep of 0.05 to 0.26 curl per minute: a median over a
+                5 s ramp trails the ramp by 2.5 s of creep, 0.002 to 0.011.
+                Chosen by a sweep on sync_day1 and sync_day2 (profile plus
+                anchor, fused leave-one-take-out): 5 s gave 58/59 and
+                54/60, 10 s 57/59 and 53/60, 20 s 57/59 and 52/60. One
+                take either way on each day, so this is the better of three
+                close settings, not a measured optimum.
+    min_frames  a window with fewer trusted residuals than this teaches no
+                new offset. 30 frames is half a second of glove at 60 Hz.
+    hold_s      an offset is applied for at most this long after the last
+                trusted frame that taught it. 120 s is two minutes of creep
+                at the measured rate, after which the offset describes a
+                glove that no longer exists. With a reset at every take
+                boundary it only matters inside a long take.
+    deadband    in FRACTION units. The applied offset is
+                sign(o) * max(0, |o| - deadband): continuous, so a median
+                wandering across the band's edge does not switch a correction
+                on and off, and zero for the few hundredths two honest
+                sensors disagree by anyway.
+    """
+    window_s: float = 5.0
+    min_frames: int = 30
+    hold_s: float = 120.0
+    deadband: float = 0.03
+
+    def described(self) -> Dict[str, float]:
+        return asdict(self)
+
+
+DEFAULT_ANCHOR = DriftAnchorParams()
+
+# How many of the most recent in-force offsets per (hand, finger) the report's
+# median is taken over. Everything else the anchor reports is a running count,
+# sum or maximum, so this bound is what keeps a multi-hour live run at
+# constant memory. 100,000 is about 28 minutes of glove at 60 Hz: every frame
+# of a recorded session, so a session report's median is exact.
+ANCHOR_MEDIAN_KEEP = 100_000
+
+
+class DriftAnchor:
+    """Learn the glove's slow error from the camera and take it back out.
+
+    EXPERIMENTAL (see `DriftAnchorParams`): the glove's error is mostly
+    pose-dependent, so an offset is only valid while the pose it was learned
+    in lasts. One object per fusion run for its report counters, but its
+    windows and offsets are cleared by `reset`, which `fuse_all` calls at
+    every take boundary and a LIVE caller must call whenever the tracker
+    loses the hand (the next hand it sees may be in any pose). Keyed by
+    (hand, finger) for the four fingers in RAIL_FINGERS. The thumb is left
+    alone: when the thumb gate passes its whole direction is already the
+    camera's, and when it fails the glove is being kept on purpose.
+
+    `learn` is called on frames that have a camera partner, `apply` on every
+    frame, both in time order. The residual is taken on flexion FRACTIONS,
+    each sensor on its own learned endpoints (`HandScale`), because the raw
+    curls are on two different rulers: the template index reads 1.97 open
+    where the camera reads 1.75, and that gap is bone length, not drift.
+
+    It keeps counters for the report: per key, the frames it learned from,
+    the learned offset in force on each frame it was consulted, the frames
+    it actually moved and by how much in curl units.
+    """
+
+    def __init__(self, params: Optional[DriftAnchorParams] = None):
+        self.params = params or DEFAULT_ANCHOR
+        self._window: Dict[Tuple[str, str], Deque[Tuple[float, float]]] = (
+            defaultdict(deque))
+        # (median residual, stamp of the newest trusted frame behind it):
+        # the offset as last established from a window of at least
+        # `min_frames`, kept while the window refills after being pruned.
+        self._held: Dict[Tuple[str, str], Tuple[float, float]] = {}
+        self._newest: Dict[Tuple[str, str], float] = {}
+        # Report counters, all constant-size per key: running counts, sums
+        # and maxima, plus the most recent ANCHOR_MEDIAN_KEEP offsets for
+        # the median.
+        self.learned: Dict[Tuple[str, str], int] = defaultdict(int)
+        self.in_force: Dict[Tuple[str, str], int] = defaultdict(int)
+        self.offset_sum: Dict[Tuple[str, str], float] = defaultdict(float)
+        self.offset_sq: Dict[Tuple[str, str], float] = defaultdict(float)
+        self._recent: Dict[Tuple[str, str], Deque[float]] = defaultdict(
+            lambda: deque(maxlen=ANCHOR_MEDIAN_KEEP))
+        self.corrected: Dict[Tuple[str, str], int] = defaultdict(int)
+        self.sum_abs: Dict[Tuple[str, str], float] = defaultdict(float)
+        self.max_abs: Dict[Tuple[str, str], float] = defaultdict(float)
+        self.spans: Dict[Tuple[str, str], float] = {}
+
+    def reset(self, hand: Optional[str] = None) -> None:
+        """Forget windows and offsets; keep the report's counters.
+
+        `hand` None forgets both hands, which is what `fuse_all` does at
+        every take boundary. A live caller loses ONE hand at a time and
+        passes it, so the other hand keeps what it has learned. Either way
+        the reason is the same: the glove's error depends on the pose, and
+        nothing learned before the break says which pose the hand is in
+        after it.
+        """
+        for store in (self._window, self._held, self._newest):
+            if hand is None:
+                store.clear()
+            else:
+                for key in [k for k in store if k[0] == hand]:
+                    del store[key]
+
+    def learn(self, hand: str, t: float, glove_curls: Sequence[float],
+              cam_curls: Optional[Sequence[float]],
+              cam_meta: Optional[dict],
+              scale: Optional[HandScale],
+              rails: Mapping[Tuple[str, str], float],
+              rail_tol: float,
+              disputed: Sequence[str] = (),
+              gates: Optional[GateParams] = None) -> Tuple[str, ...]:
+        """Record this frame's residuals, if the frame can teach any.
+
+        `glove_curls` must be the UNCORRECTED glove: the residual is the
+        glove's own error, and measuring it on a hand this anchor has already
+        moved would teach the anchor about itself.
+
+        A finger teaches only when every one of these holds:
+
+          the camera frame is trusted   `frame_trust` passes AND the palm
+                                        faces the module within the view
+                                        gate. An edge-on hand is the camera
+                                        inferring fingers it cannot see (the
+                                        thumbs_up failure), and a confident
+                                        wrong curl there is not a reference.
+          the finger is normalisable    both sensors have endpoints for it.
+          it is not disputed            glove on its rail while the camera
+                                        sees it flexed: that is the rail
+                                        override's case, not drift.
+          the glove is OFF its rail     a rail reading is the sensor against
+                                        its stop, the same bits whatever the
+                                        finger does, so it carries no
+                                        information about slope or creep. A
+                                        finger with no learned rail counts
+                                        as off it.
+
+        Returns the fingers that taught, for tests and diagnostics.
+        """
+        if scale is None or cam_curls is None:
+            return ()
+        if not camera_trusted(cam_meta, gates):
+            return ()
+        taught = []
+        t = float(t)
+        for finger in RAIL_FINGERS:
+            if finger in disputed or not scale.normalisable(finger):
+                continue
+            i = FINGER_NAMES.index(finger)
+            g = float(glove_curls[i])
+            rail = rails.get((hand, finger))
+            if rail is not None and abs(g - float(rail)) <= rail_tol:
+                continue
+            gf = scale.fraction(SENSOR_GLOVE, finger, g)
+            cf = scale.fraction(SENSOR_CAMERA, finger, float(cam_curls[i]))
+            if gf is None or cf is None:
+                continue
+            key = (hand, finger)
+            win = self._window[key]
+            win.append((t, cf - gf))
+            newest = max(t, self._newest.get(key, t))
+            self._newest[key] = newest
+            while win and win[0][0] < newest - self.params.window_s:
+                win.popleft()
+            self.learned[key] += 1
+            if len(win) >= self.params.min_frames:
+                self._held[key] = (median([r for _s, r in win]), newest)
+            taught.append(finger)
+        return tuple(taught)
+
+    def _deadbanded(self, raw: float) -> float:
+        return math.copysign(max(0.0, abs(raw) - self.params.deadband), raw)
+
+    def learned_offset(self, hand: str, finger: str,
+                       t: float) -> Optional[float]:
+        """The offset in force at `t` BEFORE the deadband, or None."""
+        held = self._held.get((hand, finger))
+        if held is None:
+            return None
+        value, last = held
+        if float(t) - last > self.params.hold_s:
+            return None
+        return value
+
+    def offset(self, hand: str, finger: str, t: float) -> Optional[float]:
+        """The offset to apply at `t`, in fraction units, or None.
+
+        None before a window of `min_frames` trusted residuals has ever been
+        seen, and once the newest trusted frame behind the offset is more than
+        `hold_s` older than `t`. Otherwise the median residual, shrunk by the
+        deadband.
+        """
+        raw = self.learned_offset(hand, finger, t)
+        return None if raw is None else self._deadbanded(raw)
+
+    def apply(self, hand: str, t: float, glove_pts: Sequence[Sequence[float]],
+              glove_curls: Sequence[float],
+              scale: Optional[HandScale]
+              ) -> Tuple[np.ndarray, Dict[str, float]]:
+        """The glove hand with its learned drift taken out, and by how much.
+
+        For each finger with an offset: the target is the glove's own
+        fraction plus the offset, kept within [0, 1] (straight to fully
+        flexed), and put back into GLOVE curl on the glove's endpoints; the
+        finger is then folded to it by `bend_finger_to_curl`. The clip never
+        reverses a correction: a glove already past an endpoint is left where
+        it is rather than pulled back against the offset's sign.
+
+        Returns the new points and the curl change actually made per finger
+        (signed, curl units). Fingers with no offset, or whose offset is
+        inside the deadband, are not in the dict and are not moved.
+        """
+        pts = np.asarray(glove_pts, dtype=float)
+        corrections: Dict[str, float] = {}
+        if scale is None:
+            return pts, corrections
+        out = None
+        for finger in RAIL_FINGERS:
+            key = (hand, finger)
+            raw = self.learned_offset(hand, finger, t)
+            ends = scale.endpoints(SENSOR_GLOVE, finger)
+            if raw is None or ends is None or ends.span <= 1e-9:
+                continue
+            self.in_force[key] += 1
+            self.offset_sum[key] += raw
+            self.offset_sq[key] += raw * raw
+            self._recent[key].append(raw)
+            self.spans[key] = ends.span
+            o = self._deadbanded(raw)
+            if o == 0.0:
+                continue
+            i = FINGER_NAMES.index(finger)
+            curl = float(glove_curls[i])
+            # Unclipped, unlike `Endpoints.fraction`: the correction is a
+            # difference of two fractions, and clipping only one of them
+            # would move a finger that is past an endpoint for no reason.
+            frac = (float(ends.open) - curl) / ends.span
+            target = min(max(frac + o, min(0.0, frac)), max(1.0, frac))
+            if target == frac:
+                continue
+            base = pts if out is None else out
+            out = bend_finger_to_curl(base, finger, ends.open
+                                      - target * ends.span)
+            tip = FINGER_CHAINS[finger][-1]
+            palm = float(np.linalg.norm(out[MIDDLE_MCP] - out[WRIST]))
+            change = float(np.linalg.norm(out[tip] - out[WRIST])) / palm - curl
+            corrections[finger] = change
+            if abs(change) > 1e-12:
+                self.corrected[key] += 1
+                self.sum_abs[key] += abs(change)
+                self.max_abs[key] = max(self.max_abs[key], abs(change))
+        return (pts if out is None else out), corrections
+
+    def summary(self) -> List[dict]:
+        """One row per (hand, finger) the anchor learned from or moved.
+
+        `median_offset` is over the most recent ANCHOR_MEDIAN_KEEP frames the
+        offset was in force (all of them, for any recorded session);
+        `mean_offset` and `sd_offset` are over every one, from running sums.
+        """
+        rows = []
+        keys = set(self.learned) | set(self.in_force)
+        for key in sorted(keys, key=lambda k: (k[0], FINGER_NAMES.index(k[1]))):
+            hand, finger = key
+            n_used = self.in_force.get(key, 0)
+            recent = self._recent.get(key)
+            span = self.spans.get(key)
+            off = median(list(recent)) if recent else None
+            mean_off = (self.offset_sum[key] / n_used) if n_used else None
+            sd_off = (math.sqrt(max(0.0, self.offset_sq[key] / n_used
+                                    - mean_off * mean_off))
+                      if n_used else None)
+            n_corr = self.corrected.get(key, 0)
+            rows.append({
+                "hand": hand, "finger": finger,
+                "learned": self.learned.get(key, 0),
+                "in_force": n_used,
+                "median_offset": off,
+                "mean_offset": mean_off,
+                "sd_offset": sd_off,
+                "median_offset_curl": (off * span if off is not None
+                                       and span is not None else None),
+                "corrected": n_corr,
+                "mean_abs": (self.sum_abs.get(key, 0.0) / n_corr
+                             if n_corr else 0.0),
+                "max_abs": self.max_abs.get(key, 0.0),
+            })
+        return rows
+
+
+# --- camera-referenced glove recalibration -----------------------------
+
+RECAL_OWN = "own"
+RECAL_CROSS = "cross"
+RECAL_VARIANTS = (RECAL_OWN, RECAL_CROSS)
+
+
+@dataclass(frozen=True)
+class RecalibrationParams:
+    """How `GloveRecalibration` fits. See the module docstring.
+
+    variant       `own`: finger i's camera fraction from finger i's glove
+                  fraction alone, a per-finger gain and offset. `cross`: from
+                  all five glove fractions, thumb included, so a channel that
+                  also answers to its neighbour (a sensor that stretches when
+                  the finger beside it bends) can be untangled.
+    ridge_lambda  the ridge penalty on STANDARDISED inputs, on the mean
+                  squared error: minimise mean((y - a - Z b)^2) + lambda |b|^2
+                  with Z each input minus its mean over its standard
+                  deviation, the intercept unpenalised. 0.01 is small beside
+                  a standardised input's unit variance, so it only matters
+                  where inputs are nearly collinear (a finger that barely
+                  moved), which is what it is for.
+    min_frames    a hand with fewer trusted frames than this to fit on gets
+                  no model and no correction, and the report says why. 50 is
+                  under a second of glove: a floor against fitting six
+                  numbers to a handful of frames, not a sufficiency claim.
+    """
+    variant: str = RECAL_CROSS
+    ridge_lambda: float = 1e-2
+    min_frames: int = 50
+
+    def described(self) -> Dict[str, object]:
+        return asdict(self)
+
+
+DEFAULT_RECAL = RecalibrationParams()
+
+
+@dataclass
+class RecalModel:
+    """One hand's fitted recalibration, or why there is none.
+
+    `coef[finger]` is (bias, {input finger: coefficient}) in FRACTION units,
+    already un-standardised: the finger's camera fraction is predicted as
+    bias + sum(coefficient * glove fraction of the input finger).
+    """
+    hand: str
+    variant: str
+    n_frames: int = 0
+    refused: str = ""
+    inputs: Tuple[str, ...] = ()
+    coef: Dict[str, Tuple[float, Dict[str, float]]] = field(
+        default_factory=dict)
+
+    def predict(self, finger: str,
+                glove_fracs: Mapping[str, float]) -> Optional[float]:
+        got = self.coef.get(finger)
+        if got is None:
+            return None
+        bias, weights = got
+        return float(bias + sum(w * float(glove_fracs[f])
+                                for f, w in weights.items()))
+
+
+def _glove_fraction(ends: Optional[Endpoints], curl: float) -> float:
+    """Unclipped glove fraction, NaN without usable endpoints."""
+    if ends is None or ends.span <= 1e-9:
+        return float("nan")
+    return (float(ends.open) - float(curl)) / ends.span
+
+
+class GloveRecalibration:
+    """Camera-referenced recalibration of the glove's finger curls.
+
+    The glove's error on these sessions is mostly a function of the POSE,
+    not of time (`DriftAnchorParams`), which is what a calibration is for:
+    per hand, for each finger i of RAIL_FINGERS,
+
+        camera_fraction_i = a_i + sum over j of b_ij * glove_fraction_j
+
+    with the inputs the glove's own fractions on its learned endpoints,
+    UNCLIPPED (a reading past an endpoint is information), and the target
+    the camera's fraction on its endpoints. Ridge regression in closed form
+    (`RecalibrationParams`); `own` keeps only j = i.
+
+    Fitted on TRUSTED frames only (`camera_trusted`, the anchor's rule).
+
+    THE RAIL RULE. A finger's reading on its own learned rail (within
+    `rail_tol` of it) means anything from straight to flexed: the sensor is
+    against its stop and reports the same bits whatever the finger does. It
+    has no slope information, so
+      - a finger's OWN on-rail frames never teach that finger's model (on
+        sync_day1's pinch the railed index taught its model a +0.24 bias,
+        which then bent every open palm's index by a quarter of its range);
+      - a finger on its rail on a frame is not corrected on that frame: a
+        rail dispute belongs to the rail override, not to a calibration.
+    The OTHER fingers' readings stay valid INPUTS whether or not they are on
+    their rails: a saturated neighbour is real cross-talk evidence. A finger
+    with no learned rail is always off it, as everywhere else in this module.
+
+    `observe` collects rows tagged with a group (a take index); `model(hand,
+    exclude=k)` fits on every group but k and caches it, which is how the
+    evaluation stays leave-one-take-out. `apply` corrects one frame with a
+    given held-out model and keeps the report's counters.
+
+    CROSS-SESSION. Given `fitted_on`, another session's
+    `GloveRecalibration`, every model this object hands out is THAT
+    session's, fitted on all of its trusted frames, and there is no
+    leave-one-take-out: nothing in this session was in the fit. Everything
+    else stays this session's own: the rows it scores, the endpoints the
+    fractions are taken on (the `scale` passed to `apply`) and the rails the
+    rail rule checks. That is how a live warm-up would deploy it: the
+    coefficients carry over, the endpoints and rails are re-learned.
+
+    It is a BATCH fit over a recorded session, and it holds its training
+    rows (ten numbers per trusted frame) to refit the held-out models. A
+    live caller would fit once from a warm-up and keep only `RecalModel`.
+    """
+
+    def __init__(self, params: Optional[RecalibrationParams] = None,
+                 gates: Optional[GateParams] = None,
+                 rails: Optional[Mapping[Tuple[str, str], float]] = None,
+                 rail_tol: float = DEFAULT_RAIL.tol,
+                 fitted_on: Optional["GloveRecalibration"] = None,
+                 source: str = ""):
+        self.params = params or DEFAULT_RECAL
+        if self.params.variant not in RECAL_VARIANTS:
+            raise ValueError(f"variant {self.params.variant!r}: choose from "
+                             f"{', '.join(RECAL_VARIANTS)}")
+        if fitted_on is not None and fitted_on.params != self.params:
+            raise ValueError("a cross-session model must be fitted with the "
+                             "same RecalibrationParams it is applied with")
+        # The session whose trusted frames the models are fitted on, when it
+        # is not this one, and how the report names it.
+        self.fitted_on = fitted_on
+        self.source = str(source)
+        self.gates = gates or DEFAULT_GATES
+        self.rails = dict(rails or {})
+        self.rail_tol = float(rail_tol)
+        # hand -> list of (group, glove fracs [5], camera fracs [4],
+        # on-its-own-rail flags [4])
+        self._rows: Dict[str, List[tuple]] = defaultdict(list)
+        self._arrays: Dict[str, tuple] = {}
+        # (hand, finger) -> trusted frames left out of that finger's fit
+        # because the glove sat on its rail
+        self.railed: Dict[Tuple[str, str], int] = defaultdict(int)
+        self._models: Dict[Tuple[str, object], RecalModel] = {}
+        self.corrected: Dict[Tuple[str, str], int] = defaultdict(int)
+        self.sum_abs: Dict[Tuple[str, str], float] = defaultdict(float)
+        self.max_abs: Dict[Tuple[str, str], float] = defaultdict(float)
+        # (hand, pose, finger) -> ([before], [after]) held-out residuals
+        self.residuals: Dict[Tuple[str, str, str],
+                             Tuple[List[float], List[float]]] = {}
+
+    def on_rail(self, hand: str, finger: str, glove_curl: float) -> bool:
+        """Is this glove reading on the finger's own learned rail?"""
+        rail = self.rails.get((str(hand), finger))
+        return rail is not None and abs(float(glove_curl) - rail) <= self.rail_tol
+
+    def observe(self, group: object, hand: str,
+                glove_curls: Sequence[float],
+                cam_curls: Optional[Sequence[float]],
+                cam_meta: Optional[dict],
+                scale: Optional[HandScale]) -> bool:
+        """Record one paired frame if it is trusted. `glove_curls` UNCORRECTED.
+
+        A finger on its own rail keeps its place as an input to the other
+        fingers' models and is flagged, so it teaches its own model nothing
+        (the rail rule, above)."""
+        if scale is None or cam_curls is None:
+            return False
+        if not camera_trusted(cam_meta, self.gates):
+            return False
+        hand = str(hand)
+        g = []
+        for finger in FINGER_NAMES:
+            ends = scale.endpoints(SENSOR_GLOVE, finger)
+            # An input whose glove range is too small to normalise is noise
+            # over noise, the same guard the thumb vote applies.
+            if ends is not None and ends.span < self.gates.min_glove_span:
+                ends = None
+            g.append(_glove_fraction(ends,
+                                     glove_curls[FINGER_NAMES.index(finger)]))
+        c = []
+        for finger in RAIL_FINGERS:
+            got = (scale.fraction(SENSOR_CAMERA, finger,
+                                  cam_curls[FINGER_NAMES.index(finger)])
+                   if scale.normalisable(finger) else None)
+            c.append(float("nan") if got is None else float(got))
+        railed = [self.on_rail(hand, finger,
+                               glove_curls[FINGER_NAMES.index(finger)])
+                  for finger in RAIL_FINGERS]
+        for finger, flag in zip(RAIL_FINGERS, railed):
+            if flag:
+                self.railed[(hand, finger)] += 1
+        self._rows[hand].append((group, g, c, railed))
+        self._arrays.pop(hand, None)
+        self._models = {k: v for k, v in self._models.items() if k[0] != hand}
+        return True
+
+    def n_frames(self, hand: str) -> int:
+        return len(self._rows.get(str(hand), ()))
+
+    def hands(self) -> List[str]:
+        return sorted(self._rows)
+
+    def _arrays_for(self, hand: str):
+        if hand not in self._arrays:
+            rows = self._rows.get(hand, [])
+            groups = [r[0] for r in rows]
+            G = np.array([r[1] for r in rows], dtype=float).reshape(-1, 5)
+            C = np.array([r[2] for r in rows], dtype=float).reshape(-1, 4)
+            R = np.array([r[3] for r in rows], dtype=bool).reshape(-1, 4)
+            self._arrays[hand] = (groups, G, C, R)
+        return self._arrays[hand]
+
+    @property
+    def cross_session(self) -> bool:
+        return self.fitted_on is not None
+
+    def model(self, hand: str, exclude: object = None) -> RecalModel:
+        """The model fitted on every trusted frame of `hand` outside group
+        `exclude` (None: all of them). Cached. Cross-session, the other
+        session's model fitted on all of its frames, whatever `exclude`."""
+        hand = str(hand)
+        if self.fitted_on is not None:
+            return self.fitted_on.model(hand)
+        key = (hand, exclude)
+        if key in self._models:
+            return self._models[key]
+        groups, G, C, R = self._arrays_for(hand)
+        keep = np.array([exclude is None or g != exclude for g in groups],
+                        dtype=bool)
+        n = int(keep.sum())
+        out = RecalModel(hand=hand, variant=self.params.variant, n_frames=n)
+        if n < self.params.min_frames:
+            out.refused = (f"{n} trusted frames of the {hand} hand to fit on, "
+                           f"need {self.params.min_frames}")
+            self._models[key] = out
+            return out
+        Gk, Ck, Rk = G[keep], C[keep], R[keep]
+        usable = [j for j in range(5) if np.all(np.isfinite(Gk[:, j]))]
+        out.inputs = tuple(FINGER_NAMES[j] for j in usable)
+        lam = float(self.params.ridge_lambda)
+        for i, finger in enumerate(RAIL_FINGERS):
+            own = FINGER_NAMES.index(finger)
+            y = Ck[:, i]
+            # the rail rule: this finger's own railed readings do not teach
+            rows = np.isfinite(y) & ~Rk[:, i]
+            if own not in usable or rows.sum() < self.params.min_frames:
+                continue
+            cols = [own] if self.params.variant == RECAL_OWN else usable
+            X = Gk[rows][:, cols]
+            yy = y[rows]
+            mu = X.mean(axis=0)
+            sd = X.std(axis=0)
+            sd[sd < 1e-9] = 1.0
+            Z = (X - mu) / sd
+            m = len(yy)
+            beta = np.linalg.solve(Z.T @ Z / m + lam * np.eye(len(cols)),
+                                   Z.T @ (yy - yy.mean()) / m)
+            b = beta / sd
+            bias = float(yy.mean() - float(b @ mu))
+            out.coef[finger] = (bias, {FINGER_NAMES[j]: float(w)
+                                       for j, w in zip(cols, b)})
+        if not out.coef:
+            out.refused = f"no finger of the {hand} hand could be fitted"
+        self._models[key] = out
+        return out
+
+    def evaluate(self, pose_of: Mapping[object, str]) -> None:
+        """Held-out residuals, per (hand, pose, finger), before and after.
+
+        For every group k, the rows of k are predicted by the model fitted
+        WITHOUT k (cross-session: by the other session's model, which never
+        saw any of them). Before: |camera fraction - glove fraction|, the
+        glove's clipped as `HandScale.fraction` clips the camera's. After:
+        |camera fraction - prediction clipped to [0, 1]|, which is the
+        target the finger is bent to. A refused model corrects nothing, and
+        a finger on its own rail is not corrected (the rail rule), so for
+        both the after is the before.
+        """
+        self.residuals = {}
+        for hand in self.hands():
+            groups, G, C, R = self._arrays_for(hand)
+            for k in sorted(set(groups), key=str):
+                mdl = self.model(hand, exclude=k)
+                pose = pose_of.get(k, "?")
+                for r in (j for j, g in enumerate(groups) if g == k):
+                    fr = dict(zip(FINGER_NAMES, G[r]))
+                    for i, finger in enumerate(RAIL_FINGERS):
+                        cam = C[r, i]
+                        glove = fr[finger]
+                        if not (np.isfinite(cam) and np.isfinite(glove)):
+                            continue
+                        before = abs(cam - min(FRAC_MAX, max(FRAC_MIN, glove)))
+                        pred = (None if mdl.refused or R[r, i]
+                                else mdl.predict(finger, fr))
+                        after = (before if pred is None
+                                 else abs(cam - min(1.0, max(0.0, pred))))
+                        slot = self.residuals.setdefault(
+                            (hand, pose, finger), ([], []))
+                        slot[0].append(float(before))
+                        slot[1].append(float(after))
+
+    def apply(self, hand: str, exclude: object,
+              glove_pts: Sequence[Sequence[float]],
+              glove_curls: Sequence[float],
+              scale: Optional[HandScale],
+              skip: Sequence[str] = ()) -> Tuple[np.ndarray, Dict[str, float]]:
+        """Correct one glove frame with the model fitted WITHOUT `exclude`.
+
+        Each finger with a fitted row is bent so its glove curl reads the
+        predicted camera fraction, clipped to [0, 1], on the GLOVE's
+        endpoints. A finger in `skip` (the ones the rail override owns this
+        frame) is never touched, and neither is one sitting on its own rail
+        (the rail rule). Returns the points and the curl change per finger
+        moved.
+        """
+        hand = str(hand)
+        pts = np.asarray(glove_pts, dtype=float)
+        mdl = self.model(hand, exclude=exclude)
+        if scale is None or mdl.refused:
+            return pts, {}
+        fr = {}
+        for finger in FINGER_NAMES:
+            ends = scale.endpoints(SENSOR_GLOVE, finger)
+            fr[finger] = _glove_fraction(
+                ends, glove_curls[FINGER_NAMES.index(finger)])
+        out = None
+        moved: Dict[str, float] = {}
+        for finger in RAIL_FINGERS:
+            if finger in skip or finger not in mdl.coef:
+                continue
+            if self.on_rail(hand, finger,
+                            glove_curls[FINGER_NAMES.index(finger)]):
+                continue
+            _bias, weights = mdl.coef[finger]
+            if not all(np.isfinite(fr[f]) for f in weights):
+                continue
+            ends = scale.endpoints(SENSOR_GLOVE, finger)
+            pred = min(1.0, max(0.0, mdl.predict(finger, fr)))
+            curl = float(glove_curls[FINGER_NAMES.index(finger)])
+            target = float(ends.open) - pred * ends.span
+            if abs(target - curl) <= 1e-12:
+                continue
+            out = bend_finger_to_curl(pts if out is None else out, finger,
+                                      target)
+            tip = FINGER_CHAINS[finger][-1]
+            palm = float(np.linalg.norm(out[MIDDLE_MCP] - out[WRIST]))
+            change = float(np.linalg.norm(out[tip] - out[WRIST])) / palm - curl
+            moved[finger] = change
+            key = (hand, finger)
+            if abs(change) > 1e-12:
+                self.corrected[key] += 1
+                self.sum_abs[key] += abs(change)
+                self.max_abs[key] = max(self.max_abs[key], abs(change))
+        return (pts if out is None else out), moved
 
 
 # --- time alignment ----------------------------------------------------
