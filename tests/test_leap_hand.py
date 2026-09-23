@@ -2306,10 +2306,14 @@ def test_record_frame_writes_the_professor_format_on_the_mock(tmp_path: Path,
 
     out_file = out_dir / "frame_128166_keypoints.txt"
     assert out_file.is_file()
-    # one block per hand, 21 landmarks each, parsed by the reader that also
-    # reads the professor's own files
+    # one block (his format holds one hand per frame), 21 landmarks, parsed by
+    # the reader that also reads the professor's own files. The mock shows
+    # both hands, so the block is the label with the most frames.
     blocks = load_file(out_file)
-    assert sorted(b.hand for b in blocks) == ["left", "right"]
+    takes = list((out_dir / "frame_128166").glob("*.jsonl"))
+    sides = [f.hand_side for f, _w in FrameRecorder.load(takes[0])]
+    most = max(sorted(set(sides)), key=sides.count)
+    assert [b.hand for b in blocks] == [most]
     for b in blocks:
         assert len(b.points) == 21
         # millimetres in camera space: a hand is tens to hundreds of mm out,
@@ -2317,7 +2321,6 @@ def test_record_frame_writes_the_professor_format_on_the_mock(tmp_path: Path,
         assert max(abs(c) for p in b.points for c in p) < 2000.0
 
     # the take it came from is kept beside it
-    takes = list((out_dir / "frame_128166").glob("*.jsonl"))
     assert len(takes) == 1
     assert len(analyse_file(takes[0])) == 2       # both hands recorded
 
@@ -2508,10 +2511,10 @@ def test_the_medoid_exports_the_original_frame_not_an_aligned_copy(tmp_path: Pat
     rec.stop()
 
     out = tmp_path / "frame_99_keypoints.txt"
-    chosen = record_frame.write_prof_file(take, out)
-    assert set(chosen) == {"right"}
-    index, total = chosen["right"]
-    assert total == len(frames)
+    result = record_frame.write_prof_file(take, out)
+    assert result["side"] == "right"
+    assert result["counts"] == {"right": len(frames)}
+    index = result["index"]
 
     # the file holds exactly the frame that won, unrotated: its coordinates
     # are the ones the recorder stored, not a copy turned to face the mean

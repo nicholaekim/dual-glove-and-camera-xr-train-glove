@@ -9,15 +9,32 @@ Usage:
   python scripts/leap/record_prof_frames.py --reference "..\\xr trainer\\xr trainer poses"
   python scripts/leap/record_prof_frames.py --reference ... --only 153624,156023
   python scripts/leap/record_prof_frames.py --reference ... --all      # every frame, DONE ones too
+  python scripts/leap/record_prof_frames.py --reference ... --rewrite  # no camera, redo the files
 
-Each frame is recorded with the hand named in the professor's own file (the
-first line reads `Frame 153624 | Hand ID 1499 (right)`), unless `--hand`
-forces one. Frames that already have an output file are skipped unless
-`--redo` is given, so an interrupted batch can simply be run again.
+Which hand. No hand filter is passed to `record_frame.py` by default, so each
+file keeps the hand that was actually recorded (the label with the most
+frames in the take). The left/right label is the tracker's opinion and it is
+unreliable for these poses on both sides: the professor's tracker calls the
+same physical arm "right" in frame 153624 and "left" in 156023, and the
+Ultraleap labelled the operator's left hand "right" in every take of the
+second run on 2026-09-23, so filtering on "left" wrote nothing for 9 frames.
+The label in his file (`Frame 153624 | Hand ID 1499 (right)`) is shown for
+reference only. `--hand left|right` forces a filter; `--hand any` is the
+default spelled out.
+
+Frames whose keypoint file (`<out>/frame_<id>_keypoints.txt`) already exists
+are skipped unless `--redo` is given, so an interrupted batch can simply be
+run again.
+
+`--rewrite` records nothing: for each listed frame it takes the newest take in
+`<out>/frame_<id>/` and writes the keypoint file again from it. Use it after
+a change to how the file is chosen, instead of asking the operator to hold
+21 poses again.
 """
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import re
 import subprocess
 import sys
@@ -27,6 +44,7 @@ HERE = Path(__file__).resolve().parent
 RECORD_FRAME = HERE / "record_frame.py"
 _FRAME_DIR = re.compile(r"^frame_(\d+)(?:_(DONE|NA))?$")
 _HAND_LINE = re.compile(r"\((left|right)\)", re.I)
+_STAMP = re.compile(r"_(\d{8}_\d{6})")
 
 
 def list_frames(reference: Path, include_done: bool = False) -> list[tuple[str, Path]]:
@@ -52,9 +70,57 @@ def hand_in_reference(folder: Path, frame_id: str) -> str | None:
     return m.group(1).lower() if m else None
 
 
+def keypoint_file(out_dir: Path, frame_id: str) -> Path:
+    """Where `record_frame.py` writes the frame: next to its take folder."""
+    return out_dir / f"frame_{frame_id}_keypoints.txt"
+
+
 def already_recorded(out_dir: Path, frame_id: str) -> bool:
-    folder = out_dir / f"frame_{frame_id}"
-    return folder.is_dir() and any(folder.glob("*.txt"))
+    return keypoint_file(out_dir, frame_id).is_file()
+
+
+def newest_take(out_dir: Path, frame_id: str) -> Path | None:
+    """The most recent take .jsonl for this frame, by the stamp in its name."""
+    takes = list((out_dir / f"frame_{frame_id}").glob("*.jsonl"))
+    if not takes:
+        return None
+
+    def key(p: Path):
+        m = _STAMP.search(p.name)
+        return (m.group(1) if m else "", p.stat().st_mtime)
+    return max(takes, key=key)
+
+
+def record_frame_module():
+    """`record_frame.py`, imported by path (scripts/leap is not a package)."""
+    spec = importlib.util.spec_from_file_location("record_frame", RECORD_FRAME)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def rewrite(frames, out_dir: Path, hand: str | None, dry_run: bool = False) -> int:
+    """Regenerate each frame's keypoint file from its newest take."""
+    rf = record_frame_module()
+    failed = []
+    for fid, _folder in frames:
+        take = newest_take(out_dir, fid)
+        if take is None:
+            print(f"{fid}  no take in {out_dir / f'frame_{fid}'}")
+            failed.append(fid)
+            continue
+        if dry_run:
+            print(f"{fid}  {take.name}  (dry run)")
+            continue
+        result = rf.write_prof_file(take, keypoint_file(out_dir, fid), hand_filter=hand)
+        counts = ", ".join(f"{s} {n}" for s, n in result["counts"].items()) or "none"
+        kept = result["side"] or "nothing written"
+        print(f"{fid}  {take.name}  kept {kept}  (frames: {counts})")
+        if result["side"] is None:
+            failed.append(fid)
+    print(f"\n{len(frames) - len(failed)} keypoint file(s) written, {len(failed)} not"
+          + (f" ({', '.join(failed)})" if failed else ""))
+    return 1 if failed else 0
 
 
 def main(argv=None) -> int:
@@ -62,15 +128,19 @@ def main(argv=None) -> int:
     p.add_argument("--reference", type=Path, required=True,
                    help="folder holding the professor's frame_<id>[_NA|_DONE] folders")
     p.add_argument("--out-dir", type=Path, default=Path("recordings") / "leap" / "prof_frames")
-    p.add_argument("--hand", choices=("left", "right"), default=None,
-                   help="force one hand (default: the hand named in each frame's file)")
+    p.add_argument("--hand", choices=("any", "left", "right"), default="any",
+                   help="keep only frames with this label (default: any, the file "
+                        "keeps the label with the most frames; labels are unreliable)")
     p.add_argument("--only", default=None, help="comma-separated frame ids to record")
     p.add_argument("--all", action="store_true", help="every frame, not only the 21 _NA ones")
     p.add_argument("--redo", action="store_true", help="record frames that already have output")
+    p.add_argument("--rewrite", action="store_true",
+                   help="record nothing; rewrite each keypoint file from its newest take")
     p.add_argument("--seconds", type=float, default=5.0)
     p.add_argument("--prep", type=float, default=5.0)
     p.add_argument("--dry-run", action="store_true", help="list what would run and stop")
     args = p.parse_args(argv)
+    hand = None if args.hand == "any" else args.hand
 
     frames = list_frames(args.reference, include_done=args.all)
     if args.only:
@@ -80,15 +150,21 @@ def main(argv=None) -> int:
         print(f"no frames found under {args.reference}")
         return 2
 
+    if args.rewrite:
+        return rewrite(frames, args.out_dir, hand, dry_run=args.dry_run)
+
     todo = [(fid, folder) for fid, folder in frames if args.redo or not already_recorded(args.out_dir, fid)]
     print(f"{len(frames)} frame(s) listed, {len(todo)} to record, {len(frames) - len(todo)} already done")
     failed = []
     for n, (fid, folder) in enumerate(todo, 1):
-        hand = args.hand or hand_in_reference(folder, fid) or "left"
         cmd = [sys.executable, str(RECORD_FRAME), fid, "--reference", str(args.reference),
-               "--out-dir", str(args.out_dir), "--hand", hand,
+               "--out-dir", str(args.out_dir),
                "--seconds", str(args.seconds), "--prep", str(args.prep)]
-        print(f"\n[{n}/{len(todo)}] frame {fid}, {hand} hand" + ("  (dry run)" if args.dry_run else ""))
+        if hand:
+            cmd += ["--hand", hand]
+        his = hand_in_reference(folder, fid) or "no"
+        print(f"\n[{n}/{len(todo)}] frame {fid}, keeping {hand or 'any'} hand"
+              f" (his file says {his})" + ("  (dry run)" if args.dry_run else ""))
         if args.dry_run:
             print("   ", " ".join(cmd))
             continue
