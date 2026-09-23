@@ -4,12 +4,15 @@ The fusion itself is `fuse_skeletons` and friends, tested in test_fusion.py
 and test_drift_anchor.py. What is new live, and tested here, is everything
 around it: pairing a lagged glove frame against a short camera buffer,
 deciding hand-id stability as frames arrive (and deciding it the way the
-offline `flag_hand_id_stability` does), learning rails and endpoints from a
-warm-up instead of a session, and `scripts/fuse_live.py` end to end.
+offline `flag_hand_id_stability` does), the ACQUIRE gate in front of each
+hand's warm-up, learning rails and endpoints from that warm-up instead of a
+session, and `scripts/fuse_live.py` end to end.
 """
 import importlib.util
 import json
 import socket
+import time
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -24,13 +27,19 @@ from cam_hand.fusion import (
 )
 from cam_hand.live_fusion import (
     FIT_NONE,
+    MIN_OPEN_CAMERA_FRAMES,
     PHASE_FIST,
     PHASE_OPEN,
-    REFUSED,
-    SEPARATION,
+    STAGE_ACQUIRE,
+    STAGE_COUNTDOWN,
+    STAGE_NOT_ACQUIRED,
+    AcquireStatus,
     CameraBuffer,
     Warmup,
+    acquire_status,
+    countdown_text,
 )
+from leap_hand.protocol import HandReading
 
 ROOT = Path(__file__).resolve().parents[1]
 HZ = 90.0
@@ -161,23 +170,31 @@ def test_warmup_learns_rails_and_endpoints_from_open_then_fist():
 
 
 def test_warmup_refuses_a_hand_never_seen_open():
+    """Every cause is named, each with what the operator can do about it."""
     result = _warmup().learn(fit=FIT_NONE)
     assert set(result.refused) == {"left"}
     why = result.refused["left"]
-    assert why.startswith(f"left: {REFUSED}")
-    assert "glove: no rail" in why and "camera: 0 frames" in why
+    assert why.startswith("LEFT hand refused: ")
+    assert result.causes["left"] == [
+        "the LEFT glove never read the index finger straight and still (no "
+        "rail in 60 frames): keep the fingers flat and still for the whole "
+        "OPEN PALM phase",
+        "the camera never saw the LEFT hand during the open palm: hold it 18 "
+        "to 28 cm above the module, palm to the lens"]
     # With the override off there are no override rails, but the gates still
     # know where a straight finger reads.
     assert result.rails == {}
     assert ("right", "index") in result.gate_rails
-    assert f"REFUSED left: {REFUSED}" in "\n".join(result.lines())
+    text = "\n".join(result.lines())
+    assert "  LEFT hand refused:\n    - the LEFT glove never read" in text
 
 
 def test_warmup_refuses_a_hand_the_camera_barely_saw_open():
     result = _warmup(right_camera_open=5).learn(fit=FIT_NONE)
-    assert "right" in result.refused
-    assert "camera: 5 frames" in result.refused["right"]
-    assert "glove" not in result.refused["right"]
+    assert result.causes["right"] == [
+        "the camera saw the RIGHT hand on only 5 frames of the open palm "
+        f"(need {MIN_OPEN_CAMERA_FRAMES}): hold it 18 to 28 cm above the "
+        "module, palm to the lens, for the whole phase"]
 
 
 def test_warmup_refuses_a_fist_that_did_not_close_the_hand():
@@ -185,13 +202,151 @@ def test_warmup_refuses_a_fist_that_did_not_close_the_hand():
     to about 1.62: a span under `min_glove_span` (0.40), which would make
     every flexion fraction noise."""
     result = _warmup(right_fist_base=1.60).learn(fit=FIT_NONE)
-    why = result.refused["right"]
-    assert why.startswith(f"right: {SEPARATION} (glove span 0.3")
-    assert "camera span 0.8" in why
     glove_span, camera_span = result.index_spans("right")
     assert glove_span < 0.40 <= camera_span
+    assert result.causes["right"] == [
+        f"the RIGHT glove did not register the fist (index span "
+        f"{glove_span:.3f}, need 0.40): close a full fist during the FIST "
+        "phase, and check the glove is calibrated in XR Trainer"]
     # The same warm-up with a real fist is not refused.
     assert "right" not in _warmup().learn(fit=FIT_NONE).refused
+
+
+# --- the ACQUIRE gate, and one hand after the other ---------------------------
+
+def _reading(hand="left", visible_s=1.0, height_cm=23.0):
+    return HandReading(hand_side=hand, hand_id=1,
+                       visible_time_us=int(visible_s * 1e6),
+                       height_cm=height_cm, lateral_cm=2.0,
+                       view_angle_deg=10.0)
+
+
+def test_acquire_status_names_what_is_still_missing():
+    nothing = acquire_status("left", 0, 0, None, False)
+    assert not nothing.ok
+    assert nothing.line() == (
+        "ACQUIRE LEFT  glove: 0 LEFT packets in the last second, need 10 (is "
+        "XR Trainer streaming?)  camera: no LEFT hand (raise it to 18 to 28 cm "
+        "above the module)")
+    other = acquire_status("left", 60, 60, None, True)
+    assert other.line(12.3) == ("ACQUIRE LEFT  glove ok  camera: RIGHT hand "
+                                "seen, need LEFT  (12 s left)")
+    assert other.caption_text == "RIGHT hand seen, need LEFT"
+    assert other.refusal(60) == ("the LEFT hand was not acquired in 60 s: "
+                                 "camera: RIGHT hand seen, need LEFT")
+    only_right = acquire_status("left", 0, 60, _reading(), False)
+    assert only_right.camera_ok and not only_right.glove_ok
+    assert only_right.glove_text.startswith("glove: no LEFT packets, only "
+                                            "RIGHT")
+    young_low = acquire_status("left", 60, 0, _reading(visible_s=0.2,
+                                                       height_cm=12.4), False)
+    assert young_low.camera_text == (
+        "camera: LEFT hand seen, hold it still (0.2 of 0.5 s tracked), raise "
+        "it to 18 to 28 cm (now 12 cm)")
+    assert acquire_status("left", 10, 0, _reading(), False).ok
+    assert acquire_status("left", 9, 0, _reading(), False).glove_ok is False
+    assert countdown_text("left", 2.0) == "LEFT hand acquired: open palm in 2"
+    assert countdown_text("left", 0.6) == "LEFT hand acquired: open palm in 1"
+
+
+def test_acquire_gate_passes_at_once_on_the_mock_sensors():
+    """The mock hand is open, in the band and facing the lens from its first
+    frame, so the gate waits only for the half second of tracking."""
+    from cam_hand.live_fusion import CameraSource, GloveSource
+
+    camera = CameraSource(("right",), mock=True).start()
+    glove = GloveSource(("right",), mock=True).start()
+    seen = []
+
+    def poll(_w):
+        camera.drain()
+        glove.drain()
+
+    def acquire(hand, now):
+        seen.append(acquire_status(hand, glove.recent_packets(hand, now),
+                                   glove.recent_packets("left", now),
+                                   camera.reading(hand, now),
+                                   camera.seen_recently("left", now)))
+        return seen[-1]
+
+    try:
+        camera.coach("open_palm")
+        w = Warmup(("right",), open_s=0.0, fist_s=0.0, acquire_s=3.0,
+                   countdown_s=0.0)
+        t0 = time.time()
+        w.run(poll, lambda *a: None, acquire=acquire)
+        took = time.time() - t0
+    finally:
+        camera.stop()
+        glove.stop()
+    assert not w.not_acquired
+    assert seen[-1].ok and seen[-1].camera_text == "camera ok"
+    assert took < 1.5
+
+
+def _clocked():
+    """A clock that advances 50 ms per sleep, so a warm-up runs instantly."""
+    now = [0.0]
+
+    def sleep(_dt):
+        now[0] += 0.05
+    return (lambda: now[0]), sleep
+
+
+def _status(hand, ok):
+    return AcquireStatus(hand=hand, glove_ok=True, glove_text="glove ok",
+                         camera_ok=ok,
+                         camera_text="camera ok" if ok else
+                         f"camera: no {hand.upper()} hand",
+                         caption_text="")
+
+
+def test_warmup_runs_each_hand_in_turn_and_learns_from_its_own_phases():
+    clock, sleep = _clocked()
+    cues = []
+    calls = Counter()
+
+    def poll(w):
+        # Both gloves stream the whole time. Each frame is tagged with the
+        # stage and the hand whose warm-up was running when it arrived.
+        for hand in ("left", "right"):
+            w.add_glove(hand, OPEN_GLOVE, frame=(w.phase, w.active))
+
+    def acquire(hand, _now):
+        calls[hand] += 1
+        return _status(hand, calls[hand] > 3)
+
+    w = Warmup(("left", "right"), open_s=0.2, fist_s=0.2, acquire_s=5.0,
+               countdown_s=0.1)
+    w.run(poll, lambda stage, hand, s: cues.append((stage, hand)),
+          acquire=acquire, clock=clock, sleep=sleep)
+    assert cues == [(STAGE_ACQUIRE, "left"), (STAGE_COUNTDOWN, "left"),
+                    (PHASE_OPEN, "left"), (PHASE_FIST, "left"),
+                    (STAGE_ACQUIRE, "right"), (STAGE_COUNTDOWN, "right"),
+                    (PHASE_OPEN, "right"), (PHASE_FIST, "right")]
+    # Nothing from the gate or the countdown, nothing of the other hand.
+    assert {h for h, _c, _tag in w.glove} == {"left", "right"}
+    for hand, _curls, (phase, active) in w.glove:
+        assert hand == active and phase in (PHASE_OPEN, PHASE_FIST)
+
+
+def test_a_hand_the_gate_times_out_on_is_refused_and_the_next_one_goes_on():
+    clock, sleep = _clocked()
+    cues = []
+    w = Warmup(("left", "right"), open_s=0.2, fist_s=0.2, acquire_s=0.3,
+               countdown_s=0.1)
+    w.run(lambda _w: None, lambda stage, hand, s: cues.append((stage, hand)),
+          acquire=lambda hand, _now: _status(hand, hand == "right"),
+          clock=clock, sleep=sleep)
+    assert cues[:2] == [(STAGE_ACQUIRE, "left"), (STAGE_NOT_ACQUIRED, "left")]
+    assert cues[2:] == [(STAGE_ACQUIRE, "right"), (STAGE_COUNTDOWN, "right"),
+                        (PHASE_OPEN, "right"), (PHASE_FIST, "right")]
+    result = w.learn(fit=FIT_NONE)
+    assert result.not_acquired == ("left",)
+    assert result.refused["left"] == ("LEFT hand refused: the LEFT hand was "
+                                      "not acquired in 0.3 s: camera: no LEFT "
+                                      "hand")
+    assert "  left: not acquired, so no warm-up" in result.lines()
 
 
 # --- the command, end to end on the mocks ---------------------------------------
@@ -205,6 +360,39 @@ def _live_module():
     return module
 
 
+def _quick(live, monkeypatch):
+    """No beeps and a short countdown: a mock session is not a rehearsal."""
+    monkeypatch.setattr(live, "beep", lambda *a, **k: None)
+    monkeypatch.setattr(live, "COUNTDOWN_S", 0.1)
+
+
+def _low_glove_floor(live, monkeypatch):
+    """The UNFITTED mock glove's index spans only 0.36 of a palm length at
+    its fist, under the 0.40 a real glove clears by far (template open
+    1.71-2.07, fist 0.63-0.80). A plumbing test lowers that one floor on the
+    script's own gates; the production default is untouched."""
+    from dataclasses import replace
+
+    from cam_hand.fusion import DEFAULT_GATES
+    monkeypatch.setattr(live, "DEFAULT_GATES",
+                        replace(DEFAULT_GATES, min_glove_span=0.30))
+
+
+def _camera_without(live, monkeypatch, hand):
+    """The mock camera, minus every frame of `hand`."""
+    real = live.CameraSource
+
+    class Without(real):
+        def start(self):
+            super().start()
+            drain = self.stream.drain
+            self.stream.drain = lambda n=16: [(s, lh) for s, lh in drain(n)
+                                              if s != hand]
+            return self
+
+    monkeypatch.setattr(live, "CameraSource", Without)
+
+
 def _osc_address_and_args(datagram):
     from pythonosc.osc_message import OscMessage
     msg = OscMessage(datagram)
@@ -213,26 +401,21 @@ def _osc_address_and_args(datagram):
 
 def test_mock_session_fuses_to_jsonl_and_osc(tmp_path, monkeypatch):
     live = _live_module()
-    monkeypatch.setattr(live, "beep", lambda *a, **k: None)
+    _quick(live, monkeypatch)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
     out = tmp_path / "live.jsonl"
     try:
-        # The mock glove closes on a slow sine and reaches its fist about 2 s
-        # in, and even then the UNFITTED cartoon's index spans only 0.36 of
-        # a palm length, under the 0.40 a real glove clears by far (template
-        # open 1.71-2.07, fist 0.63-0.80). So this plumbing test lowers that
-        # one floor on the script's own gates; the production default is
-        # untouched, and the fitted mock below passes it as it stands.
-        from cam_hand.fusion import DEFAULT_GATES
-        from dataclasses import replace
-        monkeypatch.setattr(live, "DEFAULT_GATES",
-                            replace(DEFAULT_GATES, min_glove_span=0.30))
+        # The mock glove starts open on the OPEN PALM cue and reaches its
+        # fist about 2 s later; the fitted mock below passes the glove's
+        # span floor as it stands, this unfitted one needs it lowered.
+        _low_glove_floor(live, monkeypatch)
         code = live.main(["--mock-glove", "--mock-leap", "--no-view",
                           "--seconds", "2", "--hand", "right",
                           "--out", str(out), "--fit-template", "none",
+                          "--acquire-timeout", "5",
                           "--warmup-open", "1", "--warmup-fist", "1.2",
                           "--osc-out", f"127.0.0.1:{port}"])
         assert code == 0
@@ -267,14 +450,18 @@ def test_mock_session_with_no_open_palm_stops_with_exit_code_2(tmp_path,
                                                                 monkeypatch,
                                                                 capsys):
     live = _live_module()
-    monkeypatch.setattr(live, "beep", lambda *a, **k: None)
+    _quick(live, monkeypatch)
     out = tmp_path / "never.jsonl"
     code = live.main(["--mock-glove", "--mock-leap", "--no-view",
                       "--seconds", "1", "--hand", "right",
                       "--out", str(out), "--fit-template", "none",
+                      "--acquire-timeout", "5",
                       "--warmup-open", "0", "--warmup-fist", "0.3"])
     assert code == 2
-    assert f"right: {REFUSED}" in capsys.readouterr().out
+    text = capsys.readouterr().out
+    assert ("the camera never saw the RIGHT hand during the open palm: hold "
+            "it 18 to 28 cm above the module, palm to the lens") in text
+    assert "No hand passed the warm-up" in text
     assert not out.exists()                     # nothing was fused
 
 
@@ -283,13 +470,15 @@ def test_mock_session_that_never_closes_the_fist_is_refused(tmp_path,
                                                             capsys):
     """One second of the mock glove is a finger that barely moved."""
     live = _live_module()
-    monkeypatch.setattr(live, "beep", lambda *a, **k: None)
+    _quick(live, monkeypatch)
     code = live.main(["--mock-glove", "--mock-leap", "--no-view",
                       "--seconds", "1", "--hand", "right",
                       "--fit-template", "none",
+                      "--acquire-timeout", "5",
                       "--warmup-open", "0.5", "--warmup-fist", "0.5"])
     assert code == 2
-    assert f"right: {SEPARATION}" in capsys.readouterr().out
+    assert ("the RIGHT glove did not register the fist (index span "
+            in capsys.readouterr().out)
 
 
 def test_mock_session_saves_its_bone_measurement_beside_the_output(
@@ -300,12 +489,13 @@ def test_mock_session_saves_its_bone_measurement_beside_the_output(
     from cam_hand.template_fit import load_measurement
 
     live = _live_module()
-    monkeypatch.setattr(live, "beep", lambda *a, **k: None)
+    _quick(live, monkeypatch)
     out = tmp_path / "session" / "live.jsonl"
     code = live.main(["--mock-glove", "--mock-leap", "--no-view",
                       "--seconds", "0.5", "--hand", "right",
                       "--out", str(out), "--fit-template", "auto",
                       "--drift-anchor", "on",
+                      "--acquire-timeout", "5",
                       "--warmup-open", "3", "--warmup-fist", "1.2"])
     assert code == 0
     saved = out.parent / "template_right.json"
@@ -313,6 +503,115 @@ def test_mock_session_saves_its_bone_measurement_beside_the_output(
     m = load_measurement(saved)
     assert m.hand == "right" and m.from_open and m.n_frames >= 200
     assert out.read_text(encoding="utf-8").strip()
+
+
+def test_mock_session_times_out_when_the_camera_never_sees_the_hand(
+        tmp_path, monkeypatch, capsys):
+    """The camera reports only the RIGHT hand: the LEFT hand's gate says so
+    on the HUD, times out, and with no hand left the program exits 2."""
+    live = _live_module()
+    _quick(live, monkeypatch)
+    _camera_without(live, monkeypatch, "left")
+    out = tmp_path / "never.jsonl"
+    code = live.main(["--mock-glove", "--mock-leap", "--no-view",
+                      "--seconds", "1", "--hand", "left",
+                      "--out", str(out), "--fit-template", "none",
+                      "--acquire-timeout", "0.5"])
+    text = capsys.readouterr().out
+    assert code == 2, text
+    assert "ACQUIRE LEFT  " in text
+    assert "camera: RIGHT hand seen, need LEFT" in text
+    assert ("LEFT hand refused: the LEFT hand was not acquired in 0.5 s: "
+            "camera: RIGHT hand seen, need LEFT") in text
+    assert "LEFT hand: OPEN PALM" not in text   # no phase ever started
+    assert not out.exists()
+
+
+def test_mock_session_goes_on_with_the_other_hand_after_a_timeout(
+        tmp_path, monkeypatch, capsys):
+    live = _live_module()
+    _quick(live, monkeypatch)
+    _low_glove_floor(live, monkeypatch)
+    _camera_without(live, monkeypatch, "left")
+    out = tmp_path / "right_only.jsonl"
+    code = live.main(["--mock-glove", "--mock-leap", "--no-view",
+                      "--seconds", "0.5", "--hand", "both",
+                      "--out", str(out), "--fit-template", "none",
+                      "--acquire-timeout", "0.5", "--warmup-open", "1",
+                      "--warmup-fist", "1.2"])
+    text = capsys.readouterr().out
+    assert code == 0, text
+    assert "Going on to the RIGHT hand." in text
+    assert ("Fusing the RIGHT hand only: the LEFT hand was refused (above)."
+            in text)
+    hands = {json.loads(line)["hand"]
+             for line in out.read_text(encoding="utf-8").splitlines()}
+    assert hands == {"right"}
+
+
+def test_mock_session_warms_up_the_left_hand_then_the_right(tmp_path,
+                                                             monkeypatch,
+                                                             capsys):
+    """--hand both: acquire, countdown, open, fist for LEFT, then the same
+    for RIGHT, in the console and in the camera window's caption."""
+    live = _live_module()
+    _quick(live, monkeypatch)
+    _low_glove_floor(live, monkeypatch)
+    captions = []
+
+    class View:
+        def __init__(self, *a, **k):
+            pass
+
+        def start(self):
+            return self
+
+        def caption(self, text, band=None):
+            captions.append(text)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(live, "CameraView", View)
+    out = tmp_path / "both.jsonl"
+    code = live.main(["--mock-glove", "--mock-leap", "--no-view",
+                      "--seconds", "0.5", "--hand", "both",
+                      "--out", str(out), "--fit-template", "none",
+                      "--acquire-timeout", "5",
+                      "--warmup-open", "1",
+                      "--warmup-fist", "1.2"])
+    text = capsys.readouterr().out
+    assert code == 0, text
+
+    def in_order(lines, wanted):
+        at = 0
+        for want in wanted:
+            while at < len(lines) and not lines[at].startswith(want):
+                at += 1
+            assert at < len(lines), f"{want!r} missing or out of order"
+            at += 1
+
+    console = text.replace("\r", "\n").splitlines()
+    in_order(console, [
+        "Warm-up, one hand at a time (LEFT, then RIGHT)",
+        "LEFT hand: ACQUIRE. Hold the LEFT hand open",
+        "LEFT hand acquired: open palm in 1",
+        "LEFT hand: OPEN PALM flat to the camera for 1 s",
+        "LEFT hand: FIST for 1.2 s",
+        "RIGHT hand: ACQUIRE. Hold the RIGHT hand open",
+        "RIGHT hand acquired: open palm in 1",
+        "RIGHT hand: OPEN PALM flat to the camera for 1 s",
+        "RIGHT hand: FIST for 1.2 s",
+        "Warm-up learned:",
+        "Fusing for 0.5 s."])
+    in_order(captions, [
+        "LEFT hand: ACQUIRE", "LEFT hand acquired: open palm in",
+        "LEFT hand: OPEN PALM", "LEFT hand: FIST",
+        "RIGHT hand: ACQUIRE", "RIGHT hand acquired: open palm in",
+        "RIGHT hand: OPEN PALM", "RIGHT hand: FIST", "LIVE FUSION"])
+    hands = {json.loads(line)["hand"]
+             for line in out.read_text(encoding="utf-8").splitlines()}
+    assert hands == {"left", "right"}
 
 
 # --- replay: the live path against fuse_all ------------------------------------

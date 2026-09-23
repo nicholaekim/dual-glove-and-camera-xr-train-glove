@@ -1444,27 +1444,60 @@ python scripts\fuse_live.py --osc-out 127.0.0.1:9010      # to a renderer
 python scripts\fuse_live.py --mock-glove --mock-leap --no-view --seconds 10
 ```
 
-**Warm-up, about six seconds.** With XR Trainer streaming to port 9002 and
-the hand 18 to 28 cm over the module, follow the beeps and the camera
-window's caption: **OPEN PALM flat to the camera** (`--warmup-open`, 3 s),
-then **FIST** (`--warmup-fist`, 3 s). The open palm gives the glove's rails,
-the camera's open reference and, with `--fit-template auto` (the default),
-the frames the operator's bone lengths are measured on; the fist gives both
-sensors' flexed ends. What was learned is printed: rails and endpoints per
-finger, the fit or why it was refused (too few trusted open-palm frames; that
-hand is then fused on the raw template), and each hand's glove lag and where
-it came from. With `--out`, a fitted hand's measurement is also saved beside
-the output as `template_<hand>.json`, the file `fuse_poses.py` writes, so a
-later run can reuse it with `--fit-template PATH`. A hand is not fused at all,
-and the program stops with exit code 2 saying which and why, when its open
-palm was not seen by both sensors, or when the fist did not separate from the
-open palm: an index span under `min_glove_span` (0.40) on the glove or
-`min_cam_span` (0.30) on the camera.
+**Warm-up, one hand at a time.** With `--hand both` the LEFT hand goes
+first, then the RIGHT, and each hand learns from its own warm-up only. The
+console, the HUD and the camera window's caption all name the hand. Per
+hand, with XR Trainer streaming to port 9002:
+
+1. **ACQUIRE.** Hold that hand open over the module, 18 to 28 cm up, palm to
+   the lens. Nothing starts until that hand's glove is streaming (10 packets
+   in the last second) and the camera has tracked that hand for half a
+   second inside the height band, palm to the lens, over the module: the
+   same `acquire_failures` gate the coached recorder uses. The HUD line says
+   what is still missing, e.g. `ACQUIRE LEFT  glove ok  camera: no LEFT hand
+   (raise it to 18 to 28 cm above the module)` or `camera: RIGHT hand seen,
+   need LEFT`. It waits up to `--acquire-timeout` seconds (60); a hand that
+   times out is refused and the next hand's warm-up starts.
+2. A beep, then `open palm in 2..1`.
+3. **OPEN PALM flat to the camera** (`--warmup-open`, 4 s), with a beep.
+4. **FIST** (`--warmup-fist`, 4 s), with a beep.
+
+```text
+LEFT hand: ACQUIRE. Hold the LEFT hand open over the module, palm to the lens, 18 to 28 cm up (waiting up to 60 s).
+ACQUIRE LEFT  glove ok  camera: no LEFT hand (raise it to 18 to 28 cm above the module)  (57 s left)
+LEFT hand acquired: open palm in 1
+LEFT hand: OPEN PALM flat to the camera for 4 s
+LEFT OPEN PALM  0.2s  glove 60/s  camera fresh
+LEFT hand: FIST for 4 s
+LEFT FIST       0.2s  glove 60/s  camera fresh
+RIGHT hand: ACQUIRE. Hold the RIGHT hand open over the module, ...
+```
+
+The open palm gives the glove's rails, the camera's open reference and, with
+`--fit-template auto` (the default), the frames the operator's bone lengths
+are measured on; the fist gives both sensors' flexed ends. What was learned
+is printed: rails and endpoints per finger, the fit or why it was refused
+(too few trusted open-palm frames; that hand is then fused on the raw
+template), and each hand's glove lag and where it came from. With `--out`, a
+fitted hand's measurement is also saved beside the output as
+`template_<hand>.json`, the file `fuse_poses.py` writes, so a later run can
+reuse it with `--fit-template PATH`.
+
+A hand is **refused**, and not fused, when its ACQUIRE gate timed out, when
+the camera did not see its open palm, or when the fist did not separate from
+the open palm: an index span under `min_glove_span` (0.40) on the glove or
+`min_cam_span` (0.30) on the camera. Every cause is printed with what to do
+about it, e.g. `the camera never saw the LEFT hand during the open palm:
+hold it 18 to 28 cm above the module, palm to the lens` or `the LEFT glove
+did not register the fist (index span 0.001, need 0.40): close a full fist
+during the FIST phase, and check the glove is calibrated in XR Trainer`.
+With `--hand both` the other hand is still fused if it passed; when every
+hand is refused the program stops with exit code 2.
 
 **The warm-up is an initial calibration, not the offline learning.**
 `fuse_poses.py` learns its rails and endpoints label-free over a whole
-session of poses; six seconds of one open palm and one fist is a far smaller
-sample, taken once. Before trusting live output:
+session of poses; eight seconds of one open palm and one fist per hand is a
+far smaller sample, taken once. Before trusting live output:
 
 1. **Replay a recorded session** with `--replay DIR`. Every take goes through
    the live path at full speed, with what `fuse_poses.py` learns from that
@@ -1539,7 +1572,7 @@ scripts/
                              coached one-hand protocol with --camera leap
   fuse_poses.py              fuse + glove/camera/fused comparison report
                              (--exclude a take, --profile a glove)
-  fuse_live.py               the same fusion live, after a 6 s warm-up
+  fuse_live.py               the same fusion live, after a per-hand warm-up (acquire, open palm, fist)
                              (--out JSONL, --osc-out HOST:PORT); --replay
                              checks it against fuse_poses on a session
 scripts/leap/

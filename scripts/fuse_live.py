@@ -9,20 +9,36 @@ by `cam_hand.live_fusion.LiveFusion`; see that module for what differs live
 (pairing against a short camera buffer, hand-id stability decided as frames
 arrive, and learning from a warm-up instead of a whole session).
 
-THE WARM-UP (about six seconds, before anything is fused)
-  Hold the gloved hand(s) over the module, 18 to 28 cm up, and follow the
-  beeps and the camera window's caption:
+THE WARM-UP (one hand at a time, before anything is fused)
+  With --hand both the LEFT hand goes first, then the RIGHT, and each hand
+  learns from its own warm-up only. For each hand, follow the beeps, the
+  console and the camera window's caption, which all name the hand:
 
-    1. OPEN PALM flat to the camera   --warmup-open seconds (default 3)
-    2. FIST                           --warmup-fist seconds (default 3)
+    1. ACQUIRE      hold that hand open over the module, 18 to 28 cm up,
+                    palm to the lens. Nothing starts until that hand's glove
+                    is streaming (10 packets in the last second) and the
+                    camera has tracked that hand for half a second inside
+                    the height band, palm to the lens, over the module: the
+                    recorder's own ACQUIRE gate. The HUD line says what is
+                    still missing, e.g. "ACQUIRE LEFT  glove ok  camera: no
+                    LEFT hand (raise it to 18 to 28 cm above the module)".
+                    Up to --acquire-timeout seconds (default 60).
+    2. a beep, then "open palm in 2..1"
+    3. OPEN PALM flat to the camera   --warmup-open seconds (default 4)
+    4. FIST                           --warmup-fist seconds (default 4)
 
-  From those frames it learns, per hand: the glove's rails (its reading for
-  each straight finger), both sensors' open and flexed curl endpoints, and,
-  with --fit-template auto, the operator's bone lengths from the open-palm
-  camera frames (refused, with the reason printed, when too few open frames
-  were trusted; that hand is then fused on the raw template). It prints what
-  it learned. A hand whose open palm was not seen by both sensors cannot be
-  fused, and the program stops with exit code 2 saying which hand and why.
+  Each phase starts with a beep. From those frames it learns, per hand: the
+  glove's rails (its reading for each straight finger), both sensors' open
+  and flexed curl endpoints, and, with --fit-template auto, the operator's
+  bone lengths from the open-palm camera frames (refused, with the reason
+  printed, when too few open frames were trusted; that hand is then fused on
+  the raw template). It prints what it learned.
+
+  A hand is REFUSED, with every cause and what to do about it, when its
+  ACQUIRE gate timed out, when the camera did not see its open palm, or when
+  the fist did not close it on the glove or on the camera. A refused hand is
+  not fused; with --hand both the other hand still is. When every hand is
+  refused the program stops with exit code 2.
 
 THE OUTPUTS, one per glove frame of each fused hand
   --out PATH.jsonl      one JSON line per fused frame: t_glove, t_cam (None
@@ -53,8 +69,8 @@ it also forgets what it learned whenever a hand's camera has been stale for
 more than a second, because the hand can come back in any pose.
 
 A WARM-UP IS AN INITIAL CALIBRATION, not the offline learning. fuse_poses.py
-learns its rails and endpoints label-free over a whole session of poses; six
-seconds of open palm and fist is a much smaller sample. Before trusting live
+learns its rails and endpoints label-free over a whole session of poses;
+eight seconds of open palm and fist per hand is a much smaller sample. Before trusting live
 output: run --replay on a recorded session (below), repeat the warm-up
 across glove don/doff and across days and compare what it prints, and check
 the lag's sign with one deliberate open-to-fist movement (the HUD's glove
@@ -72,8 +88,8 @@ REPLAY (--replay DIR, no hardware, no warm-up)
   the session, the profile as fallback); --hand is ignored.
 
 Exit codes: 0 normal (Ctrl-C or --seconds ends a normal run; a replay that
-agrees), 1 a sensor or argument problem, 2 the warm-up refused a hand, 3 a
-replay that disagrees with fuse_all.
+agrees), 1 a sensor or argument problem, 2 the warm-up refused every hand,
+3 a replay that disagrees with fuse_all.
 
 Usage:
   python scripts/fuse_live.py                               # both hands
@@ -90,6 +106,7 @@ import tempfile
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -131,8 +148,15 @@ from cam_hand.fusion import (  # noqa: E402
     pairing_clock,
 )
 from cam_hand.live_fusion import (  # noqa: E402
+    ACQUIRE_TIMEOUT_S,
+    COUNTDOWN_S,
     MIN_SCORE,
     MOCK_POSE,
+    STAGE_ACQUIRE,
+    STAGE_COUNTDOWN,
+    STAGE_NOT_ACQUIRED,
+    WARMUP_FIST_S,
+    WARMUP_OPEN_S,
     CameraBuffer,
     CameraSource,
     GloveSource,
@@ -140,7 +164,10 @@ from cam_hand.live_fusion import (  # noqa: E402
     LiveFusion,
     OscSink,
     Warmup,
+    acquire_status,
+    band_words,
     camera_fresh,
+    countdown_text,
     hud_line,
     hud_segment,
     learn_from_session,
@@ -159,8 +186,9 @@ from leap_hand.protocol import (  # noqa: E402
 
 HAND_CHOICES = ("left", "right", "both")
 # A phase cue: the high note says "change pose now", as in the coached
-# recording protocol.
+# recording protocol. The lower note says "hand acquired, get ready".
 CUE_FREQ = 1320
+ACQUIRED_FREQ = 880
 CUE_MS = 180
 
 
@@ -189,10 +217,15 @@ def build_parser() -> argparse.ArgumentParser:
                         f"Default {FIT_AUTO}: measured per hand on the warm-up's "
                         "open-palm camera frames. PATH: a saved measurement "
                         "(e.g. <session>/template_right.json from fuse_poses)")
-    p.add_argument("--warmup-open", type=float, default=3.0,
-                   help="seconds of the OPEN PALM warm-up phase (default 3)")
-    p.add_argument("--warmup-fist", type=float, default=3.0,
-                   help="seconds of the FIST warm-up phase (default 3)")
+    p.add_argument("--warmup-open", type=float, default=WARMUP_OPEN_S,
+                   help="seconds of each hand's OPEN PALM warm-up phase "
+                        f"(default {WARMUP_OPEN_S:g})")
+    p.add_argument("--warmup-fist", type=float, default=WARMUP_FIST_S,
+                   help="seconds of each hand's FIST warm-up phase "
+                        f"(default {WARMUP_FIST_S:g})")
+    p.add_argument("--acquire-timeout", type=float, default=ACQUIRE_TIMEOUT_S,
+                   help="seconds the ACQUIRE gate waits for each hand before "
+                        f"refusing it (default {ACQUIRE_TIMEOUT_S:g})")
     p.add_argument("--max-dt", type=float, default=0.05,
                    help="max seconds between a glove frame (after its lag) "
                         "and the camera frame it is paired with (default 0.05)")
@@ -613,14 +646,49 @@ def main(argv=None) -> int:
                 pass
 
     # --- the warm-up ------------------------------------------------------
-    warmup = Warmup(hands, open_s=args.warmup_open, fist_s=args.warmup_fist)
+    warmup = Warmup(hands, open_s=args.warmup_open, fist_s=args.warmup_fist,
+                    acquire_s=args.acquire_timeout, countdown_s=COUNTDOWN_S,
+                    band=DEFAULT_BAND)
+    words = band_words(DEFAULT_BAND)
+    print("Warm-up, one hand at a time ("
+          + ", then ".join(h.upper() for h in hands)
+          + f"): acquire, open palm {args.warmup_open:g} s, fist "
+          f"{args.warmup_fist:g} s.")
+    shown = [None]
+    next_hud = [0.0]
 
-    def cue(phase, seconds):
-        beeper.beep(CUE_FREQ, CUE_MS)
-        camera.coach(MOCK_POSE.get(phase))
-        view.caption(f"WARM-UP: {phase} ({seconds:g} s)", band=DEFAULT_BAND)
+    def caption(text):
+        # The window's caption is a status file; write it only on a change.
+        if text != shown[0]:
+            shown[0] = text
+            view.caption(text, band=DEFAULT_BAND)
+
+    def cue(stage, hand, seconds):
+        name = hand.upper()
+        camera.coach(MOCK_POSE.get(stage))
+        glove.coach(hand, stage)
         hud.close()
-        print(f"Warm-up: {phase} for {seconds:g} s")
+        if stage == STAGE_ACQUIRE:
+            caption(f"{name} hand: ACQUIRE, open palm {words} up")
+            print(f"{name} hand: ACQUIRE. Hold the {name} hand open over the "
+                  f"module, palm to the lens, {words} up (waiting up to "
+                  f"{seconds:g} s).")
+        elif stage == STAGE_COUNTDOWN:
+            beeper.beep(ACQUIRED_FREQ, CUE_MS)
+            now = time.time()
+            caption(countdown_text(hand, seconds))
+            hud.show(countdown_text(hand, seconds), now, force=True)
+            next_hud[0] = now + HUD_EVERY
+        elif stage == STAGE_NOT_ACQUIRED:
+            caption(f"{name} hand: NOT ACQUIRED")
+            later = hands[hands.index(hand) + 1:]
+            print(f"{name} hand refused: {warmup.not_acquired[hand]}"
+                  + (f". Going on to the {later[0].upper()} hand."
+                     if later else ""))
+        else:
+            beeper.beep(CUE_FREQ, CUE_MS)
+            caption(f"{name} hand: {stage} ({seconds:g} s)")
+            print(f"{name} hand: {stage} for {seconds:g} s")
 
     def poll(w):
         for row in camera.drain():
@@ -629,23 +697,35 @@ def main(argv=None) -> int:
             w.add_glove(g["hand_side"], flexion_features(g["pts"]),
                         g["frame"])
 
-    next_hud = [0.0]
+    def acquire(hand, now):
+        other = "right" if hand == "left" else "left"
+        return acquire_status(hand, glove.recent_packets(hand, now),
+                              glove.recent_packets(other, now),
+                              camera.reading(hand, now),
+                              camera.seen_recently(other, now),
+                              band=DEFAULT_BAND)
 
-    def show(phase, left):
+    def show(stage, hand, left, status):
         now = time.time()
         if now < next_hud[0]:
             return
         next_hud[0] = now + HUD_EVERY
-        parts = [f"{phase[:9]:<9} {max(0.0, left):4.1f}s"]
-        for hand in hands:
+        if stage == STAGE_ACQUIRE:
+            line = status.line(left)
+            caption(f"{hand.upper()} hand: ACQUIRE, {status.caption_text}")
+        elif stage == STAGE_COUNTDOWN:
+            line = countdown_text(hand, left)
+            caption(line)
+        else:
             hz = glove.rate_hz(hand)
-            parts.append(
-                f"{hand} glove {'--' if hz is None else f'{hz:.0f}'}/s "
-                f"camera {'fresh' if camera_fresh(buffer, hand, now) else 'STALE'}")
-        hud.show("  ".join(parts), now, force=True)
+            fresh = camera_fresh(buffer, hand, now)
+            line = (f"{hand.upper()} {stage[:9]:<9} {max(0.0, left):4.1f}s  "
+                    f"glove {'--' if hz is None else f'{hz:.0f}'}/s  "
+                    f"camera {'fresh' if fresh else 'STALE'}")
+        hud.show(line, now, force=True)
 
     try:
-        warmup.run(poll, cue, show)
+        warmup.run(poll, cue, show, acquire=acquire)
     except KeyboardInterrupt:
         shutdown()
         print("\nStopped during the warm-up; nothing was fused.")
@@ -663,14 +743,18 @@ def main(argv=None) -> int:
     if learned.fit_refusals and fit == FIT_AUTO:
         print("  (a longer --warmup-open gives the camera more open-palm "
               "frames to measure the bones on)")
-    if learned.refused:
+    fused_hands = tuple(h for h in hands if h not in learned.refused)
+    if not fused_hands:
         shutdown()
-        for why in learned.refused.values():
-            print(why)
-        print("Hold the open palm flat to the camera for the whole first "
-              "phase and close a full fist for the second, with both sensors "
-              "running, and start again.")
+        print("No hand passed the warm-up, so nothing was fused. Do what is "
+              "listed above and start again.")
         return 2
+    if learned.refused:
+        refused = [h.upper() for h in hands if h in learned.refused]
+        print(f"Fusing the {' and '.join(h.upper() for h in fused_hands)} "
+              f"hand only: the {' and '.join(refused)} hand was refused "
+              "(above).")
+        learned = replace(learned, hands=fused_hands)
     if fit == FIT_AUTO and args.out is not None:
         for path in save_measurements(learned, args.out.parent):
             print(f"Saved the warm-up's bone measurement to {path} "
@@ -679,7 +763,7 @@ def main(argv=None) -> int:
     # --- the fusion ---------------------------------------------------------
     fusion = LiveFusion(learned, buffer, gates=gates, rail_params=rail_params,
                         unreliable=unreliable, anchor=anchor,
-                        lag={h: lags[h][0] for h in hands},
+                        lag={h: lags[h][0] for h in fused_hands},
                         max_dt=args.max_dt)
     if args.out is not None:
         sinks.append(JsonlSink(args.out))
@@ -712,7 +796,7 @@ def main(argv=None) -> int:
                 hud.show(hud_line([hud_segment(h, latest.get(h),
                                                glove.rate_hz(h),
                                                camera_fresh(buffer, h, now))
-                                   for h in hands]), now, force=True)
+                                   for h in fused_hands]), now, force=True)
             time.sleep(0.002)
     except KeyboardInterrupt:
         pass

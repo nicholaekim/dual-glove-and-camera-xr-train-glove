@@ -29,8 +29,11 @@ What is different live, and why
 
   Learning      the offline report learns the rails, the flexion endpoints
                 and the operator's bone lengths from the whole session. Live
-                they come from a coached WARM-UP (`Warmup`): an open palm
-                held flat to the camera, then a fist. The open palm gives the
+                they come from a coached WARM-UP (`Warmup`), one hand at a
+                time: an ACQUIRE gate that waits until that hand's glove is
+                streaming and the camera has held that hand, still and at
+                the right height, for half a second; then an open palm held
+                flat to the camera; then a fist. The open palm gives the
                 glove's rails, the camera's open reference and the frames a
                 bone-length measurement is taken over; the fist gives both
                 sensors' flexed ends. Nothing is learned after that, so the
@@ -51,6 +54,7 @@ hardware and the mocks produce the same per-frame dicts, and the outputs
 `scripts/fuse_live.py` is the command that puts them together.
 """
 import json
+import math
 import time
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
@@ -89,6 +93,18 @@ from cam_hand.template_fit import (
     fit_template,
     measure_hand,
 )
+from leap_hand.protocol import (
+    ACQUIRE_VISIBLE_TIME_US,
+    DEFAULT_BAND,
+    NOT_FACING,
+    OFF_AXIS,
+    TOO_HIGH,
+    TOO_LOW,
+    TOO_YOUNG,
+    HandReading,
+    acquire_failures,
+    read_hand,
+)
 from xr_hand.keypoints21 import MP21_TO_OPENXR_IDX, frame_to_keypoints21
 
 # How long the camera buffer remembers each hand. The largest glove lag
@@ -115,17 +131,33 @@ FIT_AUTO = "auto"
 FIT_NONE = "none"
 
 # --- the warm-up ----------------------------------------------------------
+# Each hand's warm-up, in order: the ACQUIRE gate, a short countdown, then the
+# two phases the learning reads. STAGE_NOT_ACQUIRED is only ever announced,
+# when a hand's gate timed out.
+STAGE_ACQUIRE = "ACQUIRE"
+STAGE_COUNTDOWN = "COUNTDOWN"
+STAGE_NOT_ACQUIRED = "NOT ACQUIRED"
 PHASE_OPEN = "OPEN PALM flat to the camera"
 PHASE_FIST = "FIST"
+WARMUP_OPEN_S = 4.0
+WARMUP_FIST_S = 4.0
+# The ACQUIRE gate: how long it waits for a hand, and how many glove packets
+# of that hand the last second must hold (the glove sends 60; ten says the
+# stream is really there, not one stray packet).
+ACQUIRE_TIMEOUT_S = 60.0
+ACQUIRE_MIN_PACKETS = 10
+# Seconds between "acquired" and the OPEN PALM cue: time to hear the beep,
+# read the line and hold still before anything is learned.
+COUNTDOWN_S = 2.0
 # The mock camera can be told which pose to hold (`MockLeapStream.set_pose`),
-# so a rehearsal with no hardware still sees an open palm and then a fist.
-MOCK_POSE = {PHASE_OPEN: "open_palm", PHASE_FIST: "fist"}
+# so a rehearsal with no hardware shows an open palm while it is acquired and
+# during the open phase, and then a fist.
+MOCK_POSE = {STAGE_ACQUIRE: "open_palm", STAGE_COUNTDOWN: "open_palm",
+             PHASE_OPEN: "open_palm", PHASE_FIST: "fist"}
 # How many frames of a hand the camera must have tracked during the OPEN
 # phase before that hand may be fused: the floor `learn_flexion_scale` uses
 # for a median open reference, about a fifth of a second of Leap tracking.
 MIN_OPEN_CAMERA_FRAMES = MIN_OPEN_REF_FRAMES
-REFUSED = "open palm not seen by both sensors during warm-up"
-SEPARATION = "open/fist separation too small"
 
 
 # --- the camera side ------------------------------------------------------
@@ -253,7 +285,10 @@ class CameraSource:
     """The Ultraleap (or its mock) as a stream of camera row dicts.
 
     Rows of a hand that is not being fused are dropped here, before the
-    forward kinematics, so a second hand in view costs nothing.
+    forward kinematics, so a second hand in view costs nothing; only the
+    moment it was seen is kept, so the ACQUIRE gate can say "RIGHT hand
+    seen, need LEFT". For each fused hand the newest `HandReading` (height,
+    time tracked, palm facing) is kept too, for the same gate.
     """
 
     def __init__(self, hands: Sequence[str], mock: bool = False,
@@ -263,6 +298,8 @@ class CameraSource:
         self.mode = mode
         self.stream = None
         self.hands_seen = 0
+        self._readings: Dict[str, Tuple[HandReading, float]] = {}
+        self._seen_at: Dict[str, float] = {}
 
     def start(self) -> "CameraSource":
         """Open the stream. Raises `leap_hand.stream.LeapUnavailable` with the
@@ -285,14 +322,34 @@ class CameraSource:
         out: List[dict] = []
         if self.stream is None:
             return out
+        now = time.time()
         for _side, lh in self.stream.drain(max_items):
             self.hands_seen += 1
-            if str(getattr(lh, "hand_side", "")).lower() not in self.hands:
+            side = str(getattr(lh, "hand_side", "")).lower()
+            self._seen_at[side] = now
+            if side not in self.hands:
                 continue
             row = camera_row(lh)
             if row is not None:
                 out.append(row)
+                if getattr(lh, "palm_pos", None):
+                    self._readings[side] = (read_hand(lh), now)
         return out
+
+    def reading(self, hand: str,
+                now: Optional[float] = None) -> Optional[HandReading]:
+        """The newest reading of `hand`, or None once it is `STALE_S` old."""
+        got = self._readings.get(hand)
+        now = time.time() if now is None else now
+        if got is None or now - got[1] > STALE_S:
+            return None
+        return got[0]
+
+    def seen_recently(self, hand: str, now: Optional[float] = None) -> bool:
+        """Did the camera report `hand` (fused or not) within `STALE_S`?"""
+        at = self._seen_at.get(hand)
+        now = time.time() if now is None else now
+        return at is not None and now - at <= STALE_S
 
     def stop(self) -> None:
         if self.stream is not None:
@@ -352,14 +409,16 @@ class GloveSource:
                     continue
                 self.packets += 1
                 side = str(frame.hand_side).lower()
-                if side not in self.hands:
-                    self.other_hand += 1
-                    continue
+                # Every side is stamped, fused or not, so the ACQUIRE gate
+                # can tell "no glove at all" from "only the other glove".
                 t = float(getattr(item, "recv_time", 0.0) or time.time())
                 stamps = self._stamps[side]
                 stamps.append(t)
                 while stamps and stamps[0] < t - self.RATE_WINDOW_S:
                     stamps.popleft()
+                if side not in self.hands:
+                    self.other_hand += 1
+                    continue
                 out.append({"t": t, "hand_side": side, "frame": frame,
                             "pts": frame_to_keypoints21(frame)})
         out.sort(key=lambda g: g["t"])
@@ -372,12 +431,162 @@ class GloveSource:
             return None
         return (len(stamps) - 1) / (stamps[-1] - stamps[0])
 
+    def recent_packets(self, hand: str, now: Optional[float] = None) -> int:
+        """Packets of `hand` that arrived in the last `RATE_WINDOW_S`."""
+        now = time.time() if now is None else now
+        return sum(1 for t in self._stamps.get(hand, ())
+                   if t >= now - self.RATE_WINDOW_S)
+
+    def coach(self, hand: str, stage: Optional[str]) -> None:
+        """Start the MOCK glove of `hand` open when its OPEN PALM phase begins.
+
+        The mock glove opens and closes on a slow sine from the moment it
+        starts, whatever the warm-up is asking for. An operator opens the
+        hand on the cue, so the rehearsal restarts that hand's sine at its
+        open end; its fist then comes about 2 s into the warm-up. A real
+        glove is whatever the operator does, so this is a no-op for it.
+        """
+        if not self.mock or stage != PHASE_OPEN:
+            return
+        for r in self._receivers:
+            if getattr(r, "hand", None) == hand:
+                r.gen.t = 0.0
+
     def stop(self) -> None:
         for r in self._receivers:
             try:
                 r.stop()
             except Exception:
                 pass
+
+
+# --- the ACQUIRE gate -------------------------------------------------------
+
+def band_words(band: Tuple[float, float] = DEFAULT_BAND) -> str:
+    """`(18, 28)` -> `18 to 28 cm`."""
+    return f"{band[0]:g} to {band[1]:g} cm"
+
+
+def _other(hand: str) -> str:
+    return "right" if hand == "left" else "left"
+
+
+@dataclass(frozen=True)
+class AcquireStatus:
+    """Where one hand stands at the ACQUIRE gate, in the operator's words.
+
+    `glove_text` and `camera_text` each say "ok" or what is missing and what
+    to do about it; `caption_text` is the short form for the camera window,
+    which is about 60 characters wide.
+    """
+
+    hand: str
+    glove_ok: bool
+    glove_text: str
+    camera_ok: bool
+    camera_text: str
+    caption_text: str
+
+    @property
+    def ok(self) -> bool:
+        return self.glove_ok and self.camera_ok
+
+    def line(self, seconds_left: Optional[float] = None) -> str:
+        """The HUD line: `ACQUIRE LEFT  glove ok  camera: no LEFT hand ...`."""
+        text = (f"ACQUIRE {self.hand.upper()}  {self.glove_text}  "
+                f"{self.camera_text}")
+        if seconds_left is not None:
+            text += f"  ({max(0.0, seconds_left):.0f} s left)"
+        return text
+
+    def refusal(self, timeout: float) -> str:
+        """Why the hand is refused when the gate times out."""
+        missing = [t for ok, t in ((self.glove_ok, self.glove_text),
+                                   (self.camera_ok, self.camera_text))
+                   if not ok]
+        return (f"the {self.hand.upper()} hand was not acquired in "
+                f"{timeout:g} s: " + "; ".join(missing))
+
+
+def acquire_status(hand: str, glove_packets: int, other_glove_packets: int,
+                   reading: Optional[HandReading], other_hand_seen: bool,
+                   band: Tuple[float, float] = DEFAULT_BAND,
+                   min_packets: int = ACQUIRE_MIN_PACKETS) -> AcquireStatus:
+    """Is `hand` ready for its warm-up, and if not, what is missing?
+
+    The glove is ready when the last second held at least `min_packets` of
+    this hand's packets. The camera is ready when `acquire_failures`, the
+    recorder's own gate, finds nothing wrong with the hand's newest reading
+    (`reading`, None when there is no fresh one): tracked for at least half
+    a second, inside the height band, palm toward the lens and roughly over
+    the module. `other_glove_packets` and `other_hand_seen` are the other
+    hand's, so a message can say "only RIGHT" rather than "nothing".
+    """
+    name, other = hand.upper(), _other(hand).upper()
+    words = band_words(band)
+    short = f"{band[0]:g}-{band[1]:g} cm"
+    if glove_packets >= min_packets:
+        glove_ok, glove_text = True, "glove ok"
+    elif other_glove_packets >= min_packets:
+        glove_ok, glove_text = False, (
+            f"glove: no {name} packets, only {other} (is the {name} glove "
+            "on and connected in XR Trainer?)")
+    else:
+        glove_ok, glove_text = False, (
+            f"glove: {glove_packets} {name} packets in the last second, need "
+            f"{min_packets} (is XR Trainer streaming?)")
+
+    failures = acquire_failures(reading, hand, band)
+    if not failures:
+        camera_ok, camera_text, caption = True, "camera ok", ""
+    elif reading is None or reading.hand_side != hand:
+        camera_ok = False
+        if other_hand_seen:
+            camera_text = f"camera: {other} hand seen, need {name}"
+            caption = f"{other} hand seen, need {name}"
+        else:
+            camera_text = (f"camera: no {name} hand (raise it to {words} "
+                           "above the module)")
+            caption = f"no {name} hand, raise it to {short}"
+    else:
+        camera_ok = False
+        fixes, short_fixes = [], []
+        for why in failures:
+            if why == TOO_YOUNG:
+                fixes.append(
+                    f"hold it still ({reading.visible_time_us / 1e6:.1f} of "
+                    f"{ACQUIRE_VISIBLE_TIME_US / 1e6:.1f} s tracked)")
+                short_fixes.append("hold still")
+            elif why == TOO_LOW:
+                fixes.append(f"raise it to {words} (now "
+                             f"{reading.height_cm:.0f} cm)")
+                short_fixes.append(f"raise to {short}")
+            elif why == TOO_HIGH:
+                fixes.append(f"lower it to {words} (now "
+                             f"{reading.height_cm:.0f} cm)")
+                short_fixes.append(f"lower to {short}")
+            elif why == NOT_FACING:
+                fixes.append("turn the palm to the lens")
+                short_fixes.append("palm to lens")
+            elif why == OFF_AXIS:
+                fixes.append("centre it over the module")
+                short_fixes.append("centre it")
+            else:
+                fixes.append(why)
+                short_fixes.append(why)
+        camera_text = f"camera: {name} hand seen, " + ", ".join(fixes)
+        caption = ", ".join(short_fixes)
+    if camera_ok and not glove_ok:
+        caption = f"no {name} glove packets"
+    return AcquireStatus(hand=hand, glove_ok=glove_ok, glove_text=glove_text,
+                         camera_ok=camera_ok, camera_text=camera_text,
+                         caption_text=caption)
+
+
+def countdown_text(hand: str, seconds_left: float) -> str:
+    """`LEFT hand acquired: open palm in 2`, then `... in 1`."""
+    return (f"{hand.upper()} hand acquired: open palm in "
+            f"{max(1, math.ceil(seconds_left))}")
 
 
 # --- the warm-up ----------------------------------------------------------
@@ -398,8 +607,12 @@ class WarmupResult:
                  template fit; empty with no fit
     measurements the bone-length measurement in force per hand (fitted hands)
     fit_refusals per hand, why a fit was asked for and not made
-    refused      per hand, why the hand cannot be fused at all; the program
-                 stops with exit code 2 when this is not empty
+    refused      per hand, why the hand cannot be fused at all, as one line
+                 ("LEFT hand refused: ..."); that hand is not fused, and the
+                 program stops with exit code 2 when every hand is refused
+    causes       per refused hand, the same reasons one by one, each naming
+                 what the operator can do about it
+    not_acquired the hands whose ACQUIRE gate timed out (no warm-up at all)
     """
 
     hands: Tuple[str, ...]
@@ -411,6 +624,8 @@ class WarmupResult:
     measurements: Dict[str, HandMeasurement] = field(default_factory=dict)
     fit_refusals: Dict[str, str] = field(default_factory=dict)
     refused: Dict[str, str] = field(default_factory=dict)
+    causes: Dict[str, List[str]] = field(default_factory=dict)
+    not_acquired: Tuple[str, ...] = ()
     fit_asked: bool = False
     # per hand, the fingers the rail override is enabled on; empty when off
     override_enabled: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
@@ -439,6 +654,9 @@ class WarmupResult:
         """
         out = ["Warm-up learned:"]
         for hand in self.hands:
+            if hand in self.not_acquired:
+                out.append(f"  {hand}: not acquired, so no warm-up")
+                continue
             out.append(f"  {hand}: {self.glove_frames.get(hand, 0)} glove "
                        f"frames, {self.camera_frames.get(hand, 0)} camera "
                        f"frames ({self.camera_open_frames.get(hand, 0)} "
@@ -485,35 +703,56 @@ class WarmupResult:
                 if finger in hs.dropped:
                     out.append(f"      {finger:<6} not normalised: "
                                f"{hs.dropped[finger]}")
-        for hand, why in sorted(self.refused.items()):
-            out.append(f"  REFUSED {why}")
+        for hand in self.hands:
+            if hand not in self.refused:
+                continue
+            out.append(f"  {hand.upper()} hand refused:")
+            for cause in self.causes.get(hand) or [self.refused[hand]]:
+                out.append(f"    - {cause}")
         return out
 
 
 class Warmup:
-    """The coached warm-up: an open palm, then a fist, both sensors watching.
+    """The coached warm-up, one hand at a time, both sensors watching.
 
-    Two phases, `PHASE_OPEN` for `open_s` seconds and `PHASE_FIST` for
-    `fist_s`. `run` drives them (the caller supplies the sensor polling and
-    the cues, so this class holds no hardware); `add_glove` and `add_camera`
-    collect what the phases produce, and `learn` turns it into a
-    `WarmupResult`.
+    For each hand in turn: the ACQUIRE gate (`STAGE_ACQUIRE`, up to
+    `acquire_s` seconds), a countdown (`STAGE_COUNTDOWN`, `countdown_s`),
+    then `PHASE_OPEN` for `open_s` seconds and `PHASE_FIST` for `fist_s`.
+    `run` drives them (the caller supplies the sensor polling, the gate's
+    check and the cues, so this class holds no hardware); `add_glove` and
+    `add_camera` collect what the phases produce, and `learn` turns it into
+    a `WarmupResult`.
 
-    Collection is label-free wherever it can be, like the offline learning:
-    every glove and camera frame of both phases goes into the rails and the
-    endpoints, whichever phase it arrived in, because the glove's lag puts
-    the first half second of each phase in the previous pose anyway. The one
-    use of the phase is choosing the camera rows a bone-length measurement
-    may be taken over, and `measure_hand` re-checks every one of those for
-    an open hand itself.
+    Each hand learns from its own phases only. While one hand is warming up
+    (`active`), frames of the other hand are dropped, and nothing is
+    collected while a hand is being acquired or counted down: that is the
+    operator getting into position, not a pose.
+
+    Within a hand's phases, collection is label-free wherever it can be,
+    like the offline learning: every glove and camera frame of both phases
+    goes into the rails and the endpoints, whichever phase it arrived in,
+    because the glove's lag puts the first half second of each phase in the
+    previous pose anyway. The one use of the phase is choosing the camera
+    rows a bone-length measurement may be taken over, and `measure_hand`
+    re-checks every one of those for an open hand itself.
     """
 
-    def __init__(self, hands: Sequence[str], open_s: float = 3.0,
-                 fist_s: float = 3.0):
+    def __init__(self, hands: Sequence[str], open_s: float = WARMUP_OPEN_S,
+                 fist_s: float = WARMUP_FIST_S,
+                 acquire_s: float = ACQUIRE_TIMEOUT_S,
+                 countdown_s: float = COUNTDOWN_S,
+                 band: Tuple[float, float] = DEFAULT_BAND):
         self.hands = tuple(hands)
         self.open_s = float(open_s)
         self.fist_s = float(fist_s)
+        self.acquire_s = float(acquire_s)
+        self.countdown_s = float(countdown_s)
+        self.band = band
         self.phase: Optional[str] = None
+        # the hand whose warm-up is running; None collects every hand
+        self.active: Optional[str] = None
+        # per hand whose ACQUIRE gate timed out, what was still missing
+        self.not_acquired: Dict[str, str] = {}
         # (hand, raw template curls, HandFrame or None)
         self.glove: List[Tuple[str, List[float], object]] = []
         self.camera: List[Tuple[str, List[float]]] = []
@@ -526,19 +765,25 @@ class Warmup:
     def begin(self, phase: Optional[str]) -> None:
         self.phase = phase
 
+    def _collects(self, side: str) -> bool:
+        """Is a frame of `side` part of the warm-up right now?"""
+        return (side in self.hands
+                and self.phase not in (STAGE_ACQUIRE, STAGE_COUNTDOWN)
+                and (self.active is None or side == self.active))
+
     def add_glove(self, hand: str, curls: Sequence[float],
                   frame=None) -> None:
         """One glove frame: its raw-template curls and, for a template fit,
         the parsed frame the fit rescales."""
         side = str(hand).strip().lower()
-        if side in self.hands:
+        if self._collects(side):
             self.glove.append((side, [float(c) for c in curls], frame))
 
     def add_camera(self, row: Mapping,
                    curls: Optional[Sequence[float]] = None) -> None:
         """One camera row (as returned by `CameraBuffer.add`)."""
         side = str(row["hand_side"]).strip().lower()
-        if side not in self.hands:
+        if not self._collects(side):
             return
         if curls is None:
             curls = flexion_features(np.asarray(row["pts"], float))
@@ -549,27 +794,73 @@ class Warmup:
                 self.open_rows.append(dict(row))
 
     def run(self, poll: Callable[["Warmup"], None],
-            cue: Callable[[str, float], None],
-            show: Optional[Callable[[str, float], None]] = None,
+            cue: Callable[[str, str, float], None],
+            show: Optional[Callable[[str, str, float,
+                                     Optional[AcquireStatus]], None]] = None,
+            acquire: Optional[Callable[[str, float], AcquireStatus]] = None,
             clock: Callable[[], float] = time.time,
             sleep: Callable[[float], None] = time.sleep) -> None:
-        """Both phases, in order. `cue(phase, seconds)` announces a phase
-        (beep, window caption, console line); `poll(self)` drains the
-        sensors into this object; `show(phase, seconds_left)` refreshes the
-        HUD."""
-        for phase, seconds in self.phases():
-            self.begin(phase)
-            cue(phase, seconds)
-            end = clock() + seconds
-            while True:
-                now = clock()
-                poll(self)
-                if show is not None:
-                    show(phase, end - now)
-                if now >= end:
-                    break
-                sleep(0.002)
+        """Every hand's warm-up, one hand after the other.
+
+        `poll(self)` drains the sensors into this object.
+        `cue(stage, hand, seconds)` announces a stage (beep, window caption,
+        console line): `STAGE_ACQUIRE` with the timeout, `STAGE_COUNTDOWN`
+        once the hand is acquired, `STAGE_NOT_ACQUIRED` when the gate timed
+        out, and each phase with its length. `show(stage, hand, seconds_left,
+        status)` refreshes the HUD; `status` is the gate's `AcquireStatus`
+        while acquiring and None otherwise. `acquire(hand, now)` is the
+        gate's check; without one the phases start at once.
+
+        A hand the gate times out on is recorded in `not_acquired` (and
+        refused by `learn`), and the next hand's warm-up starts.
+        """
+        for hand in self.hands:
+            self.active = hand
+            if acquire is not None and not self._acquire(
+                    hand, poll, cue, show, acquire, clock, sleep):
+                continue
+            for phase, seconds in self.phases():
+                self._hold(phase, hand, seconds, poll, cue, show, clock,
+                           sleep)
         self.begin(None)
+        self.active = None
+
+    def _hold(self, stage, hand, seconds, poll, cue, show, clock,
+              sleep) -> None:
+        """Announce `stage` and keep the sensors drained for `seconds`."""
+        self.begin(stage)
+        cue(stage, hand, seconds)
+        end = clock() + seconds
+        while True:
+            now = clock()
+            poll(self)
+            if show is not None:
+                show(stage, hand, end - now, None)
+            if now >= end:
+                break
+            sleep(0.002)
+
+    def _acquire(self, hand, poll, cue, show, acquire, clock, sleep) -> bool:
+        """The ACQUIRE gate, then the countdown. False if it timed out."""
+        self.begin(STAGE_ACQUIRE)
+        cue(STAGE_ACQUIRE, hand, self.acquire_s)
+        end = clock() + self.acquire_s
+        while True:
+            now = clock()
+            poll(self)
+            status = acquire(hand, now)
+            if status.ok:
+                break
+            if show is not None:
+                show(STAGE_ACQUIRE, hand, end - now, status)
+            if now >= end:
+                self.not_acquired[hand] = status.refusal(self.acquire_s)
+                cue(STAGE_NOT_ACQUIRED, hand, self.acquire_s)
+                return False
+            sleep(0.002)
+        self._hold(STAGE_COUNTDOWN, hand, self.countdown_s, poll, cue, show,
+                   clock, sleep)
+        return True
 
     def learn(self, gates: Optional[GateParams] = None,
               rail_params: Optional[RailOverrideParams] = None,
@@ -586,16 +877,18 @@ class Warmup:
 
         Then everything `fuse_all` learns, by the same code (`_learn_core`).
 
-        A hand is REFUSED when the glove taught no rail on any finger (it
-        never held a straight hand still) or the camera tracked it for fewer
-        than `min_open_camera` frames of the open phase: either way there is
-        no open endpoint to normalise against, and fusing it would gate on
-        numbers that were never measured. It is also refused when the fist
-        did not close it far enough: an index span under
-        `gates.min_glove_span` on the glove or `gates.min_cam_span` on the
-        camera, the same floors `learn_flexion_scale` refuses to normalise a
-        finger below. Endpoints that close together turn every flexion
-        fraction, and so every gate built on one, into noise.
+        A hand is REFUSED when its ACQUIRE gate timed out; when the glove
+        sent nothing or taught no index rail (it never held the finger
+        straight and still); when the camera tracked it for fewer than
+        `min_open_camera` frames of the open phase (either way there is no
+        open endpoint to normalise against, and fusing it would gate on
+        numbers that were never measured); or when the fist did not close it
+        far enough: an index span under `gates.min_glove_span` on the glove
+        or `gates.min_cam_span` on the camera, the same floors
+        `learn_flexion_scale` refuses to normalise a finger below. Endpoints
+        that close together turn every flexion fraction, and so every gate
+        built on one, into noise. Every cause found is reported, each with
+        what the operator can do about it (`WarmupResult.causes`).
         """
         gates = gates or DEFAULT_GATES
         result = WarmupResult(hands=self.hands)
@@ -604,6 +897,8 @@ class Warmup:
         # --- the template fit, per hand ------------------------------
         if fit == FIT_AUTO:
             for hand in self.hands:
+                if hand in self.not_acquired:
+                    continue                # no open palm to measure on
                 m = measure_hand(self.open_rows, hand=hand, gates=gates,
                                  source="live warm-up")
                 why = (fit_refusal(m) if min_fit_frames is None
@@ -627,41 +922,69 @@ class Warmup:
         _learn_core(result, self.glove, self.camera, gates, rail_params)
 
         # --- counts, and the refusal -----------------------------------
+        result.not_acquired = tuple(h for h in self.hands
+                                    if h in self.not_acquired)
         for hand in self.hands:
             result.glove_frames[hand] = sum(1 for h, *_ in self.glove
                                             if h == hand)
             result.camera_frames[hand] = sum(1 for h, _c in self.camera
                                              if h == hand)
             result.camera_open_frames[hand] = int(self.camera_open[hand])
-            missing = []
-            if not any((hand, f) in result.gate_rails for f in FINGER_NAMES):
-                missing.append(f"glove: no rail learned on any finger from "
-                               f"{result.glove_frames[hand]} frames")
-            if result.camera_open_frames[hand] < min_open_camera:
-                missing.append(f"camera: {result.camera_open_frames[hand]} "
-                               "frames of this hand during the open palm, "
-                               f"need {min_open_camera}")
-            if missing:
-                result.refused[hand] = (f"{hand}: {REFUSED} ("
-                                        + "; ".join(missing) + ")")
-                continue
-            # Seen open by both, but did the fist actually CLOSE the hand?
-            # The same spans `learn_flexion_scale` refuses to normalise a
-            # finger on, read on the index: the finger every gate and the
-            # rail override lean on hardest.
-            spans = result.index_spans(hand)
-            if (spans[0] is None or spans[1] is None
-                    or spans[0] < gates.min_glove_span
-                    or spans[1] < gates.min_cam_span):
-                result.refused[hand] = (
-                    f"{hand}: {SEPARATION} (glove span {_span_text(spans[0])}"
-                    f", camera span {_span_text(spans[1])}; need "
-                    f"{gates.min_glove_span:.2f} and {gates.min_cam_span:.2f})")
+            if hand in self.not_acquired:
+                causes = [self.not_acquired[hand]]
+            else:
+                causes = self._causes(result, hand, gates, min_open_camera)
+            if causes:
+                result.causes[hand] = causes
+                result.refused[hand] = (f"{hand.upper()} hand refused: "
+                                        + "; ".join(causes))
         return result
 
+    def _causes(self, result: WarmupResult, hand: str, gates: GateParams,
+                min_open_camera: int) -> List[str]:
+        """Why a hand that went through its phases cannot be fused, if it
+        cannot, each cause with what the operator can do about it.
 
-def _span_text(span: Optional[float]) -> str:
-    return "--" if span is None else f"{span:.2f}"
+        The spans are read on the index, the finger every gate and the rail
+        override lean on hardest, and are the same spans
+        `learn_flexion_scale` refuses to normalise a finger on.
+        """
+        name = hand.upper()
+        words = band_words(self.band)
+        glove_n = result.glove_frames[hand]
+        cam_open = result.camera_open_frames[hand]
+        glove_span, cam_span = result.index_spans(hand)
+        out: List[str] = []
+        if glove_n == 0:
+            out.append(f"the {name} glove sent nothing during its warm-up: "
+                       "check XR Trainer is streaming that glove")
+        elif glove_span is None:
+            out.append(f"the {name} glove never read the index finger "
+                       f"straight and still (no rail in {glove_n} frames): "
+                       "keep the fingers flat and still for the whole OPEN "
+                       "PALM phase")
+        elif glove_span < gates.min_glove_span:
+            out.append(f"the {name} glove did not register the fist (index "
+                       f"span {glove_span:.3f}, need "
+                       f"{gates.min_glove_span:.2f}): close a full fist "
+                       "during the FIST phase, and check the glove is "
+                       "calibrated in XR Trainer")
+        if cam_open == 0:
+            out.append(f"the camera never saw the {name} hand during the "
+                       f"open palm: hold it {words} above the module, palm "
+                       "to the lens")
+        elif cam_open < min_open_camera:
+            out.append(f"the camera saw the {name} hand on only {cam_open} "
+                       f"frames of the open palm (need {min_open_camera}): "
+                       f"hold it {words} above the module, palm to the lens, "
+                       "for the whole phase")
+        elif cam_span is None or cam_span < gates.min_cam_span:
+            span = "--" if cam_span is None else f"{cam_span:.3f}"
+            out.append(f"the camera did not see the {name} fist close (index "
+                       f"span {span}, need {gates.min_cam_span:.2f}): close "
+                       "a full fist during the FIST phase, palm still to the "
+                       "lens")
+        return out
 
 
 def _learn_core(result: WarmupResult,
