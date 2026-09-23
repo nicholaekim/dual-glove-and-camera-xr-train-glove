@@ -593,6 +593,44 @@ Day-1 session with the corrected recorder (2026-09-18, 18:36 to 18:48,
   wrong. Reported as is: fusion needs per-hand, per-finger reliability
   logic; glove curl does not automatically dominate.
 
+Day 3 (2026-09-23 evening, `recordings/sync_day3`): the recalibration's
+prospective test, and it fails the per-finger criterion
+- Session: 3 takes x 6 poses x 2 hands = 36 takes, 8 rejected attempts
+  kept, 0 label mismatches (7 warnings), glove 60 Hz, camera 90 Hz. Gloves
+  recalibrated in XR Train before the session. Nothing from this session
+  was used to fit anything.
+- Baseline: glove 30/36, camera 36/36, fused with profile 35/36. The right
+  glove behaved well today: before any correction its trusted-frame
+  residuals were 0.03 to 0.07 (day 2: up to 0.40 on the pinky). So the
+  right glove's "reads too open" fault is SESSION-DEPENDENT, present on
+  days 1 and 2 and largely absent on day 3.
+- Cross-session recalibration applied to day 3 (coefficients from day 1,
+  endpoints re-learned): fused 36/36 (day 2 model: 35/36; own from day 1:
+  36/36). The classifier hides what the per-finger residuals show. Before
+  -> after, median |camera - glove fraction| on trusted frames, day 1 model:
+  left index .048 -> .027, middle .038 -> .055, ring .036 -> .043, pinky
+  .147 -> .042; right index .038 -> .066, middle .032 -> .123, ring .029
+  -> .134, pinky .071 -> .109. Per pose on the right hand it helps where
+  day 1's fault reappears (index_point middle .48 -> .16, pinky .53 -> .12;
+  peace pinky .38 -> .08) and harms where the glove was right (pinch middle
+  .04 -> .77, thumbs_up index .04 -> .32 and ring .01 -> .17, fist all four
+  worse). The day 2 model is worse still (right middle .032 -> .163).
+- Verdict: the reviewer's "no meaningful per-finger regression" criterion
+  fails, so `--recalibrate` stays OFF and is not stored in the profile. A
+  calibration fitted on a day the glove misbehaved over-corrects on a day
+  it does not; the fault is not a fixed property of the glove that a
+  static model can remove. What would still be legitimate: a correction
+  learned WITHIN the session from trusted camera frames (the anchor's idea,
+  with the rail rule and per-pose care), or the fault fixed at the source
+  (StretchSense: raw stream, calibration sets).
+- The live frozen-warm-up run (`fuse_live.py`) was attempted twice; the
+  first attempt started its 3 s phases before a hand was over the module
+  and was refused (camera 0 frames, glove span 0). The script now has an
+  ACQUIRE gate, a countdown and per-hand warm-ups (main 6a3b742); the
+  second attempt left no output file, so the frozen-warm-up path is still
+  untested on hardware. With the offline verdict above it is no longer the
+  deciding test.
+
 The professor's 21 poses, recorded with the camera (2026-09-23, main
 dc6821f, 397 tests)
 - All 21 `_NA` frames recorded bare-handed (left hand) with
