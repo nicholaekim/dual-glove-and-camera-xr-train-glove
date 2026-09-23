@@ -43,6 +43,7 @@ carries the hand's real position in camera space, so the `Wrist:` line is a
 measured position rather than the glove's `(0, 0, 0)`. The 0..20 landmark
 block is unchanged, and `compare_to_tracker.py` aligns rigidly before scoring.
 """
+import os
 import argparse
 import importlib.util
 import re
@@ -293,6 +294,8 @@ def main() -> None:
                    help=f"output root (default: {DEFAULT_OUT})")
     p.add_argument("--reference", type=Path, default=DEFAULT_REFERENCE,
                    help=f"the professor's frames (default: {DEFAULT_REFERENCE})")
+    p.add_argument("--no-open", action="store_true",
+                   help="do not open the reference photo on screen; only print its path")
     p.add_argument("--mock", action="store_true",
                    help="synthetic hands; no camera needed (pipeline test)")
     p.add_argument("--mode", default="desktop",
@@ -306,7 +309,17 @@ def main() -> None:
     print(f"Professor frame {name}" + ("  [mock]" if args.mock else ""))
     if image is not None:
         print(f"  reference image: {image}")
-        print("  Open it and copy the pose with your hand.")
+        if args.no_open:
+            print("  Open it and copy the pose with your hand.")
+        else:
+            # Put the professor's photo on screen so the operator is not
+            # hunting for a file while the countdown runs. Windows opens it
+            # in the default viewer; elsewhere the path is all we can offer.
+            try:
+                os.startfile(str(image))
+                print("  The photo is opening on screen: copy the pose with your hand.")
+            except (AttributeError, OSError):
+                print("  Open it and copy the pose with your hand.")
     else:
         print(f"  no reference image under {args.reference} — frame {name}")
         print("  Copy the pose from the sheet or the folder you have.")
