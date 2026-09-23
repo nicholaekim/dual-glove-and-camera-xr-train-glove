@@ -618,8 +618,16 @@ prospective test, and it fails the per-finger criterion
 - Verdict: the reviewer's "no meaningful per-finger regression" criterion
   fails, so `--recalibrate` stays OFF and is not stored in the profile. A
   calibration fitted on a day the glove misbehaved over-corrects on a day
-  it does not; the fault is not a fixed property of the glove that a
-  static model can remove. What would still be legitimate: a correction
+  it does not; the right glove's OBSERVED calibration error is
+  session-dependent (reviewer wording), so a static model cannot remove
+  it. Reviewer verdict (2026-09-23): default off and nothing stored in
+  the profile is supported; the four checks asked for hold by
+  construction (one HandScale normalises before and after, the rail rule
+  runs at fit and at apply and is tested, one finger order throughout,
+  residual columns computed on the same trusted rows). The next
+  legitimate experiment is a within-session adaptive correction learned
+  only from the current session's trusted camera frames; a 6 s open/fist
+  warm-up cannot fit a five-input model (two poses only). What would still be legitimate: a correction
   learned WITHIN the session from trusted camera frames (the anchor's idea,
   with the rail rule and per-pose care), or the fault fixed at the source
   (StretchSense: raw stream, calibration sets).
