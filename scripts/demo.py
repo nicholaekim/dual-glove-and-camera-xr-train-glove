@@ -961,7 +961,10 @@ def run_live(args, s: Settings) -> int:
             readme.write_text("\n".join(text) + "\n", encoding="utf-8")
         except OSError as e:
             print(f"Could not write {readme}: {e}")
-        if fusing_from is not None and not (args.no_open or args.no_window):
+        # Opened whether or not fusing began: a run stopped with Ctrl-C during
+        # the warm-up still leaves the warm-up report and this README, and
+        # the question "where is the data" gets the same answer either way.
+        if not (args.no_open or args.no_window):
             open_folder(folder)
         print(f"Data for this demo: {folder.resolve()}")
         return code
