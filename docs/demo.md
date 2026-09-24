@@ -31,6 +31,8 @@ take after take (take 1 of every pose, then take 2, and so on), and loops.
 The header shows the take and its true pose. Keys: `space` pause, `n` next
 take, `r` restart this take, `+` / `-` speed, `q` quit.
 
+**Video:** add `--video clip.mp4` to the replay to write it to an MP4 at real speed instead of a window (every take once; `--takes 12` keeps take 1 of each pose, both hands, about 65 s).
+
 **Live** runs the same warm-up as `fuse_live.py`, LEFT hand then RIGHT hand,
 with the steps shown in the window, on the console and in the camera window:
 hold the hand open 18 to 28 cm over the module until it is acquired, then

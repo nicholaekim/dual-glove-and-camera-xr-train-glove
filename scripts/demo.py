@@ -50,6 +50,14 @@ HEADLESS (for tests and a look without a screen)
   --no-window --snapshot PATH --frames N renders N frames without a window
   (a replay then runs as fast as it can) and writes the last one as a PNG.
 
+A VIDEO OF A REPLAY
+  --replay DIR --video PATH.mp4 draws without a window and writes every
+  frame to an MP4 at 30 frames a second, the replay's real pace (times
+  --speed): each video frame moves the replay on by 1/30 s, so the 60 Hz
+  glove frames are sampled, not slowed down. Every take is played once, in
+  the window's order; --takes N keeps only the first N. The frames are the
+  window's own pictures, padded to an even width and height.
+
 Flags shared with scripts/fuse_live.py (--hand, --profile, --glove-lag,
 --fit-template, --warmup-*, --acquire-timeout, --max-dt, --drift-anchor,
 --rail-fingers, --no-rail-override, --port, --mock-glove, --mock-leap,
@@ -67,6 +75,8 @@ Usage:
   python scripts/demo.py --live --mock-glove --mock-leap --no-view
   python scripts/demo.py --replay recordings/sync_day2 --no-window \\
       --snapshot runs/demo.png --frames 400
+  python scripts/demo.py --replay recordings/sync_day2 --video demo.mp4 \\
+      --takes 12
 """
 import sys
 import time
@@ -113,6 +123,9 @@ from fuse_poses import (  # noqa: E402
 from cam_hand.demo_view import (  # noqa: E402
     CentroidClassifier,
     SideState,
+    canvas_size,
+    even_size,
+    pad_to,
     pose_features,
     render,
     render_message,
@@ -172,6 +185,9 @@ FRAME_S = 1.0 / 60.0
 REPLAY_KEYS = ("space pause   n next take   r restart take   + / - speed   "
                "q quit")
 LIVE_KEYS = "q quit"
+# A --video file: frames a second, and the codecs tried, in order.
+VIDEO_FPS = 30.0
+VIDEO_CODECS = ("avc1", "mp4v")
 
 
 # --- the command line --------------------------------------------------------
@@ -204,6 +220,14 @@ def build_parser():
                    help="write the last frame drawn as a PNG")
     p.add_argument("--frames", type=int, default=None,
                    help="stop after drawing this many frames")
+    p.add_argument("--video", type=Path, default=None, metavar="PATH.mp4",
+                   help="replay only: no window; play every take once and "
+                        f"write each frame drawn to an MP4 at {VIDEO_FPS:g} "
+                        "frames a second, at the replay's real pace "
+                        "(times --speed)")
+    p.add_argument("--takes", type=int, default=None, metavar="N",
+                   help="replay only: play just the first N takes, in the "
+                        "order the replay plays them")
     return p
 
 
@@ -443,6 +467,51 @@ def write_snapshot(path: Optional[Path], img) -> Optional[Path]:
     return path
 
 
+class VideoOut:
+    """An MP4 file that the replay's frames are written to, one picture per
+    frame, all padded to one even size (the codecs need even dimensions).
+
+    The avc1 (H.264) codec is tried first, then mp4v. If this OpenCV can open
+    neither, it stops with a plain message.
+    """
+
+    def __init__(self, path: Path, size: Tuple[int, int],
+                 fps: float = VIDEO_FPS):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.size = even_size(size)
+        self.fps = float(fps)
+        self.frames = 0
+        self.writer = None
+        self.codec = None
+        for codec in VIDEO_CODECS:
+            writer = cv2.VideoWriter(str(self.path),
+                                     cv2.VideoWriter_fourcc(*codec),
+                                     self.fps, self.size)
+            if writer.isOpened():
+                self.writer, self.codec = writer, codec
+                break
+            writer.release()
+        if self.writer is None:
+            raise SystemExit(
+                f"Could not write the video {self.path}: this OpenCV opens "
+                f"neither the {' nor the '.join(VIDEO_CODECS)} codec for an "
+                "MP4 file.")
+
+    def write(self, img) -> None:
+        self.writer.write(pad_to(img, self.size))
+        self.frames += 1
+
+    def close(self) -> None:
+        if self.writer is not None:
+            self.writer.release()
+            self.writer = None
+
+    @property
+    def seconds(self) -> float:
+        return self.frames / self.fps
+
+
 def guesses_for(states: Dict[str, SideState], sides: Sequence[str],
                 clf: Optional[CentroidClassifier],
                 exclude_take: Optional[str] = None) -> dict:
@@ -530,7 +599,7 @@ def run_replay(args, s: Settings) -> int:
     wanted = ("left", "right") if args.hand == "both" else (args.hand,)
     # The window opens once the session is fused: a window left without
     # its message loop for half a minute would be marked "not responding".
-    window = Window(enabled=not args.no_window)
+    window = Window(enabled=not args.no_window and args.video is None)
     print(f"Replay of {args.replay} (reading and fusing every take first): "
           "profile "
           f"{s.profile_path.name if s.profile_path else '(none)'}, "
@@ -541,19 +610,38 @@ def run_replay(args, s: Settings) -> int:
     if not takes:
         print(f"--replay {args.replay}: no take of the {args.hand} hand")
         return 1
+    if args.takes is not None:
+        takes = takes[:args.takes]
     clf, holdout, note = load_classifier(args.classifier_from, s,
                                          replay_dir=args.replay,
                                          replay_samples=samples)
     print(f"Playing {len(takes)} take(s)"
-          + ("" if args.no_window else "; " + REPLAY_KEYS))
+          + ("; " + REPLAY_KEYS if window.enabled else ""))
     player = ReplayPlayer(takes, args.speed)
+    video = None
+    if args.video is not None:
+        rows = max(len([h for h in ("left", "right")
+                        if h in t.hands and h in wanted]) for t in takes)
+        video = VideoOut(args.video, canvas_size(rows))
+        print(f"Writing {args.video} ({video.size[0]} x {video.size[1]}, "
+              f"{VIDEO_FPS:g} fps, codec {video.codec}), every take once...")
     states: Dict[str, SideState] = {}
     drawn = 0
     last = time.perf_counter()
     try:
         while True:
             t_loop = time.perf_counter()
-            if args.no_window:
+            if video is not None:
+                # The replay's own clock moves 1/VIDEO_FPS s per video frame
+                # (times the speed), however long the drawing takes.
+                frames, changed = player.advance(
+                    1.0 / VIDEO_FPS if drawn else 0.0)
+                if changed:
+                    if player.k == 0:
+                        break                    # every take played once
+                    # The new take's first frame, so no empty frame between.
+                    frames, _ = player.advance(0.0)
+            elif args.no_window:
                 frames, changed = player.step()
             else:
                 frames, changed = player.advance(t_loop - last)
@@ -576,6 +664,8 @@ def run_replay(args, s: Settings) -> int:
                          truth=take.pose, guess_note=note,
                          progress=player.progress)
             drawn += 1
+            if video is not None:
+                video.write(img)
             spent = time.perf_counter() - t_loop
             key = window.show(img, int(1000 * max(0.0, FRAME_S - spent)))
             if key in ("q", "Q"):
@@ -598,7 +688,12 @@ def run_replay(args, s: Settings) -> int:
         pass
     finally:
         window.close()
+        if video is not None:
+            video.close()
     write_snapshot(args.snapshot, window.last)
+    if video is not None:
+        print(f"Video: {video.path} ({video.frames} frames, "
+              f"{video.seconds:.1f} s)")
     print(f"Drew {drawn} frame(s).")
     return 0
 
@@ -874,6 +969,12 @@ def main(argv=None) -> int:
         return 1
     if args.speed <= 0:
         print("--speed must be above 0.")
+        return 1
+    if args.video is not None and args.replay is None:
+        print("--video works with --replay only.")
+        return 1
+    if args.takes is not None and args.takes < 1:
+        print("--takes must be 1 or more.")
         return 1
     s = settings_from_args(args)
     if args.replay is not None:

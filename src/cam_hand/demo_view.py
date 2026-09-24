@@ -366,6 +366,25 @@ def canvas_size(n_rows: int) -> Tuple[int, int]:
     return WIDTH, HEADER_H + max(1, n_rows) * ROW_H + FOOTER_H
 
 
+def even_size(size: Tuple[int, int]) -> Tuple[int, int]:
+    """(width, height) rounded up to even numbers, as video codecs want."""
+    w, h = (int(v) for v in size)
+    return w + w % 2, h + h % 2
+
+
+def pad_to(img: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
+    """`img` in the top left of a picture of `size` (width, height), the rest
+    the background colour. A picture already that size comes back as is; a
+    larger one is cut to it."""
+    w, h = size
+    if img.shape[1] == w and img.shape[0] == h:
+        return img
+    out = np.full((h, w, 3), BG_BGR, np.uint8)
+    ih, iw = min(h, img.shape[0]), min(w, img.shape[1])
+    out[:ih, :iw] = img[:ih, :iw]
+    return out
+
+
 def _col_x(k: int) -> int:
     return MARGIN + sum(COL_W[:k]) + GAP * k
 

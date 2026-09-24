@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 from cam_hand.demo_view import (
+    BG_BGR,
     BONES,
     MM_PER_PX,
     CentroidClassifier,
@@ -20,6 +21,8 @@ from cam_hand.demo_view import (
     badge_text,
     canvas_size,
     draw_hand,
+    even_size,
+    pad_to,
     palm_view_mm,
     to_pixels,
 )
@@ -274,6 +277,45 @@ def test_replay_of_a_synthetic_session_writes_a_snapshot(tmp_path, capsys):
                        cv2.IMREAD_COLOR)
     assert img.shape[1::-1] == canvas_size(1)
     assert img.std() > 10                             # something was drawn
+
+
+def test_replay_to_a_video_keeps_the_recordings_pace(tmp_path, capsys):
+    """Every take once, 30 video frames per second of recording (times the
+    speed) plus the gap after each take, and a picture in the first frame."""
+    demo = _demo()
+    root, lag = _session_with_two_poses(tmp_path / "session")
+    flags = ["--replay", str(root), "--profile", "none",
+             "--glove-lag", f"right:{lag}", "--fit-template", "none"]
+    video = tmp_path / "clips" / "replay.mp4"
+    code = demo.main(flags + ["--video", str(video), "--speed", "2"])
+    text = capsys.readouterr().out
+    assert code == 0, text
+    assert video.is_file() and "Video: " in text
+
+    s = demo.settings_from_args(demo.build_parser().parse_args(flags))
+    takes, _samples = demo.fuse_session(root, s, log=lambda *a: None)
+    step = 2.0 / demo.VIDEO_FPS
+    expected = sum(math.ceil((t.frames[-1].t_glove - t.frames[0].t_glove
+                              + demo.TAKE_GAP_S) / step) for t in takes)
+    cap = cv2.VideoCapture(str(video))
+    try:
+        assert cap.isOpened()
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        assert abs(count - expected) <= len(takes), (count, expected)
+        ok, first = cap.read()
+    finally:
+        cap.release()
+    assert ok
+    assert first.shape[1::-1] == even_size(canvas_size(1))
+    assert first.std() > 10                           # not a blank frame
+
+
+def test_a_video_frame_is_padded_to_an_even_size():
+    assert even_size((1131, 562)) == (1132, 562)
+    img = np.full((3, 5, 3), 200, np.uint8)
+    out = pad_to(img, even_size(img.shape[1::-1]))
+    assert out.shape == (4, 6, 3)
+    assert (out[:3, :5] == 200).all() and (out[3] == BG_BGR).all()
 
 
 def test_live_on_the_mock_sensors_writes_a_snapshot(tmp_path, monkeypatch,
