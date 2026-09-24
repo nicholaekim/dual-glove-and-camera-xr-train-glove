@@ -38,6 +38,33 @@ TWO MODES, THE SAME WINDOW
                  this window, on the console, and in the camera window
                  (--no-view closes that one).
 
+WHERE A LIVE DEMO'S DATA GOES
+  Every --live run saves, in a folder made at the start,
+  recordings/demo/<YYYY-MM-DD_HHMM>_<hands>/ (hands: left, right or both;
+  _2, _3 and so on is added when a run in the same minute has the name):
+    <hands>.jsonl          the fused frames, as fuse_live.py --out writes
+                           them; with --hand both, both hands in this one
+                           file, each line naming its hand
+    <hands>.warmup.txt     what the console said up to the fusion
+    <hands>.summary.txt    the end-of-run summary
+    template_<hand>.json   each hand's bone measurement from the warm-up
+                           (with --fit-template auto)
+    demo.mp4               every frame the window drew while fusing, at 30
+                           frames a second (the window draws 30 a second
+                           while it records, so the video is real time).
+                           OpenCV writes it with the mp4v codec; if ffmpeg
+                           is on PATH it is then re-encoded to H.264 at CRF
+                           23 and the mp4v file deleted. The summary says
+                           which happened
+    snapshot.png           the last frame drawn
+    README.txt             every file with one line each, the hands, the
+                           duration, the frame counts, and each hand's
+                           paired share and camera use per DOF
+  --out PATH.jsonl puts all of these beside PATH instead; --no-save writes
+  none of them. When the run ends (q, Esc, --seconds, or Ctrl-C) the last
+  line printed is "Data for this demo: FOLDER", and the folder opens in
+  File Explorer (not with --no-open or --no-window).
+
 THE POSE GUESS
   Centroids are the per-take means of the fused hand's `all_features` over
   the session given by --classifier-from (default: the replayed session in
@@ -61,8 +88,9 @@ A VIDEO OF A REPLAY
 Flags shared with scripts/fuse_live.py (--hand, --profile, --glove-lag,
 --fit-template, --warmup-*, --acquire-timeout, --max-dt, --drift-anchor,
 --rail-fingers, --no-rail-override, --port, --mock-glove, --mock-leap,
---no-view, --out, --osc-out, --seconds) mean exactly what they mean there;
---out, --osc-out and --seconds apply to --live only. The live setup below is
+--no-view, --out, --osc-out, --seconds) mean exactly what they mean there,
+except that --out also moves the demo's other files (above); --out,
+--osc-out and --seconds apply to --live only. The live setup below is
 a copy of fuse_live.main's sequence (that function is one piece, so it
 cannot be called part-way); every piece it calls is imported from there,
 including what it says after the warm-up and at the end and the
@@ -72,16 +100,22 @@ Usage:
   python scripts/demo.py --replay recordings/sync_day2
   python scripts/demo.py --live
   python scripts/demo.py --live --hand right
+  python scripts/demo.py --live --no-save
   python scripts/demo.py --live --mock-glove --mock-leap --no-view
   python scripts/demo.py --replay recordings/sync_day2 --no-window \\
       --snapshot runs/demo.png --frames 400
   python scripts/demo.py --replay recordings/sync_day2 --video demo.mp4 \\
       --takes 12
 """
+import os
+import shutil
+import subprocess
 import sys
 import time
 from collections import defaultdict
+from contextlib import suppress
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -109,6 +143,7 @@ from fuse_poses import (  # noqa: E402
     AUTO,
     CAM_DIRS,
     FIT_AUTO,
+    FIT_FILE,
     FIT_NONE,
     LEAP,
     fit_measurements,
@@ -159,6 +194,7 @@ from cam_hand.live_fusion import (  # noqa: E402
     hud_segment,
     learn_from_session,
     replay_take,
+    wall_clock,
 )
 from cam_hand.recorder import take_files  # noqa: E402
 from cam_hand.template_fit import load_measurement  # noqa: E402
@@ -188,6 +224,15 @@ LIVE_KEYS = "q quit"
 # A --video file: frames a second, and the codecs tried, in order.
 VIDEO_FPS = 30.0
 VIDEO_CODECS = ("avc1", "mp4v")
+# A live run's video: mp4v first, because OpenCV's avc1 on this laptop writes
+# about 19 Mbit/s; ffmpeg, when it is on PATH, re-encodes it afterwards.
+LIVE_VIDEO_CODECS = ("mp4v", "avc1")
+H264_CRF = 23
+# Where a live demo's data goes, and the names of the files in its folder.
+DEMO_DIR = ROOT / "recordings" / "demo"
+DEMO_VIDEO = "demo.mp4"
+DEMO_SNAPSHOT = "snapshot.png"
+DEMO_README = "README.txt"
 
 
 # --- the command line --------------------------------------------------------
@@ -203,6 +248,10 @@ def build_parser():
             action.help = ("no hardware: play a recorded session (DIR/glove, "
                            "DIR/leap) through the live fusion path at the "
                            "recording's pace, take after take")
+        elif "--out" in action.option_strings:
+            action.help = ("live: write the fused frames here and every "
+                           "other file of the demo beside it, instead of in "
+                           "recordings/demo/<YYYY-MM-DD_HHMM>_<hands>/")
     p.add_argument("--live", action="store_true",
                    help="the gloves and the Ultraleap: warm up, then draw "
                         "every fused frame as it is made")
@@ -228,6 +277,13 @@ def build_parser():
     p.add_argument("--takes", type=int, default=None, metavar="N",
                    help="replay only: play just the first N takes, in the "
                         "order the replay plays them")
+    p.add_argument("--no-save", action="store_true",
+                   help="live only: save nothing (by default a live run "
+                        "saves its frames, logs, video, snapshot and a "
+                        "README in recordings/demo/<YYYY-MM-DD_HHMM>_<hands>/)")
+    p.add_argument("--no-open", action="store_true",
+                   help="live only: do not open the data folder in File "
+                        "Explorer at the end (--no-window never opens it)")
     return p
 
 
@@ -452,9 +508,9 @@ class Window:
                 pass
 
 
-def write_snapshot(path: Optional[Path], img) -> Optional[Path]:
+def write_snapshot(path: Optional[Path], img, say=print) -> Optional[Path]:
     """The last frame as a PNG (encoded here, so a path OpenCV's own writer
-    cannot open still works)."""
+    cannot open still works). `say` is given the line naming the file."""
     if path is None or img is None:
         return None
     path = Path(path)
@@ -463,7 +519,7 @@ def write_snapshot(path: Optional[Path], img) -> Optional[Path]:
     if not ok:
         raise SystemExit(f"could not encode the snapshot for {path}")
     path.write_bytes(data.tobytes())
-    print(f"Snapshot: {path}")
+    say(f"Snapshot: {path}")
     return path
 
 
@@ -471,12 +527,13 @@ class VideoOut:
     """An MP4 file that the replay's frames are written to, one picture per
     frame, all padded to one even size (the codecs need even dimensions).
 
-    The avc1 (H.264) codec is tried first, then mp4v. If this OpenCV can open
-    neither, it stops with a plain message.
+    The codecs are tried in the order given: by default avc1 (H.264) first,
+    then mp4v. If this OpenCV can open none of them, it stops with a plain
+    message.
     """
 
     def __init__(self, path: Path, size: Tuple[int, int],
-                 fps: float = VIDEO_FPS):
+                 fps: float = VIDEO_FPS, codecs: Sequence[str] = VIDEO_CODECS):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.size = even_size(size)
@@ -484,7 +541,7 @@ class VideoOut:
         self.frames = 0
         self.writer = None
         self.codec = None
-        for codec in VIDEO_CODECS:
+        for codec in codecs:
             writer = cv2.VideoWriter(str(self.path),
                                      cv2.VideoWriter_fourcc(*codec),
                                      self.fps, self.size)
@@ -495,7 +552,7 @@ class VideoOut:
         if self.writer is None:
             raise SystemExit(
                 f"Could not write the video {self.path}: this OpenCV opens "
-                f"neither the {' nor the '.join(VIDEO_CODECS)} codec for an "
+                f"neither the {' nor the '.join(codecs)} codec for an "
                 "MP4 file.")
 
     def write(self, img) -> None:
@@ -698,11 +755,158 @@ def run_replay(args, s: Settings) -> int:
     return 0
 
 
+# --- where a live demo's data goes -------------------------------------------
+
+def demo_folder(hand: str, when: Optional[datetime] = None,
+                base: Optional[Path] = None) -> Path:
+    """A live demo's own folder, `recordings/demo/<YYYY-MM-DD_HHMM>_<hand>`
+    (`base` in place of recordings/demo), `hand` being left, right or both.
+    When a run earlier in the same minute already has that folder, `_2`,
+    `_3` and so on is added, so no run overwrites another."""
+    base = DEMO_DIR if base is None else Path(base)
+    when = datetime.now() if when is None else when
+    name = f"{when:%Y-%m-%d_%H%M}_{hand}"
+    path, n = base / name, 2
+    while path.exists():
+        path, n = base / f"{name}_{n}", n + 1
+    return path
+
+
+def live_out_path(args, when: Optional[datetime] = None) -> Optional[Path]:
+    """The fused frames' file of a live run, which every other file of the
+    demo goes beside: --out PATH as given, else `<hand>.jsonl` in a new
+    `demo_folder`; None with --no-save."""
+    if args.no_save:
+        return None
+    if args.out is not None:
+        return Path(args.out)
+    return demo_folder(args.hand, when) / f"{args.hand}.jsonl"
+
+
+def shown_path(path: Path, longest: int = 80) -> str:
+    """`path` for the window's footer: relative to the working folder when
+    it is inside it, else in full, or its last two parts after "..." when
+    the full path is longer than `longest` characters."""
+    path = Path(path).resolve()
+    try:
+        return str(path.relative_to(Path.cwd().resolve()))
+    except ValueError:
+        pass
+    if len(str(path)) <= longest:
+        return str(path)
+    return os.sep.join(["...", path.parent.name, path.name])
+
+
+def reencode_h264(path: Path, codec: str, crf: int = H264_CRF,
+                  timeout: float = 900.0) -> str:
+    """Re-encode the video at `path` to H.264 at `crf` with ffmpeg, in
+    place, when ffmpeg is on PATH, and say in words what the file now is.
+    The file OpenCV wrote (with `codec`) is replaced only by a finished
+    re-encode; with no ffmpeg, or one that fails, it stays as it is."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return f"{codec} (ffmpeg is not on PATH, so not re-encoded)"
+    tmp = path.with_name(path.stem + ".h264" + path.suffix)
+    print(f"Re-encoding {path.name} to H.264 with ffmpeg...")
+    try:
+        done = subprocess.run(
+            [ffmpeg, "-nostdin", "-y", "-loglevel", "error", "-i", str(path),
+             "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p",
+             "-movflags", "+faststart", "-an", str(tmp)],
+            capture_output=True, text=True, timeout=timeout)
+        ok = (done.returncode == 0 and tmp.is_file()
+              and tmp.stat().st_size > 0)
+        why = (done.stderr.strip().splitlines()
+               or [f"exit code {done.returncode}"])[-1]
+        if ok:
+            os.replace(tmp, path)
+    except (OSError, subprocess.SubprocessError) as e:
+        ok, why = False, str(e)
+    if not ok:
+        with suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        return f"{codec} (the ffmpeg re-encode failed: {why})"
+    return (f"H.264 CRF {crf}, re-encoded by ffmpeg from OpenCV's {codec} "
+            "file (deleted)")
+
+
+def finish_video(video: "VideoOut") -> Tuple[Optional[Path], str]:
+    """Close a live run's video and re-encode it (`reencode_h264`).
+    Returns (its path, what it is in words), or (None, why) when no frame
+    was drawn and the empty file was removed."""
+    video.close()
+    if not video.frames:
+        with suppress(OSError):
+            video.path.unlink(missing_ok=True)
+        return None, "no frame was drawn while fusing"
+    return video.path, reencode_h264(video.path, video.codec)
+
+
+def open_folder(folder: Path) -> None:
+    """Show `folder` in File Explorer. Windows only: elsewhere, or if it
+    fails, the run just ends."""
+    startfile = getattr(os, "startfile", None)
+    if startfile is None:
+        return
+    try:
+        startfile(str(folder))
+    except OSError as e:
+        print(f"Could not open {folder}: {e}")
+
+
+def summary_for_readme(lines: Sequence[str]) -> List[str]:
+    """From `LiveFusion.summary_lines`: each hand's line (glove frames
+    fused, the share paired with a camera frame, camera use, lag) and its
+    camera use per gated DOF. Why the camera was refused and what the drift
+    anchor did stay in the summary file."""
+    out, keep = [], False
+    for line in list(lines)[1:]:
+        depth = len(line) - len(line.lstrip())
+        text = line.strip()
+        if depth <= 2:
+            keep = not text.startswith("drift anchor")
+        elif depth <= 4:
+            keep = text.startswith("camera use per gated DOF")
+        if keep:
+            out.append(line)
+    return out
+
+
+def readme_lines(hands: Sequence[str], fused_hands: Sequence[str],
+                 started: float, fusing_from: Optional[float], ended: float,
+                 frames: str, files: Sequence[Tuple[Path, str]],
+                 summary: Sequence[str] = ()) -> List[str]:
+    """README.txt of a live demo's folder: when it ran, the hands, how long
+    it fused, the frame counts, every file with one line on what it holds,
+    and each hand's paired share and camera use per DOF from the summary."""
+    asked = ", ".join(hands)
+    shown = ", ".join(fused_hands) or "none"
+    width = max((len(p.name) for p, _what in files), default=0) + 2
+    lines = ["Glove + camera fusion demo (scripts/demo.py --live)",
+             f"Run: {wall_clock(started)} to {wall_clock(ended)}",
+             f"Hands: {shown}" + ("" if shown == asked else
+                                  f" (asked for {asked}; the warm-up file "
+                                  "says why)"),
+             "Duration: " + ("nothing was fused" if fusing_from is None else
+                             f"{ended - fusing_from:.1f} s of fusion")
+             + f" ({ended - started:.1f} s with the warm-up)",
+             f"Frames: {frames}",
+             "",
+             "Files:"]
+    lines += [f"  {p.name:<{width}}{what}" for p, what in files]
+    picked = summary_for_readme(summary)
+    if picked:
+        lines += ["", "From the summary (camera use per DOF counts paired "
+                      "frames only):"] + picked
+    return lines
+
+
 # --- --live ------------------------------------------------------------------
 
 def run_live(args, s: Settings) -> int:
     """fuse_live.main's sequence (profile, sensors, warm-up, fusion), with
-    the demo window in place of nothing."""
+    the demo window in place of nothing, and everything the run makes kept
+    in one folder (see "WHERE A LIVE DEMO'S DATA GOES" above)."""
     hands = ("left", "right") if args.hand == "both" else (args.hand,)
     gates, rail_params = s.gates, s.rail_params
     lags = resolve_lag(parse_glove_lag(args.glove_lag), hands, s.profile_lag,
@@ -721,9 +925,46 @@ def run_live(args, s: Settings) -> int:
     window = Window(enabled=not args.no_window)
     clf, _holdout, note = load_classifier(args.classifier_from, s)
 
-    log = RunLog(args.out, header=run_header(
+    out_path = live_out_path(args)
+    folder = None if out_path is None else out_path.parent
+    if folder is not None:
+        folder.mkdir(parents=True, exist_ok=True)
+    started = time.time()
+    log = RunLog(out_path, header=run_header(
         "demo.py --live", hands, s.profile_path, s.profile_how, lags,
         fit_spec))
+    if folder is not None:
+        log.say(f"Saving this demo in {folder}")
+    listed: List[Tuple[Path, str]] = []
+
+    def list_file(path, what) -> None:
+        """Name `path` in README.txt, if it was written."""
+        if path is not None and Path(path).is_file():
+            listed.append((Path(path), what))
+
+    def wrap_up(code, fused_hands=(), fusing_from=None, ended=None,
+                frames="none fused", summary=()) -> int:
+        """README.txt, then (after a fusion) the folder in File Explorer,
+        and its path as the last line printed."""
+        if folder is None:
+            return code
+        ended = time.time() if ended is None else ended
+        if not listed:
+            list_file(log.warmup_path, "what the console said up to the "
+                      "fusion: settings, each hand's acquire, what the "
+                      "warm-up learned")
+        readme = folder / DEMO_README
+        text = readme_lines(hands, fused_hands, started, fusing_from, ended,
+                            frames, listed + [(readme, "this file")],
+                            summary)
+        try:
+            readme.write_text("\n".join(text) + "\n", encoding="utf-8")
+        except OSError as e:
+            print(f"Could not write {readme}: {e}")
+        if fusing_from is not None and not (args.no_open or args.no_window):
+            open_folder(folder)
+        print(f"Data for this demo: {folder.resolve()}")
+        return code
     log.say(f"Profile: {s.profile_path or '(none)'}  [{s.profile_how}]"
             + (f"  {s.profile_name}" if s.profile_name else ""))
     for hand in hands:
@@ -746,7 +987,7 @@ def run_live(args, s: Settings) -> int:
         log.say(f"camera: {e}")
         log.write_warmup()
         window.close()
-        return 1
+        return wrap_up(1)
     try:
         glove.start()
     except OSError as e:
@@ -755,7 +996,7 @@ def run_live(args, s: Settings) -> int:
         log.say(f"glove: cannot listen on OSC port {args.port} ({e}). Is "
                 "another recorder still running?")
         log.write_warmup()
-        return 1
+        return wrap_up(1)
     view = CameraView(hand=args.hand if args.hand != "both" else None,
                       band=DEFAULT_BAND,
                       enabled=not (args.no_view or args.mock_leap)).start()
@@ -876,7 +1117,7 @@ def run_live(args, s: Settings) -> int:
         shutdown()
         log.say("\nStopped during the warm-up; nothing was fused.")
         log.write_warmup()
-        return 1
+        return wrap_up(1)
     except BaseException:
         shutdown()
         log.write_warmup()
@@ -886,20 +1127,34 @@ def run_live(args, s: Settings) -> int:
     buffer.keep_abs26 = False
     learned = warmup.learn(gates=gates, rail_params=rail_params, fit=fit)
     del warmup
-    learned, fused_hands = conclude_warmup(learned, hands, fit, args.out, log)
+    learned, fused_hands = conclude_warmup(learned, hands, fit, out_path,
+                                           log)
     if not fused_hands:
         shutdown()
-        return 2
+        return wrap_up(2)
 
     # --- the fusion (as fuse_live.main, drawing every frame) ---------------
     fusion = LiveFusion(learned, buffer, gates=gates, rail_params=rail_params,
                         unreliable=s.unreliable, anchor=s.anchor,
                         lag={h: lags[h][0] for h in fused_hands},
                         max_dt=args.max_dt)
-    if args.out is not None:
-        sinks.append(JsonlSink(args.out))
+    jsonl = None if out_path is None else JsonlSink(out_path)
+    if jsonl is not None:
+        sinks.append(jsonl)
     if osc_target is not None:
         sinks.append(OscSink(*osc_target))
+    video = None
+    if folder is not None:
+        try:
+            video = VideoOut(folder / DEMO_VIDEO, canvas_size(len(fused_hands)),
+                             codecs=LIVE_VIDEO_CODECS)
+        except SystemExit as e:              # the fusion goes on without it
+            log.say(f"{e} Going on without a video.")
+    # Recording, the window draws VIDEO_FPS times a second, so each picture
+    # drawn is one video frame and the video plays in real time.
+    period = FRAME_S if video is None else 1.0 / VIDEO_FPS
+    footer = (LIVE_KEYS if folder is None
+              else f"{LIVE_KEYS}   saving to {shown_path(folder)}")
     beeper.beep(CUE_FREQ, CUE_MS)
     view.caption("LIVE FUSION", band=DEFAULT_BAND)
     print("Fusing" + (f" for {args.seconds:g} s" if args.seconds else
@@ -940,13 +1195,18 @@ def run_live(args, s: Settings) -> int:
             due = (fresh_frames if args.no_window
                    else now >= next_draw[0])
             if due:
-                next_draw[0] = now + FRAME_S
+                # A fixed schedule, so the draws keep their rate on average;
+                # one that fell behind starts again from now.
+                next_draw[0] = (now + period if now - next_draw[0] > period
+                                else next_draw[0] + period)
                 fresh_frames = False
                 img = render(states, fused_hands, now, header=header,
-                             footer=LIVE_KEYS,
+                             footer=footer,
                              guesses=guesses_for(states, fused_hands, clf),
                              guess_note=note)
                 drawn += 1
+                if video is not None:
+                    video.write(img)
                 if window.show(img, 1) in ("q", "Q"):
                     break
                 if args.frames is not None and drawn >= args.frames:
@@ -956,10 +1216,46 @@ def run_live(args, s: Settings) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        t_stop = time.time()
         shutdown()
-    report_run(log, fusion, sinks, more=[f"Drew {drawn} frame(s)."])
+        if video is not None:
+            video.close()
+    more = [f"Drew {drawn} frame(s)."]
+    video_path, video_what = None, ""
+    if video is not None:
+        video_path, video_what = finish_video(video)
+        more.append(f"Video: {video_path} ({video.frames} frames, "
+                    f"{video.seconds:.1f} s at {video.fps:g} fps), "
+                    f"{video_what}" if video_path is not None
+                    else f"Video: none, {video_what}.")
+    snapshot = (None if folder is None else
+                write_snapshot(folder / DEMO_SNAPSHOT, window.last,
+                               say=more.append))
+    report_run(log, fusion, sinks, more=more)
     write_snapshot(args.snapshot, window.last)
-    return 0
+    if folder is None:
+        return 0
+    list_file(out_path, "the fused frames, one JSON line per glove frame: "
+              "stamps, hand, the 21 fused points, where each DOF came from"
+              + ("; both hands in this one file" if len(hands) > 1 else ""))
+    list_file(log.warmup_path, "what the console said up to the fusion: "
+              "settings, each hand's acquire, what the warm-up learned")
+    list_file(log.summary_path, "the end-of-run summary: pairing, camera use "
+              "and refusals per DOF, the drift anchor, the outputs")
+    if fit == FIT_AUTO:
+        for hand in sorted(learned.measurements):
+            list_file(folder / FIT_FILE.format(hand=hand),
+                      f"the {hand} hand's bone measurement from the warm-up "
+                      "(reuse it with --fit-template PATH)")
+    list_file(video_path, f"every frame the window drew while fusing, "
+              f"{VIDEO_FPS:g} fps, {video_what}")
+    list_file(snapshot, "the last frame the window drew")
+    frames = (f"{jsonl.written} fused frames saved, {drawn} drawn in the "
+              "window, "
+              + (f"{video.frames} in {DEMO_VIDEO}" if video_path is not None
+                 else f"no {DEMO_VIDEO}"))
+    return wrap_up(0, fused_hands, log.fusing_from, t_stop, frames,
+                   fusion.summary_lines())
 
 
 def main(argv=None) -> int:
@@ -975,6 +1271,9 @@ def main(argv=None) -> int:
         return 1
     if args.takes is not None and args.takes < 1:
         print("--takes must be 1 or more.")
+        return 1
+    if args.no_save and args.out is not None:
+        print("--no-save and --out contradict each other: give one.")
         return 1
     s = settings_from_args(args)
     if args.replay is not None:

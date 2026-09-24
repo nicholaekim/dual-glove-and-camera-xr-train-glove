@@ -5,6 +5,7 @@ import importlib.util
 import json
 import math
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -318,28 +319,43 @@ def test_a_video_frame_is_padded_to_an_even_size():
     assert (out[:3, :5] == 200).all() and (out[3] == BG_BGR).all()
 
 
-def test_live_on_the_mock_sensors_writes_a_snapshot(tmp_path, monkeypatch,
-                                                     capsys):
-    demo = _demo()
-    root, _lag = _session_with_two_poses(tmp_path / "session")
+def _quiet_live(demo, monkeypatch):
+    """No beeps, a short countdown, and File Explorer never opened."""
+    opened = []
     monkeypatch.setattr(demo, "beep", lambda *a, **k: None)
     monkeypatch.setattr(demo, "COUNTDOWN_S", 0.1)
-    # The unfitted mock glove's index spans less than the real glove's floor
-    # (see test_live_fusion._low_glove_floor); a plumbing test lowers it.
-    monkeypatch.setattr(demo, "DEFAULT_GATES",
-                        replace(demo.DEFAULT_GATES, min_glove_span=0.30))
+    monkeypatch.setattr(demo, "open_folder", opened.append)
+    return opened
+
+
+def test_live_on_the_mock_sensors_saves_everything_in_one_folder(
+        tmp_path, monkeypatch, capsys):
+    """--out PATH: the fused frames, the warm-up and summary records, the
+    fitted template, the video of every frame drawn, the last frame and a
+    README naming each of them, all beside PATH; the folder is the last
+    line printed, and --no-window never opens it."""
+    demo = _demo()
+    root, _lag = _session_with_two_poses(tmp_path / "session")
+    opened = _quiet_live(demo, monkeypatch)
     png = tmp_path / "live.png"
     out = tmp_path / "run" / "live.jsonl"
     code = demo.main(["--live", "--mock-glove", "--mock-leap", "--no-view",
                       "--no-window", "--snapshot", str(png), "--frames", "30",
-                      "--hand", "right", "--fit-template", "none",
-                      "--acquire-timeout", "5", "--warmup-open", "1",
+                      "--hand", "right", "--fit-template", "auto",
+                      "--acquire-timeout", "5", "--warmup-open", "3",
                       "--warmup-fist", "1.2", "--out", str(out),
                       "--classifier-from", str(root)])
     text = capsys.readouterr().out
     assert code == 0, text
     assert "Drew 30 frame(s)." in text
     assert "Pose centroids from" in text
+    folder = out.parent
+    assert text.rstrip().splitlines()[-1] == (
+        f"Data for this demo: {folder.resolve()}")
+    assert opened == []
+    names = ["live.jsonl", "live.warmup.txt", "live.summary.txt",
+             "template_right.json", "demo.mp4", "snapshot.png", "README.txt"]
+    assert sorted(p.name for p in folder.iterdir()) == sorted(names)
     # The same record beside --out as scripts/fuse_live.py writes.
     kept = (out.parent / "live.warmup.txt").read_text(encoding="utf-8")
     assert " demo.py --live  hands right  profile " in kept.splitlines()[0]
@@ -350,9 +366,86 @@ def test_live_on_the_mock_sensors_writes_a_snapshot(tmp_path, monkeypatch,
     assert summary.startswith("Run started ")
     assert f"  right: {n} glove frames fused, " in summary
     assert "Drew 30 frame(s)." in summary
-    img = cv2.imdecode(np.frombuffer(png.read_bytes(), np.uint8),
-                       cv2.IMREAD_COLOR)
-    assert img.shape[1::-1] == canvas_size(1)
+    # The summary says whether ffmpeg re-encoded the video.
+    assert ("re-encoded by ffmpeg from OpenCV's mp4v file" in summary
+            or "mp4v (ffmpeg is not on PATH" in summary)
+    for path in (png, folder / "snapshot.png"):
+        img = cv2.imdecode(np.frombuffer(path.read_bytes(), np.uint8),
+                           cv2.IMREAD_COLOR)
+        assert img.shape[1::-1] == canvas_size(1)
+    cap = cv2.VideoCapture(str(folder / "demo.mp4"))
+    try:
+        assert cap.isOpened()
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        ok, first = cap.read()
+    finally:
+        cap.release()
+    assert abs(count - 30) <= 2 and ok
+    assert first.shape[1::-1] == even_size(canvas_size(1))
+
+    readme = (folder / "README.txt").read_text(encoding="utf-8")
+    for name in names:
+        assert f"\n  {name}  " in readme, name
+    assert "\nHands: right\n" in readme
+    assert " s of fusion (" in readme
+    assert f"Frames: {n} fused frames saved, 30 drawn in the window, " \
+           "30 in demo.mp4" in readme
+    assert f"  right: {n} glove frames fused, " in readme
+    for dof in GATED_DOFS:
+        assert f"      {dof} " in readme
+    assert "why the camera was refused" not in readme
+
+
+def test_live_with_no_save_writes_nothing(tmp_path, monkeypatch, capsys):
+    demo = _demo()
+    _quiet_live(demo, monkeypatch)
+    # The unfitted mock glove's index spans less than the real glove's floor
+    # (see test_live_fusion._low_glove_floor); a plumbing test lowers it.
+    monkeypatch.setattr(demo, "DEFAULT_GATES",
+                        replace(demo.DEFAULT_GATES, min_glove_span=0.30))
+    monkeypatch.setattr(demo, "DEMO_DIR", tmp_path / "demo")
+    monkeypatch.chdir(tmp_path)
+    code = demo.main(["--live", "--mock-glove", "--mock-leap", "--no-view",
+                      "--no-window", "--frames", "30", "--hand", "right",
+                      "--fit-template", "none", "--acquire-timeout", "5",
+                      "--warmup-open", "1", "--warmup-fist", "1.2",
+                      "--classifier-from", "none", "--no-save"])
+    text = capsys.readouterr().out
+    assert code == 0, text
+    assert "Drew 30 frame(s)." in text
+    assert list(tmp_path.iterdir()) == []
+    assert "Data for this demo" not in text
+
+
+def test_the_default_demo_folder_is_named_by_minute_and_hands(tmp_path,
+                                                              monkeypatch):
+    demo = _demo()
+    when = datetime(2026, 9, 24, 14, 5, 59)
+    assert (demo.demo_folder("left", when, base=tmp_path)
+            == tmp_path / "2026-09-24_1405_left")
+    (tmp_path / "2026-09-24_1405_left").mkdir()
+    assert (demo.demo_folder("left", when, base=tmp_path).name
+            == "2026-09-24_1405_left_2")
+    assert demo.DEMO_DIR == ROOT / "recordings" / "demo"
+    monkeypatch.setattr(demo, "DEMO_DIR", tmp_path)
+    parse = demo.build_parser().parse_args
+    assert (demo.live_out_path(parse(["--live", "--hand", "both"]), when)
+            == tmp_path / "2026-09-24_1405_both" / "both.jsonl")
+    assert (demo.live_out_path(parse(["--live", "--out", "x/run.jsonl"]))
+            == Path("x/run.jsonl"))
+    assert demo.live_out_path(parse(["--live", "--no-save"])) is None
+    assert demo.main(["--live", "--no-save", "--out", "x.jsonl"]) == 1
+
+
+def test_without_ffmpeg_the_video_stays_as_opencv_wrote_it(tmp_path,
+                                                          monkeypatch):
+    demo = _demo()
+    monkeypatch.setattr(demo.shutil, "which", lambda name: None)
+    video = tmp_path / "demo.mp4"
+    video.write_bytes(b"mp4v")
+    what = demo.reencode_h264(video, "mp4v")
+    assert what == "mp4v (ffmpeg is not on PATH, so not re-encoded)"
+    assert video.read_bytes() == b"mp4v"
 
 
 def test_exactly_one_mode_is_asked_for(capsys):

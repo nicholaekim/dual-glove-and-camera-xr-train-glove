@@ -41,6 +41,16 @@ frame is drawn as it is made. `q` quits. It first spends about 35 s learning
 the pose centroids from sync_day2. `--hand right` shows one bigger row: on
 the laptop screen the two-hand window is scaled down to fit.
 
+**Where the data goes:** every live run saves into
+`recordings\demo\<YYYY-MM-DD_HHMM>_<hands>\` (the window's footer names it):
+the fused frames (`<hands>.jsonl`, both hands in one file with `--hand
+both`), the warm-up and summary logs, the fitted `template_<hand>.json`,
+`demo.mp4` (every frame the window drew, 30 fps), `snapshot.png`, and a
+`README.txt` listing each file with the duration, paired share and camera use
+per DOF. When you quit, the console's last line is `Data for this demo:
+<folder>` and the folder opens itself in File Explorer. `--out PATH.jsonl`
+puts it all beside PATH; `--no-save` saves nothing.
+
 If the hardware misbehaves, fall back to the replay: it is the same fusion
 code.
 

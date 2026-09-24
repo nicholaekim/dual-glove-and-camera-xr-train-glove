@@ -98,6 +98,8 @@ python scripts\demo.py --replay recordings\sync_day2
 python scripts\demo.py --live
 ```
 
+A live run saves what it showed (fused frames, logs, `demo.mp4`, a snapshot and a `README.txt`) in `recordings\demo\<YYYY-MM-DD_HHMM>_<hands>\`, and that folder opens itself when the run ends.
+
 The runbook for showing it (what to plug in, what to point at, the limits to
 say out loud) is `docs/demo.md`.
 
