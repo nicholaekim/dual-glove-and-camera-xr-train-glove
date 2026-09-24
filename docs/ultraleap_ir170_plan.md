@@ -593,6 +593,24 @@ Day-1 session with the corrected recorder (2026-09-18, 18:36 to 18:48,
   wrong. Reported as is: fusion needs per-hand, per-finger reliability
   logic; glove curl does not automatically dominate.
 
+Live fusion on hardware (2026-09-24, main 64c3678, 417 tests): works
+- `scripts/demo.py --live` (same path as `fuse_live.py`, plus the three-hand
+  window) ran on both gloves, one hand per run. Left, 60 s: 3558 fused
+  frames at 59 Hz, 68 % paired with the camera, thumb from the camera on
+  60 % of frames, spread on about half, template fit saved. Right, 30 s:
+  acquired in 6 s, template fit on 360 open-palm frames, 1810 fused frames,
+  93 % paired, thumb from the camera 96 %, spread 70 to 84 %, index
+  override on 0.5 %. Endpoints learned in the 8 s warm-up are sensible
+  (glove spans 0.7 to 1.2, camera 0.6 to 1.0).
+- In a `--hand both` run the right hand was refused during the warm-up
+  and only the console knew why; the warm-up report and the end summary
+  are now saved as `<out>.warmup.txt` and `<out>.summary.txt`. For a demo,
+  run one hand at a time.
+- The recorded demo (`--replay recordings/sync_day2`) plays 60 takes with
+  a pose guess right on 86 % of frames (54 of 60 takes by majority); the
+  right glove's index point and peace are the misses. `docs/demo.md` is
+  the runbook.
+
 Day 3 (2026-09-23 evening, `recordings/sync_day3`): the recalibration's
 prospective test, and it fails the per-finger criterion
 - Session: 3 takes x 6 poses x 2 hands = 36 takes, 8 rejected attempts
