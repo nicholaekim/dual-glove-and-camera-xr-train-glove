@@ -287,16 +287,27 @@ def test_live_on_the_mock_sensors_writes_a_snapshot(tmp_path, monkeypatch,
     monkeypatch.setattr(demo, "DEFAULT_GATES",
                         replace(demo.DEFAULT_GATES, min_glove_span=0.30))
     png = tmp_path / "live.png"
+    out = tmp_path / "run" / "live.jsonl"
     code = demo.main(["--live", "--mock-glove", "--mock-leap", "--no-view",
                       "--no-window", "--snapshot", str(png), "--frames", "30",
                       "--hand", "right", "--fit-template", "none",
                       "--acquire-timeout", "5", "--warmup-open", "1",
-                      "--warmup-fist", "1.2",
+                      "--warmup-fist", "1.2", "--out", str(out),
                       "--classifier-from", str(root)])
     text = capsys.readouterr().out
     assert code == 0, text
     assert "Drew 30 frame(s)." in text
     assert "Pose centroids from" in text
+    # The same record beside --out as scripts/fuse_live.py writes.
+    kept = (out.parent / "live.warmup.txt").read_text(encoding="utf-8")
+    assert " demo.py --live  hands right  profile " in kept.splitlines()[0]
+    assert "RIGHT hand: acquired after " in kept
+    assert "Warm-up learned:" in kept and "  right: " in kept
+    n = len(out.read_text(encoding="utf-8").splitlines())
+    summary = (out.parent / "live.summary.txt").read_text(encoding="utf-8")
+    assert summary.startswith("Run started ")
+    assert f"  right: {n} glove frames fused, " in summary
+    assert "Drew 30 frame(s)." in summary
     img = cv2.imdecode(np.frombuffer(png.read_bytes(), np.uint8),
                        cv2.IMREAD_COLOR)
     assert img.shape[1::-1] == canvas_size(1)

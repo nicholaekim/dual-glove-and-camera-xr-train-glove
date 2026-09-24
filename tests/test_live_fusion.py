@@ -10,6 +10,7 @@ session, and `scripts/fuse_live.py` end to end.
 """
 import importlib.util
 import json
+import re
 import socket
 import time
 from collections import Counter
@@ -35,9 +36,11 @@ from cam_hand.live_fusion import (
     STAGE_NOT_ACQUIRED,
     AcquireStatus,
     CameraBuffer,
+    RunLog,
     Warmup,
     acquire_status,
     countdown_text,
+    run_log_paths,
 )
 from leap_hand.protocol import HandReading
 
@@ -463,6 +466,14 @@ def test_mock_session_with_no_open_palm_stops_with_exit_code_2(tmp_path,
             "it 18 to 28 cm above the module, palm to the lens") in text
     assert "No hand passed the warm-up" in text
     assert not out.exists()                     # nothing was fused
+    # The refusal and its cause are on disk, not only in the console.
+    warmup_txt, summary_txt = run_log_paths(out)
+    kept = warmup_txt.read_text(encoding="utf-8")
+    assert "RIGHT hand refused:" in kept
+    assert ("the camera never saw the RIGHT hand during the open palm"
+            in kept)
+    assert "No hand passed the warm-up" in kept
+    assert not summary_txt.exists()             # there was no run to sum up
 
 
 def test_mock_session_that_never_closes_the_fist_is_refused(tmp_path,
@@ -529,11 +540,24 @@ def test_mock_session_times_out_when_the_camera_never_sees_the_hand(
 
 def test_mock_session_goes_on_with_the_other_hand_after_a_timeout(
         tmp_path, monkeypatch, capsys):
+    """Also the run's record: PATH.warmup.txt exists before the first
+    fused frame is written and names each hand's outcome, the refused hand
+    with its cause; PATH.summary.txt holds the end summary."""
     live = _live_module()
     _quick(live, monkeypatch)
     _low_glove_floor(live, monkeypatch)
     _camera_without(live, monkeypatch, "left")
     out = tmp_path / "right_only.jsonl"
+    warmup_txt, summary_txt = run_log_paths(out)
+    written_before_fusing = []
+    real_sink = live.JsonlSink
+
+    class Sink(real_sink):
+        def __init__(self, path):
+            written_before_fusing.append(warmup_txt.is_file())
+            super().__init__(path)
+
+    monkeypatch.setattr(live, "JsonlSink", Sink)
     code = live.main(["--mock-glove", "--mock-leap", "--no-view",
                       "--seconds", "0.5", "--hand", "both",
                       "--out", str(out), "--fit-template", "none",
@@ -544,9 +568,63 @@ def test_mock_session_goes_on_with_the_other_hand_after_a_timeout(
     assert "Going on to the RIGHT hand." in text
     assert ("Fusing the RIGHT hand only: the LEFT hand was refused (above)."
             in text)
-    hands = {json.loads(line)["hand"]
-             for line in out.read_text(encoding="utf-8").splitlines()}
+    lines = out.read_text(encoding="utf-8").splitlines()
+    hands = {json.loads(line)["hand"] for line in lines}
     assert hands == {"right"}
+
+    assert written_before_fusing == [True]
+    kept = warmup_txt.read_text(encoding="utf-8").splitlines()
+    first = kept[0]
+    assert re.match(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d  fuse_live\.py  "
+                    r"hands left, right  profile ", first), first
+    assert "glove lag left " in first and "; right " in first
+    assert first.endswith("template fit none")
+    body = "\n".join(kept[1:])
+    assert ("LEFT hand refused: the LEFT hand was not acquired in 0.5 s: "
+            "camera: RIGHT hand seen, need LEFT") in body
+    assert "RIGHT hand: acquired after " in body
+    assert "Warm-up learned:" in body
+    assert "  left: not acquired, so no warm-up" in body
+    assert "  right: " in body and " glove frames, " in body
+    assert "    glove rails: " in body
+    assert "Fusing the RIGHT hand only" in body
+    for line in body.splitlines():              # exactly as printed
+        assert line in text, line
+    summary = summary_txt.read_text(encoding="utf-8")
+    assert re.search(r"^Run started \d{4}-", summary, re.M)
+    assert re.search(r"^Fusion started \d{4}-.*s of fusion\)$", summary,
+                     re.M)
+    assert re.search(r"^Run ended \d{4}-", summary, re.M)
+    assert "Live fusion summary:" in summary
+    assert f"  right: {len(lines)} glove frames fused, " in summary
+    assert f"Wrote {len(lines)} fused frames to {out}" in summary
+    assert "Warm-up learned:" not in summary
+
+
+def test_run_log_prints_everything_and_writes_only_with_a_path(tmp_path):
+    printed = []
+    clock = iter([100.0, 160.0, 225.5])
+    log = RunLog(tmp_path / "a.jsonl", header="cmd  hands right",
+                 echo=printed.append, clock=lambda: next(clock))
+    log.say("one")
+    log.say("\ntwo")
+    assert log.write_warmup() == tmp_path / "a.warmup.txt"
+    log.fusing()
+    log.say("the end")
+    assert log.write_summary() == tmp_path / "a.summary.txt"
+    assert printed == ["one", "\ntwo", "the end"]
+    warm = (tmp_path / "a.warmup.txt").read_text(encoding="utf-8")
+    assert warm.splitlines()[0].endswith("  cmd  hands right")
+    assert warm.splitlines()[1:] == ["one", "", "two"]
+    summary = (tmp_path / "a.summary.txt").read_text(encoding="utf-8")
+    assert "(65.5 s of fusion)" in summary.splitlines()[1]
+    assert summary.splitlines()[3:] == ["the end"]
+
+    quiet = RunLog(None, echo=printed.append)
+    quiet.say("x")
+    assert quiet.write_warmup() is None and quiet.write_summary() is None
+    assert sorted(q.name for q in tmp_path.iterdir()) == [
+        "a.summary.txt", "a.warmup.txt"]
 
 
 def test_mock_session_warms_up_the_left_hand_then_the_right(tmp_path,

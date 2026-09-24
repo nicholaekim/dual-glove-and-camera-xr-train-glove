@@ -56,7 +56,9 @@ Flags shared with scripts/fuse_live.py (--hand, --profile, --glove-lag,
 --no-view, --out, --osc-out, --seconds) mean exactly what they mean there;
 --out, --osc-out and --seconds apply to --live only. The live setup below is
 a copy of fuse_live.main's sequence (that function is one piece, so it
-cannot be called part-way); every piece it calls is imported from there.
+cannot be called part-way); every piece it calls is imported from there,
+including what it says after the warm-up and at the end and the
+PATH.warmup.txt and PATH.summary.txt it writes beside --out PATH.jsonl.
 
 Usage:
   python scripts/demo.py --replay recordings/sync_day2
@@ -69,7 +71,7 @@ Usage:
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -87,8 +89,11 @@ from fuse_live import (  # noqa: E402
     ACQUIRED_FREQ,
     CUE_FREQ,
     CUE_MS,
+    acquired_line,
+    conclude_warmup,
+    report_run,
     resolve_lag,
-    save_measurements,
+    run_header,
 )
 from fuse_poses import (  # noqa: E402
     AUTO,
@@ -131,6 +136,7 @@ from cam_hand.live_fusion import (  # noqa: E402
     JsonlSink,
     LiveFusion,
     OscSink,
+    RunLog,
     Warmup,
     acquire_status,
     band_words,
@@ -620,17 +626,20 @@ def run_live(args, s: Settings) -> int:
     window = Window(enabled=not args.no_window)
     clf, _holdout, note = load_classifier(args.classifier_from, s)
 
-    print(f"Profile: {s.profile_path or '(none)'}  [{s.profile_how}]"
-          + (f"  {s.profile_name}" if s.profile_name else ""))
+    log = RunLog(args.out, header=run_header(
+        "demo.py --live", hands, s.profile_path, s.profile_how, lags,
+        fit_spec))
+    log.say(f"Profile: {s.profile_path or '(none)'}  [{s.profile_how}]"
+            + (f"  {s.profile_name}" if s.profile_name else ""))
     for hand in hands:
         seconds, why = lags[hand]
         masked = ", ".join(s.unreliable.get(hand, ())) or "(none)"
         override = ("off (--no-rail-override)" if rail_params is None
                     else ", ".join(rail_params.fingers_for(hand)) or "(none)")
-        print(f"  {hand}: glove lag {seconds:.3f} s ({why}); unreliable "
-              f"{masked}; rail override {override}")
-    print(f"Template fit: {fit_spec}.  Drift anchor: {args.drift_anchor}.  "
-          f"Pairing within {args.max_dt:g} s.")
+        log.say(f"  {hand}: glove lag {seconds:.3f} s ({why}); unreliable "
+                f"{masked}; rail override {override}")
+    log.say(f"Template fit: {fit_spec}.  Drift anchor: {args.drift_anchor}.  "
+            f"Pairing within {args.max_dt:g} s.")
 
     # --- the sensors (as fuse_live.main) ------------------------------------
     buffer = CameraBuffer(gates=gates, keep_abs26=True)
@@ -639,7 +648,8 @@ def run_live(args, s: Settings) -> int:
     try:
         camera.start()
     except Exception as e:                  # LeapUnavailable says what to do
-        print(f"camera: {e}")
+        log.say(f"camera: {e}")
+        log.write_warmup()
         window.close()
         return 1
     try:
@@ -647,8 +657,9 @@ def run_live(args, s: Settings) -> int:
     except OSError as e:
         camera.stop()
         window.close()
-        print(f"glove: cannot listen on OSC port {args.port} ({e}). Is "
-              "another recorder still running?")
+        log.say(f"glove: cannot listen on OSC port {args.port} ({e}). Is "
+                "another recorder still running?")
+        log.write_warmup()
         return 1
     view = CameraView(hand=args.hand if args.hand != "both" else None,
                       band=DEFAULT_BAND,
@@ -671,14 +682,15 @@ def run_live(args, s: Settings) -> int:
                     acquire_s=args.acquire_timeout, countdown_s=COUNTDOWN_S,
                     band=DEFAULT_BAND)
     words = band_words(DEFAULT_BAND)
-    print("Warm-up, one hand at a time ("
-          + ", then ".join(h.upper() for h in hands)
-          + f"): acquire, open palm {args.warmup_open:g} s, fist "
-          f"{args.warmup_fist:g} s.")
+    log.say("Warm-up, one hand at a time ("
+            + ", then ".join(h.upper() for h in hands)
+            + f"): acquire, open palm {args.warmup_open:g} s, fist "
+            f"{args.warmup_fist:g} s.")
     shown = [None]
     status = [""]
     next_hud = [0.0]
     next_draw = [0.0]
+    asked = {}
 
     def caption(text):
         if text != shown[0]:
@@ -691,26 +703,28 @@ def run_live(args, s: Settings) -> int:
         glove.coach(hand, stage)
         hud.close()
         if stage == STAGE_ACQUIRE:
+            asked[hand] = time.time()
             caption(f"{name} hand: ACQUIRE, open palm {words} up")
-            print(f"{name} hand: ACQUIRE. Hold the {name} hand open over the "
-                  f"module, palm to the lens, {words} up (waiting up to "
-                  f"{seconds:g} s).")
+            log.say(f"{name} hand: ACQUIRE. Hold the {name} hand open over "
+                    f"the module, palm to the lens, {words} up (waiting up "
+                    f"to {seconds:g} s).")
         elif stage == STAGE_COUNTDOWN:
             beeper.beep(ACQUIRED_FREQ, CUE_MS)
             now = time.time()
+            log.say(acquired_line(hand, now - asked.get(hand, now)))
             caption(countdown_text(hand, seconds))
             hud.show(countdown_text(hand, seconds), now, force=True)
             next_hud[0] = now + HUD_EVERY
         elif stage == STAGE_NOT_ACQUIRED:
             caption(f"{name} hand: NOT ACQUIRED")
             later = hands[hands.index(hand) + 1:]
-            print(f"{name} hand refused: {warmup.not_acquired[hand]}"
-                  + (f". Going on to the {later[0].upper()} hand."
-                     if later else ""))
+            log.say(f"{name} hand refused: {warmup.not_acquired[hand]}"
+                    + (f". Going on to the {later[0].upper()} hand."
+                       if later else ""))
         else:
             beeper.beep(CUE_FREQ, CUE_MS)
             caption(f"{name} hand: {stage} ({seconds:g} s)")
-            print(f"{name} hand: {stage} for {seconds:g} s")
+            log.say(f"{name} hand: {stage} for {seconds:g} s")
 
     def draw_warmup():
         now = time.time()
@@ -765,29 +779,22 @@ def run_live(args, s: Settings) -> int:
         warmup.run(poll, cue, show, acquire=acquire)
     except KeyboardInterrupt:
         shutdown()
-        print("\nStopped during the warm-up; nothing was fused.")
+        log.say("\nStopped during the warm-up; nothing was fused.")
+        log.write_warmup()
         return 1
     except BaseException:
         shutdown()
+        log.write_warmup()
         raise
     hud.close()
     camera.coach(None)
     buffer.keep_abs26 = False
     learned = warmup.learn(gates=gates, rail_params=rail_params, fit=fit)
     del warmup
-    for line in learned.lines():
-        print(line)
-    fused_hands = tuple(h for h in hands if h not in learned.refused)
+    learned, fused_hands = conclude_warmup(learned, hands, fit, args.out, log)
     if not fused_hands:
         shutdown()
-        print("No hand passed the warm-up, so nothing was fused. Do what is "
-              "listed above and start again.")
         return 2
-    if learned.refused:
-        learned = replace(learned, hands=fused_hands)
-    if fit == FIT_AUTO and args.out is not None:
-        for path in save_measurements(learned, args.out.parent):
-            print(f"Saved the warm-up's bone measurement to {path}")
 
     # --- the fusion (as fuse_live.main, drawing every frame) ---------------
     fusion = LiveFusion(learned, buffer, gates=gates, rail_params=rail_params,
@@ -802,6 +809,7 @@ def run_live(args, s: Settings) -> int:
     view.caption("LIVE FUSION", band=DEFAULT_BAND)
     print("Fusing" + (f" for {args.seconds:g} s" if args.seconds else
                       " until q or Ctrl-C") + ".")
+    log.fusing()
     latest = {}
     states: Dict[str, SideState] = {}
     header = [f"LIVE   {' + '.join(h.upper() for h in fused_hands)}   "
@@ -854,11 +862,8 @@ def run_live(args, s: Settings) -> int:
         pass
     finally:
         shutdown()
-    print()
-    for line in fusion.summary_lines():
-        print(line)
+    report_run(log, fusion, sinks, more=[f"Drew {drawn} frame(s)."])
     write_snapshot(args.snapshot, window.last)
-    print(f"Drew {drawn} frame(s).")
     return 0
 
 

@@ -51,6 +51,8 @@ learned from the session (`learn_from_session`), and `scripts/fuse_live.py
 The sensors are wrapped (`GloveSource`, `CameraSource`) so that the real
 hardware and the mocks produce the same per-frame dicts, and the outputs
 (`JsonlSink`, `OscSink`, `hud_line`) read one `FusedFrame` per glove frame.
+`RunLog` keeps what the run prints about its warm-up and its end, and
+writes both beside the JSONL output.
 `scripts/fuse_live.py` is the command that puts them together.
 """
 import json
@@ -1490,6 +1492,105 @@ class OscSink:
 
     def close(self) -> None:
         pass
+
+
+# --- the run's own record, beside the fused frames ---------------------------
+
+WARMUP_LOG = ".warmup.txt"
+SUMMARY_LOG = ".summary.txt"
+
+
+def run_log_paths(out) -> Tuple[Path, Path]:
+    """`PATH.jsonl` -> (`PATH.warmup.txt`, `PATH.summary.txt`), beside it."""
+    out = Path(out)
+    return (out.with_name(out.stem + WARMUP_LOG),
+            out.with_name(out.stem + SUMMARY_LOG))
+
+
+def wall_clock(t: float) -> str:
+    """A time.time() stamp as local `YYYY-MM-DD HH:MM:SS`."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+
+
+class RunLog:
+    """What a live run tells its operator, printed AND kept on disk.
+
+    The console a live run prints to may be a window nobody else ever sees,
+    and the warm-up's verdict (which hand was refused, and why) would exist
+    only there. Every line given to `say` is printed exactly as before and
+    kept. With an output path (`--out PATH.jsonl`) two files are written
+    beside it:
+
+      PATH.warmup.txt   by `write_warmup`, the moment the warm-up is over and
+                        before anything is fused, so it is there even if the
+                        run is killed later. Its first line is the date and
+                        `header` (the command's hands, profile, lag and its
+                        source, template fit mode); then every kept line so
+                        far, as printed.
+      PATH.summary.txt  by `write_summary`, at the end: the run's wall-clock
+                        start, when the fusion started and the end; then
+                        every line kept since the warm-up file was written.
+
+    The HUD line, rewritten in place four times a second, is not kept; what
+    it ends on (a hand acquired, a hand refused) is said in a kept line. A
+    file that cannot be written is reported on the console and the run goes
+    on: losing the record must never stop a fusion. Without an output path
+    nothing is written and `say` is plain printing.
+    """
+
+    def __init__(self, out=None, header: str = "",
+                 echo: Callable[[str], None] = print,
+                 clock: Callable[[], float] = time.time):
+        self.warmup_path, self.summary_path = (
+            run_log_paths(out) if out is not None else (None, None))
+        self.header = header
+        self._echo = echo
+        self._clock = clock
+        self.started = clock()
+        self.fusing_from: Optional[float] = None
+        self.lines: List[str] = []
+
+    def say(self, text: str = "") -> None:
+        """Print one line (it may hold newlines) and keep it."""
+        self._echo(text)
+        self.lines.extend(str(text).split("\n"))
+
+    def fusing(self) -> None:
+        """Note the moment the fusion starts."""
+        self.fusing_from = self._clock()
+
+    def write_warmup(self) -> Optional[Path]:
+        """Write PATH.warmup.txt: the date and header, then every line kept
+        so far. The lines kept from here on are the summary's."""
+        text = [f"{wall_clock(self.started)}  {self.header}".rstrip()]
+        text += self.lines
+        self.lines = []
+        return self._write(self.warmup_path, text)
+
+    def write_summary(self) -> Optional[Path]:
+        """Write PATH.summary.txt: the run's start, the fusion's start and
+        the end, then every line kept since `write_warmup`."""
+        end = self._clock()
+        fused = ("never" if self.fusing_from is None else
+                 f"{wall_clock(self.fusing_from)} "
+                 f"({end - self.fusing_from:.1f} s of fusion)")
+        text = [f"Run started {wall_clock(self.started)}",
+                f"Fusion started {fused}",
+                f"Run ended {wall_clock(end)}"] + self.lines
+        self.lines = []
+        return self._write(self.summary_path, text)
+
+    def _write(self, path: Optional[Path], lines: Sequence[str]
+               ) -> Optional[Path]:
+        if path is None:
+            return None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError as e:
+            self._echo(f"Could not write {path}: {e}")
+            return None
+        return path
 
 
 # --- the HUD ------------------------------------------------------------------

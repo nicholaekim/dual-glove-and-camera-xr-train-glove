@@ -46,7 +46,16 @@ THE OUTPUTS, one per glove frame of each fused hand
                         21 fused points (wrist-centred metres, MediaPipe-21
                         order), dof_source per gated DOF, camera_used, the
                         rail override's fingers and the drift anchor's
-                        per-finger curl corrections
+                        per-finger curl corrections. Beside it:
+    PATH.warmup.txt     everything the console said up to the fusion (the
+                        settings, each hand's acquire outcome, what the
+                        warm-up learned, every refusal and its causes), under
+                        a first line with the date, hands, profile, lag and
+                        its source and the template fit mode. Written the
+                        moment the warm-up ends, before anything is fused, so
+                        it is there even if the run is killed.
+    PATH.summary.txt    the end-of-run summary as printed, under the run's
+                        wall-clock start, fusion start and end
   --osc-out HOST:PORT   /fused/<hand>/keypoints21 (63 floats, the same
                         points) and /fused/<hand>/sources (one "dof=source"
                         string per gated DOF), per frame
@@ -163,6 +172,7 @@ from cam_hand.live_fusion import (  # noqa: E402
     JsonlSink,
     LiveFusion,
     OscSink,
+    RunLog,
     Warmup,
     acquire_status,
     band_words,
@@ -321,6 +331,74 @@ def save_measurements(learned, folder) -> list:
     later run (live or offline) can pass it with --fit-template PATH."""
     return [m.save(Path(folder) / FIT_FILE.format(hand=hand))
             for hand, m in sorted(learned.measurements.items())]
+
+
+# --- what the live run says, shared with scripts/demo.py --live ---------------
+
+def run_header(command, hands, profile_path, profile_how, lags,
+               fit_spec) -> str:
+    """The warm-up file's first line (after the date): the command, its
+    hands, the profile, each hand's lag with where it came from, and the
+    template fit mode."""
+    lag = "; ".join(f"{h} {lags[h][0]:.3f} s ({lags[h][1]})" for h in hands)
+    return (f"{command}  hands {', '.join(hands)}  profile "
+            f"{profile_path or '(none)'} [{profile_how}]  glove lag {lag}  "
+            f"template fit {fit_spec}")
+
+
+def acquired_line(hand, seconds) -> str:
+    """The kept line for a hand that passed its ACQUIRE gate (the HUD's
+    countdown that follows is rewritten in place and not kept)."""
+    return f"{hand.upper()} hand: acquired after {seconds:.1f} s."
+
+
+def conclude_warmup(learned, hands, fit, out, log):
+    """Say what the warm-up learned and decided, save each fitted hand's
+    bone measurement beside `out`, and write PATH.warmup.txt.
+
+    Returns (learned, the hands to fuse), `learned` narrowed to those hands.
+    No hand to fuse means the caller shuts down and exits with code 2.
+    """
+    for line in learned.lines():
+        log.say(line)
+    if learned.fit_refusals and fit == FIT_AUTO:
+        log.say("  (a longer --warmup-open gives the camera more open-palm "
+                "frames to measure the bones on)")
+    fused_hands = tuple(h for h in hands if h not in learned.refused)
+    if not fused_hands:
+        log.say("No hand passed the warm-up, so nothing was fused. Do what "
+                "is listed above and start again.")
+        log.write_warmup()
+        return learned, fused_hands
+    if learned.refused:
+        refused = [h.upper() for h in hands if h in learned.refused]
+        log.say(f"Fusing the {' and '.join(h.upper() for h in fused_hands)} "
+                f"hand only: the {' and '.join(refused)} hand was refused "
+                "(above).")
+        learned = replace(learned, hands=fused_hands)
+    if fit == FIT_AUTO and out is not None:
+        for path in save_measurements(learned, out.parent):
+            log.say(f"Saved the warm-up's bone measurement to {path} "
+                    "(reuse it with --fit-template PATH)")
+    log.write_warmup()
+    return learned, fused_hands
+
+
+def report_run(log, fusion, sinks, more=()) -> None:
+    """Say the end-of-run summary, what each output received and `more`,
+    then write PATH.summary.txt."""
+    log.say()
+    for line in fusion.summary_lines():
+        log.say(line)
+    for sink in sinks:
+        if isinstance(sink, JsonlSink):
+            log.say(f"Wrote {sink.written} fused frames to {sink.path}")
+        elif isinstance(sink, OscSink):
+            log.say(f"Sent {sink.sent} fused frames to "
+                    f"{sink.host}:{sink.port}")
+    for line in more:
+        log.say(line)
+    log.write_summary()
 
 
 # --- --replay ------------------------------------------------------------------
@@ -601,17 +679,19 @@ def main(argv=None) -> int:
         except (OSError, ValueError, json.JSONDecodeError) as e:
             raise SystemExit(f"--fit-template {fit_spec}: {e}")
 
-    print(f"Profile: {profile_path or '(none)'}  [{profile_how}]"
-          + (f"  {profile_name}" if profile_name else ""))
+    log = RunLog(args.out, header=run_header(
+        "fuse_live.py", hands, profile_path, profile_how, lags, fit_spec))
+    log.say(f"Profile: {profile_path or '(none)'}  [{profile_how}]"
+            + (f"  {profile_name}" if profile_name else ""))
     for hand in hands:
         seconds, why = lags[hand]
         masked = ", ".join(unreliable.get(hand, ())) or "(none)"
         override = ("off (--no-rail-override)" if rail_params is None
                     else ", ".join(rail_params.fingers_for(hand)) or "(none)")
-        print(f"  {hand}: glove lag {seconds:.3f} s ({why}); unreliable "
-              f"{masked}; rail override {override}")
-    print(f"Template fit: {fit_spec}.  Drift anchor: {args.drift_anchor}.  "
-          f"Pairing within {args.max_dt:g} s.")
+        log.say(f"  {hand}: glove lag {seconds:.3f} s ({why}); unreliable "
+                f"{masked}; rail override {override}")
+    log.say(f"Template fit: {fit_spec}.  Drift anchor: {args.drift_anchor}.  "
+            f"Pairing within {args.max_dt:g} s.")
 
     # --- the sensors ---------------------------------------------------------
     buffer = CameraBuffer(gates=gates, keep_abs26=True)
@@ -620,14 +700,16 @@ def main(argv=None) -> int:
     try:
         camera.start()
     except Exception as e:                  # LeapUnavailable says what to do
-        print(f"camera: {e}")
+        log.say(f"camera: {e}")
+        log.write_warmup()
         return 1
     try:
         glove.start()
     except OSError as e:
         camera.stop()
-        print(f"glove: cannot listen on OSC port {args.port} ({e}). Is "
-              "another recorder still running?")
+        log.say(f"glove: cannot listen on OSC port {args.port} ({e}). Is "
+                "another recorder still running?")
+        log.write_warmup()
         return 1
     view = CameraView(hand=args.hand if args.hand != "both" else None,
                       band=DEFAULT_BAND,
@@ -650,12 +732,13 @@ def main(argv=None) -> int:
                     acquire_s=args.acquire_timeout, countdown_s=COUNTDOWN_S,
                     band=DEFAULT_BAND)
     words = band_words(DEFAULT_BAND)
-    print("Warm-up, one hand at a time ("
-          + ", then ".join(h.upper() for h in hands)
-          + f"): acquire, open palm {args.warmup_open:g} s, fist "
-          f"{args.warmup_fist:g} s.")
+    log.say("Warm-up, one hand at a time ("
+            + ", then ".join(h.upper() for h in hands)
+            + f"): acquire, open palm {args.warmup_open:g} s, fist "
+            f"{args.warmup_fist:g} s.")
     shown = [None]
     next_hud = [0.0]
+    asked = {}
 
     def caption(text):
         # The window's caption is a status file; write it only on a change.
@@ -669,26 +752,28 @@ def main(argv=None) -> int:
         glove.coach(hand, stage)
         hud.close()
         if stage == STAGE_ACQUIRE:
+            asked[hand] = time.time()
             caption(f"{name} hand: ACQUIRE, open palm {words} up")
-            print(f"{name} hand: ACQUIRE. Hold the {name} hand open over the "
-                  f"module, palm to the lens, {words} up (waiting up to "
-                  f"{seconds:g} s).")
+            log.say(f"{name} hand: ACQUIRE. Hold the {name} hand open over "
+                    f"the module, palm to the lens, {words} up (waiting up "
+                    f"to {seconds:g} s).")
         elif stage == STAGE_COUNTDOWN:
             beeper.beep(ACQUIRED_FREQ, CUE_MS)
             now = time.time()
+            log.say(acquired_line(hand, now - asked.get(hand, now)))
             caption(countdown_text(hand, seconds))
             hud.show(countdown_text(hand, seconds), now, force=True)
             next_hud[0] = now + HUD_EVERY
         elif stage == STAGE_NOT_ACQUIRED:
             caption(f"{name} hand: NOT ACQUIRED")
             later = hands[hands.index(hand) + 1:]
-            print(f"{name} hand refused: {warmup.not_acquired[hand]}"
-                  + (f". Going on to the {later[0].upper()} hand."
-                     if later else ""))
+            log.say(f"{name} hand refused: {warmup.not_acquired[hand]}"
+                    + (f". Going on to the {later[0].upper()} hand."
+                       if later else ""))
         else:
             beeper.beep(CUE_FREQ, CUE_MS)
             caption(f"{name} hand: {stage} ({seconds:g} s)")
-            print(f"{name} hand: {stage} for {seconds:g} s")
+            log.say(f"{name} hand: {stage} for {seconds:g} s")
 
     def poll(w):
         for row in camera.drain():
@@ -728,37 +813,22 @@ def main(argv=None) -> int:
         warmup.run(poll, cue, show, acquire=acquire)
     except KeyboardInterrupt:
         shutdown()
-        print("\nStopped during the warm-up; nothing was fused.")
+        log.say("\nStopped during the warm-up; nothing was fused.")
+        log.write_warmup()
         return 1
     except BaseException:
         shutdown()
+        log.write_warmup()
         raise
     hud.close()
     camera.coach(None)
     buffer.keep_abs26 = False
     learned = warmup.learn(gates=gates, rail_params=rail_params, fit=fit)
     del warmup
-    for line in learned.lines():
-        print(line)
-    if learned.fit_refusals and fit == FIT_AUTO:
-        print("  (a longer --warmup-open gives the camera more open-palm "
-              "frames to measure the bones on)")
-    fused_hands = tuple(h for h in hands if h not in learned.refused)
+    learned, fused_hands = conclude_warmup(learned, hands, fit, args.out, log)
     if not fused_hands:
         shutdown()
-        print("No hand passed the warm-up, so nothing was fused. Do what is "
-              "listed above and start again.")
         return 2
-    if learned.refused:
-        refused = [h.upper() for h in hands if h in learned.refused]
-        print(f"Fusing the {' and '.join(h.upper() for h in fused_hands)} "
-              f"hand only: the {' and '.join(refused)} hand was refused "
-              "(above).")
-        learned = replace(learned, hands=fused_hands)
-    if fit == FIT_AUTO and args.out is not None:
-        for path in save_measurements(learned, args.out.parent):
-            print(f"Saved the warm-up's bone measurement to {path} "
-                  "(reuse it with --fit-template PATH)")
 
     # --- the fusion ---------------------------------------------------------
     fusion = LiveFusion(learned, buffer, gates=gates, rail_params=rail_params,
@@ -773,6 +843,7 @@ def main(argv=None) -> int:
     view.caption("LIVE FUSION", band=DEFAULT_BAND)
     print("Fusing" + (f" for {args.seconds:g} s" if args.seconds else
                       " until Ctrl-C") + ".")
+    log.fusing()
     latest = {}
     t_end = None if args.seconds is None else time.time() + args.seconds
     try:
@@ -802,14 +873,7 @@ def main(argv=None) -> int:
         pass
     finally:
         shutdown()
-    print()
-    for line in fusion.summary_lines():
-        print(line)
-    for sink in sinks:
-        if isinstance(sink, JsonlSink):
-            print(f"Wrote {sink.written} fused frames to {sink.path}")
-        elif isinstance(sink, OscSink):
-            print(f"Sent {sink.sent} fused frames to {sink.host}:{sink.port}")
+    report_run(log, fusion, sinks)
     return 0
 
 
