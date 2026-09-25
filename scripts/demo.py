@@ -17,6 +17,13 @@ report's nearest-centroid classifier on the fused hand's features, with the
 margin to the next pose. A stream not seen for half a second goes grey and
 says "no hand".
 
+When the fusion refused the camera frame for the whole hand, the CAMERA hand
+is drawn grey-blue with the reason under its title ("not trusted: palm
+turned away"). When the two sensors' curls of a finger differ by 0.35 or more
+of its learned range, that fingertip gets an amber ring on the FUSED hand
+(green when the camera took that curl over) and a "disagree:" line names the
+fingers and which sensor sees them more bent.
+
 TWO MODES, THE SAME WINDOW
 
   --replay DIR   no hardware. The recorded session (DIR/glove, DIR/leap, as
@@ -44,7 +51,11 @@ WHERE A LIVE DEMO'S DATA GOES
   _2, _3 and so on is added when a run in the same minute has the name):
     <hands>.jsonl          the fused frames, as fuse_live.py --out writes
                            them; with --hand both, both hands in this one
-                           file, each line naming its hand
+                           file, each line naming its hand. Each line also
+                           has the step's two inputs, glove_in and cam_in
+                           (21 points each; cam_in null when no camera
+                           frame was paired), and per DOF the camera did
+                           not supply, the reason (rejected)
     <hands>.warmup.txt     what the console said up to the fusion
     <hands>.summary.txt    the end-of-run summary
     template_<hand>.json   each hand's bone measurement from the warm-up
@@ -344,6 +355,9 @@ class Take:
     number: int
     hands: Tuple[str, ...]
     frames: list
+    # The run's learned endpoints (`FlexionScale`), for the disagreement
+    # marks; the same for every take of a session.
+    scale: object = None
 
 
 def _take_number(value) -> int:
@@ -410,7 +424,7 @@ def fuse_session(input_dir, s: Settings, log=print):
         for hand, feats in per_hand.items():
             samples.append((pose, hand, entry["name"], mean_vector(feats)))
         takes.append(Take(entry["name"], pose, _take_number(first.get("take")),
-                          tuple(sorted(per_hand)), frames))
+                          tuple(sorted(per_hand)), frames, learned.scale))
     return takes, samples
 
 
@@ -578,6 +592,14 @@ def guesses_for(states: Dict[str, SideState], sides: Sequence[str],
             for side in sides if side in states}
 
 
+def scales_for(scale, sides: Sequence[str]) -> Optional[dict]:
+    """Per side, its `HandScale` from a run's `FlexionScale` (None when the
+    run has none), for `render`'s disagreement marks."""
+    if not scale:
+        return None
+    return {side: scale.for_hand(side) for side in sides}
+
+
 # --- --replay ----------------------------------------------------------------
 
 class ReplayPlayer:
@@ -719,7 +741,8 @@ def run_replay(args, s: Settings) -> int:
                          guesses=guesses_for(states, sides, clf,
                                              take.name if holdout else None),
                          truth=take.pose, guess_note=note,
-                         progress=player.progress)
+                         progress=player.progress,
+                         scales=scales_for(take.scale, sides))
             drawn += 1
             if video is not None:
                 video.write(img)
@@ -1165,6 +1188,7 @@ def run_live(args, s: Settings) -> int:
     log.fusing()
     latest = {}
     states: Dict[str, SideState] = {}
+    scales = scales_for(learned.scale, fused_hands)
     header = [f"LIVE   {' + '.join(h.upper() for h in fused_hands)}   "
               f"profile {s.profile_path.name if s.profile_path else '(none)'}"
               "   lag " + "  ".join(f"{h[0].upper()} {lags[h][0]:.2f} s"
@@ -1206,7 +1230,7 @@ def run_live(args, s: Settings) -> int:
                 img = render(states, fused_hands, now, header=header,
                              footer=footer,
                              guesses=guesses_for(states, fused_hands, clf),
-                             guess_note=note)
+                             guess_note=note, scales=scales)
                 drawn += 1
                 if video is not None:
                     video.write(img)
@@ -1239,7 +1263,10 @@ def run_live(args, s: Settings) -> int:
     if folder is None:
         return 0
     list_file(out_path, "the fused frames, one JSON line per glove frame: "
-              "stamps, hand, the 21 fused points, where each DOF came from"
+              "stamps, hand, the 21 fused points, where each DOF came from, "
+              "the camera's reason per DOF it did not supply (rejected), and "
+              "the step's inputs: the glove's 21 points (glove_in) and the "
+              "camera's (cam_in, null when no camera frame was paired)"
               + ("; both hands in this one file" if len(hands) > 1 else ""))
     list_file(log.warmup_path, "what the console said up to the fusion: "
               "settings, each hand's acquire, what the warm-up learned")

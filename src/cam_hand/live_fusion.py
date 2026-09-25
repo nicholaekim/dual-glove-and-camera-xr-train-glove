@@ -1083,11 +1083,14 @@ class FusedFrame:
     glove_in     the glove points this step fused (the fitted hand when a
                  template fit is in force, before any drift-anchor change)
     cam_in       the paired camera frame's points, or None when unpaired
+    rejected     per gated DOF the camera did not supply, why not
+                 (`fuse_skeletons`'s `info["rejected"]`)
 
     `glove_in` and `cam_in` are the step's two inputs, kept so a viewer
     (`scripts/demo.py`) can draw the glove, camera and fused hands of one
-    step side by side without pairing again. They are not written by
-    `to_json` and play no part in comparing frames.
+    step side by side without pairing again, and written by `to_json` so a
+    saved run can compare the two sensors frame by frame afterwards.
+    `glove_in`, `cam_in` and `rejected` play no part in comparing frames.
     """
 
     t_glove: float
@@ -1102,8 +1105,15 @@ class FusedFrame:
                                            compare=False)
     cam_in: Optional[np.ndarray] = field(default=None, repr=False,
                                          compare=False)
+    rejected: Dict[str, str] = field(default_factory=dict, repr=False,
+                                     compare=False)
 
     def to_json(self) -> dict:
+        def points(p):
+            return (None if p is None else
+                    [[round(float(v), 6) for v in row]
+                     for row in np.asarray(p, float)])
+
         return {
             "t_glove": self.t_glove,
             "t_cam": self.t_cam,
@@ -1114,6 +1124,9 @@ class FusedFrame:
             "rail_active": list(self.rail_active),
             "corrections": {k: round(float(v), 6)
                             for k, v in self.corrections.items()},
+            "rejected": dict(self.rejected),
+            "glove_in": points(self.glove_in),
+            "cam_in": points(self.cam_in),
         }
 
 
@@ -1302,7 +1315,8 @@ class LiveFusion:
             rail_active=tuple(rail.active) if rail is not None else (),
             corrections={k: float(v) for k, v in moved.items()},
             glove_in=glove_in,
-            cam_in=C)
+            cam_in=C,
+            rejected=dict(info["rejected"]))
 
     def summary_lines(self) -> List[str]:
         """The end-of-run report: per hand, how much was paired, how often

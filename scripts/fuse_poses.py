@@ -145,8 +145,13 @@ from cam_hand.fusion import (
     DEFAULT_GATES,
     DEFAULT_RAIL,
     GATED_DOFS,
+    MODE_DISAGREE,
+    MODE_RAIL,
     NOT_MEASURABLE,
+    OVERRIDE_MODES,
     RAIL_FINGERS,
+    SENSOR_CAMERA,
+    SENSOR_GLOVE,
     SENSORS,
     SPREAD_FINGERS,
     SRC_RAIL,
@@ -158,6 +163,7 @@ from cam_hand.fusion import (
     RecalibrationParams,
     RailOverrideParams,
     RailOverrideTracker,
+    camera_trusted,
     curl_gates_from_rails,
     estimate_glove_lag,
     flag_hand_id_stability,
@@ -242,6 +248,9 @@ FIT_NONE = "none"
 # The pose whose frames the camera has actually measured a hand on, rather
 # than inferred one: nothing is occluded on an open palm.
 OPEN_POSE = "open_palm"
+# The poses on which both sensors should agree about every finger, so a curl
+# override that fires there is a false fire (`override_lines`).
+FALSE_FIRE_POSES = (OPEN_POSE, "fist")
 # Where `auto` leaves the measurement it took: beside the report, in the
 # session it was measured from, because that is the session it describes.
 FIT_FILE = "template_{hand}.json"
@@ -652,6 +661,116 @@ def gate_tables(dof_used, dof_total, reasons, gates, rail_params, rails,
         lines.append(f"    {hand:<6} {finger:<7} {value:.3f}{mark}")
 
 
+def mode_text(params):
+    """One line naming the curl override's mode and what it tests."""
+    if params is None:
+        return "off (--no-rail-override)"
+    if not params.disagree:
+        return ("rail: the glove bit-exact on its learned rail while a trusted "
+                "camera sees the finger flexed")
+    way = ("either direction" if params.disagree_both_ways
+           else "camera more bent only")
+    return (f"disagree: a trusted camera and the glove {params.disagree_frac:.2f}"
+            f" of the range apart ({way}), released below "
+            f"{params.disagree_release:.2f}")
+
+
+def override_lines(run, lines):
+    """Where the curl override fired, whether it fired where it should not,
+    and how far the fused hand then sits from the camera.
+
+    Three tables, all over this run's paired frames:
+
+      activity     per hand and pose, per finger: frames the camera's curl
+                   was used, with the median camera-minus-glove flexion
+                   fraction gap on those frames
+      FALSE-FIRE   the same counts on open_palm and fist only, where both
+                   sensors should agree about every finger
+      residual     per hand and finger, median |camera fraction - glove
+                   fraction| (before) and |camera fraction - fused fraction|
+                   (after) on trusted frames
+    """
+    params = run.rail_params
+    lines.append("")
+    lines.append("Curl override activity (frames on which a finger's curl "
+                 "came from the camera, of that")
+    lines.append("  pose's paired frames; in brackets the median camera-minus-"
+                 "glove flexion-fraction gap")
+    lines.append("  on those frames, positive = the camera saw the finger MORE "
+                 "bent than the glove)")
+    if params is None:
+        lines.append("  (override disabled)")
+        return
+    lines.append(f"  mode {mode_text(params)}")
+    keys = sorted(run.override_paired)
+
+    def cell(hand, pose, finger, with_gap=True):
+        gaps = run.override_fired.get((hand, pose, finger), [])
+        if not gaps:
+            return "0"
+        known = [g for g in gaps if g is not None]
+        if not with_gap or not known:
+            return str(len(gaps))
+        return f"{len(gaps)} ({median(known):+.2f})"
+
+    lines.append(f"  {'hand':<6} {'pose':<12} {'paired':>6}   "
+                 + "".join(f"{f:<15}" for f in RAIL_FINGERS))
+    for hand, pose in keys:
+        lines.append(f"  {hand:<6} {pose:<12} "
+                     f"{run.override_paired[(hand, pose)]:>6}   "
+                     + "".join(f"{cell(hand, pose, f):<15}"
+                               for f in RAIL_FINGERS))
+    for direction, keep in (("camera more bent", lambda g: g > 0),
+                            ("glove more bent", lambda g: g < 0)):
+        n = sum(1 for got in run.override_fired.values() for g in got
+                if g is not None and keep(g))
+        lines.append(f"  fired with the {direction:<17} {n:>7} finger-frames")
+
+    lines.append("")
+    lines.append("  FALSE-FIRE check: open_palm and fist, where both sensors "
+                 "should agree about every")
+    lines.append("  finger, so every frame counted here is the override firing "
+                 "where it should not")
+    lines.append(f"  {'hand':<6} {'pose':<12} {'paired':>6}   "
+                 + "".join(f"{f:>8}" for f in RAIL_FINGERS) + f"{'total':>8}")
+    total_fired = total_frames = 0
+    for hand, pose in keys:
+        if pose not in FALSE_FIRE_POSES:
+            continue
+        counts = [len(run.override_fired.get((hand, pose, f), []))
+                  for f in RAIL_FINGERS]
+        paired = run.override_paired[(hand, pose)]
+        total_fired += sum(counts)
+        total_frames += paired * len(RAIL_FINGERS)
+        lines.append(f"  {hand:<6} {pose:<12} {paired:>6}   "
+                     + "".join(f"{c:>8}" for c in counts)
+                     + f"{sum(counts):>8}")
+    share = 100.0 * total_fired / total_frames if total_frames else 0.0
+    lines.append(f"  false fires: {total_fired} of {total_frames} "
+                 f"finger-frames ({share:.2f}%)")
+
+    lines.append("")
+    lines.append("  Camera-vs-fused residual: median |camera fraction - "
+                 "fraction| over trusted frames,")
+    lines.append("  before = the glove's fraction, after = the fused hand's "
+                 "(on the glove's endpoints).")
+    lines.append("  On a fired frame the fused finger is built from the "
+                 "camera's bone directions, so")
+    lines.append("  'after' there is small by construction; the classifier "
+                 "rows are the check that is not.")
+    lines.append(f"  {'hand':<6} {'finger':<7} {'trusted':>8} {'fired':>7} "
+                 f"{'before':>7} {'after':>7}")
+    for hand, finger in sorted(run.residual,
+                               key=lambda k: (k[0],
+                                              RAIL_FINGERS.index(k[1]))):
+        res = run.residual[(hand, finger)]
+        if not res["before"]:
+            continue
+        lines.append(f"  {hand:<6} {finger:<7} {len(res['before']):>8} "
+                     f"{res['fired']:>7} {median(res['before']):7.3f} "
+                     f"{median(res['after']):7.3f}")
+
+
 # --- what the command line asked for, as values ------------------------
 
 def parse_unreliable(specs):
@@ -693,7 +812,8 @@ def parse_rail_fingers(text):
 # Everything a profile may hold. A key outside this list is an error rather
 # than something to ignore: `rail-fingers` written for `rail_fingers` would
 # leave the override at its default and nothing in the report would say so.
-PROFILE_KEYS = ("name", "comment", "unreliable", "rail_fingers", "glove_lag_s")
+PROFILE_KEYS = ("name", "comment", "unreliable", "rail_fingers", "glove_lag_s",
+                "override_mode")
 
 
 def load_profile(path):
@@ -805,11 +925,41 @@ def load_profile(path):
             out[side] = float(value)
         return out
 
+    # Optional, and read by `profile_override_mode`; checked here so a bad
+    # value stops every caller of a profile, not only the ones that read it.
+    _override_mode_of(data, path)
+
     return (per_hand("unreliable", FLEXION_NAMES),
             per_hand("rail_fingers", RAIL_FINGERS),
             str(data.get("name", "")).strip(),
             str(data.get("comment", "")).strip(),
             lag_block())
+
+
+def _override_mode_of(data, path):
+    """A profile's optional `override_mode`, checked, or None if absent."""
+    value = data.get("override_mode")
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text not in OVERRIDE_MODES:
+        raise SystemExit(f"--profile {path}: 'override_mode' is {value!r}; "
+                         f"choose from {', '.join(OVERRIDE_MODES)}")
+    return text
+
+
+def profile_override_mode(path):
+    """The curl override mode a profile asks for, or None if it names none.
+
+    Separate from `load_profile` so that function's five-value return, which
+    other scripts unpack, stays as it is. An explicit --override-mode beats
+    this, and this beats the default ("rail").
+    """
+    if path is None:
+        return None
+    load_profile(path)                     # every key checked first
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return _override_mode_of(data, path)
 
 
 def resolve_profile(spec, profiles_dir=None):
@@ -1224,6 +1374,17 @@ class FusionRun:
     # The run's `GloveRecalibration` (its fitted models, held-out residuals
     # and counters), or None when it was off.
     recal: object = None
+    # The curl override's activity, for `override_lines`. Paired frames per
+    # (hand, pose); per (hand, pose, finger) the camera-minus-glove flexion
+    # fraction gap on every frame the override actually took that finger
+    # (None where the finger could not be put on a fraction); and per (hand,
+    # finger) on trusted frames the camera's disagreement with the glove
+    # ("before") and with the fused hand ("after"), plus how many of those
+    # frames the override took.
+    override_paired: dict = field(default_factory=lambda: defaultdict(int))
+    override_fired: dict = field(default_factory=lambda: defaultdict(list))
+    residual: dict = field(default_factory=lambda: defaultdict(
+        lambda: {"before": [], "after": [], "fired": 0}))
     n_pairs: int = 0
     n_matched: int = 0
     n_cam_used: int = 0
@@ -1326,6 +1487,36 @@ def recalibration_from_session(loaded, gates, rail_params, recalibrate,
     observe_trusted(recal, loaded, session_pairs(loaded, max_dt, glove_lag),
                     fitted, scale)
     return recal
+
+
+def record_override(run, hand, pose, rail, info, meta, gates, hand_scale,
+                    curls_g, curls_c, curls_f):
+    """Count one paired frame for the curl override's report tables.
+
+    Fired frames are the fingers `fuse_skeletons` actually rebuilt from the
+    camera (`info["rail_override"]`), not the tracker's wish list. The
+    residual is taken on trusted frames only, each curl on its own sensor's
+    endpoints; the FUSED hand is on the glove's bones, so it is read on the
+    glove's endpoints.
+    """
+    run.override_paired[(hand, pose)] += 1
+    fired = set(info["rail_override"])
+    gaps = rail.gaps if rail is not None else {}
+    for finger in fired:
+        run.override_fired[(hand, pose, finger)].append(gaps.get(finger))
+    if hand_scale is None or not camera_trusted(meta, gates):
+        return
+    for finger in RAIL_FINGERS:
+        if not hand_scale.normalisable(finger):
+            continue
+        i = FLEXION_NAMES.index(finger)
+        cam = hand_scale.fraction(SENSOR_CAMERA, finger, curls_c[i])
+        res = run.residual[(hand, finger)]
+        res["before"].append(
+            abs(cam - hand_scale.fraction(SENSOR_GLOVE, finger, curls_g[i])))
+        res["after"].append(
+            abs(cam - hand_scale.fraction(SENSOR_GLOVE, finger, curls_f[i])))
+        res["fired"] += int(finger in fired)
 
 
 def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
@@ -1439,7 +1630,8 @@ def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
         # and consecutive across a take boundary is a fiction: the takes are
         # separate recordings seconds apart, so a run built at the end of one
         # must not still be armed at the start of the next.
-        tracker = (RailOverrideTracker(run.rails, rail_params, gates)
+        tracker = (RailOverrideTracker(run.rails, rail_params, gates,
+                                       scale=run.scale)
                    if rail_params is not None else None)
         # ...and a fresh anchor window, for a stronger reason: the glove's
         # error depends on the pose, and the next take is another pose.
@@ -1532,6 +1724,9 @@ def fuse_all(loaded, gates, rail_params, unreliable, max_dt, min_score,
                 for why in info["rejected"].values():
                     run.reasons[why] += 1
                 slot["sources"].append(dict(info["dof_source"]))
+                record_override(run, hand, pose, rail, info, meta, gates,
+                                hand_scale, curls_g, curls_c,
+                                flexion_features(fused))
                 # The fit's before: the same residual against the template
                 # hand that went in unfitted. Measured here and not inside
                 # `fuse_skeletons`, which only ever sees one of the two.
@@ -2059,7 +2254,8 @@ def profile_comparison(plain, masked, profile_path, name, comment, lines,
         lines.append(f"  {comment}")
     lines.append(f"  {'unreliable fingers':<22} {mask_text(masked.unreliable)}")
     rail = ("DISABLED (--no-rail-override)" if masked.rail_params is None
-            else masked.rail_params.described()["fingers"])
+            else f"{masked.rail_params.described()['fingers']} "
+                 f"({masked.rail_params.mode} mode)")
     lines.append(f"  {'rail override fingers':<22} {rail}")
     labelled = [("ordinary (no reliability profile)", plain),
                 ("with reliability profile", masked)]
@@ -2186,7 +2382,32 @@ def main() -> None:
                         f"on BOTH hands (any of {','.join(RAIL_FINGERS)}; "
                         f"default {','.join(DEFAULT_RAIL.fingers_for())}). "
                         "Overrides --profile. Per-hand lists come from a "
-                        "profile, not from here.")
+                        "profile, not from here. With --override-mode "
+                        "disagree it names that mode's fingers instead "
+                        "(default all four; the profile's rail_fingers is "
+                        "the rail rule's list and does not apply).")
+    p.add_argument("--override-mode", choices=OVERRIDE_MODES, default=None,
+                   help="which curl override runs. 'rail' (the default): the "
+                        "glove must sit bit-exact on its learned rail while a "
+                        "trusted camera sees the finger flexed. 'disagree': "
+                        "no rail needed; a trusted camera that sees a finger "
+                        "more bent than the glove by --disagree-frac of its "
+                        "flexion range takes that finger's curl. Beats the "
+                        "profile's override_mode.")
+    p.add_argument("--disagree-frac", type=float,
+                   default=DEFAULT_RAIL.disagree_frac,
+                   help="'disagree' mode: camera fraction minus glove "
+                        "fraction at which a frame counts toward entering "
+                        f"(default {DEFAULT_RAIL.disagree_frac})")
+    p.add_argument("--disagree-release", type=float,
+                   default=DEFAULT_RAIL.disagree_release,
+                   help="'disagree' mode: gap below which frames count toward "
+                        "releasing the finger; must not exceed "
+                        f"--disagree-frac (default {DEFAULT_RAIL.disagree_release})")
+    p.add_argument("--disagree-both-ways", action="store_true",
+                   help="'disagree' mode: also let the camera win when it sees "
+                        "the finger STRAIGHTER than the glove by the same "
+                        "margin (default: camera more bent only)")
     p.add_argument("--profile", default=PROFILE_AUTO,
                    metavar="{auto,none,PATH.json}",
                    help="a reliability profile: per-hand 'unreliable' and "
@@ -2321,13 +2542,31 @@ def main() -> None:
     (profile_unreliable, profile_rail, profile_name, profile_comment,
      profile_lag) = (load_profile(profile_path) if profile_path is not None
                      else ({}, {}, "", "", {}))
+    # The curl override's mode, with the same precedence: the flag, then the
+    # profile, then "rail". The ordinary run ignores the profile's mode.
+    profile_mode = profile_override_mode(profile_path)
+    override_mode = args.override_mode or profile_mode or MODE_RAIL
+    mode_how = ("--override-mode" if args.override_mode
+                else f"the profile's override_mode" if profile_mode
+                else "default")
+    plain_mode = args.override_mode or MODE_RAIL
 
     unreliable = dict(profile_unreliable)
     unreliable.update(cli_unreliable)
 
-    def rail_params_for(rail_spec):
-        return (None if args.no_rail_override
-                else RailOverrideParams(fingers=rail_spec))
+    def rail_params_for(rail_spec, mode):
+        if args.no_rail_override:
+            return None
+        try:
+            return RailOverrideParams(
+                fingers=rail_spec,
+                disagree_fingers=(cli_rail if cli_rail is not None
+                                  else DEFAULT_RAIL.disagree_fingers),
+                mode=mode, disagree_frac=args.disagree_frac,
+                disagree_release=args.disagree_release,
+                disagree_both_ways=args.disagree_both_ways)
+        except ValueError as e:
+            raise SystemExit(f"curl override: {e}")
 
     if cli_rail is not None:
         rail_spec = cli_rail
@@ -2335,10 +2574,10 @@ def main() -> None:
         rail_spec = profile_rail
     else:
         rail_spec = DEFAULT_RAIL.fingers
-    rail_params = rail_params_for(rail_spec)
+    rail_params = rail_params_for(rail_spec, override_mode)
     # What this command would do with no --profile at all.
     plain_rail_params = rail_params_for(
-        cli_rail if cli_rail is not None else DEFAULT_RAIL.fingers)
+        cli_rail if cli_rail is not None else DEFAULT_RAIL.fingers, plain_mode)
     comparing = profile_path is not None
     lag_spec = parse_glove_lag(args.glove_lag)
     fit_spec = str(args.fit_template).strip()
@@ -2446,6 +2685,10 @@ def main() -> None:
     lines = []
     lines.append("=" * 66)
     lines.append(f"Sensor fusion report — {len(takes)} takes from {args.input}")
+    lines.append(f"Curl override mode      {mode_text(rail_params)}")
+    lines.append(f"  chosen by             {mode_how}"
+                 + (f"; fingers {rail_params.described()['fingers']}"
+                    if rail_params is not None else ""))
     lines.append("")
     if patterns:
         lines.append("Excluded by --exclude (a named take is read on NEITHER "
@@ -2547,6 +2790,7 @@ def main() -> None:
     gate_tables(run.dof_used, run.dof_total, run.reasons, gates,
                 run.rail_params, run.rails, unreliable, lines,
                 scale=run.scale)
+    override_lines(run, lines)
 
     lines.append("")
     lines.append("=" * 66)

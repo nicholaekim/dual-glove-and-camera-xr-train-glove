@@ -28,6 +28,26 @@ What the badges say
   the glove), and for the thumb, its direction. Then which fingers the rail
   override is holding, whether the camera is fresh, and the glove's rate.
 
+When the camera is not trusted
+
+  When the fusion refused the camera frame for the hand as a whole (no
+  camera frame, the hand not seen long enough, a new hand id, the palm off
+  the module's centre or turned away), the CAMERA hand is drawn grey-blue
+  with one line saying why, e.g. "not trusted: palm turned away"
+  (`camera_refusal`). The reason is read off the frame (`dof_source` and
+  `rejected`); nothing here judges the camera itself.
+
+When the two sensors disagree
+
+  Per finger (index to pinky), both curls are put on the 0..1 flexion
+  fraction with the run's learned endpoints (`HandScale`), and a finger
+  whose camera and glove fractions differ by `DISAGREE_FRAC` or more is
+  marked (`disagreements`): an amber ring round its tip on the FUSED hand,
+  and a badge line naming it and which sensor sees it more bent. The ring
+  is green instead when that finger's fused curl came from the camera (the
+  rail override): the disagreement was handled. A finger without endpoints
+  is not marked.
+
 The pose guess is a nearest-centroid classifier on `features.all_features`
 of the fused hand, the report's own features and classifier
 (`fuse_poses.loo_table`), with centroids from the per-take means of a fused
@@ -40,11 +60,21 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 
-from cam_hand.features import ALL_COLS, all_features
+from cam_hand.features import ALL_COLS, all_features, flexion_features
 from cam_hand.fusion import (
     FINGER_CHAINS,
+    FINGER_NAMES,
+    R_FIELD,
+    R_HAND_ID,
+    R_NO_FRAME,
+    R_SCORE,
+    R_VIEW,
+    R_VISIBLE,
+    SENSOR_CAMERA,
+    SENSOR_GLOVE,
     SPREAD_FINGERS,
     SRC_RAIL,
+    HandScale,
     palm_basis,
 )
 from cam_hand.live_fusion import STALE_S
@@ -53,6 +83,12 @@ from cam_hand.live_fusion import STALE_S
 GLOVE_BGR = (0x34, 0x68, 0xEB)      # #eb6834 orange
 CAMERA_BGR = (0xD6, 0x78, 0x2A)     # #2a78d6 blue
 FUSED_BGR = (0x7A, 0xAF, 0x1B)      # #1baf7a green
+# The camera hand when the fusion refused it for the whole hand.
+CAMERA_DIM_BGR = (0x96, 0x80, 0x6E)  # #6e8096 grey-blue
+# The disagreement marks: amber, the fused hand follows the glove; green,
+# the camera took that finger's curl over.
+AMBER_BGR = (0x23, 0xB0, 0xF5)      # #f5b023
+HANDLED_BGR = (0x78, 0xF0, 0x78)    # #78f078
 GREY_BGR = (105, 105, 105)
 TEXT_BGR = (235, 235, 235)
 DIM_BGR = (160, 160, 160)
@@ -157,6 +193,14 @@ def text_width(text: str, scale=0.5, thick=1) -> int:
     return cv2.getTextSize(text, FONT, scale, thick)[0][0]
 
 
+def fit_scale(text: str, width: int, scale=0.5, smallest=0.35) -> float:
+    """`scale`, or smaller (down to `smallest`) until `text` fits `width`
+    pixels."""
+    while scale > smallest and text_width(text, scale) > width:
+        scale = round(scale - 0.02, 2)
+    return scale
+
+
 # --- the badges --------------------------------------------------------------
 
 def source_word(source: Optional[str]) -> str:
@@ -211,6 +255,142 @@ def status_text(camera_fresh: bool, glove_hz: Optional[float]) -> str:
     hz = "--" if glove_hz is None else f"{glove_hz:.0f}"
     return (f"camera {'fresh' if camera_fresh else 'STALE'}   "
             f"glove {hz} Hz")
+
+
+# --- is the camera trusted ----------------------------------------------------
+
+# The refusals that are about the camera frame as a whole, most basic first,
+# each in the few words the camera panel shows. Any other refusal (a curled
+# finger, a thumb vote) is about one DOF and leaves the frame trusted.
+WHOLE_HAND_REASONS: Tuple[Tuple[str, str], ...] = (
+    (R_NO_FRAME, "no camera frame"),
+    (R_SCORE, "camera score too low"),
+    (R_VISIBLE, "hand not seen long enough"),
+    (R_HAND_ID, "hand id just changed"),
+    (R_FIELD, "palm off the module's centre"),
+    (R_VIEW, "palm turned away"),
+)
+
+
+def camera_refusal(frame) -> Optional[str]:
+    """Why the fusion refused this frame's camera hand as a whole, in a few
+    words, or None when it trusted it.
+
+    Read off the frame: no camera frame paired (`cam_in` None) is a refusal;
+    a camera frame that supplied any DOF (`dof_source`) was trusted; else the
+    first whole-hand reason found in `rejected` (`WHOLE_HAND_REASONS`). A
+    frame refused only finger by finger counts as trusted.
+    """
+    if frame is None:
+        return None
+    if getattr(frame, "cam_in", None) is None:
+        return dict(WHOLE_HAND_REASONS)[R_NO_FRAME]
+    sources = getattr(frame, "dof_source", None) or {}
+    if any(str(s).startswith("camera") for s in sources.values()):
+        return None
+    reasons = set((getattr(frame, "rejected", None) or {}).values())
+    for reason, words in WHOLE_HAND_REASONS:
+        if reason in reasons:
+            return words
+    return None
+
+
+# --- do the two sensors disagree ---------------------------------------------
+
+# A finger is marked when its camera and glove flexion fractions (0 straight,
+# 1 fully flexed, each on its own sensor's learned endpoints) differ by this
+# much or more.
+DISAGREE_FRAC = 0.35
+
+
+@dataclass
+class Disagreement:
+    finger: str
+    glove: float                  # the glove's flexion fraction
+    camera: float                 # the camera's
+    handled: bool                 # the fused curl came from the camera
+
+    @property
+    def camera_more_bent(self) -> bool:
+        return self.camera > self.glove
+
+
+def disagreement_flags(curls_glove: Sequence[float],
+                       curls_camera: Sequence[float],
+                       scale: Optional[HandScale],
+                       dof_source: Optional[Mapping[str, str]] = None,
+                       threshold: float = DISAGREE_FRAC
+                       ) -> List[Disagreement]:
+    """The fingers (index to pinky) whose two curls, put on the flexion
+    fraction with `scale`, differ by `threshold` or more.
+
+    `curls_*` are `flexion_features` of each sensor's hand, in FINGER_NAMES
+    order. A finger `scale` cannot normalise is skipped, as is everything
+    with no `scale`. `handled` is set when `dof_source` says the fused curl
+    of that finger came from the camera (the rail override).
+    """
+    if scale is None:
+        return []
+    out = []
+    for finger in SPREAD_FINGERS:
+        if not scale.normalisable(finger):
+            continue
+        i = FINGER_NAMES.index(finger)
+        g = scale.fraction(SENSOR_GLOVE, finger, curls_glove[i])
+        c = scale.fraction(SENSOR_CAMERA, finger, curls_camera[i])
+        if g is None or c is None or abs(c - g) < threshold:
+            continue
+        src = (dof_source or {}).get(f"curl {finger}")
+        out.append(Disagreement(finger, float(g), float(c), src == SRC_RAIL))
+    return out
+
+
+def disagreements(frame, scale: Optional[HandScale]) -> List[Disagreement]:
+    """`disagreement_flags` for one fused frame: its glove and camera inputs
+    (`glove_in`, `cam_in`); none when either is missing."""
+    glove = getattr(frame, "glove_in", None)
+    cam = getattr(frame, "cam_in", None)
+    if frame is None or glove is None or cam is None or scale is None:
+        return []
+    return disagreement_flags(flexion_features(np.asarray(glove, float)),
+                              flexion_features(np.asarray(cam, float)),
+                              scale, getattr(frame, "dof_source", None))
+
+
+def disagree_cells(flags: Sequence[Disagreement], checked: bool
+                   ) -> List[Tuple[str, tuple]]:
+    """The badge line, as coloured pieces: "disagree: middle, ring (camera
+    more bent)", amber, a finger the camera took over in green. Fingers bent
+    more by each sensor are grouped: "disagree: index (camera more bent);
+    ring (glove more bent)". `checked` False (no camera frame or no
+    endpoints) says so."""
+    out = [("disagree: ", DIM_BGR)]
+    if not checked:
+        return out + [("not checked", DIM_BGR)]
+    if not flags:
+        return out + [("none", TEXT_BGR)]
+    groups = [([f for f in flags if f.camera_more_bent], "camera"),
+              ([f for f in flags if not f.camera_more_bent], "glove")]
+    for fingers, who in (g for g in groups if g[0]):
+        if len(out) > 1:
+            out.append(("; ", AMBER_BGR))
+        for k, f in enumerate(fingers):
+            if k:
+                out.append((", ", AMBER_BGR))
+            out.append((f.finger, HANDLED_BGR if f.handled else AMBER_BGR))
+        out.append((f" ({who} more bent)", AMBER_BGR))
+    return out
+
+
+def disagree_text(flags: Sequence[Disagreement], checked: bool = True) -> str:
+    """`disagree_cells` as one plain string."""
+    return "".join(t for t, _c in disagree_cells(flags, checked))
+
+
+LEGEND = [("amber", AMBER_BGR), (" = sensors disagree, fused follows the "
+                                 "glove; ", DIM_BGR),
+          ("green", HANDLED_BGR), (" = camera took over", DIM_BGR)]
+LEGEND_SCALE = 0.45
 
 
 # --- the pose guess ----------------------------------------------------------
@@ -345,13 +525,18 @@ class SideState:
 
 MARGIN = 16
 GAP = 10
-COL_W = (330, 330, 420)          # glove, camera, fused (+ badges)
+COL_W = (330, 330, 440)          # glove, camera, fused (+ badges)
 HEADER_H = 70
 PANEL_TITLE_H = 26
 HAND_H = 270
 WRIST_FROM_BOTTOM = 30
 LINE_H = 20
-INFO_H = 7 * LINE_H + 14
+# Under the fused hand: thumb, four fingers, override, disagree, status,
+# legend.
+INFO_LINES = 9
+INFO_H = INFO_LINES * LINE_H + 14
+# The ring round a disagreeing fingertip (the tip dot has radius 5).
+RING_R = 10
 # x of the badge columns: finger, curl (or the thumb's direction), spread
 BADGE_COLS = (0, 70, 250)
 ROW_H = PANEL_TITLE_H + HAND_H + INFO_H + 12
@@ -402,9 +587,16 @@ def draw_tick(img, x: int, y: int, ok: bool, size: int = 14) -> None:
 
 
 def _panel(img, state: SideState, stream: str, x: int, y: int, w: int,
-           now: float, mm_per_px: float, prefix: str = "") -> None:
+           now: float, mm_per_px: float, prefix: str = "",
+           refusal: Optional[str] = None,
+           rings: Sequence[Disagreement] = ()) -> None:
+    """One hand's panel. `refusal` (the camera panel) draws the hand
+    grey-blue with "not trusted: <refusal>" under the title; `rings` (the
+    fused panel) circles those fingertips, amber, or green when handled."""
     colour = STREAM_BGR[stream]
     seen = state.seen(stream, now)
+    if seen and refusal:
+        colour = CAMERA_DIM_BGR
     tx = x + 2
     if prefix:
         tx = put(img, prefix, (tx, y + 19), 0.65, TEXT_BGR, 2) + 14
@@ -417,13 +609,24 @@ def _panel(img, state: SideState, stream: str, x: int, y: int, w: int,
     roi = img[top:top + HAND_H, x:x + w]
     pts = getattr(state, stream)
     if pts is not None:
-        draw_hand(roi, pts, state.side,
-                  (w / 2.0, HAND_H - WRIST_FROM_BOTTOM),
-                  colour if seen else GREY_BGR, mm_per_px)
+        px = draw_hand(roi, pts, state.side,
+                       (w / 2.0, HAND_H - WRIST_FROM_BOTTOM),
+                       colour if seen else GREY_BGR, mm_per_px)
+        if seen:
+            for flag in rings:
+                tip = FINGER_CHAINS[flag.finger][-1]
+                cv2.circle(roi, tuple(px[tip]), RING_R,
+                           HANDLED_BGR if flag.handled else AMBER_BGR, 2,
+                           cv2.LINE_AA)
     if not seen:
         label = "no hand"
         put(img, label, (x + (w - text_width(label, 0.9, 2)) // 2,
                          top + HAND_H // 2), 0.9, TEXT_BGR, 2)
+    elif refusal:
+        # On a dark strip, so the fingertips under it cannot hide it.
+        cv2.rectangle(img, (x, top), (x + w - 1, top + 24), BG_BGR, -1)
+        put_segments(img, [("not trusted: ", BAD_BGR), (refusal, TEXT_BGR)],
+                     (x + 6, top + 17), 0.55)
 
 
 def _guess_block(img, x: int, y: int, guess: Optional[Guess],
@@ -450,13 +653,17 @@ def render(states: Mapping[str, SideState], sides: Sequence[str], now: float,
            guesses: Optional[Mapping[str, Optional[Guess]]] = None,
            truth: Optional[str] = None, guess_note: str = "",
            progress: Optional[float] = None,
-           mm_per_px: float = MM_PER_PX) -> np.ndarray:
+           mm_per_px: float = MM_PER_PX,
+           scales: Optional[Mapping[str, Optional[HandScale]]] = None
+           ) -> np.ndarray:
     """The whole picture: one row per side in `sides`, each with the glove,
     camera and fused hands, the fused hand's badges and the pose guess.
 
     `header` is up to two lines at the top, `footer` the key help;
     `guesses` per side (see `CentroidClassifier.guess`), `truth` the true
     pose when it is known (a replay), `progress` 0..1 of the current take.
+    `scales` per side is the run's learned endpoints (`HandScale`), which
+    the disagreement marks need; without them no finger is marked.
     """
     w, h = canvas_size(len(sides))
     img = np.full((h, w, 3), BG_BGR, np.uint8)
@@ -486,27 +693,43 @@ def render(states: Mapping[str, SideState], sides: Sequence[str], now: float,
         if r:
             cv2.line(img, (MARGIN, y0 - 4), (w - MARGIN, y0 - 4), PANEL_BGR, 1)
         y1 = y0
+        frame = state.frame
+        live = frame is not None and state.seen("fused", now)
+        scale = (scales or {}).get(side)
+        flags = disagreements(frame, scale) if live else []
+        refusal = camera_refusal(frame) if live else None
         for k, stream in enumerate(STREAMS):
             _panel(img, state, stream, _col_x(k), y1, COL_W[k], now, mm_per_px,
-                   prefix=f"{side.upper()} HAND" if k == 0 else "")
+                   prefix=f"{side.upper()} HAND" if k == 0 else "",
+                   refusal=refusal if stream == "camera" else None,
+                   rings=flags if stream == "fused" else ())
         y2 = y1 + PANEL_TITLE_H + HAND_H + 8
         guess = (guesses or {}).get(side)
         if not state.seen("fused", now):
             guess = None
         _guess_block(img, _col_x(0) + 4, y2, guess, truth, guess_note)
         bx = _col_x(2) + 4
-        frame = state.frame
-        if frame is not None and state.seen("fused", now):
-            for i, line in enumerate(badge_cells(frame.dof_source,
-                                                 frame.rail_active)):
+        if live:
+            lines = badge_cells(frame.dof_source, frame.rail_active)
+            for i, line in enumerate(lines):
                 for col, cell in zip(BADGE_COLS, line):
                     put_segments(img, cell, (bx + col, y2 + 16 + i * LINE_H),
                                  0.5)
+            checked = (scale is not None
+                       and getattr(frame, "cam_in", None) is not None
+                       and getattr(frame, "glove_in", None) is not None)
+            cells = disagree_cells(flags, checked)
+            put_segments(img, cells, (bx, y2 + 16 + len(lines) * LINE_H),
+                         fit_scale("".join(t for t, _c in cells),
+                                   COL_W[2] - 8))
             put(img, status_text(state.camera_fresh(now), state.glove_hz(now)),
-                (bx, y2 + 16 + 6 * LINE_H), 0.5,
+                (bx, y2 + 16 + (len(lines) + 1) * LINE_H), 0.5,
                 TEXT_BGR if state.camera_fresh(now) else BAD_BGR)
         else:
             put(img, "no fused frame", (bx, y2 + 16), 0.5, DIM_BGR)
+        put_segments(img, LEGEND, (bx, y2 + 16 + (INFO_LINES - 1) * LINE_H),
+                     fit_scale("".join(t for t, _c in LEGEND), COL_W[2] - 8,
+                               LEGEND_SCALE))
     if footer:
         put(img, footer, (MARGIN, h - 10), 0.5, DIM_BGR)
     return img

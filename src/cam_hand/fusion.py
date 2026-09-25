@@ -270,6 +270,33 @@ left glove reports correctly. A plain sequence still means both hands, so
 nothing written before the mapping existed changes. `fingers_for(hand)` is the
 only reader.
 
+THE GENERAL FORM: THE DISAGREEMENT OVERRIDE (`mode="disagree"`)
+  The rail rule catches one failure: a finger pinned bit-exact on its rail.
+  A glove can also DRIFT. In a live run on 2026-09-25 the left glove
+  registered a full fist early in the session and, from 22 s on, reported
+  the fingers mostly open while a trusted, palm-facing camera saw a full
+  fist. No finger sat on its rail, so the rail rule could not fire, and the
+  fused hand followed the glove.
+
+  `RailOverrideParams(mode="disagree")` drops the on-rail condition and asks
+  whether the two sensors disagree by a lot, on the same flexion fractions
+  the thumb vote uses (`HandScale`). A frame qualifies for a finger when the
+  camera frame is trusted (`frame_trust` plus the view gate), the finger can
+  be put on a fraction on both sensors, and
+
+      camera fraction - glove fraction >= disagree_frac
+
+  that is, the camera sees the finger MORE bent than the glove does. The
+  override enters after `enter_frames` such frames in a row. It leaves after
+  `exit_frames` frames in a row that are untrusted or whose gap is below
+  `disagree_release`; a gap between the two thresholds holds whatever state
+  the finger is in. With `disagree_both_ways` a camera that sees the finger
+  straighter than the glove by the same margin also wins. When active the
+  camera takes the curl through exactly the rail rule's path
+  (`RailDecision.active`, then `transfer_finger_flexion`), and `disputed`
+  keeps its meaning for the thumb gate. The fingers default to all four
+  (`disagree_fingers`), written once or per hand like `fingers`.
+
 WHEN THE TWO SENSORS ARE DESCRIBING DIFFERENT INSTANTS
 ------------------------------------------------------
 Everything above assumes a paired glove frame and camera frame are two views
@@ -490,6 +517,15 @@ R_RAIL_NONE = "no rail learned for this finger"
 R_RAIL_OFF = "glove is off its rail, so it is measuring"
 R_RAIL_EXTENDED = "camera does not see the finger flexed"
 R_RAIL_ARMING = "rail disagreement not sustained yet"
+# ...and in "disagree" mode (see `RailOverrideParams.mode`).
+R_DIS_NO_SCALE = "finger has no flexion endpoints on both sensors"
+R_DIS_AGREE = "camera and glove agree within disagree_frac"
+R_DIS_ARMING = "camera-glove disagreement not sustained yet"
+
+# The two override modes. "rail" is the original rule and the default.
+MODE_RAIL = "rail"
+MODE_DISAGREE = "disagree"
+OVERRIDE_MODES = (MODE_RAIL, MODE_DISAGREE)
 
 # Which fingers the rail override is enabled on: one list for both hands, or
 # one list per hand. See `RailOverrideParams.fingers`.
@@ -546,6 +582,36 @@ class RailOverrideParams:
                      curl seen for that finger. A rail is the top of the
                      sensor's range; a mode well below the maximum is a pose
                      that was simply held a lot, and teaches no rail.
+    mode             "rail" (the default) is the rule above: the glove must
+                     sit on its learned rail. "disagree" is the general form
+                     (see the module docstring): no rail needed, the two
+                     sensors' flexion fractions must disagree by
+                     `disagree_frac`. The tracker then needs the session's
+                     `FlexionScale`.
+    disagree_frac    "disagree" mode: how much MORE bent the camera must see
+                     a finger than the glove does, in flexion fraction (0 is
+                     straight, 1 is that sensor's most flexed), for a frame
+                     to count toward entering. 0.35 is about a third of the
+                     finger's range: well above the 0.20 the thumb vote
+                     already treats as disagreement, so ordinary scale
+                     mismatch between the sensors does not arm it.
+    disagree_release "disagree" mode: once active, the finger is released
+                     after `exit_frames` frames in a row whose gap is below
+                     this (or whose camera frame is untrusted). A gap between
+                     the two thresholds holds the current state, so a gap
+                     hovering at the entry threshold cannot flicker the
+                     override on and off.
+    disagree_both_ways  "disagree" mode: also let the camera win when it sees
+                     the finger STRAIGHTER than the glove by `disagree_frac`.
+                     Off by default: the failure seen live is a glove that
+                     drifted open under a fist, and the reverse claim, that
+                     the glove reads a finger curled that is straight, has
+                     not yet been shown on these gloves.
+    disagree_fingers "disagree" mode's fingers, in either form `fingers`
+                     takes. Default all four: the drift seen live was on
+                     every finger of the hand. `fingers` stays the rail
+                     rule's list, so a profile's `rail_fingers` does not
+                     narrow this one.
     """
     tol: float = 0.005
     margin: float = 0.25
@@ -555,6 +621,31 @@ class RailOverrideParams:
     cam_open_curl: Tuple[float, ...] = (1.30, 1.75, 1.82, 1.69, 1.44)
     min_rail_share: float = 0.05
     rail_max_gap: float = 0.02
+    mode: str = MODE_RAIL
+    disagree_frac: float = 0.35
+    disagree_release: float = 0.20
+    disagree_both_ways: bool = False
+    disagree_fingers: FingerSpec = RAIL_FINGERS
+
+    def __post_init__(self):
+        if self.mode not in OVERRIDE_MODES:
+            raise ValueError(f"override mode {self.mode!r}: choose from "
+                             f"{', '.join(OVERRIDE_MODES)}")
+        if not 0.0 <= self.disagree_release <= self.disagree_frac:
+            raise ValueError(
+                f"disagree_release {self.disagree_release} must be between 0 "
+                f"and disagree_frac {self.disagree_frac}: the finger has to "
+                "be released at a smaller gap than the one that armed it")
+
+    @property
+    def disagree(self) -> bool:
+        """Is this the general, no-rail-needed form of the override?"""
+        return self.mode == MODE_DISAGREE
+
+    @property
+    def _spec(self) -> FingerSpec:
+        """The finger list the current mode reads."""
+        return self.disagree_fingers if self.disagree else self.fingers
 
     def open_curl(self, finger: str) -> float:
         return self.cam_open_curl[FINGER_NAMES.index(finger)]
@@ -569,8 +660,11 @@ class RailOverrideParams:
 
         An unknown hand gets () from a mapping, not the mapping's first
         entry: a hand nobody wrote a line for has not been enabled.
+
+        Reads `fingers` in "rail" mode and `disagree_fingers` in "disagree"
+        mode.
         """
-        spec = self.fingers
+        spec = self._spec
         if isinstance(spec, Mapping):
             if hand is None:
                 named = {f for fs in spec.values() for f in fs}
@@ -582,21 +676,35 @@ class RailOverrideParams:
 
     @property
     def per_hand(self) -> bool:
-        """Is `fingers` written per hand, rather than once for both?"""
-        return isinstance(self.fingers, Mapping)
+        """Is the current mode's finger list written per hand?"""
+        return isinstance(self._spec, Mapping)
 
     def described(self) -> Dict[str, str]:
+        """The parameters as the report prints them.
+
+        "fingers" is the list the current mode acts on. The disagree-only
+        parameters are left out in "rail" mode, where they do nothing.
+        """
         d = asdict(self)
+        for key in ("disagree_fingers", "mode", "disagree_frac",
+                    "disagree_release", "disagree_both_ways"):
+            d.pop(key)
         if self.per_hand:
             d["fingers"] = "; ".join(
                 f"{hand}: {', '.join(self.fingers_for(hand)) or '(none)'}"
-                for hand in sorted(self.fingers)) or "(none)"
+                for hand in sorted(self._spec)) or "(none)"
         else:
             d["fingers"] = (", ".join(self.fingers_for()) + " (both hands)"
                             if self.fingers_for() else "(none)")
         d["cam_open_curl"] = "  ".join(
             f"{n} {v:.2f}" for n, v in zip(FINGER_NAMES, self.cam_open_curl))
-        return d
+        out = {"mode": self.mode}
+        if self.disagree:
+            out.update(disagree_frac=self.disagree_frac,
+                       disagree_release=self.disagree_release,
+                       disagree_both_ways=self.disagree_both_ways)
+        out.update(d)
+        return out
 
 
 DEFAULT_RAIL = RailOverrideParams()
@@ -968,10 +1076,18 @@ class RailDecision:
     thumb on almost every right-hand peace frame. A rail is suspect only when
     the camera contradicts it, which is the same disagreement the override
     itself is built on.
+
+    `gaps` is this frame's camera fraction minus glove fraction per finger
+    (positive: the camera sees it more bent), for every finger that could be
+    put on a fraction on a trusted camera frame. It is what "disagree" mode
+    decides on, and it is filled in either mode when the tracker has a scale,
+    so a report can say how big the gap was when the override fired. It
+    never changes a decision in "rail" mode.
     """
     active: Tuple[str, ...] = ()
     rejected: Mapping[str, str] = field(default_factory=dict)
     disputed: Tuple[str, ...] = ()
+    gaps: Mapping[str, float] = field(default_factory=dict)
 
 
 NO_RAIL_OVERRIDE = RailDecision()
@@ -986,17 +1102,78 @@ class RailOverrideTracker:
 
     Counters are keyed by (hand, finger) because the two hands interleave in
     one file and are separate pieces of evidence.
+
+    `scale` is the session's learned endpoints: a `FlexionScale` (both
+    hands) or one hand's `HandScale`. "disagree" mode cannot fire without
+    it, since its test is a gap between flexion fractions; "rail" mode only
+    uses it to fill `RailDecision.gaps` for the report.
     """
 
     def __init__(self, rails: Optional[Mapping[Tuple[str, str], float]] = None,
                  params: Optional[RailOverrideParams] = None,
-                 gates: Optional[GateParams] = None):
+                 gates: Optional[GateParams] = None,
+                 scale: Union[FlexionScale, HandScale, None] = None):
         self.params = params or DEFAULT_RAIL
         self.gates = gates or DEFAULT_GATES
         self.rails = dict(rails or {})
+        self.scale = scale
         self._run: Dict[Tuple[str, str], int] = defaultdict(int)
         self._idle: Dict[Tuple[str, str], int] = defaultdict(int)
         self._active: set = set()
+
+    def hand_scale(self, hand: str) -> Optional[HandScale]:
+        """This hand's endpoints, from whichever form `scale` was given in."""
+        if self.scale is None:
+            return None
+        if isinstance(self.scale, HandScale):
+            return self.scale
+        return self.scale.for_hand(hand)
+
+    def gap(self, hand: str, finger: str, glove_curl: float,
+            cam_curl: Optional[float]) -> Optional[float]:
+        """Camera fraction minus glove fraction, or None if not measurable.
+
+        Positive means the camera sees the finger more bent than the glove.
+        Each curl is put on its own sensor's endpoints for this hand and
+        finger, the same endpoints the thumb vote uses.
+        """
+        hs = self.hand_scale(hand)
+        if hs is None or cam_curl is None or not hs.normalisable(finger):
+            return None
+        return (hs.fraction(SENSOR_CAMERA, finger, float(cam_curl))
+                - hs.fraction(SENSOR_GLOVE, finger, float(glove_curl)))
+
+    def _effective(self, gap: float) -> float:
+        """The gap the thresholds read: signed, or its size with both ways."""
+        return abs(gap) if self.params.disagree_both_ways else gap
+
+    def disagrees(self, hand: str, finger: str, glove_curl: float,
+                  cam_curl: Optional[float],
+                  frame_reasons: Sequence[str] = (),
+                  view_deg: Optional[float] = None
+                  ) -> Tuple[Optional[str], Optional[float]]:
+        """"disagree" mode's per-frame test: (None, gap) if the frame
+        qualifies, else (why not, gap or None).
+
+        The same camera checks as `qualifies` (a frame, `frame_trust`, the
+        view gate), then the gap. No rail is needed: a railed reading
+        qualifies too if the gap is there.
+        """
+        hs = self.hand_scale(hand)
+        if hs is None or not hs.normalisable(finger):
+            return R_DIS_NO_SCALE, None
+        if cam_curl is None:
+            return R_NO_FRAME, None
+        if frame_reasons:
+            return frame_reasons[0], None
+        if view_deg is None:
+            return R_NO_GEOMETRY, None
+        if view_deg >= self.gates.view_gate_deg:
+            return R_VIEW, None
+        gap = self.gap(hand, finger, glove_curl, cam_curl)
+        if self._effective(gap) >= self.params.disagree_frac:
+            return None, gap
+        return R_DIS_AGREE, gap
 
     def qualifies(self, hand: str, finger: str, glove_curl: float,
                   cam_curl: Optional[float],
@@ -1041,12 +1218,27 @@ class RailOverrideTracker:
         camera (either argument None) is a non-qualifying frame — it decays the
         run, it does not reset the whole state — which is what keeps a dropped
         camera frame mid-pinch from flickering the override off and on.
+
+        In "disagree" mode the per-frame test is `disagrees` instead of
+        `qualifies`, and leaving is hysteretic on the gap as well: an active
+        finger is released only by `exit_frames` frames in a row that are
+        untrusted or below `disagree_release`.
         """
         frame_reasons: Sequence[str] = (R_NO_FRAME,)
         view_deg = None
         if cam_meta is not None:
             _ok, frame_reasons, metrics = frame_trust(cam_meta, self.gates)
             view_deg = metrics["view_angle_deg"]
+        trusted = (cam_curls is not None and not frame_reasons
+                   and view_deg is not None
+                   and view_deg < self.gates.view_gate_deg)
+        gaps: Dict[str, float] = {}
+        if trusted:
+            for f in RAIL_FINGERS:
+                i = FINGER_NAMES.index(f)
+                got = self.gap(hand, f, glove_curls[i], cam_curls[i])
+                if got is not None:
+                    gaps[f] = got
 
         # Every finger the two sensors CONTRADICT each other about — on its
         # rail while the camera reads it flexed — computed for all four, not
@@ -1076,15 +1268,30 @@ class RailOverrideTracker:
                 continue
             key = (hand, finger)
             i = FINGER_NAMES.index(finger)
-            why = self.qualifies(
-                hand, finger, glove_curls[i],
-                None if cam_curls is None else cam_curls[i],
-                frame_reasons, view_deg)
+            cam_i = None if cam_curls is None else cam_curls[i]
+            holding = False
+            if self.params.disagree:
+                why, gap = self.disagrees(hand, finger, glove_curls[i], cam_i,
+                                          frame_reasons, view_deg)
+                # Between the release and entry thresholds an active finger
+                # stays active and its exit count starts again.
+                holding = (why is not None and key in self._active
+                           and gap is not None
+                           and self._effective(gap)
+                           >= self.params.disagree_release)
+                arming = R_DIS_ARMING
+            else:
+                why = self.qualifies(hand, finger, glove_curls[i], cam_i,
+                                     frame_reasons, view_deg)
+                arming = R_RAIL_ARMING
             if why is None:
                 self._run[key] += 1
                 self._idle[key] = 0
                 if self._run[key] >= self.params.enter_frames:
                     self._active.add(key)
+            elif holding:
+                self._run[key] = 0
+                self._idle[key] = 0
             else:
                 self._idle[key] += 1
                 self._run[key] = 0
@@ -1093,8 +1300,8 @@ class RailOverrideTracker:
             if key in self._active:
                 active.append(finger)
             else:
-                rejected[f"curl {finger}"] = why if why is not None else R_RAIL_ARMING
-        return RailDecision(tuple(active), rejected, disputed)
+                rejected[f"curl {finger}"] = why if why is not None else arming
+        return RailDecision(tuple(active), rejected, disputed, gaps)
 
 
 def _unit(v: np.ndarray) -> np.ndarray:

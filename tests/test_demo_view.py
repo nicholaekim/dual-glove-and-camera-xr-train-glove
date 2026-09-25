@@ -13,22 +13,51 @@ import cv2
 import numpy as np
 import pytest
 
+import cam_hand.demo_view as demo_view
 from cam_hand.demo_view import (
+    AMBER_BGR,
     BG_BGR,
     BONES,
+    CAMERA_DIM_BGR,
+    COL_W,
+    DISAGREE_FRAC,
+    HEADER_H,
     MM_PER_PX,
+    PANEL_TITLE_H,
     CentroidClassifier,
     SideState,
+    _col_x,
     badge_text,
+    camera_refusal,
     canvas_size,
+    disagree_text,
+    disagreement_flags,
     draw_hand,
     even_size,
     pad_to,
     palm_view_mm,
+    render,
     to_pixels,
 )
-from cam_hand.features import loo_take_nearest_centroid
-from cam_hand.fusion import GATED_DOFS, SRC_CAMERA, SRC_GLOVE, SRC_RAIL
+from cam_hand.features import flexion_features, loo_take_nearest_centroid
+from cam_hand.fusion import (
+    CAMERA_DOFS,
+    FINGER_NAMES,
+    GATED_DOFS,
+    R_CURLED,
+    R_DISAGREE,
+    R_FIELD,
+    R_HAND_ID,
+    R_NO_FRAME,
+    R_VIEW,
+    R_VISIBLE,
+    SENSORS,
+    SRC_CAMERA,
+    SRC_GLOVE,
+    SRC_RAIL,
+    Endpoints,
+    HandScale,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -140,6 +169,153 @@ def test_badge_text_says_where_each_finger_came_from():
     # spread).
     words = sum(line.count(": ") for line in lines[:-1])
     assert words == len(GATED_DOFS)
+
+
+# --- camera trust and disagreement -------------------------------------------
+
+def _frame(rejected=None, sources=None, cam=True, glove=None, camera=None):
+    hand = _flat_open_hand()
+    dof_source = {dof: SRC_GLOVE for dof in GATED_DOFS}
+    dof_source.update(sources or {})
+    return SimpleNamespace(
+        t_glove=10.0, hand="right", pts=hand.tolist(),
+        glove_in=hand if glove is None else glove,
+        cam_in=None if not cam else (hand if camera is None else camera),
+        dof_source=dof_source, rail_active=(), rejected=dict(rejected or {}))
+
+
+def _all(reason, extra=()):
+    return {dof: reason for dof in tuple(CAMERA_DOFS) + tuple(extra)}
+
+
+def test_the_camera_panel_says_why_the_whole_hand_was_refused():
+    assert camera_refusal(_frame(cam=False, rejected=_all(R_NO_FRAME))) == \
+        "no camera frame"
+    assert camera_refusal(_frame(rejected=_all(R_VISIBLE))) == \
+        "hand not seen long enough"
+    assert camera_refusal(_frame(rejected=_all(R_HAND_ID))) == \
+        "hand id just changed"
+    assert camera_refusal(_frame(rejected=_all(R_FIELD))) == \
+        "palm off the module's centre"
+    # Turned away: a curled finger's spread is refused for its curl first,
+    # but the view still refuses the rest, so the whole hand is refused.
+    turned = dict(_all(R_VIEW), **{"spread ring": R_CURLED})
+    assert camera_refusal(_frame(rejected=turned)) == "palm turned away"
+    # Refusals finger by finger leave the frame trusted...
+    per_dof = dict(_all(R_CURLED), thumb=R_DISAGREE)
+    assert camera_refusal(_frame(rejected=per_dof)) is None
+    # ...as does a frame that supplied anything at all.
+    assert camera_refusal(_frame(rejected=turned,
+                                 sources={"curl index": SRC_RAIL})) is None
+    assert camera_refusal(_frame(sources={"thumb": SRC_CAMERA})) is None
+    assert camera_refusal(None) is None
+
+
+def _scale(glove_open, cam_open, span=0.5, dropped=()):
+    """Endpoints per finger: open at the given curls, flexed `span` below."""
+    ends = {}
+    for sensor, opens in zip(SENSORS, (glove_open, cam_open)):
+        for i, finger in enumerate(FINGER_NAMES):
+            ends[(sensor, finger)] = Endpoints(opens[i], opens[i] - span, 100,
+                                               "test")
+    return HandScale(hand="right", ends=ends,
+                     dropped={f: "test" for f in dropped})
+
+
+def test_disagreement_flags_compare_flexion_fractions():
+    opens = [1.5, 2.0, 2.1, 2.0, 1.8]
+    scale = _scale(opens, opens)
+    glove = list(opens)
+    cam = list(opens)
+    cam[2] -= 0.5 * (DISAGREE_FRAC + 0.05)      # middle: camera more bent
+    glove[3] -= 0.5 * (DISAGREE_FRAC + 0.10)    # ring: glove more bent
+    cam[4] -= 0.5 * (DISAGREE_FRAC - 0.05)      # pinky: just under
+    cam[0] -= 0.5                               # the thumb is never marked
+    flags = disagreement_flags(glove, cam, scale)
+    assert [f.finger for f in flags] == ["middle", "ring"]
+    assert flags[0].camera_more_bent and not flags[1].camera_more_bent
+    assert not any(f.handled for f in flags)
+    assert disagree_text(flags) == ("disagree: middle (camera more bent); "
+                                    "ring (glove more bent)")
+    # The rail override took the middle curl: handled, drawn green.
+    got = disagreement_flags(glove, cam, scale,
+                             {"curl middle": SRC_RAIL})
+    assert [f.handled for f in got] == [True, False]
+    # A finger without endpoints is skipped; no endpoints, nothing marked.
+    assert [f.finger for f in disagreement_flags(
+        glove, cam, _scale(opens, opens, dropped=("middle",)))] == ["ring"]
+    assert disagreement_flags(glove, cam, None) == []
+    # Two fingers bent more by the camera share one bracket.
+    cam[3] = opens[3] - 0.5 * 0.9
+    both = disagreement_flags(opens, cam, scale)
+    assert disagree_text(both) == "disagree: middle, ring (camera more bent)"
+    assert disagree_text([]) == "disagree: none"
+    assert disagree_text([], checked=False) == "disagree: not checked"
+
+
+def _curl_middle(hand):
+    """`hand` with the middle finger folded most of the way to its knuckle."""
+    out = np.array(hand, float)
+    knuckle = out[9]
+    for k in (10, 11, 12):
+        out[k] = knuckle + 0.25 * (out[k] - knuckle)
+    return out
+
+
+def test_a_snapshot_shows_a_distrusted_camera_and_a_disagreeing_finger(
+        tmp_path, monkeypatch):
+    """Camera refused (palm turned away) and the middle finger read bent by
+    the camera, open by the glove: the camera hand is grey-blue with the
+    reason, the fused middle tip has an amber ring, the badge names it, the
+    legend is there, and the PNG is written."""
+    demo = _demo()
+    open_hand = _flat_open_hand()
+    bent = _curl_middle(open_hand)
+    cg, cc = flexion_features(open_hand), flexion_features(bent)
+    scale = _scale(cg, cg, span=(cg[2] - cc[2]) / 0.8)
+    frame = _frame(rejected=_all(R_VIEW), camera=bent)
+    state = SideState("right")
+    state.update(frame)
+    lines = []
+    real_put, real_segments = demo_view.put, demo_view.put_segments
+
+    def put(img, text, *a, **k):
+        lines.append(text)
+        return real_put(img, text, *a, **k)
+
+    def put_segments(img, segments, *a, **k):
+        lines.append("".join(t for t, _c in segments))
+        return real_segments(img, segments, *a, **k)
+
+    monkeypatch.setattr(demo_view, "put", put)
+    monkeypatch.setattr(demo_view, "put_segments", put_segments)
+    img = render({"right": state}, ["right"], 10.0,
+                 scales={"right": scale})
+    assert "not trusted: palm turned away" in lines
+    assert "disagree: middle (camera more bent)" in lines
+    assert ("amber = sensors disagree, fused follows the glove; green = "
+            "camera took over") in lines
+    top = HEADER_H + PANEL_TITLE_H
+
+    def count(colour, k):
+        panel = img[top:top + 270, _col_x(k):_col_x(k) + COL_W[k]]
+        return int(np.all(panel == colour, axis=2).sum())
+
+    assert count(CAMERA_DIM_BGR, 1) > 200         # the camera hand, dimmed
+    assert count(AMBER_BGR, 2) > 20               # the ring on the fused hand
+    png = demo.write_snapshot(tmp_path / "trust.png", img, say=lambda s: None)
+    back = cv2.imdecode(np.frombuffer(png.read_bytes(), np.uint8),
+                        cv2.IMREAD_COLOR)
+    assert back.shape == img.shape
+
+    # Trusted and in agreement: drawn as before, with no ring and no reason.
+    lines.clear()
+    trusted = SideState("right")
+    trusted.update(_frame(rejected=_all(R_CURLED)))
+    img = render({"right": trusted}, ["right"], 10.0, scales={"right": scale})
+    assert not any(t.startswith("not trusted") for t in lines)
+    assert "disagree: none" in lines
+    assert count(CAMERA_DIM_BGR, 1) == 0 and count(AMBER_BGR, 2) == 0
 
 
 # --- the pose guess ----------------------------------------------------------

@@ -431,6 +431,13 @@ def test_mock_session_fuses_to_jsonl_and_osc(tmp_path, monkeypatch):
             assert len(d["pts"]) == 21
             assert all(len(p) == 3 for p in d["pts"])
             assert set(d["dof_source"]) == set(GATED_DOFS)
+            # The step's inputs are saved, so the two sensors can be
+            # compared afterwards; no camera input on an unpaired frame.
+            assert np.asarray(d["glove_in"]).shape == (21, 3)
+            assert (d["cam_in"] is None) == (d["t_cam"] is None)
+            if d["cam_in"] is not None:
+                assert np.asarray(d["cam_in"]).shape == (21, 3)
+            assert isinstance(d["rejected"], dict)
         assert any(d["t_cam"] is not None for d in frames)
 
         sock.settimeout(2.0)
@@ -447,6 +454,28 @@ def test_mock_session_fuses_to_jsonl_and_osc(tmp_path, monkeypatch):
     assert all(isinstance(v, float) for v in keypoints)
     sources = got["/fused/right/sources"]
     assert [s.split("=", 1)[0] for s in sources] == list(GATED_DOFS)
+
+
+def test_a_fused_frames_json_carries_both_inputs():
+    """glove_in and cam_in go into the JSON line (cam_in null when unpaired),
+    with the refusal reasons, and none of them changes frame equality."""
+    from cam_hand.live_fusion import FusedFrame
+
+    glove = np.arange(63, dtype=float).reshape(21, 3) / 1000.0
+    cam = glove + 0.0015
+    base = dict(t_glove=1.0, t_cam=0.99, hand="right", pts=glove.tolist(),
+                dof_source={"thumb": "camera"}, camera_used=True)
+    paired = FusedFrame(**base, glove_in=glove, cam_in=cam,
+                        rejected={"spread index": "glove says the finger is "
+                                                  "curled"})
+    d = json.loads(json.dumps(paired.to_json()))
+    assert np.allclose(d["glove_in"], glove, atol=1e-6)
+    assert np.allclose(d["cam_in"], cam, atol=1e-6)
+    assert d["rejected"] == {"spread index": "glove says the finger is curled"}
+    unpaired = FusedFrame(**dict(base, t_cam=None), glove_in=glove)
+    d = json.loads(json.dumps(unpaired.to_json()))
+    assert d["cam_in"] is None and np.asarray(d["glove_in"]).shape == (21, 3)
+    assert paired == FusedFrame(**base)
 
 
 def test_mock_session_with_no_open_palm_stops_with_exit_code_2(tmp_path,
