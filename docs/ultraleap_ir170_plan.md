@@ -593,6 +593,42 @@ Day-1 session with the corrected recorder (2026-09-18, 18:36 to 18:48,
   wrong. Reported as is: fusion needs per-hand, per-finger reliability
   logic; glove curl does not automatically dominate.
 
+The disagreement override (2026-09-25, main 2bc865c+, 441 tests): the
+fusion no longer follows a glove that has drifted
+- What prompted it: a live left-hand run (`recordings/demo/2026-09-25_1037_left`)
+  in which the glove registered a fist at 8 s, then from 22 s reported the
+  fingers mostly open (index 1.73, middle 1.40, ring 1.64, pinky 1.36 on
+  rails of 1.74/1.82/1.68/1.44) while the camera, trusted and palm-facing,
+  saw a fist. The fused hand followed the glove because the glove owned
+  curl and the rail-only override needs the glove bit-exact on its rail.
+- `RailOverrideParams(mode="disagree")`: a frame qualifies for a finger when
+  the camera frame passes the trust gates and the view gate, both sensors
+  are normalisable on the warm-up endpoints, and camera fraction minus
+  glove fraction >= 0.35 (camera more bent; `disagree_both_ways` adds the
+  reverse, off by default). Enter after 10 consecutive frames, release
+  below 0.20 after 5. On all four fingers of both hands. When active the
+  camera takes the finger's curl exactly as the rail override does. The
+  thumb vote's `disputed` is unchanged.
+- Measured (profile on, anchor off):
+    day 1: fused 57/59 -> 57/59; false fires 0.66 % of open-palm and fist
+           finger-frames; right pinky residual .245 -> .190
+    day 2: fused 53/60 -> 59/60; false fires 0.03 %; right ring .195 ->
+           .123, pinky .400 -> .138, middle .068 -> .051
+    day 3: fused 35/36 -> 35/36; false fires 1.28 %; right pinky .071 ->
+           .045, everything else within 0.005
+    both-ways on day 2: 58/60, so camera-more-bent only is the default.
+- Now the profile default (`override_mode: disagree` in profiles/default.json
+  and the NK profile); `--override-mode rail` restores the old behaviour.
+  The live path (fuse_live.py, demo.py) is being wired to read the same key
+  so the demo behaves like the offline tool.
+- Demo honesty (same commit): the camera panel dims with the reason when
+  its frame is not trusted, fingers whose fractions differ by 0.35 or more
+  get an amber ring (green when the camera took over) and a `disagree:`
+  badge, and the saved JSONL now carries each step's glove and camera
+  inputs.
+- Unchanged by this: the recalibration verdict (still off). The override
+  acts per frame on a trusted camera; it learns nothing across sessions.
+
 Live fusion on hardware (2026-09-24, main 64c3678, 417 tests): works
 - `scripts/demo.py --live` (same path as `fuse_live.py`, plus the three-hand
   window) ran on both gloves, one hand per run. Left, 60 s: 3558 fused
