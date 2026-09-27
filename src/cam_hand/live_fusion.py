@@ -80,6 +80,7 @@ from cam_hand.fusion import (
     DriftAnchorParams,
     FlexionScale,
     GateParams,
+    MODE_DISAGREE,
     RailOverrideParams,
     RailOverrideTracker,
     curl_gates_from_rails,
@@ -598,13 +599,16 @@ class WarmupResult:
     """What the warm-up taught, in the shapes `fuse_all` holds them in.
 
     rails        the rail override's rails, keyed (hand, finger); empty when
-                 the override is off (`rail_params` None), as in `fuse_all`
+                 the override is off (`rail_params` None), as in `fuse_all`.
+                 "disagree" mode needs no rail to act, but still reads them
+                 to tell the thumb gate which railed fingers are disputed
     gate_rails   the rails the gates and the drift anchor use, learned with
                  `DEFAULT_RAIL` when the override is off: switching the
                  override off decides who may TAKE a curl, not whether the
                  gates know where a straight finger reads
     rail_tol     the tolerance those rails were learned with
-    scale        the flexion-fraction endpoints, per hand, finger and sensor
+    scale        the flexion-fraction endpoints, per hand, finger and sensor;
+                 "disagree" mode compares the two sensors on these
     curl_gates   per hand, the spread gate's thresholds carried across a
                  template fit; empty with no fit
     measurements the bone-length measurement in force per hand (fitted hands)
@@ -629,8 +633,10 @@ class WarmupResult:
     causes: Dict[str, List[str]] = field(default_factory=dict)
     not_acquired: Tuple[str, ...] = ()
     fit_asked: bool = False
-    # per hand, the fingers the rail override is enabled on; empty when off
+    # per hand, the fingers the curl override is enabled on; empty when off
     override_enabled: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    # the curl override's mode ("rail" or "disagree"); None when it is off
+    override_mode: Optional[str] = None
     glove_frames: Dict[str, int] = field(default_factory=dict)
     camera_frames: Dict[str, int] = field(default_factory=dict)
     camera_open_frames: Dict[str, int] = field(default_factory=dict)
@@ -681,7 +687,18 @@ class WarmupResult:
                 for f in FINGER_NAMES)
             out.append(f"    glove rails: {rails}")
             enabled = self.override_enabled.get(hand)
-            if enabled is not None:
+            if enabled is not None and self.override_mode == MODE_DISAGREE:
+                # No rail needed, but no endpoints means no fraction to
+                # compare, so the finger can never be taken.
+                hs = self.scale.for_hand(hand)
+                no_ends = [f for f in enabled
+                           if hs is None or not hs.normalisable(f)]
+                out.append(
+                    "    disagree override enabled on: "
+                    + (", ".join(enabled) or "(no finger)")
+                    + (f"; no endpoints for {', '.join(no_ends)}, so it "
+                       "can never act there" if no_ends else ""))
+            elif enabled is not None:
                 no_rail = [f for f in enabled if (hand, f) not in self.rails]
                 out.append(
                     "    rail override enabled on: "
@@ -1026,6 +1043,7 @@ def _learn_core(result: WarmupResult,
         result.rails = result.gate_rails
         result.override_enabled = {h: rail_params.fingers_for(h)
                                    for h in result.hands}
+        result.override_mode = rail_params.mode
     result.scale = learn_flexion_scale(glove_curls, cam_curls,
                                        result.gate_rails, gates=gates,
                                        rail_params=rail_for_gates)
@@ -1138,6 +1156,13 @@ class LiveFusion:
     hysteresis counts consecutive frames of that hand), one `DriftAnchor`
     for the run, each hand's glove lag, and what the warm-up learned.
 
+    The trackers are built as `fuse_all` builds its own: the learned rails,
+    `rail_params` (in either mode) and the learned endpoints
+    (`learned.scale`). "disagree" mode compares the two sensors on those
+    endpoints and cannot fire without them; "rail" mode uses them only for
+    the per-frame gaps. A `LiveFusion` is made after the warm-up, so the
+    endpoints always exist by then.
+
     `step` pairs, then runs `fuse_all`'s sequence exactly:
 
       1. the rail tracker advances on the UNCORRECTED glove curls (the
@@ -1192,7 +1217,8 @@ class LiveFusion:
         self.curl_gates = dict(learned.curl_gates)
         self.measurements = dict(learned.measurements)
         self.trackers = ({h: RailOverrideTracker(learned.rails, rail_params,
-                                                 self.gates)
+                                                 self.gates,
+                                                 scale=learned.scale)
                           for h in self.hands}
                          if rail_params is not None else {})
         # session counters, per hand

@@ -100,6 +100,11 @@ centroids.
   straight reading while the camera sees it bent. After a few frames the
   badge turns to `index curl: camera (override)` and `override: index`. The
   left-hand pinch takes show it for about 90 % of their frames.
+- **The override when the glove drifts.** The live demo runs the profile's
+  `override_mode` (the header says `override: disagree` or `override: rail`);
+  in `disagree` a trusted camera takes a finger the glove has drifted on (the
+  camera sees it at least 0.35 of its range more bent, for 10 frames), so the
+  badge reads `curl: camera (override)` and that finger's ring turns green.
 - **The pose guess.** Tick or cross against the true pose, and the margin
   (small margin, unsure guess).
 

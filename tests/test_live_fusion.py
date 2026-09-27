@@ -721,6 +721,66 @@ def test_mock_session_warms_up_the_left_hand_then_the_right(tmp_path,
     assert hands == {"left", "right"}
 
 
+def _disagree_profile(folder):
+    """A profile whose only claim is the curl override's mode: "disagree",
+    with the rail rule's fingers narrowed to the index."""
+    path = folder / "disagree_profile.json"
+    path.write_text(json.dumps({"name": "disagree test",
+                                "rail_fingers": {"right": ["index"]},
+                                "override_mode": "disagree"}),
+                    encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("flags, mode, how", [
+    ([], "disagree", "[the profile's override_mode]"),
+    (["--override-mode", "rail"], "rail", "[--override-mode]"),
+])
+def test_the_profiles_override_mode_reaches_the_live_tracker(
+        tmp_path, monkeypatch, flags, mode, how):
+    """A profile naming override_mode "disagree" runs the live override in
+    that mode, each hand's tracker holding the warm-up's endpoints, and the
+    warm-up file's settings block says so; --override-mode beats the
+    profile."""
+    live = _live_module()
+    _quick(live, monkeypatch)
+    _low_glove_floor(live, monkeypatch)
+    made = []
+
+    class Kept(live.LiveFusion):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            made.append(self)
+
+    monkeypatch.setattr(live, "LiveFusion", Kept)
+    out = tmp_path / "live.jsonl"
+    code = live.main(["--mock-glove", "--mock-leap", "--no-view",
+                      "--seconds", "0.5", "--hand", "right",
+                      "--profile", str(_disagree_profile(tmp_path)),
+                      "--out", str(out), "--fit-template", "none",
+                      "--acquire-timeout", "5", "--warmup-open", "1",
+                      "--warmup-fist", "1.2"] + flags)
+    assert code == 0
+
+    kept = (tmp_path / "live.warmup.txt").read_text(encoding="utf-8")
+    settings = kept.split("Warm-up, one hand at a time")[0]
+    assert f"Curl override: {mode}: " in settings
+    assert how in settings
+    # "disagree" acts on all four fingers: the profile's rail_fingers is the
+    # rail rule's list, as in fuse_poses.py.
+    fingers = (("index", "middle", "ring", "pinky") if mode == "disagree"
+               else ("index",))
+    assert f"; {mode} override on {', '.join(fingers)}" in settings
+    assert f"    {mode} override enabled on: {', '.join(fingers)}" in kept
+
+    (fusion,) = made
+    tracker = fusion.trackers["right"]
+    assert tracker.params.mode == mode
+    assert tracker.params.fingers_for("right") == fingers
+    assert tracker.scale is fusion.learned.scale
+    assert tracker.hand_scale("right").normalisable("index")
+
+
 # --- replay: the live path against fuse_all ------------------------------------
 
 LAG = 0.47
@@ -779,7 +839,8 @@ def _write_session(root, seconds=2.0):
     return root
 
 
-@pytest.mark.parametrize("variant", ["plain", "fitted_with_anchor"])
+@pytest.mark.parametrize("variant",
+                         ["plain", "fitted_with_anchor", "disagree"])
 def test_replay_through_the_live_path_matches_fuse_all(tmp_path, monkeypatch,
                                                        variant):
     """Frame for frame: the same fused points to 1e-9 m, the same dof_source
@@ -816,7 +877,9 @@ def test_replay_through_the_live_path_matches_fuse_all(tmp_path, monkeypatch,
         r.pop("abs26", None)
     loaded = [{"name": TAKE, "glove": glove, "cam": cam, "source": fp.LEAP,
                "clock": clock, "with_scale": False}]
-    rail_params = RailOverrideParams(fingers=("index", "middle"))
+    rail_params = RailOverrideParams(
+        fingers=("index", "middle"),
+        mode="disagree" if variant == "disagree" else "rail")
     unreliable = {"right": ("ring",)}
     lag = {"right": LAG}
 
@@ -881,19 +944,37 @@ def test_replay_through_the_live_path_matches_fuse_all(tmp_path, monkeypatch,
         assert any(f.corrections for f in live)
 
 
+def _default_profile_mode():
+    """profiles/default.json's override_mode ("disagree" since 2026-09-25),
+    read the way the scripts read it."""
+    fp = _fuse_module()
+    path, _how = fp.resolve_profile(fp.PROFILE_AUTO)
+    return fp.profile_override_mode(path) or "rail"
+
+
+@pytest.mark.parametrize("extra, mode", [
+    (["--profile", "none"], "rail"),
+    (["--profile", "none", "--drift-anchor", "on"], "rail"),
+    (["--profile", "none", "--override-mode", "disagree"], "disagree"),
+    ([], None),                         # the default profile's own mode
+    (["--override-mode", "rail"], "rail"),
+])
 def test_replay_command_agrees_with_fuse_all_on_a_recorded_session(
-        tmp_path, monkeypatch, capsys):
+        tmp_path, capsys, extra, mode):
+    """Both sides run the same override: the default profile's mode when
+    no flag names one (fuse_all honours it, so the replay must too), and
+    --override-mode over the profile."""
     live = _live_module()
     root = _write_session(tmp_path / "session")
-    for extra in ([], ["--drift-anchor", "on"]):
-        code = live.main(["--replay", str(root), "--profile", "none",
-                          "--glove-lag", f"right:{LAG}",
-                          "--fit-template", "none"] + extra)
-        text = capsys.readouterr().out
-        assert code == 0, text
-        assert "identical to fuse_all's" in text
-        assert "Live path agrees with fuse_all on every take." in text
-        assert TAKE[:40] in text
+    mode = mode or _default_profile_mode()
+    code = live.main(["--replay", str(root), "--glove-lag", f"right:{LAG}",
+                      "--fit-template", "none"] + extra)
+    text = capsys.readouterr().out
+    assert code == 0, text
+    assert f"  Curl override: {mode}: " in text
+    assert "identical to fuse_all's" in text
+    assert "Live path agrees with fuse_all on every take." in text
+    assert TAKE[:40] in text
 
 
 def test_anchor_forgets_once_per_camera_gap_longer_than_a_second():

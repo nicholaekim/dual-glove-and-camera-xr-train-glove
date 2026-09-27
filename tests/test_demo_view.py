@@ -593,6 +593,43 @@ def test_live_with_no_save_writes_nothing(tmp_path, monkeypatch, capsys):
     assert "Data for this demo" not in text
 
 
+@pytest.mark.parametrize("flags, mode", [
+    ([], "disagree"),
+    (["--override-mode", "rail"], "rail"),
+])
+def test_the_live_header_names_the_override_mode(tmp_path, monkeypatch,
+                                                 capsys, flags, mode):
+    """The window's header says which curl override is running: the
+    profile's override_mode, or --override-mode over it."""
+    demo = _demo()
+    _quiet_live(demo, monkeypatch)
+    monkeypatch.setattr(demo, "DEFAULT_GATES",
+                        replace(demo.DEFAULT_GATES, min_glove_span=0.30))
+    headers = []
+    real = demo.render
+
+    def spy(*a, **k):
+        headers.append(list(k.get("header", ())))
+        return real(*a, **k)
+
+    monkeypatch.setattr(demo, "render", spy)
+    profile = tmp_path / "disagree_profile.json"
+    profile.write_text(json.dumps({"name": "disagree test",
+                                   "override_mode": "disagree"}),
+                       encoding="utf-8")
+    code = demo.main(["--live", "--mock-glove", "--mock-leap", "--no-view",
+                      "--no-window", "--frames", "5", "--hand", "right",
+                      "--profile", str(profile), "--fit-template", "none",
+                      "--acquire-timeout", "5", "--warmup-open", "1",
+                      "--warmup-fist", "1.2", "--classifier-from", "none",
+                      "--no-save"] + flags)
+    text = capsys.readouterr().out
+    assert code == 0, text
+    assert f"Curl override: {mode}: " in text
+    assert headers and all(h[1].endswith(f"override: {mode}")
+                           for h in headers)
+
+
 def test_the_default_demo_folder_is_named_by_minute_and_hands(tmp_path,
                                                               monkeypatch):
     demo = _demo()

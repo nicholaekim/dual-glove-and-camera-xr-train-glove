@@ -73,6 +73,16 @@ THE GLOVE LAG
   with no profile lag for a hand nothing is applied, and the startup lines say
   so. A live session has no settle clips to measure a lag from.
 
+THE CURL OVERRIDE runs in the profile's `override_mode` unless
+--override-mode names one, and "rail" when neither does, as in fuse_poses.py.
+"rail": the camera takes a finger's curl while the glove sits bit-exact on
+its learned rail and a trusted camera sees the finger flexed. "disagree": no
+rail needed; a trusted camera that sees a finger more bent than the glove by
+--disagree-frac of its flexion range (on the warm-up's learned endpoints) for
+10 frames in a row takes that finger's curl, until the gap falls below
+--disagree-release. The mode is printed with the settings, so it is in
+PATH.warmup.txt.
+
 THE DRIFT ANCHOR is EXPERIMENTAL and off by default (--drift-anchor on). On,
 it also forgets what it learned whenever a hand's camera has been stale for
 more than a second, because the hand can come back in any pose.
@@ -140,8 +150,10 @@ from fuse_poses import (  # noqa: E402
     LAG_NONE,
     PROFILE_AUTO,
     load_profile,
+    mode_text,
     parse_glove_lag,
     parse_rail_fingers,
+    profile_override_mode,
     resolve_profile,
 )
 
@@ -152,6 +164,8 @@ from cam_hand.fusion import (  # noqa: E402
     DEFAULT_RAIL,
     DriftAnchor,
     DriftAnchorParams,
+    MODE_RAIL,
+    OVERRIDE_MODES,
     RailOverrideParams,
     flag_hand_id_stability,
     pairing_clock,
@@ -261,7 +275,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rail-fingers", default=None,
                    help="comma-separated fingers the rail override may act "
                         "on, both hands; overrides the profile (default "
-                        f"{','.join(DEFAULT_RAIL.fingers_for())})")
+                        f"{','.join(DEFAULT_RAIL.fingers_for())}). With "
+                        "--override-mode disagree it names that mode's "
+                        "fingers instead (default all four; the profile's "
+                        "rail_fingers is the rail rule's list and does not "
+                        "apply)")
+    p.add_argument("--override-mode", choices=OVERRIDE_MODES, default=None,
+                   help="which curl override runs, as in fuse_poses.py. "
+                        "'rail': the glove must sit bit-exact on its learned "
+                        "rail while a trusted camera sees the finger flexed. "
+                        "'disagree': no rail needed; a trusted camera that "
+                        "sees a finger more bent than the glove by "
+                        "--disagree-frac of its flexion range takes that "
+                        "finger's curl. Default: the profile's "
+                        "override_mode, else rail")
+    p.add_argument("--disagree-frac", type=float,
+                   default=DEFAULT_RAIL.disagree_frac,
+                   help="'disagree' mode: camera fraction minus glove "
+                        "fraction at which a frame counts toward entering "
+                        f"(default {DEFAULT_RAIL.disagree_frac})")
+    p.add_argument("--disagree-release", type=float,
+                   default=DEFAULT_RAIL.disagree_release,
+                   help="'disagree' mode: gap below which frames count "
+                        "toward releasing the finger; must not exceed "
+                        "--disagree-frac (default "
+                        f"{DEFAULT_RAIL.disagree_release})")
+    p.add_argument("--disagree-both-ways", action="store_true",
+                   help="'disagree' mode: also let the camera win when it "
+                        "sees the finger STRAIGHTER than the glove by the "
+                        "same margin (default: camera more bent only)")
     p.add_argument("--out", type=Path, default=None, metavar="PATH.jsonl",
                    help="write one JSON line per fused frame")
     p.add_argument("--osc-out", default=None, metavar="HOST:PORT",
@@ -294,6 +336,68 @@ def parse_host_port(text: str):
         return host, int(port)
     except ValueError:
         raise SystemExit(f"--osc-out {text}: {port!r} is not a port number")
+
+
+def override_from_args(args, profile_path, profile_rail):
+    """The curl override's parameters, and where its mode came from.
+
+    fuse_poses.main's rules, so the live override is the offline one. The
+    mode is --override-mode, else the profile's `override_mode`, else
+    "rail". The rail rule's fingers are --rail-fingers, else the profile's
+    `rail_fingers`, else the index. "disagree" mode acts on --rail-fingers,
+    else all four fingers: a profile's `rail_fingers` is the rail rule's
+    list and does not narrow it. The parameters are None with
+    --no-rail-override.
+
+    Returns `(RailOverrideParams or None, where the mode came from)`.
+    """
+    profile_mode = profile_override_mode(profile_path)
+    mode = args.override_mode or profile_mode or MODE_RAIL
+    how = ("--override-mode" if args.override_mode
+           else "the profile's override_mode" if profile_mode
+           else "default")
+    if args.no_rail_override:
+        return None, how
+    cli_rail = (None if args.rail_fingers is None
+                else parse_rail_fingers(args.rail_fingers))
+    if cli_rail is not None:
+        rail_spec = cli_rail
+    elif profile_rail:
+        rail_spec = profile_rail
+    else:
+        rail_spec = DEFAULT_RAIL.fingers
+    try:
+        params = RailOverrideParams(
+            fingers=rail_spec,
+            disagree_fingers=(cli_rail if cli_rail is not None
+                              else DEFAULT_RAIL.disagree_fingers),
+            mode=mode, disagree_frac=args.disagree_frac,
+            disagree_release=args.disagree_release,
+            disagree_both_ways=args.disagree_both_ways)
+    except ValueError as e:
+        raise SystemExit(f"curl override: {e}")
+    return params, how
+
+
+def override_name(rail_params) -> str:
+    """The override's mode in one word: "rail", "disagree" or "off"."""
+    return "off" if rail_params is None else rail_params.mode
+
+
+def override_line(rail_params, how) -> str:
+    """The settings block's line naming the curl override's mode, what it
+    tests and where the mode came from."""
+    if rail_params is None:
+        return f"Curl override: {mode_text(None)}."
+    return f"Curl override: {mode_text(rail_params)}  [{how}]."
+
+
+def override_fingers(rail_params, hand) -> str:
+    """A hand's settings line's override part: the mode and its fingers."""
+    if rail_params is None:
+        return "curl override off (--no-rail-override)"
+    return (f"{rail_params.mode} override on "
+            + (", ".join(rail_params.fingers_for(hand)) or "(no finger)"))
 
 
 def resolve_lag(spec, hands, profile_lag, profile_path):
@@ -510,7 +614,8 @@ REPLAY_TOL_M = 1e-9
 
 
 def replay_session(input_dir, gates, rail_params, unreliable, profile_lag,
-                   anchor, fit_spec, lag_text, max_dt) -> int:
+                   anchor, fit_spec, lag_text, max_dt,
+                   override_how="default") -> int:
     """`--replay`: the session through `fuse_all` and through the live path.
 
     Loading, hand-id flagging, per-take bone measurement, the lag and the
@@ -521,7 +626,8 @@ def replay_session(input_dir, gates, rail_params, unreliable, profile_lag,
     rails, endpoints and curl gates), one fresh `LiveFusion` per take as
     `fuse_all` has one fresh rail tracker per take, and with the anchor on,
     ONE `DriftAnchor` in the order `fuse_all` fused the takes, reset wherever
-    `fuse_all` reset its own.
+    `fuse_all` reset its own. Both sides run the same curl override,
+    `rail_params`, in whichever mode `override_how` says it came from.
     """
     fp = fuse_poses
     input_dir = Path(input_dir)
@@ -601,6 +707,7 @@ def replay_session(input_dir, gates, rail_params, unreliable, profile_lag,
     for hand, why in sorted(refusals.items()):
         print(f"  {hand}: template fit refused ({why})")
     print("  drift anchor: " + ("on" if anchor is not None else "off"))
+    print("  " + override_line(rail_params, override_how))
     print("  rails, endpoints and curl gates handed to the live path: "
           + ("identical to fuse_all's" if same_learning
              else "DIFFERENT from fuse_all's"))
@@ -650,16 +757,8 @@ def main(argv=None) -> int:
     (unreliable, profile_rail, profile_name, _comment,
      profile_lag) = (load_profile(profile_path) if profile_path is not None
                      else ({}, {}, "", "", {}))
-    cli_rail = (None if args.rail_fingers is None
-                else parse_rail_fingers(args.rail_fingers))
-    if cli_rail is not None:
-        rail_spec = cli_rail
-    elif profile_rail:
-        rail_spec = profile_rail
-    else:
-        rail_spec = DEFAULT_RAIL.fingers
-    rail_params = (None if args.no_rail_override
-                   else RailOverrideParams(fingers=rail_spec))
+    rail_params, override_how = override_from_args(args, profile_path,
+                                                   profile_rail)
     lags = resolve_lag(parse_glove_lag(args.glove_lag), hands, profile_lag,
                        profile_path)
     anchor = (DriftAnchorParams(window_s=args.anchor_window,
@@ -670,7 +769,7 @@ def main(argv=None) -> int:
     if args.replay is not None:
         return replay_session(args.replay, gates, rail_params, unreliable,
                               profile_lag, anchor, fit_spec, args.glove_lag,
-                              args.max_dt)
+                              args.max_dt, override_how)
     if fit_spec.lower() in (FIT_AUTO, FIT_NONE):
         fit = fit_spec.lower()
     else:
@@ -686,10 +785,9 @@ def main(argv=None) -> int:
     for hand in hands:
         seconds, why = lags[hand]
         masked = ", ".join(unreliable.get(hand, ())) or "(none)"
-        override = ("off (--no-rail-override)" if rail_params is None
-                    else ", ".join(rail_params.fingers_for(hand)) or "(none)")
         log.say(f"  {hand}: glove lag {seconds:.3f} s ({why}); unreliable "
-                f"{masked}; rail override {override}")
+                f"{masked}; {override_fingers(rail_params, hand)}")
+    log.say(override_line(rail_params, override_how))
     log.say(f"Template fit: {fit_spec}.  Drift anchor: {args.drift_anchor}.  "
             f"Pairing within {args.max_dt:g} s.")
 

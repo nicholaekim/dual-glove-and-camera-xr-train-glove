@@ -43,7 +43,9 @@ TWO MODES, THE SAME WINDOW
                  fusion as scripts/fuse_live.py, with every fused frame drawn
                  as it is made. q quits. The warm-up's instructions are in
                  this window, on the console, and in the camera window
-                 (--no-view closes that one).
+                 (--no-view closes that one). The curl override runs in the
+                 profile's override_mode unless --override-mode names one
+                 ("rail" when neither does); the window's header says which.
 
 WHERE A LIVE DEMO'S DATA GOES
   Every --live run saves, in a folder made at the start,
@@ -98,7 +100,8 @@ A VIDEO OF A REPLAY
 
 Flags shared with scripts/fuse_live.py (--hand, --profile, --glove-lag,
 --fit-template, --warmup-*, --acquire-timeout, --max-dt, --drift-anchor,
---rail-fingers, --no-rail-override, --port, --mock-glove, --mock-leap,
+--rail-fingers, --no-rail-override, --override-mode, --disagree-frac,
+--disagree-release, --disagree-both-ways, --port, --mock-glove, --mock-leap,
 --no-view, --out, --osc-out, --seconds) mean exactly what they mean there,
 except that --out also moves the demo's other files (above); --out,
 --osc-out and --seconds apply to --live only. The live setup below is
@@ -146,6 +149,10 @@ from fuse_live import (  # noqa: E402
     CUE_MS,
     acquired_line,
     conclude_warmup,
+    override_fingers,
+    override_from_args,
+    override_line,
+    override_name,
     report_run,
     resolve_lag,
     run_header,
@@ -161,7 +168,6 @@ from fuse_poses import (  # noqa: E402
     glove_lag_of,
     load_profile,
     parse_glove_lag,
-    parse_rail_fingers,
     read_session,
     resolve_profile,
 )
@@ -179,7 +185,6 @@ from cam_hand.demo_view import (  # noqa: E402
 from cam_hand.features import flexion_features, mean_vector  # noqa: E402
 from cam_hand.fusion import (  # noqa: E402
     DEFAULT_GATES,
-    DEFAULT_RAIL,
     DriftAnchorParams,
     RailOverrideParams,
 )
@@ -313,26 +318,20 @@ class Settings:
     fit_spec: str
     lag_text: str
     max_dt: float
+    # where the curl override's mode came from (`override_from_args`)
+    override_how: str = "default"
 
 
 def settings_from_args(args) -> Settings:
-    """The profile, the masks, the rail fingers and the drift anchor, with
-    fuse_live.main's precedence: a flag beats the profile, the profile beats
-    the default."""
+    """The profile, the masks, the curl override (its mode and fingers) and
+    the drift anchor, with fuse_live.main's precedence: a flag beats the
+    profile, the profile beats the default."""
     profile_path, profile_how = resolve_profile(args.profile)
     (unreliable, profile_rail, profile_name, _comment,
      profile_lag) = (load_profile(profile_path) if profile_path is not None
                      else ({}, {}, "", "", {}))
-    cli_rail = (None if args.rail_fingers is None
-                else parse_rail_fingers(args.rail_fingers))
-    if cli_rail is not None:
-        rail_spec = cli_rail
-    elif profile_rail:
-        rail_spec = profile_rail
-    else:
-        rail_spec = DEFAULT_RAIL.fingers
-    rail_params = (None if args.no_rail_override
-                   else RailOverrideParams(fingers=rail_spec))
+    rail_params, override_how = override_from_args(args, profile_path,
+                                                   profile_rail)
     anchor = (DriftAnchorParams(window_s=args.anchor_window,
                                 hold_s=args.anchor_hold,
                                 deadband=args.anchor_deadband)
@@ -342,7 +341,8 @@ def settings_from_args(args) -> Settings:
                     profile_how=profile_how, profile_name=profile_name,
                     profile_lag=profile_lag, anchor=anchor,
                     fit_spec=str(args.fit_template).strip(),
-                    lag_text=args.glove_lag, max_dt=args.max_dt)
+                    lag_text=args.glove_lag, max_dt=args.max_dt,
+                    override_how=override_how)
 
 
 # --- a recorded session, fused through the live path -------------------------
@@ -683,7 +683,8 @@ def run_replay(args, s: Settings) -> int:
           "profile "
           f"{s.profile_path.name if s.profile_path else '(none)'}, "
           f"template fit {s.fit_spec}, drift anchor "
-          f"{'on' if s.anchor is not None else 'off'}")
+          f"{'on' if s.anchor is not None else 'off'}, override "
+          f"{override_name(s.rail_params)}")
     takes, samples = fuse_session(args.replay, s)
     takes = [t for t in play_order(takes) if set(t.hands) & set(wanted)]
     if not takes:
@@ -735,7 +736,8 @@ def run_replay(args, s: Settings) -> int:
             header = [f"REPLAY {Path(args.replay).name}   take {player.k + 1}"
                       f"/{len(takes)}   {take.name}   speed x{player.speed:g}"
                       + ("   PAUSED" if player.paused else ""),
-                      f"pose: {take.pose}"]
+                      f"pose: {take.pose}   override: "
+                      f"{override_name(s.rail_params)}"]
             img = render(states, sides, player.clock, header=header,
                          footer=REPLAY_KEYS,
                          guesses=guesses_for(states, sides, clf,
@@ -996,10 +998,9 @@ def run_live(args, s: Settings) -> int:
     for hand in hands:
         seconds, why = lags[hand]
         masked = ", ".join(s.unreliable.get(hand, ())) or "(none)"
-        override = ("off (--no-rail-override)" if rail_params is None
-                    else ", ".join(rail_params.fingers_for(hand)) or "(none)")
         log.say(f"  {hand}: glove lag {seconds:.3f} s ({why}); unreliable "
-                f"{masked}; rail override {override}")
+                f"{masked}; {override_fingers(rail_params, hand)}")
+    log.say(override_line(rail_params, s.override_how))
     log.say(f"Template fit: {fit_spec}.  Drift anchor: {args.drift_anchor}.  "
             f"Pairing within {args.max_dt:g} s.")
 
@@ -1193,7 +1194,8 @@ def run_live(args, s: Settings) -> int:
               f"profile {s.profile_path.name if s.profile_path else '(none)'}"
               "   lag " + "  ".join(f"{h[0].upper()} {lags[h][0]:.2f} s"
                                    for h in fused_hands),
-              f"template fit {fit_spec}"]
+              f"template fit {fit_spec}   override: "
+              f"{override_name(rail_params)}"]
     drawn = 0
     fresh_frames = False
     t_end = None if args.seconds is None else time.time() + args.seconds
