@@ -30,13 +30,88 @@ no sunlight and no other IR sources.
   python scripts/leap/record_poses.py --mock --takes 1 --duration 2 --prep 1
 
 Ctrl+C at any point keeps the takes recorded so far.
+
+The professor's grasp set (--protocol, Set A)
+---------------------------------------------
+`--protocol protocols/grasps.json --hand left` runs Set A of
+docs/grasp_and_flexion_protocol_plan.md and writes the session folder that
+docs/protocol_formats.md specifies (sections 1, 3, 5 and 7), so the checker
+and the packager read it without knowing who wrote it:
+
+    recordings/protocol/grasps/<YYYYMMDD_HHMMSS>_<hand>/
+      session.json                      rewritten after every take
+      leap/<take>.jsonl                 every frame, both hands if two were seen
+      stills/<take>.png                 one hand-cropped IR still per take
+      keypoints/<take>_keypoints.txt    the take's summary frame, his format
+      meta/<take>.json                  the numbers and the decision
+      rejected/...                      attempts not kept, same layout, plus
+                                        rejected/<take>.reason.txt
+
+What changes from the plain session, and why:
+
+  The grasp list is data. Items, takes, seconds and preparation come from
+  the protocol file, so a grasp named in the papers is a new JSON entry, not
+  a code change; `--items`, `--takes`, `--duration`, `--prep` subset or
+  override them for a redo.
+
+  Every frame is kept. The professor wants the FINAL configuration, and the
+  take's stillest two seconds (`leap_hand.static_interval`) are only
+  findable in the full-rate stream. The summary frame is the medoid of that
+  window, not of the whole take, so the reach into the pose cannot pull it.
+
+  The operator's hand is `--hand`, and it is what the files are named after.
+  The tracker's own left/right label is written on every line and counted
+  in the meta, but it filters nothing: it called the left hand "right" in 20
+  of 21 poses on 2026-09-23.
+
+  The orientation is measured, not remembered. Plan D3 turns palm-down
+  grasps only as far as the camera needs and asks for the rotation used, so
+  each take's meta carries the summary frame's palm height and its angle to
+  the lens; `--note` adds words to that.
+
+  Two decisions per take. The acquisition gate is automatic: at least 90 %
+  of the take's frames tracked and no re-acquisition inside the static
+  interval, or the attempt moves to `rejected/` with its reason and is
+  retried (`--retries`). The gate is a minimum, not the acceptance: a take
+  can be 95 % tracked with one fingertip wrong. So the recorder then shows
+  the still with the numbers and the operator keeps it (Enter or space),
+  redoes it (r) or ends the session (q). The decision and its time are
+  written by the recorder, never by hand. `--auto-accept` skips the prompt.
+
+  One session per set (plan D9). A grasp still short of its takes at the
+  end is recorded with `--resume <session folder>`, which adds the missing
+  takes to that same folder and carries the take numbering on, instead of
+  starting a second session that restarts at take 1. The end table prints
+  the exact command.
+
+  python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left
+  python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left --items hook,lateral_key --takes 1
+  python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left --resume recordings/protocol/grasps/<session>
+  python scripts/leap/record_poses.py --mock --protocol protocols/grasps.json --hand left --auto-accept --takes 1 --duration 1 --prep 0.5 --no-open
+
+A --mock session is written to recordings/protocol_mock/grasps/ instead, with
+the same layout, so a rehearsal on synthetic hands can never be collected
+with the real sessions. The runbook is docs/grasp_recording.md.
 """
 import argparse
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import re
+import subprocess
+import sys
 import time
 from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator, List, Optional, Tuple
 
+from leap_hand.protocol import row_height_cm, row_view_angle_deg
 from leap_hand.recorder import LeapRecorder
+from leap_hand.static_interval import (DEFAULT_STATIC_S, MIN_TRACKED_FRACTION,
+                                       row_frame, summarise_take)
 from leap_hand.stream import LeapUnavailable, open_stream
 from xr_hand.recorder import finalize_pose_name, hand_tag, pose_filename, slugify
 
@@ -59,6 +134,14 @@ STREAM_WAIT_TIMEOUT = 120.0   # s to wait for the first hands
 STREAM_WAIT_HANDS = 10        # hands seen before the first take starts
 MIN_VISIBLE_TIME_US = 300_000  # plan section 6: a hand counts after 0.3 s
 MAX_DRAIN_ROUNDS = 8           # bound on the post-beep flush
+
+# The plain session's defaults, applied when neither the command line nor a
+# protocol file says otherwise.
+LEGACY_TAKES = 3
+LEGACY_DURATION = 5.0
+LEGACY_PREP = 5.0
+LEGACY_HZ = 5.0
+LEGACY_OUT = Path("recordings") / "leap" / "poses"
 
 
 def beep(freq: int = 880, ms: int = 180) -> None:
@@ -247,27 +330,1268 @@ class Session:
             print(f"  21 points: python scripts/glove/export_keypoints21.py {self.out_dir}")
 
 
+# =============================================================================
+# Set A: the professor's grasp protocol (--protocol). See the module docstring
+# and docs/protocol_formats.md, which is the contract for every file below.
+# =============================================================================
+REPO = Path(__file__).resolve().parents[2]
+SET_NAME = "grasps"
+PROTOCOL_OUT = Path("recordings") / "protocol" / SET_NAME
+# A rehearsal on synthetic hands goes beside the real sessions, never among
+# them: whatever collects `recordings/protocol/grasps/` for the professor must
+# not be able to pick up a mock session by accident. Same layout inside.
+MOCK_PROTOCOL_OUT = Path("recordings") / "protocol_mock" / SET_NAME
+# What a protocol file that leaves a field out gets: plan D4.
+PROTOCOL_DEFAULTS = {"takes_per_item": 3, "duration_s": 5.0, "prep_s": 5.0}
+PROTOCOL_RETRIES = 2
+# Plan D3: not palm-to-lens for every grasp, an envelope every grasp can meet.
+ENVELOPE_BAND_CM = (20.0, 40.0)
+ENVELOPE = (
+    "Orientation: hand 20 to 40 cm above the module, wrist inside the view,",
+    "every finger chain visible to the lens, no finger edge-on. A palm-down",
+    "grasp (lateral, hook, extension) is rotated only as much as that needs.",
+)
+STILL_MODES = ("hand", "full", "none")
+STILL_OFF = "still_off"        # still_missing_reason with --still none
+STILL_WAIT_S = 1.5             # how long the viewer gets to write the still
+REVIEW_KEYS = "Enter or space = keep   r = redo   q = quit"
+MIN_TRACKED = MIN_TRACKED_FRACTION   # plan section 4, the acquisition gate
+LEAP_DIR, STILLS_DIR, KEYPOINTS_DIR, META_DIR = "leap", "stills", "keypoints", "meta"
+REJECTED_DIR = "rejected"
+# An item id goes into every file name between separators, so it must be
+# file-name safe and must not contain the `_take` that the name is split on.
+_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+
+
+class QuitSession(Exception):
+    """The operator pressed q at a take's review."""
+
+
+# --- the protocol file --------------------------------------------------------
+def load_protocol(path: Path) -> Tuple[dict, str]:
+    """(the protocol, sha256 of its bytes). Exits with the reason if unusable.
+
+    Only what this recorder needs is checked: an `items` list whose entries
+    have a file-name safe, unique `id` and a `label`. A Set B or C file is
+    refused by name, because its items carry cycles or steps that this
+    recorder would silently ignore.
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as e:
+        raise SystemExit(f"cannot read the protocol file {path}: {e}")
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise SystemExit(f"the protocol file {path} is not valid JSON: {e}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"the protocol file {path} is not a JSON object")
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        raise SystemExit(f"the protocol file {path} has no items")
+    seen = set()
+    for n, item in enumerate(items, 1):
+        if not isinstance(item, dict) or not item.get("id") or not item.get("label"):
+            raise SystemExit(f"item {n} of {path} needs an id and a label")
+        iid = str(item["id"])
+        if not _ID_RE.fullmatch(iid) or "_take" in iid:
+            raise SystemExit(f"item id {iid!r} in {path} is not file-name safe "
+                             "(letters, digits, _ and -, no '_take')")
+        if iid in seen:
+            raise SystemExit(f"item id {iid!r} appears twice in {path}")
+        seen.add(iid)
+        if "steps" in item or "cycles" in item:
+            raise SystemExit(
+                f"{path} is a finger flexion or sequence protocol (item "
+                f"{iid!r} has steps or cycles). Record it with "
+                "scripts/record_protocol.py; this recorder is for grasps.")
+    for key, default in PROTOCOL_DEFAULTS.items():
+        value = data.get(key, default)
+        try:
+            data[key] = type(default)(value)
+        except (TypeError, ValueError):
+            raise SystemExit(f"{key} in {path} must be a number, not {value!r}")
+    return data, hashlib.sha256(raw).hexdigest()
+
+
+def select_items(protocol: dict, only: Optional[str]) -> List[dict]:
+    """The protocol's items, or the ones named in `--items`, in that order."""
+    items = list(protocol["items"])
+    if not only:
+        return items
+    by_id = {str(it["id"]): it for it in items}
+    wanted = [x.strip() for x in only.split(",") if x.strip()]
+    unknown = [x for x in wanted if x not in by_id]
+    if unknown:
+        raise SystemExit(f"not in the protocol: {', '.join(unknown)}\n"
+                         f"  items are: {', '.join(by_id)}")
+    return [by_id[x] for x in wanted]
+
+
+def take_name(item: str, hand: str, n: int, stamp: str) -> str:
+    """`<item>_<hand>_take<N>_<YYYYMMDD_HHMMSS>`, contract section 1."""
+    return f"{item}_{hand}_take{n}_{stamp}"
+
+
+def repo_relative(path: Path) -> str:
+    """The path relative to the repo when it is inside it, forward slashes."""
+    p = Path(path).resolve()
+    try:
+        return p.relative_to(REPO).as_posix()
+    except ValueError:
+        return p.as_posix()
+
+
+def tool_commit() -> Optional[str]:
+    """The repo's short commit, or None when git cannot say."""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO,
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None if out.returncode == 0 else None
+
+
+def iso_now(t: Optional[float] = None) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t))
+
+
+def _num(value: Optional[float]) -> str:
+    return "-" if value is None else f"{value:.2f}"
+
+
+_EXPORTER = None
+
+
+def prof_exporter():
+    """`scripts/glove/export_prof_format.py`, imported by path, once.
+
+    The professor's block layout is defined there and nowhere else, for the
+    reason `scripts/leap/record_frame.py` gives: two copies would drift while
+    both claimed to be his format.
+    """
+    global _EXPORTER
+    if _EXPORTER is None:
+        path = REPO / "scripts" / "glove" / "export_prof_format.py"
+        spec = importlib.util.spec_from_file_location("glove_prof_format", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _EXPORTER = module
+    return _EXPORTER
+
+
+def write_json(path: Path, data: dict) -> None:
+    """Write through a temporary file, so a reader never sees half of it.
+
+    session.json is rewritten after every take while the checker may already
+    be reading it. OneDrive can hold a file for a moment after it changes,
+    so the swap is retried briefly rather than failing the session.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    for attempt in range(20):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.05)
+
+
+def read_rows(path: Path) -> List[dict]:
+    """A take's lines, parsed. The bytes actually written, not a copy of them."""
+    if not path.is_file():
+        return []
+    with open(path, "r", encoding="utf-8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
+
+
+# --- recording plumbing ---------------------------------------------------------
+class _KeysWriter:
+    """The recorder's file handle, with fixed keys added to every line.
+
+    The contract's `session` and `item` on every frame, added where the line
+    meets the file, the same trick `scripts/record_simultaneous.py` uses for
+    `capture_time`: `LeapRecorder` is not changed and its `record()` is not
+    copied. `take` is already on the line (LeapRecorder's own label).
+    """
+
+    def __init__(self, fh, keys: dict):
+        self._fh = fh
+        self._keys = dict(keys)
+
+    def write(self, text: str) -> int:
+        if text.strip():
+            d = json.loads(text)
+            d.update(self._keys)
+            text = json.dumps(d) + "\n"
+        return self._fh.write(text)
+
+    def flush(self) -> None:
+        self._fh.flush()
+
+    def close(self) -> None:
+        self._fh.close()
+
+
+class _Tap:
+    """The tracking source, remembering the newest hand of each label.
+
+    The mock still is drawn from the hand the tracker reported at the
+    moment the still is asked for, as the real viewer does; everything else
+    passes straight through to the source.
+    """
+
+    def __init__(self, source):
+        self._source = source
+        self.last = {}
+
+    def drain(self, max_items: int = 16):
+        items = self._source.drain(max_items)
+        for _side, lh in items:
+            self.last[lh.hand_side] = lh
+        return items
+
+    def latest(self, prefer: Optional[str] = None):
+        if prefer in self.last:
+            return self.last[prefer]
+        return next(iter(self.last.values()), None)
+
+    def __getattr__(self, name):
+        return getattr(self._source, name)
+
+
+def _still_view_class():
+    """`leap_hand.protocol.CameraView` that also passes `--still` to the viewer.
+
+    The viewer (`scripts/leap/camera_view.py`) already knows how to cut a
+    still to the hand or keep the whole frame; `CameraView.start` just never
+    tells it which. Built on first use so the plain session never imports it.
+    """
+    from leap_hand.protocol import CameraView
+
+    class StillView(CameraView):
+        def __init__(self, still: str = "hand", **kwargs):
+            super().__init__(**kwargs)
+            self.still = still
+
+        def start(self):
+            if not self.enabled or self._proc is not None:
+                return self
+            import atexit
+            import tempfile
+            self._status = (Path(tempfile.gettempdir())
+                            / f"leap_view_status_{os.getpid()}.txt")
+            self.caption("starting")
+            cmd = [sys.executable, str(self.SCRIPT), "--hand", self.hand,
+                   "--status-file", str(self._status),
+                   "--parent-pid", str(os.getpid()), "--still", self.still]
+            if self.band:
+                cmd += ["--band", f"{self.band[0]:g},{self.band[1]:g}"]
+            try:
+                self._proc = subprocess.Popen(cmd)
+            except OSError:
+                self.enabled = False
+                return self
+            atexit.register(self.close)
+            return self
+
+    return StillView
+
+
+# Joint chains of the 26 OpenXR joints, wrist outward, for drawing.
+_CHAINS = ([1, 2, 3, 4, 5],) + tuple([1] + list(range(6 + 5 * f, 11 + 5 * f))
+                                     for f in range(4))
+
+
+def write_mock_still(path: Path, lh, caption: str = "",
+                     full: bool = False) -> Optional[str]:
+    """A still for a mock take: the synthetic IR ramp with the hand drawn on it.
+
+    There is no camera behind `--mock`, so there is no picture to cut. The
+    still is drawn instead from `leap_hand.images.MockImageSampler`'s ramp,
+    which is obviously synthetic on sight, and it says MOCK on it, so nobody
+    can mistake it for evidence. It exists to exercise the rest of the path:
+    the crop (`hand_crop_box`, the viewer's own rule), the PNG, the review.
+    With no hand it writes the viewer's `.skipped.txt` note instead, the
+    same as the real viewer. `full` keeps the whole frame, as `--still full`
+    asks the viewer to. Returns the reason when there is no still.
+    """
+    import cv2
+    import numpy as np
+
+    from leap_hand.images import MockImageSampler
+    from leap_hand.protocol import (NO_TRACKED_HAND, hand_crop_box,
+                                    skipped_still_path, skipped_still_text)
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    size = 768
+    pts = []
+    if lh is not None:
+        for x, y, z in lh.abs26:
+            if y <= 0.005:
+                pts.append(None)
+                continue
+            u = size / 2 + 300.0 * x / y
+            v = size / 2 + 300.0 * z / y
+            pts.append((int(round(size - 1 - u)), int(round(v))))   # mirrored, as the viewer is
+    box = hand_crop_box([p for p in pts if p is not None], size) if pts else None
+    if box is None:
+        skipped_still_path(path).write_text(
+            skipped_still_text(NO_TRACKED_HAND, time.time()), encoding="utf-8")
+        return NO_TRACKED_HAND
+
+    eye = MockImageSampler().latest().left
+    frame = cv2.cvtColor(cv2.resize(eye, (size, size)), cv2.COLOR_GRAY2BGR)
+    colour = (255, 220, 0) if lh.hand_side == "left" else (60, 60, 255)
+    for chain in _CHAINS:
+        for a, b in zip(chain, chain[1:]):
+            if pts[a] is not None and pts[b] is not None:
+                cv2.line(frame, pts[a], pts[b], colour, 2, cv2.LINE_AA)
+    for p in pts:
+        if p is not None:
+            cv2.circle(frame, p, 3, (255, 255, 255), -1, cv2.LINE_AA)
+    x0, y0, x1, y1 = (0, 0, size, size) if full else box
+    crop = np.ascontiguousarray(frame[y0:y1, x0:x1])
+    for k, text in enumerate(("MOCK, not evidence", caption)):
+        if text:
+            # Shrunk to fit the crop, as the viewer fits its caption.
+            width = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 1)[0][0] or 1
+            scale = max(0.3, min(0.55, (crop.shape[1] - 16) / width))
+            org = (8, 20 + 20 * k)
+            cv2.putText(crop, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale,
+                        (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(crop, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale,
+                        (0, 255, 255), 1, cv2.LINE_AA)
+    if not cv2.imwrite(str(path), crop):
+        return "write_failed"
+    return None
+
+
+# --- the operator's decision ------------------------------------------------------
+class Reviewer:
+    """Asks the operator to keep, redo or quit after a take passed the gate.
+
+    The still and the numbers go in a review window beside the camera window,
+    and the key is read from that window or from the console, whichever has
+    the focus, so a bare hand on the keyboard is all it takes. `auto` keeps
+    every take without asking (the mock rehearsal, hands-free runs). `keys`
+    is a scripted key sequence for tests.
+    """
+
+    WINDOW = "Take review"
+    ACTIONS = {"\r": "accept", "\n": "accept", " ": "accept",
+               "r": "redo", "q": "quit"}
+
+    def __init__(self, auto: bool = False, keys: Optional[Iterator[str]] = None):
+        self.auto = bool(auto)
+        self._keys = keys
+
+    def decide(self, still: Optional[Path], lines: List[str],
+               pump=None) -> Tuple[str, float, str]:
+        """("accept" | "redo" | "quit", when, "auto" | "operator")."""
+        if self.auto:
+            return "accept", time.time(), "auto"
+        if self._keys is not None:
+            key = next(self._keys, "q")
+            return self.ACTIONS.get(key.lower(), "quit"), time.time(), "operator"
+        print(f"      {REVIEW_KEYS}")
+        try:
+            return self._window(still, lines, pump)
+        except Exception as e:                     # no GUI: fall back to the console
+            print(f"      (review window unavailable: {e})")
+        while True:
+            answer = input("      keep (Enter), redo (r) or quit (q)? ")
+            action = self.ACTIONS.get((answer[:1] or "\r").lower())
+            if action:
+                return action, time.time(), "operator"
+
+    def _window(self, still, lines, pump) -> Tuple[str, float, str]:
+        import cv2
+        image = self.compose(still, lines)
+        cv2.namedWindow(self.WINDOW, cv2.WINDOW_AUTOSIZE)
+        try:
+            cv2.setWindowProperty(self.WINDOW, cv2.WND_PROP_TOPMOST, 1)
+            cv2.moveWindow(self.WINDOW, 800, 40)
+        except Exception:
+            pass
+        try:
+            msvcrt = __import__("msvcrt")
+        except ImportError:
+            msvcrt = None
+        try:
+            while True:
+                if cv2.getWindowProperty(self.WINDOW, cv2.WND_PROP_VISIBLE) < 1:
+                    cv2.namedWindow(self.WINDOW, cv2.WINDOW_AUTOSIZE)
+                cv2.imshow(self.WINDOW, image)
+                code = cv2.waitKey(50)
+                key = chr(code & 0xFF) if code != -1 else ""
+                if not key and msvcrt is not None and msvcrt.kbhit():
+                    key = msvcrt.getwch()
+                action = self.ACTIONS.get(key.lower()) if key else None
+                if action:
+                    return action, time.time(), "operator"
+                if pump is not None:
+                    pump()
+        finally:
+            try:
+                cv2.destroyWindow(self.WINDOW)
+                cv2.waitKey(1)
+            except Exception:
+                pass
+
+    @staticmethod
+    def compose(still: Optional[Path], lines: List[str]):
+        """The still (or a note that there is none) above the numbers."""
+        import cv2
+        import numpy as np
+
+        width = 720
+        img = cv2.imread(str(still)) if still is not None and Path(still).is_file() else None
+        if img is None:
+            top = np.zeros((120, width, 3), np.uint8)
+            cv2.putText(top, "no still for this take", (16, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 190, 255), 2, cv2.LINE_AA)
+        else:
+            scale = min(width / img.shape[1], 480 / img.shape[0])
+            img = cv2.resize(img, (max(1, int(img.shape[1] * scale)),
+                                   max(1, int(img.shape[0] * scale))))
+            top = np.zeros((img.shape[0], width, 3), np.uint8)
+            x = (width - img.shape[1]) // 2
+            top[:, x:x + img.shape[1]] = img
+        panel = np.zeros((34 * (len(lines) + 1), width, 3), np.uint8)
+        for k, text in enumerate(lines + [REVIEW_KEYS]):
+            colour = (0, 255, 255) if k == 0 or k == len(lines) else (230, 230, 230)
+            cv2.putText(panel, text, (14, 26 + 34 * k), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.62 if k else 0.8, colour, 2 if k == 0 else 1, cv2.LINE_AA)
+        return np.vstack([top, panel])
+
+
+# --- the session ------------------------------------------------------------------
+@dataclass
+class Attempt:
+    """One recorded attempt, as the end-of-session table shows it."""
+
+    item: str
+    take: int
+    attempt: int
+    name: str
+    accepted: bool
+    reason: str
+    tracked_fraction: float
+    grab: Optional[float]
+    pinch: Optional[float]
+    by: str
+
+
+def load_session(folder: Path, hand: str, sha256: str, mock: bool) -> dict:
+    """An earlier session's session.json, checked before `--resume` adds to it.
+
+    Refused when it is not a grasp session, is another hand's, was a mock
+    when this run is not (or the other way round), or was recorded against
+    a protocol file whose bytes have since changed: one session, one hand,
+    one version of the grasp list.
+    """
+    path = Path(folder) / "session.json"
+    try:
+        old = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"cannot resume {folder}: no readable session.json ({e})")
+    if old.get("set") != SET_NAME:
+        raise SystemExit(f"cannot resume {folder}: it is a {old.get('set')!r} "
+                         "session, not a grasp session")
+    if old.get("hand") != hand:
+        raise SystemExit(f"cannot resume {folder}: it is the {old.get('hand')} "
+                         f"hand's session, not the {hand} hand's")
+    if bool(old.get("mock")) != mock:
+        raise SystemExit(f"cannot resume {folder}: it was "
+                         f"{'a mock' if old.get('mock') else 'a camera'} session")
+    if old.get("protocol_sha256") != sha256:
+        raise SystemExit(f"cannot resume {folder}: the protocol file has changed "
+                         "since that session was recorded; start a new session")
+    return old
+
+
+def make_session_dir(root: Path, hand: str) -> Path:
+    """`<root>/<YYYYMMDD_HHMMSS>_<hand>/`, new. Two runs in one second wait."""
+    while True:
+        folder = Path(root) / f"{time.strftime('%Y%m%d_%H%M%S')}_{hand}"
+        try:
+            folder.mkdir(parents=True, exist_ok=False)
+            return folder
+        except FileExistsError:
+            time.sleep(0.2)
+
+
+class ProtocolSession(Session):
+    """Set A: one guided session over a protocol file's grasps, one hand.
+
+    Per take: announce the grasp and the orientation envelope, count down,
+    record every frame for the take's seconds, then read the file back and
+    measure it (`leap_hand.static_interval.summarise_take`). A take that
+    fails the acquisition gate moves to `rejected/` with its reason and is
+    retried up to `retries` times; one that passes is shown to the operator,
+    whose decision is final. session.json is rewritten after every decision,
+    so a crash or a Ctrl+C never loses the record of what was already kept.
+    """
+
+    def __init__(self, source, out_root: Path, protocol: dict, sha256: str,
+                 protocol_path: Path, hand: str, items: List[dict], takes: int,
+                 duration: float, prep: float, static_s: float, retries: int,
+                 still: str, reviewer: Reviewer, view=None, mock: bool = False,
+                 raw: bool = False, note: str = "", operator: Optional[str] = None,
+                 auto_accept: bool = False,
+                 resume: Optional[Tuple[Path, dict]] = None):
+        self.session_dir = (Path(resume[0]) if resume is not None
+                            else make_session_dir(out_root, hand))
+        super().__init__(_Tap(source), hz=None, out_dir=self.session_dir, raw=raw)
+        self.protocol = protocol
+        self.sha256 = sha256
+        self.protocol_path = Path(protocol_path)
+        self.hand = hand
+        self.items = items
+        self.takes = int(takes)
+        self.duration = float(duration)
+        self.prep = float(prep)
+        self.static_s = float(static_s)
+        self.retries = int(retries)
+        self.still = still
+        self.reviewer = reviewer
+        self.view = view
+        self.mock = bool(mock)
+        self.note = note or ""
+        self.operator = operator
+        self.auto_accept = bool(auto_accept)
+        self.entries: List[dict] = []          # session.json "takes"
+        self.attempts: List[Attempt] = []
+        self.accepted = {str(it["id"]): 0 for it in items}
+        self.item_ids = [str(it["id"]) for it in items]   # session.json "items"
+        self.started = iso_now()
+        self.resumed: List[str] = []
+        self.ended: Optional[str] = None
+        self.commit = tool_commit()
+        self._last_stamp = None
+        if resume is not None:
+            self._pick_up(resume[1])
+        self.write_session()
+
+    def _pick_up(self, old: dict) -> None:
+        """Carry an earlier run's record of this session forward (`--resume`).
+
+        Plan D9: one session per set is the deliverable, and the contract's
+        take number counts the kept takes of an item within its session. So
+        a redo continues the session it completes: the takes already kept
+        are counted, the numbering carries on from them, and the earlier
+        attempts stay in session.json exactly as they were written.
+        """
+        self.entries = list(old.get("takes") or [])
+        self.started = old.get("started") or self.started
+        earlier = [str(i) for i in (old.get("items") or [])]
+        self.item_ids = earlier + [i for i in self.item_ids if i not in earlier]
+        self.resumed = list(old.get("resumed") or []) + [iso_now()]
+        if not self.operator:
+            self.operator = old.get("operator")
+        for e in self.entries:
+            iid = str(e.get("item"))
+            if e.get("accepted") and iid in self.accepted:
+                self.accepted[iid] += 1
+            self.attempts.append(Attempt(
+                item=iid, take=int(e.get("take") or 0),
+                attempt=int(e.get("attempt") or 0), name=str(e.get("name")),
+                accepted=bool(e.get("accepted")), reason=str(e.get("reason") or ""),
+                tracked_fraction=float(e.get("tracked_fraction") or 0.0),
+                grab=e.get("grab_strength"), pinch=e.get("pinch_strength"),
+                by=str(e.get("decided_by") or "")))
+
+    # --- folders ---------------------------------------------------------
+    def folder(self, kind: str, rejected: bool = False) -> Path:
+        base = self.session_dir / REJECTED_DIR if rejected else self.session_dir
+        return base / kind
+
+    def rel(self, path: Optional[Path]) -> Optional[str]:
+        return None if path is None else Path(path).relative_to(
+            self.session_dir).as_posix()
+
+    # --- session.json -------------------------------------------------------
+    def session_dict(self) -> dict:
+        """Contract section 3, plus how this session was run."""
+        return {
+            "set": SET_NAME,
+            "protocol_file": repo_relative(self.protocol_path),
+            "protocol_name": self.protocol.get("name"),
+            "protocol_version": self.protocol.get("version"),
+            "protocol_sha256": self.sha256,
+            "protocol_status": self.protocol.get("status"),
+            "hand": self.hand,
+            "operator": self.operator,
+            "camera": "leap",
+            "mock": self.mock,
+            "glove": False,
+            "started": self.started,
+            "ended": self.ended,
+            "resumed": self.resumed,
+            "xr_trainer_calibrated_at": None,
+            "seed": None,
+            "rounds": None,
+            "tool_commit": self.commit,
+            "items": self.item_ids,
+            "takes_per_item": self.takes,
+            "duration_s": self.duration,
+            "prep_s": self.prep,
+            "static_s": self.static_s,
+            "retries": self.retries,
+            "min_tracked_fraction": MIN_TRACKED,
+            "still": self.still,
+            "auto_accept": self.auto_accept,
+            "orientation_note": self.note,
+            "takes": self.entries,
+        }
+
+    def write_session(self) -> None:
+        write_json(self.session_dir / "session.json", self.session_dict())
+
+    def finish(self) -> None:
+        self.ended = iso_now()
+        self.write_session()
+
+    # --- the camera window ------------------------------------------------
+    def _caption(self, text: str) -> None:
+        if self.view is not None:
+            self.view.caption(text, band=ENVELOPE_BAND_CM)
+
+    # --- one grasp ----------------------------------------------------------
+    def announce(self, item: dict, index: int, count: int) -> None:
+        print("=" * 62)
+        print(f"Grasp {index}/{count}: {item['label']}   (id {item['id']})")
+        if item.get("shape"):
+            print(f"  shape:  {item['shape']}")
+        source = ", ".join(str(item[k]) for k in ("source", "figure") if item.get(k))
+        if source:
+            print(f"  from:   {source}")
+        if item.get("object_implied"):
+            print("  mimed:  no object in the hand; hold the shape the object would give")
+        for line in ENVELOPE:
+            print(f"  {line}")
+        if self.note:
+            print(f"  note:   {self.note}")
+        print("=" * 62)
+
+    def run_item(self, item: dict, index: int, count: int) -> None:
+        """One slot per take still missing: all of them in a new session,
+        only the ones short of `takes` in a resumed one."""
+        iid = str(item["id"])
+        slots = self.takes - self.accepted[iid]
+        if slots <= 0:
+            print(f"Grasp {index}/{count}: {item['label']} already has "
+                  f"{self.accepted[iid]} kept take(s); skipped\n")
+            return
+        self.announce(item, index, count)
+        for slot in range(1, slots + 1):
+            n = self.accepted[iid] + 1
+            if self.run_slot(item, n, slot):
+                self.accepted[iid] += 1
+
+    def run_slot(self, item: dict, n: int, slot: int) -> bool:
+        """Attempts at take `n` until one is kept or the retries run out.
+
+        An operator's redo always gets another attempt: the retries bound
+        what the automatic gate throws away, not the operator's judgement.
+        """
+        failed = 0
+        attempt = 0
+        while True:
+            attempt += 1
+            got = self.attempt(item, n, slot, attempt)
+            if got.accepted:
+                return True
+            if got.by == "operator":
+                print("      redo: recording the take again\n")
+                continue
+            failed += 1
+            if failed > self.retries:
+                print(f"      FAILED: take {n} of {item['id']} not kept after "
+                      f"{attempt} attempt(s); moving on\n")
+                return False
+            print(f"      retrying ({failed}/{self.retries})\n")
+
+    def _stamp(self) -> str:
+        """This second's stamp, never the one the previous attempt used."""
+        while True:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            if stamp != self._last_stamp:
+                self._last_stamp = stamp
+                return stamp
+            time.sleep(0.05)
+
+    def _countdown(self, label: str) -> None:
+        """`prep` seconds to get into the grasp; beeps on the last three."""
+        t_end = time.time() + self.prep
+        shown = None
+        while True:
+            left = t_end - time.time()
+            if left <= 0:
+                break
+            whole = math.ceil(left)
+            if whole != shown:
+                shown = whole
+                self._caption(f"GET READY: {label}   {whole}s")
+                if whole <= 3:
+                    print(f"      {whole}...")
+                    beep(660, 120)
+            self._consume()
+            time.sleep(0.02)
+
+    def _request_still(self, path: Optional[Path], caption: str) -> None:
+        if path is None:
+            return
+        if self.mock:
+            write_mock_still(path, self.source.latest(self.hand), caption,
+                             full=self.still == "full")
+        elif self.view is not None:
+            self.view.snapshot(path)
+
+    def _still_result(self, path: Optional[Path]) -> Tuple[Optional[Path], Optional[str]]:
+        """(the still, None) or (None, why there is none), contract names."""
+        if path is None:
+            return None, STILL_OFF
+        from leap_hand.protocol import STILL_UNKNOWN, still_status
+        deadline = time.time() + (0.0 if self.mock else STILL_WAIT_S)
+        while True:
+            name, missing = still_status(path)
+            if name or missing != STILL_UNKNOWN or time.time() >= deadline:
+                break
+            self._consume()
+            time.sleep(0.05)
+        return (path, None) if name else (None, missing)
+
+    def attempt(self, item: dict, n: int, slot: int, attempt: int) -> Attempt:
+        iid, label = str(item["id"]), str(item["label"])
+        name = take_name(iid, self.hand, n, self._stamp())
+        leap_path = self.folder(LEAP_DIR) / f"{name}.jsonl"
+        still_path = (None if self.still == "none"
+                      else self.folder(STILLS_DIR) / f"{name}.png")
+        print(f"--- {label}: take {n}/{self.takes} (slot {slot}), attempt "
+              f"{attempt}, {self.hand} hand ---")
+        # The mock can act out a pose it knows; a grasp it does not know makes
+        # it cycle, which still gives the static interval something to find.
+        if hasattr(self.source, "set_pose"):
+            self.source.set_pose(iid if iid in ("open_palm", "fist") else None)
+        self._countdown(label)
+
+        recorder = LeapRecorder(hz=None, pose=iid, take=n)
+        t_start = t_stop = time.time()
+        try:
+            with self._raw_capture(leap_path.with_suffix(".lmt")):
+                # Beep, drop what queued behind it, and only then open the file.
+                beep(1000, 250)
+                self._discard_backlog()
+                recorder.start(leap_path)
+                recorder._file = _KeysWriter(recorder._file, {
+                    "session": self.session_dir.name, "item": iid})
+                t_start = time.time()
+                try:
+                    self._record(recorder, t_start, label, still_path)
+                finally:
+                    recorder.stop()
+                    t_stop = time.time()
+                    beep(500, 300)
+        except KeyboardInterrupt:
+            # Nothing recorded is deleted: an interrupted attempt is kept
+            # under rejected/ with the reason, like any attempt not kept.
+            self._conclude(item, n, attempt, name, None, (t_start, t_stop),
+                           None, accepted=False,
+                           reason="interrupted (Ctrl+C) during the take",
+                           by="operator", decided_at=time.time())
+            raise
+
+        rows = read_rows(leap_path)
+        summary = summarise_take(rows, t_stop - t_start, self.static_s,
+                                 prefer=self.hand, min_tracked=MIN_TRACKED)
+        still, missing = self._still_result(still_path)
+        lines = self.review_lines(item, n, attempt, summary, t_start)
+        for line in lines[1:]:
+            print(f"      {line}")
+
+        if not summary.passed:
+            print(f"      REJECTED by the gate: {summary.gate_reason}")
+            return self._conclude(item, n, attempt, name, summary,
+                                  (t_start, t_stop), missing,
+                                  accepted=False, reason=summary.gate_reason,
+                                  by="gate", decided_at=time.time())
+
+        self._caption(f"REVIEW {label} take {n}: Enter keep, r redo, q quit")
+        try:
+            action, when, by = self.reviewer.decide(still, lines,
+                                                    pump=self._consume)
+        except KeyboardInterrupt:
+            self._conclude(item, n, attempt, name, summary, (t_start, t_stop),
+                           missing, accepted=False,
+                           reason="interrupted (Ctrl+C) at the review",
+                           by="operator", decided_at=time.time())
+            raise
+        if action == "accept":
+            print(f"      KEPT ({by})\n")
+            return self._conclude(item, n, attempt, name, summary,
+                                  (t_start, t_stop), missing,
+                                  accepted=True, reason="", by=by,
+                                  decided_at=when)
+        if action == "redo":
+            return self._conclude(item, n, attempt, name, summary,
+                                  (t_start, t_stop), missing,
+                                  accepted=False, reason="operator redo",
+                                  by="operator", decided_at=when)
+        self._conclude(item, n, attempt, name, summary, (t_start, t_stop),
+                       missing, accepted=False,
+                       reason="the operator quit the session at the review",
+                       by="operator", decided_at=when)
+        raise QuitSession()
+
+    def _record(self, recorder, t_start: float, label: str,
+                still_path: Optional[Path]) -> None:
+        print(f"      REC {self.duration:g} s - hold it ", end="", flush=True)
+        t_end = t_start + self.duration
+        midpoint = t_start + self.duration / 2.0
+        next_dot = t_start + 0.5
+        shown = None
+        try:
+            while True:
+                now = time.time()
+                if now >= t_end:
+                    break
+                self._consume(recorder)
+                whole = math.ceil(t_end - now)
+                if whole != shown:
+                    shown = whole
+                    self._caption(f"HOLD: {label}   REC {whole}s")
+                # The still at the midpoint: the hand is settled by then and
+                # the take is not over, so it shows what the file holds.
+                if still_path is not None and now >= midpoint:
+                    self._request_still(still_path, f"{label}  REC")
+                    still_path = None
+                if now >= next_dot:
+                    print(".", end="", flush=True)
+                    next_dot += 0.5
+                time.sleep(0.005)
+        finally:
+            print(flush=True)
+
+    def review_lines(self, item: dict, n: int, attempt: int, s,
+                     t_start: float) -> List[str]:
+        """What the operator reads before deciding: the label and the numbers."""
+        lines = [f"{item['label']}   take {n}/{self.takes}, attempt {attempt}"]
+        lines.append(f"tracked {s.tracked_fraction * 100:.0f} %   "
+                     f"re-acquisitions {s.reacquisitions} "
+                     f"({len(s.interval_reacquisitions)} in the static interval)")
+        if s.medoid_row is not None:
+            lines.append(f"grab {_num(s.grab_strength)}   "
+                         f"pinch {_num(s.pinch_strength)}")
+            height, angle = row_height_cm(s.medoid_row), row_view_angle_deg(s.medoid_row)
+            if height is not None and angle is not None:
+                lines.append(f"palm {height:.0f} cm above the module, "
+                             f"{angle:.0f} deg from facing the lens")
+            lines.append("curls  " + "  ".join(f"{k} {v:.2f}"
+                                               for k, v in s.curls.items()))
+            t0, t1 = s.interval
+            lines.append(f"static interval {t0 - t_start:.1f} to "
+                         f"{t1 - t_start:.1f} s, summary frame at "
+                         f"{s.medoid_wall_time - t_start:.1f} s")
+        else:
+            lines.append("no summary frame: no tracked frame in the static interval")
+        return lines
+
+    # --- the verdict ----------------------------------------------------------
+    def _conclude(self, item: dict, n: int, attempt: int, name: str, summary,
+                  span: Tuple[float, float], still_missing: Optional[str],
+                  accepted: bool, reason: str, by: str,
+                  decided_at: float) -> Attempt:
+        """Write the keypoints and the meta, move a refused attempt, log it."""
+        iid = str(item["id"])
+        rejected = not accepted
+        leap_src = self.folder(LEAP_DIR) / f"{name}.jsonl"
+        # The contract's "files" keys for every set; a grasp take has no glove
+        # file and no events file, and says so rather than leaving them out.
+        files = {"glove": None, "events": None}
+
+        def place(src: Path, kind: str, fname: str) -> Optional[Path]:
+            if not src.is_file():
+                return None
+            dst = self.folder(kind, rejected) / fname
+            if dst != src:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                src.replace(dst)
+            return dst
+
+        leap = place(leap_src, LEAP_DIR, f"{name}.jsonl")
+        place(leap_src.with_suffix(".lmt"), LEAP_DIR, f"{name}.lmt")
+        files["leap"] = self.rel(leap)
+        # The still goes wherever its take goes, and so does the viewer's
+        # note when it skipped the still. Whatever is on disk NOW decides,
+        # so a still the viewer wrote after the wait is still found.
+        from leap_hand.protocol import STILL_UNKNOWN, skipped_still_path
+        still_src = self.folder(STILLS_DIR) / f"{name}.png"
+        placed = place(still_src, STILLS_DIR, f"{name}.png")
+        place(skipped_still_path(still_src), STILLS_DIR,
+              skipped_still_path(still_src).name)
+        files["still"] = self.rel(placed)
+        if placed is not None:
+            still_missing = None
+        elif not still_missing:
+            still_missing = STILL_UNKNOWN
+
+        keypoints = None
+        if summary is not None and summary.medoid_row is not None:
+            keypoints = self.folder(KEYPOINTS_DIR, rejected) / f"{name}_keypoints.txt"
+            keypoints.parent.mkdir(parents=True, exist_ok=True)
+            block = prof_exporter().frame_block(row_frame(summary.medoid_row),
+                                                summary.medoid_wall_time)
+            keypoints.write_text(block + "\n", encoding="utf-8")
+        files["keypoints"] = self.rel(keypoints)
+        meta_path = self.folder(META_DIR, rejected) / f"{name}.json"
+        files["meta"] = self.rel(meta_path)
+        note = self.session_dir / REJECTED_DIR / f"{name}.reason.txt"
+        if rejected:
+            files["reason"] = self.rel(note)
+
+        meta = self.meta_dict(item, n, attempt, name, summary, span, files,
+                              still_missing, accepted, reason, by, decided_at)
+        write_json(meta_path, meta)
+        if rejected:
+            note.parent.mkdir(parents=True, exist_ok=True)
+            note.write_text(
+                f"{reason}\n"
+                f"decided_by={by}\n"
+                f"decided_at={decided_at:.3f}  ({iso_now(decided_at)})\n"
+                f"item={iid} take={n} attempt={attempt}\n"
+                f"tracked_fraction={meta['tracked_fraction']}\n",
+                encoding="utf-8")
+
+        self.entries.append({
+            "item": iid, "take": n, "attempt": attempt, "name": name,
+            "accepted": accepted, "reason": reason, "decided_at": decided_at,
+            "decided_by": by, "tracked_fraction": meta["tracked_fraction"],
+            "grab_strength": meta["grab_strength"],
+            "pinch_strength": meta["pinch_strength"], "files": files})
+        self.write_session()
+        got = Attempt(item=iid, take=n, attempt=attempt, name=name,
+                      accepted=accepted, reason=reason,
+                      tracked_fraction=meta["tracked_fraction"],
+                      grab=meta["grab_strength"], pinch=meta["pinch_strength"],
+                      by=by)
+        self.attempts.append(got)
+        return got
+
+    def meta_dict(self, item: dict, n: int, attempt: int, name: str, s,
+                  span: Tuple[float, float], files: dict,
+                  still_missing: Optional[str], accepted: bool, reason: str,
+                  by: str, decided_at: float) -> dict:
+        """Contract section 7, every field, then what else is known."""
+        row = None if s is None else s.medoid_row
+        interval = None if s is None or s.interval is None else [
+            round(s.interval[0], 6), round(s.interval[1], 6)]
+        height = None if row is None else row_height_cm(row)
+        angle = None if row is None else row_view_angle_deg(row)
+        return {
+            "item": str(item["id"]),
+            "take": n,
+            "hand": self.hand,
+            "frames": 0 if s is None else s.frames,
+            "tracked_fraction": 0.0 if s is None else round(s.tracked_fraction, 4),
+            "reacquisitions": 0 if s is None else s.reacquisitions,
+            "tracker_hand_labels": {} if s is None else s.labels,
+            "static_interval": interval,
+            "medoid_wall_time": None if row is None else s.medoid_wall_time,
+            "grab_strength": None if s is None else s.grab_strength,
+            "pinch_strength": None if s is None else s.pinch_strength,
+            "curls": None if s is None else s.curls,
+            "orientation_note": self.note,
+            "accepted": accepted,
+            "reason": reason,
+            "decided_at": decided_at,
+            # --- beyond the contract's list
+            "decided_by": by,
+            "name": name,
+            "session": self.session_dir.name,
+            "attempt": attempt,
+            "label": item.get("label"),
+            "shape": item.get("shape"),
+            "source": item.get("source"),
+            "figure": item.get("figure"),
+            "object_implied": item.get("object_implied"),
+            "protocol_name": self.protocol.get("name"),
+            "protocol_version": self.protocol.get("version"),
+            "mock": self.mock,
+            "take_start": round(span[0], 6),
+            "take_end": round(span[1], 6),
+            "duration_s": round(span[1] - span[0], 3),
+            "static_s": self.static_s,
+            "gate": {
+                "passed": bool(s is not None and s.passed),
+                "reason": "" if s is None else s.gate_reason,
+                "min_tracked_fraction": MIN_TRACKED,
+                "tracked_frames": None if s is None else s.tracked_frames,
+                "expected_frames": None if s is None else s.expected_frames,
+                "reacquisitions_in_static_interval": (
+                    None if s is None else len(s.interval_reacquisitions)),
+            },
+            # The tracker label whose frames were taken as the operator's
+            # hand (the one with the most frames), and the summary frame's
+            # own identity: its line in the leap file, counted from 0.
+            "operator_hand_label": None if s is None else s.hand_label,
+            "medoid_line": None if s is None else s.medoid_index,
+            "medoid_frame_id": None if row is None else row.get("frame_id"),
+            "medoid_hand_id": None if row is None else row.get("hand_id"),
+            # The orientation the summary frame was actually held at (plan
+            # D3 asks for the rotation used): palm height above the module,
+            # and the angle between the palm normal and the ray to the lens,
+            # 0 = palm square to the lens, 90 = edge-on.
+            "palm_height_cm": None if height is None else round(height, 1),
+            "view_angle_deg": None if angle is None else round(angle, 1),
+            "still": files.get("still"),
+            "still_missing_reason": still_missing,
+            "files": dict(files),
+        }
+
+    # --- the end ----------------------------------------------------------------
+    def print_table(self) -> None:
+        print("=" * 62)
+        if not self.attempts:
+            print("Nothing recorded.")
+        else:
+            kept = sum(1 for a in self.attempts if a.accepted)
+            print(f"Grasp session ({self.hand} hand): {kept} take(s) kept, "
+                  f"{len(self.attempts) - kept} attempt(s) not kept")
+            print(f"  {'item':<22} {'take':>4}  {'accepted':<8} {'tracked':>7} "
+                  f"{'grab':>5} {'pinch':>5}")
+            for a in self.attempts:
+                grab, pinch = f"{_num(a.grab):>5}", f"{_num(a.pinch):>5}"
+                print(f"  {a.item:<22} {a.take:>4}  {'yes' if a.accepted else 'no':<8} "
+                      f"{a.tracked_fraction * 100:6.0f}% {grab} {pinch}"
+                      + ("" if a.accepted else f"   {a.reason}"))
+            short = {i: n for i, n in self.accepted.items() if n < self.takes}
+            if short:
+                print(f"\n  Short of {self.takes} kept takes: " + ", ".join(
+                    f"{i} ({n}/{self.takes})" for i, n in short.items()))
+                print("  Record the missing takes into this same session:")
+                print(f"    {self.resume_command()}")
+        print(f"\nFolder: {self.session_dir}")
+
+    def resume_command(self) -> str:
+        """The command that records what this session is still missing."""
+        protocol = repo_relative(self.protocol_path).replace("/", os.sep)
+        return (rf".venv\Scripts\python.exe scripts\leap\record_poses.py "
+                f"{'--mock ' if self.mock else ''}--protocol {protocol} "
+                f"--hand {self.hand} --resume \"{self.session_dir}\"")
+
+
+def run_protocol(args, parser) -> None:
+    """`--protocol`: Set A, one session folder per run."""
+    if args.hand is None:
+        parser.error("--protocol needs --hand left|right (the operator's hand)")
+    if args.poses is not None:
+        parser.error("--poses does not apply with --protocol; use --items")
+    if args.hz:
+        parser.error("a protocol take keeps every frame (plan D4); drop --hz")
+    if args.raw and args.mock:
+        raise SystemExit("--raw needs a live camera: there is no LeapC stream "
+                         "behind --mock")
+    retries = PROTOCOL_RETRIES if args.retries is None else args.retries
+    if retries < 0:
+        parser.error("--retries cannot be negative")
+    if args.mock_dropout is not None and not args.mock:
+        parser.error("--mock-dropout only applies with --mock")
+
+    protocol, sha = load_protocol(args.protocol)
+    resume = None
+    # Each setting comes from the command line, else from the session being
+    # resumed (a session keeps one timing throughout), else from the file.
+    base = {"takes_per_item": protocol["takes_per_item"],
+            "duration_s": protocol["duration_s"], "prep_s": protocol["prep_s"],
+            "static_s": protocol.get("static_s", DEFAULT_STATIC_S),
+            "still": "hand", "items": None}
+    if args.resume is not None:
+        old = load_session(args.resume, args.hand, sha, bool(args.mock))
+        resume = (Path(args.resume), old)
+        for key in base:
+            if old.get(key) is not None:
+                base[key] = old[key]
+    items = select_items(protocol, args.items if args.items else (
+        ",".join(base["items"]) if base["items"] else None))
+    takes = int(base["takes_per_item"]) if args.takes is None else args.takes
+    duration = float(base["duration_s"]) if args.duration is None else args.duration
+    prep = float(base["prep_s"]) if args.prep is None else args.prep
+    static_s = float(base["static_s"] if args.static_s is None else args.static_s)
+    still = args.still or base["still"]
+    if takes < 1 or duration <= 0 or prep < 0 or static_s <= 0:
+        parser.error("takes must be at least 1, duration and static-s above 0, "
+                     "prep 0 or more")
+
+    if args.mock:
+        # A clean mock: the default one drops 20 frames in 300 and changes
+        # hand id every 5 s, so a 1 s rehearsal take would fail the gate at
+        # random. --mock-dropout puts a dropout back on purpose, to rehearse
+        # the rejection path.
+        from leap_hand.mock import MockLeapStream
+        dropout = args.mock_dropout or 0.0
+        if dropout > 0:
+            source = MockLeapStream(dropout_every=90, reacquire_every=0,
+                                    dropout_frames=max(1, min(89, round(90 * dropout))))
+        else:
+            source = MockLeapStream(dropout_every=0, reacquire_every=0)
+        # Skip the mock hand past its first 0.3 s of visibility, which the
+        # recorder drops as settling: a live hand has been in view that long
+        # by the time the stream wait is over, and with --prep 0 the first
+        # take would otherwise start on a hand too young to record.
+        source.generate(int(math.ceil(MIN_VISIBLE_TIME_US / 1e6 * source.hz)) + 9)
+        source.start()
+    else:
+        try:
+            source = open_stream(mode=args.mode)
+        except LeapUnavailable as e:
+            raise SystemExit(f"\nNo live tracking: {e}\n")
+
+    view = None
+    if not args.mock:
+        view = _still_view_class()(still="full" if still == "full" else "hand",
+                                   hand=None, band=ENVELOPE_BAND_CM).start()
+    out_root = ((MOCK_PROTOCOL_OUT if args.mock else PROTOCOL_OUT)
+                if args.out_dir is None else args.out_dir)
+    reviewer = Reviewer(auto=args.auto_accept)
+    session = None
+    try:
+        session = ProtocolSession(
+            source, out_root, protocol, sha, args.protocol, args.hand, items,
+            takes, duration, prep, static_s, retries, still, reviewer,
+            view=view, mock=args.mock, raw=args.raw, note=args.note or "",
+            operator=args.operator, auto_accept=args.auto_accept,
+            resume=resume)
+
+        eta = len(items) * takes * (prep + duration + 1.0)
+        print("=" * 62)
+        print(f"Grasp protocol (Set A): {protocol.get('name')} v"
+              f"{protocol.get('version')}, {len(items)} grasp(s) x {takes} "
+              f"take(s) x {duration:g} s  (~{eta / 60:.1f} min)")
+        print(f"  hand:    {args.hand} (the operator's; the tracker's own label "
+              "is recorded, not trusted)")
+        print(f"  gate:    {MIN_TRACKED * 100:.0f} % of frames tracked and no "
+              f"re-acquisition in the {static_s:g} s static interval; "
+              f"{retries} retries")
+        print("  review:  " + ("every take that passes the gate is kept "
+                               "(--auto-accept)" if args.auto_accept else REVIEW_KEYS))
+        print(f"  folder:  {session.session_dir}")
+        if resume is not None:
+            kept = sum(session.accepted.values())
+            print(f"  resume:  {kept} take(s) already kept here; recording only "
+                  "the missing ones, numbering carries on")
+        if protocol.get("status"):
+            print(f"  status:  {protocol['status']}")
+        if args.mock:
+            print("  Mock mode: synthetic hands, no camera; the stills say MOCK.")
+        print("=" * 62 + "\n")
+
+        if not args.mock:
+            session.wait_for_stream()
+        for i, item in enumerate(items, 1):
+            session.run_item(item, i, len(items))
+    except KeyboardInterrupt:
+        print("\nInterrupted - the takes kept so far are in session.json.")
+    except QuitSession:
+        print("\nSession ended at the review (q).")
+    finally:
+        source.stop()
+        if view is not None:
+            view.close()
+        if session is not None:
+            session.finish()
+            session.print_table()
+            if not args.no_open:
+                try:
+                    os.startfile(str(session.session_dir))
+                except (AttributeError, OSError):
+                    pass
+
+
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Guided, hands-free pose recording with the Ultraleap camera.")
-    p.add_argument("--poses", default=",".join(DEFAULT_POSES),
+        description="Guided, hands-free pose recording with the Ultraleap camera. "
+                    "With --protocol, the professor's grasp set (Set A).")
+    p.add_argument("--poses", default=None,
                    help=f"comma-separated pose names (default: {','.join(DEFAULT_POSES)})")
-    p.add_argument("--takes", type=int, default=3, help="repetitions per pose (default: 3)")
-    p.add_argument("--duration", type=float, default=5.0,
-                   help="seconds recorded per take (default: 5)")
-    p.add_argument("--prep", type=float, default=5.0,
-                   help="seconds to get into the pose before each take (default: 5)")
-    p.add_argument("--hz", type=float, default=5.0,
-                   help="frames saved per second (default: 5; 0 = keep every frame)")
-    p.add_argument("--out-dir", type=Path,
-                   default=Path("recordings") / "leap" / "poses")
+    p.add_argument("--takes", type=int, default=None,
+                   help=f"repetitions per pose (default: {LEGACY_TAKES}; with "
+                        "--protocol, the file's takes_per_item)")
+    p.add_argument("--duration", type=float, default=None,
+                   help=f"seconds recorded per take (default: {LEGACY_DURATION:g}; "
+                        "with --protocol, the file's duration_s)")
+    p.add_argument("--prep", type=float, default=None,
+                   help=f"seconds to get into the pose before each take (default: "
+                        f"{LEGACY_PREP:g}; with --protocol, the file's prep_s)")
+    p.add_argument("--hz", type=float, default=None,
+                   help=f"frames saved per second (default: {LEGACY_HZ:g}; 0 = keep "
+                        "every frame). A protocol take always keeps every frame")
+    p.add_argument("--out-dir", type=Path, default=None,
+                   help=f"output folder (default: {LEGACY_OUT}; with --protocol, "
+                        f"{PROTOCOL_OUT}, one session folder inside it per run; "
+                        f"{MOCK_PROTOCOL_OUT} with --mock)")
     p.add_argument("--mock", action="store_true",
                    help="dry-run with synthetic hands; no camera needed")
     p.add_argument("--mode", default="desktop",
                    choices=("desktop", "hmd", "screentop"))
     p.add_argument("--raw", action="store_true",
                    help="also write LeapC's own .lmt recording beside each take")
+    g = p.add_argument_group("the professor's grasp set (Set A)")
+    g.add_argument("--protocol", type=Path, default=None,
+                   help="protocol file, e.g. protocols/grasps.json")
+    g.add_argument("--hand", choices=("left", "right"), default=None,
+                   help="the operator's hand; required with --protocol")
+    g.add_argument("--items", default=None,
+                   help="comma-separated item ids to record, a subset of the file's")
+    g.add_argument("--resume", type=Path, default=None,
+                   help="an earlier session folder to add the missing takes to, "
+                        "continuing its numbering (the end table prints this command)")
+    g.add_argument("--still", choices=STILL_MODES, default=None,
+                   help="per-take still: cropped to the hand (default), the whole "
+                        "frame, or none")
+    g.add_argument("--retries", type=int, default=None,
+                   help=f"new attempts after the gate rejects one (default: "
+                        f"{PROTOCOL_RETRIES})")
+    g.add_argument("--static-s", type=float, default=None,
+                   help="length of the static interval in seconds (default: the "
+                        "file's static_s, else 2)")
+    g.add_argument("--auto-accept", action="store_true",
+                   help="keep every take that passes the gate without asking")
+    g.add_argument("--no-open", action="store_true",
+                   help="do not open the session folder at the end")
+    g.add_argument("--note", default=None,
+                   help="orientation note stored in every take's meta, e.g. "
+                        "'palm turned 30 degrees toward the lens'")
+    g.add_argument("--operator", default=None,
+                   help="who recorded the session, for session.json")
+    g.add_argument("--mock-dropout", type=float, default=None,
+                   help="with --mock: fraction of frames the mock drops, to "
+                        "rehearse the gate's rejection (e.g. 0.3)")
     args = p.parse_args()
+
+    if args.protocol is not None:
+        run_protocol(args, p)
+        return
+    protocol_only = [flag for flag, value in (
+        ("--hand", args.hand), ("--items", args.items), ("--still", args.still),
+        ("--resume", args.resume),
+        ("--retries", args.retries), ("--static-s", args.static_s),
+        ("--auto-accept", args.auto_accept), ("--no-open", args.no_open),
+        ("--note", args.note), ("--operator", args.operator),
+        ("--mock-dropout", args.mock_dropout)) if value not in (None, False)]
+    if protocol_only:
+        p.error(f"{', '.join(protocol_only)} only apply with --protocol")
+    args.poses = ",".join(DEFAULT_POSES) if args.poses is None else args.poses
+    args.takes = LEGACY_TAKES if args.takes is None else args.takes
+    args.duration = LEGACY_DURATION if args.duration is None else args.duration
+    args.prep = LEGACY_PREP if args.prep is None else args.prep
+    args.hz = LEGACY_HZ if args.hz is None else args.hz
+    args.out_dir = LEGACY_OUT if args.out_dir is None else args.out_dir
 
     poses = [slugify(x) for x in args.poses.split(",") if slugify(x)]
     if not poses:

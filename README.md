@@ -103,6 +103,31 @@ A live run saves what it showed (fused frames, logs, `demo.mp4`, a snapshot and 
 The runbook for showing it (what to plug in, what to point at, the limits to
 say out loud) is `docs/demo.md`.
 
+## The professor's protocol sets (grasps, finger flexion, sequences)
+
+Three recording sets asked for in September 2026, each with its own runbook
+that names the hardware setup of every step:
+
+- Set A, static grasp-type poses from the reference papers, camera only,
+  bare left hand: `scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left`
+  (runbook `docs/grasp_recording.md`). The grasp list in `protocols/grasps.json`
+  is a placeholder until the papers are in hand.
+- Set B, single-finger flexion (5 cycles per finger, index also slow and
+  fast) and Set C, the seven cued finger sequences, gloves on with the camera
+  as the reference, one hand per run: `scripts/record_protocol.py --set
+  finger_flexion|sequences --hand left|right` (runbook
+  `docs/protocol_recording.md`). The sequences are data in
+  `protocols/sequences.json`, so a new order is a new entry, not code.
+- `scripts/check_protocol.py <session folder>` grades a session against the
+  plan's rules and writes `check.csv` / `check.txt`;
+  `scripts/package_professor_set.py` builds the hand-in folder (JSONL, the
+  professor's 21-landmark text format, summaries, README, no images).
+
+Plan and decisions: `docs/grasp_and_flexion_protocol_plan.md`. File formats
+shared by the tools: `docs/protocol_formats.md`. Every tool runs without
+hardware with `--mock` / `--mock-glove --mock-leap`, and mock sessions land in
+`recordings/protocol_mock/`, apart from the real ones.
+
 ## Daily use — glove
 
 Needs XR Trainer streaming to `127.0.0.1:9002`, glove connected and calibrated.
@@ -1612,6 +1637,18 @@ profiles/         reliability profiles: per-hand unreliable / rail fingers
 tests/                       pytest: fusion invariants, recording, formats
 models/hand_landmarker.task  MediaPipe model
 docs/ultraleap_ir170_plan.md Ultraleap Stereo IR 170 integration plan (next phase)
+docs/grasp_and_flexion_protocol_plan.md  the professor's three recording sets: plan
+docs/protocol_formats.md     file-format contract for those sets
+docs/grasp_recording.md      runbook, Set A (camera only, bare left hand)
+docs/protocol_recording.md   runbook, Sets B and C (gloves on + camera)
+protocols/                   grasps.json (placeholder list), finger_flexion.json,
+                             sequences.json (the seven sequences as data)
+scripts/record_protocol.py   cue-driven recorder for Sets B and C
+scripts/check_protocol.py    grades a protocol session: check.csv, check.txt
+scripts/package_professor_set.py  builds the hand-in folder, no images
+src/cam_hand/recording_protocol.py  schedules, rounds, events, quick checks
+src/cam_hand/protocol_check.py      the checker's rules and the report
+src/leap_hand/static_interval.py    quietest window of a take and its medoid
 archive/summer-xr-trainer/   July glove-only repo, merged with history: the
                              42-take July dataset, REPORT.txt, technical PDF,
                              record_frame.ps1 (frozen, see archive/README.md)

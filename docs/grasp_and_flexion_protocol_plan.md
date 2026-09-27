@@ -1,9 +1,15 @@
 # Plan: the professor's grasp and finger-flexion recordings
 
-Written 2026-09-27. Status: plan only, no code yet. Reviewed the same day in a
-new ChatGPT chat (the project page would not load in Chrome, so the chat ran
-outside the project with the context given in the prompt); the review
-outcome is in section 8 and its accepted points are already folded in below.
+Written 2026-09-27. Reviewed the same day in a new ChatGPT chat (the project
+page would not load in Chrome, so the chat ran outside the project with the
+context given in the prompt); the review outcome is in section 8 and its
+accepted points are already folded in below.
+
+Status 2026-09-27 evening: the tools in section 1 are built and pass their
+mock end-to-end runs (record, check, package) for all three sets; nothing
+has run on hardware yet, and the grasp list is still the placeholder.
+Runbooks: `docs/grasp_recording.md` (Set A), `docs/protocol_recording.md`
+(Sets B and C). File formats: `docs/protocol_formats.md`.
 
 The professor asked for three sets:
 
@@ -106,8 +112,9 @@ D5. Sets B and C are recorded one hand at a time with the camera running as
     time, and the camera columns are simply absent from the report.
 D6. Set B timing per cycle: bend 4 s, hold 1 s, straighten 4 s, rest 1 s;
     5 cycles in one take, so one take per finger (five takes), then index
-    slow (same timing, 5 cycles) and index fast (bend 1 s, hold 0.5 s,
-    straighten 1 s, rest 0.5 s, 8 cycles). Seven takes per hand. Every phase
+    slow (bend 6 s, hold 1 s, straighten 6 s, rest 1 s, 5 cycles, so it is
+    measurably slower than the normal take) and index fast (bend 1 s, hold
+    0.5 s, straighten 1 s, rest 0.5 s, 8 cycles). Seven takes per hand. Every phase
     of every cycle (bend, hold, straighten, rest) is a cued event with its
     own timestamp in the events file, so a missed cue, fatigue or creep can
     be located to the cycle, and the checker counts cycles from the events
@@ -116,8 +123,8 @@ D6. Set B timing per cycle: bend 4 s, hold 1 s, straighten 4 s, rest 1 s;
     checker verifies "5 repetitions" rather than assuming it.
 D7. Set C timing: each configuration is cued by a beep and held 2.5 s (the
     first second is the movement, the rest is the hold; the hold window used
-    for checking is the last 1.5 s). Sequence 7 (flex then release) has 10
-    steps, the others 6 to 8. 3 takes per sequence, 21 takes per hand,
+    for checking is the last 1.5 s). Sequence 7 (flex then release) has 11
+    steps counting the opening open hand, the others 6 to 8. 3 takes per sequence, 21 takes per hand,
     recorded as three rounds: each round runs all seven sequences in a
     shuffled order (seed saved in the session meta), so the three takes of a
     sequence are independent repetitions and practice or fatigue cannot be
@@ -195,11 +202,13 @@ Set B (glove, camera reference):
 
 Set C (glove, camera reference):
 - initial bands: for each step, the median glove fraction over the hold
-  window above 0.6 for fingers that should be flexed and below 0.3 for
-  fingers that should be straight; the continuous fractions are kept, and
-  after the first hand the bands are re-derived from that session's
-  warm-up and from the open-hand and full-fist steps every sequence begins
-  and ends with;
+  window above 0.6 for fingers that should be flexed; a finger that should
+  be straight fails only when it reads flexed (0.6 or more); between 0.3
+  and 0.6 it is reported as coupling (the ring pulls its neighbours along
+  and the glove senses flexion only), not failed; the continuous fractions
+  are kept, and after the first hand the bands are re-derived from that
+  session's warm-up and from the open-hand and full-fist steps every
+  sequence begins and ends with;
 - a take passes when every step passes for the cued fingers;
 - the same check on the camera where it is trusted (existing trust gates),
   so a glove fault (the right glove's too-open readings) is reported as the

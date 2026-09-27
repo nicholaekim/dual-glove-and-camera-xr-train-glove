@@ -1,0 +1,88 @@
+{
+  "name": "sequences",
+  "version": 1,
+  "description": "Set C: the professor's seven sequential movements, gloves on, camera as the reference. A step is the set of fingers flexed at that moment; a finger not listed is straight. Each step is cued by a beep and held hold_s seconds (the first second is the movement); the quick check reads the last check_window_s seconds of each hold. Three takes per sequence, recorded as three rounds in a shuffled order whose seed is saved in session.json. The word little in the labels is the pinky finger in the data.",
+  "hold_s": 2.5,
+  "check_window_s": 1.5,
+  "takes_per_item": 3,
+  "shuffle_rounds": true,
+  "items": [
+    {"id": "seq1_one_at_a_time", "label": "Sequence 1: one finger at a time",
+     "steps": [
+       {"label": "open hand", "flexed": []},
+       {"label": "thumb flexion", "flexed": ["thumb"]},
+       {"label": "index flexion", "flexed": ["index"]},
+       {"label": "middle flexion", "flexed": ["middle"]},
+       {"label": "ring flexion", "flexed": ["ring"]},
+       {"label": "little flexion", "flexed": ["pinky"]},
+       {"label": "all fingers flexed", "flexed": ["thumb", "index", "middle", "ring", "pinky"]},
+       {"label": "open hand", "flexed": []}
+     ]},
+    {"id": "seq2_reverse", "label": "Sequence 2: reverse order",
+     "steps": [
+       {"label": "open hand", "flexed": []},
+       {"label": "little flexion", "flexed": ["pinky"]},
+       {"label": "ring flexion", "flexed": ["ring"]},
+       {"label": "middle flexion", "flexed": ["middle"]},
+       {"label": "index flexion", "flexed": ["index"]},
+       {"label": "thumb flexion", "flexed": ["thumb"]},
+       {"label": "all fingers flexed", "flexed": ["thumb", "index", "middle", "ring", "pinky"]},
+       {"label": "open hand", "flexed": []}
+     ]},
+    {"id": "seq3_alternating", "label": "Sequence 3: alternating",
+     "steps": [
+       {"label": "open hand", "flexed": []},
+       {"label": "thumb flexion", "flexed": ["thumb"]},
+       {"label": "middle flexion", "flexed": ["middle"]},
+       {"label": "index flexion", "flexed": ["index"]},
+       {"label": "little flexion", "flexed": ["pinky"]},
+       {"label": "ring flexion", "flexed": ["ring"]},
+       {"label": "open hand", "flexed": []}
+     ]},
+    {"id": "seq4_pairs", "label": "Sequence 4: pairs",
+     "steps": [
+       {"label": "open hand", "flexed": []},
+       {"label": "thumb + index", "flexed": ["thumb", "index"]},
+       {"label": "index + middle", "flexed": ["index", "middle"]},
+       {"label": "middle + ring", "flexed": ["middle", "ring"]},
+       {"label": "ring + little", "flexed": ["ring", "pinky"]},
+       {"label": "all fingers flexed", "flexed": ["thumb", "index", "middle", "ring", "pinky"]},
+       {"label": "open hand", "flexed": []}
+     ]},
+    {"id": "seq5_progressive", "label": "Sequence 5: progressive closing",
+     "steps": [
+       {"label": "open hand", "flexed": []},
+       {"label": "thumb", "flexed": ["thumb"]},
+       {"label": "thumb + index", "flexed": ["thumb", "index"]},
+       {"label": "thumb + index + middle", "flexed": ["thumb", "index", "middle"]},
+       {"label": "+ring", "flexed": ["thumb", "index", "middle", "ring"]},
+       {"label": "+little", "flexed": ["thumb", "index", "middle", "ring", "pinky"]},
+       {"label": "full fist", "flexed": ["thumb", "index", "middle", "ring", "pinky"]},
+       {"label": "open hand", "flexed": []}
+     ]},
+    {"id": "seq6_configurations", "label": "Sequence 6: other configurations",
+     "steps": [
+       {"label": "open hand", "flexed": []},
+       {"label": "index only", "flexed": ["index"]},
+       {"label": "index + middle", "flexed": ["index", "middle"]},
+       {"label": "middle + ring", "flexed": ["middle", "ring"]},
+       {"label": "ring + little", "flexed": ["ring", "pinky"]},
+       {"label": "all fingers flexed", "flexed": ["thumb", "index", "middle", "ring", "pinky"]},
+       {"label": "open hand", "flexed": []}
+     ]},
+    {"id": "seq7_flex_release", "label": "Sequence 7: flex and release in sequence",
+     "steps": [
+       {"label": "open hand", "flexed": []},
+       {"label": "thumb flex", "flexed": ["thumb"]},
+       {"label": "thumb extend", "flexed": []},
+       {"label": "index flex", "flexed": ["index"]},
+       {"label": "index extend", "flexed": []},
+       {"label": "middle flex", "flexed": ["middle"]},
+       {"label": "middle extend", "flexed": []},
+       {"label": "ring flex", "flexed": ["ring"]},
+       {"label": "ring extend", "flexed": []},
+       {"label": "little flex", "flexed": ["pinky"]},
+       {"label": "little extend", "flexed": []}
+     ]}
+  ]
+}

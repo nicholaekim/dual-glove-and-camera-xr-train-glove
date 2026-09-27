@@ -1,0 +1,968 @@
+"""The professor's finger-flexion and sequence protocols (Sets B and C), as values.
+
+`scripts/record_protocol.py` runs these sessions with the gloves on and the
+camera as the reference, and `scripts/check_protocol.py` and
+`scripts/package_professor_set.py` read what it writes. The three are built
+separately against `docs/protocol_formats.md`, so everything the recorder
+decides that a later tool has to agree with lives here, as plain functions
+with tests, rather than inside a loop that drives hardware:
+
+  protocol files   `protocols/*.json`, loaded and validated with an error
+                   message that names the file, the item and the field.
+                   Sequences are data, not code: the professor's "try other
+                   orders" is a new JSON entry, and a typo in one must stop
+                   the session before the gloves go on, not halfway through.
+  cue schedule     every cue of a take, in order, with its words, the set of
+                   fingers that should be flexed and how long it lasts. Set B
+                   cues every phase of every cycle (bend, hold, straighten,
+                   rest) so a missed cue, fatigue or creep can be located to
+                   the cycle; Set C cues every step.
+  rounds           the order the takes are recorded in. Set C runs all seven
+                   sequences once per round in a shuffled order, so the three
+                   takes of a sequence are independent repetitions and
+                   practice or fatigue cannot pass for a glove effect. The
+                   order is a pure function of the seed, and the seed is saved.
+  events           one JSON line per cue and per decision, stamped with
+                   `time.time()`, the clock the frame files use.
+  warm-up          each finger's own open and fist curl for this session,
+                   as medians over the two cued windows. A glove that barely
+                   moves between them has no range to measure fractions
+                   against, so the session is refused.
+  fraction         `(open - curl) / (open - fist)`: 0 at the warm-up open
+                   palm, 1 at the warm-up fist. Every band below is in these
+                   units, so one number means the same thing on every finger.
+  quick check      the acquisition gates the recorder applies before it
+                   accepts a take (plan, section 4). Set B: the cued finger
+                   has to cover at least 60 % of its range. Set C: in the
+                   last `check_window_s` of every step, a finger the step
+                   says is flexed has to read above 0.6 and a finger the step
+                   says is straight must not read flexed. A straight finger
+                   between 0.3 and 0.6 is reported as coupling and does not
+                   fail the take: the ring drags the middle and the little
+                   finger along, and a hard cutoff would reject real motion.
+
+The curl is the repo's one curl: `xr_hand.keypoints21.frame_to_keypoints21`
+then `cam_hand.features.flexion_features`, fingertip-to-wrist over palm
+length, higher = straighter, exactly as `leap_hand.pose_check` computes it.
+`read_curls` is the only function here that touches a file.
+"""
+import hashlib
+import json
+import math
+import random
+import re
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
+
+from .features import FLEXION_NAMES
+
+FINGERS: Tuple[str, ...] = tuple(FLEXION_NAMES)   # thumb index middle ring pinky
+
+# The words the operator reads for a finger. "little" is what the professor
+# wrote; `pinky` stays the name in the data (`flexed`, `finger`).
+FINGER_WORDS = {"thumb": "thumb", "index": "index", "middle": "middle",
+                "ring": "ring", "pinky": "little finger"}
+
+SETS = ("grasps", "finger_flexion", "sequences")
+GRASPS, FLEXION, SEQUENCES = SETS
+
+# Set B phases, in the order one cycle runs them.
+BEND, HOLD, STRAIGHTEN, REST = "bend", "hold", "straighten", "rest"
+PHASES = (BEND, HOLD, STRAIGHTEN, REST)
+
+# --- the numbers the contract fixes (docs/protocol_formats.md) ---------------
+# A glove span under this on any of these fingers refuses the session: a range
+# that small turns every fraction into noise.
+REFUSE_SPAN = 0.30
+REFUSE_FINGERS = ("index", "middle", "ring", "pinky")
+# Fractions are clipped here, so one wild frame cannot drag a median.
+FRACTION_CLIP = (-0.5, 1.5)
+# Set B acquisition gate: the cued finger spans at least this much of its range.
+SPAN_GATE = 0.60
+# Set C initial bands, in fractions of the finger's range.
+FLEXED_ABOVE = 0.6
+STRAIGHT_BELOW = 0.3
+# A take's span is read between these percentiles, the same pair
+# `scripts/leap/finger_sweep.py` uses for the glove, so one spike or one
+# dropped frame does not make a finger look as if it moved.
+SPAN_PERCENTILES = (5.0, 95.0)
+# Peak counting (Set B, "cycles counted two ways"): a peak is a rise above
+# PEAK_HIGH of the take's own range after a fall below PEAK_LOW of it. A
+# finger whose range in the take is under PEAK_MIN_RANGE has no peaks.
+PEAK_LOW, PEAK_HIGH, PEAK_MIN_RANGE = 0.3, 0.6, 0.15
+# A warm-up span this close to zero is not a range at all.
+MIN_SPAN = 1e-6
+
+_ID_RE = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
+
+
+class ProtocolError(ValueError):
+    """A protocol file that cannot be recorded, with what to fix."""
+
+
+# --- protocol files ----------------------------------------------------------
+@dataclass(frozen=True)
+class Protocol:
+    """One loaded, validated protocol file."""
+
+    path: Path
+    data: dict
+    sha256: str
+
+    @property
+    def name(self) -> str:
+        return self.data["name"]
+
+    @property
+    def version(self) -> int:
+        return int(self.data["version"])
+
+    @property
+    def items(self) -> List[dict]:
+        return list(self.data["items"])
+
+    @property
+    def ids(self) -> List[str]:
+        return [it["id"] for it in self.data["items"]]
+
+    @property
+    def takes_per_item(self) -> int:
+        return int(self.data["takes_per_item"])
+
+    @property
+    def shuffle_rounds(self) -> bool:
+        return bool(self.data.get("shuffle_rounds", False))
+
+    def item(self, item_id: str) -> dict:
+        for it in self.data["items"]:
+            if it["id"] == item_id:
+                return it
+        raise ProtocolError(f"{self.path}: no item {item_id!r}; the items are "
+                            f"{', '.join(self.ids)}")
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _is_number(v) -> bool:
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(float(v)))
+
+
+def _positive(where: str, d: Mapping, key: str) -> None:
+    if key not in d:
+        raise ProtocolError(f"{where}: missing {key!r} (seconds, above 0)")
+    v = d[key]
+    if not _is_number(v) or float(v) <= 0:
+        raise ProtocolError(f"{where}: {key!r} must be a number of seconds "
+                            f"above 0, got {v!r}")
+
+
+def _whole(where: str, d: Mapping, key: str, minimum: int = 1) -> None:
+    if key not in d:
+        raise ProtocolError(f"{where}: missing {key!r} (a whole number >= "
+                            f"{minimum})")
+    v = d[key]
+    if not _is_int(v) or v < minimum:
+        raise ProtocolError(f"{where}: {key!r} must be a whole number >= "
+                            f"{minimum}, got {v!r}")
+
+
+def _text(where: str, d: Mapping, key: str) -> None:
+    v = d.get(key)
+    if not isinstance(v, str) or not v.strip():
+        raise ProtocolError(f"{where}: {key!r} must be non-empty text, got "
+                            f"{v!r}")
+
+
+def _fingers(where: str, value, allow_empty: bool = True) -> None:
+    if not isinstance(value, list):
+        raise ProtocolError(f"{where}: must be a list of finger names, got "
+                            f"{value!r}")
+    if not value and not allow_empty:
+        raise ProtocolError(f"{where}: must name at least one finger")
+    for f in value:
+        if f not in FINGERS:
+            hint = " (the little finger is 'pinky' in the data)" \
+                if f in ("little", "little finger") else ""
+            raise ProtocolError(f"{where}: {f!r} is not a finger name{hint}; "
+                                f"use {', '.join(FINGERS)}")
+    if len(set(value)) != len(value):
+        raise ProtocolError(f"{where}: names a finger twice: {value!r}")
+
+
+def validate_protocol(data, where: str = "protocol") -> None:
+    """Raise ProtocolError naming the first thing wrong with `data`.
+
+    Checks what every tool downstream relies on: the shared header, unique
+    file-name-safe ids, the per-set fields with their units, and finger names
+    from the one list the data uses. A file that passes can be recorded,
+    checked and packaged without any tool second-guessing it.
+    """
+    if not isinstance(data, dict):
+        raise ProtocolError(f"{where}: the file must hold one JSON object")
+    _text(where, data, "name")
+    if data["name"] not in SETS:
+        raise ProtocolError(f"{where}: 'name' must be one of {', '.join(SETS)} "
+                            f"(it names the session folder), got "
+                            f"{data['name']!r}")
+    _whole(where, data, "version")
+    if not isinstance(data.get("description"), str):
+        raise ProtocolError(f"{where}: 'description' must be text")
+    _whole(where, data, "takes_per_item")
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        raise ProtocolError(f"{where}: 'items' must be a non-empty list")
+    kind = data["name"]
+    if kind == SEQUENCES:
+        _positive(where, data, "hold_s")
+        _positive(where, data, "check_window_s")
+        if float(data["check_window_s"]) > float(data["hold_s"]):
+            raise ProtocolError(
+                f"{where}: 'check_window_s' ({data['check_window_s']}) cannot "
+                f"be longer than 'hold_s' ({data['hold_s']})")
+        if not isinstance(data.get("shuffle_rounds"), bool):
+            raise ProtocolError(f"{where}: 'shuffle_rounds' must be true or "
+                                "false")
+    if kind == GRASPS:
+        _text(where, data, "status")
+        _positive(where, data, "duration_s")
+        _positive(where, data, "prep_s")
+
+    seen = set()
+    for i, it in enumerate(items):
+        at = f"{where}: items[{i}]"
+        if not isinstance(it, dict):
+            raise ProtocolError(f"{at} must be an object")
+        item_id = it.get("id")
+        if not isinstance(item_id, str) or not _ID_RE.match(item_id):
+            raise ProtocolError(
+                f"{at}: 'id' must be file-name safe (lower-case letters, "
+                f"digits and single underscores), got {item_id!r}")
+        at = f"{at} ({item_id!r})"
+        if item_id in seen:
+            raise ProtocolError(f"{at}: the id is used twice")
+        seen.add(item_id)
+        _text(at, it, "label")
+        if kind == FLEXION:
+            if it.get("finger") not in FINGERS:
+                raise ProtocolError(f"{at}: 'finger' must be one of "
+                                    f"{', '.join(FINGERS)}, got "
+                                    f"{it.get('finger')!r}")
+            _whole(at, it, "cycles")
+            for key in ("bend_s", "hold_s", "straighten_s", "rest_s"):
+                _positive(at, it, key)
+        elif kind == SEQUENCES:
+            steps = it.get("steps")
+            if not isinstance(steps, list) or not steps:
+                raise ProtocolError(f"{at}: 'steps' must be a non-empty list")
+            for k, step in enumerate(steps):
+                sat = f"{at} step {k}"
+                if not isinstance(step, dict):
+                    raise ProtocolError(f"{sat} must be an object")
+                _text(sat, step, "label")
+                _fingers(f"{sat} 'flexed'", step.get("flexed"))
+        else:
+            for key in ("source", "figure"):
+                if key not in it or not (it[key] is None
+                                         or isinstance(it[key], str)):
+                    raise ProtocolError(f"{at}: {key!r} must be text or null")
+            _text(at, it, "shape")
+            if not isinstance(it.get("object_implied"), bool):
+                raise ProtocolError(f"{at}: 'object_implied' must be true or "
+                                    "false")
+
+
+def file_sha256(path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def load_protocol(path) -> Protocol:
+    """Read, parse and validate one protocol file. Raises ProtocolError."""
+    path = Path(path)
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        raise ProtocolError(f"{path}: cannot be read ({e})") from None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError as e:
+        raise ProtocolError(f"{path}: is not UTF-8 text ({e})") from None
+    except json.JSONDecodeError as e:
+        raise ProtocolError(f"{path}: is not valid JSON (line {e.lineno}, "
+                            f"column {e.colno}: {e.msg})") from None
+    validate_protocol(data, where=str(path))
+    return Protocol(path=path, data=data,
+                    sha256=hashlib.sha256(raw).hexdigest())
+
+
+def select_items(protocol: Protocol,
+                 wanted: Optional[Sequence[str]] = None) -> List[str]:
+    """The item ids to record, in the protocol's order.
+
+    `wanted` is the `--items a,b` subset. An id that is not in the file is an
+    error that lists the ones that are: a silently empty session is worse
+    than no session.
+    """
+    ids = protocol.ids
+    if not wanted:
+        return ids
+    wanted = [w.strip() for w in wanted if w and w.strip()]
+    unknown = [w for w in wanted if w not in ids]
+    if unknown:
+        raise ProtocolError(f"{protocol.path}: no item named "
+                            f"{', '.join(unknown)}; the items are "
+                            f"{', '.join(ids)}")
+    return [i for i in ids if i in set(wanted)]
+
+
+# --- the cue schedule --------------------------------------------------------
+@dataclass(frozen=True)
+class Cue:
+    """One cue: a beep, words on the window, and what the hand should do.
+
+    `hold_s` is how long this cue lasts until the next one (the contract's
+    name for it, in both sets). `cycle` and `phase` are Set B only.
+    """
+
+    step: int
+    label: str
+    flexed: Tuple[str, ...]
+    hold_s: float
+    cycle: Optional[int] = None
+    phase: Optional[str] = None
+
+    def event_fields(self) -> dict:
+        """The cue's fields as the events file writes them (contract 6)."""
+        out = {"step": self.step, "label": self.label,
+               "flexed": list(self.flexed), "hold_s": round(self.hold_s, 6)}
+        if self.cycle is not None:
+            out["cycle"] = self.cycle
+            out["phase"] = self.phase
+        return out
+
+
+def _ordered(fingers: Iterable[str]) -> Tuple[str, ...]:
+    """Finger names in the hand's order, whatever order they were given in."""
+    s = set(fingers)
+    return tuple(f for f in FINGERS if f in s)
+
+
+def flexion_cues(item: Mapping, time_scale: float = 1.0) -> List[Cue]:
+    """Set B: `cycles` x (bend, hold, straighten, rest), each its own cue."""
+    finger = item["finger"]
+    words = FINGER_WORDS[finger]
+    durations = {BEND: item["bend_s"], HOLD: item["hold_s"],
+                 STRAIGHTEN: item["straighten_s"], REST: item["rest_s"]}
+    labels = {BEND: f"bend the {words}", HOLD: "hold",
+              STRAIGHTEN: "straighten", REST: "rest"}
+    out: List[Cue] = []
+    for cycle in range(1, int(item["cycles"]) + 1):
+        for phase in PHASES:
+            flexed = (finger,) if phase in (BEND, HOLD) else ()
+            out.append(Cue(step=len(out), label=labels[phase], flexed=flexed,
+                           hold_s=float(durations[phase]) * time_scale,
+                           cycle=cycle, phase=phase))
+    return out
+
+
+def sequence_cues(item: Mapping, hold_s: float,
+                  time_scale: float = 1.0) -> List[Cue]:
+    """Set C: one cue per step, each held the protocol's `hold_s`."""
+    return [Cue(step=k, label=step["label"], flexed=_ordered(step["flexed"]),
+                hold_s=float(hold_s) * time_scale)
+            for k, step in enumerate(item["steps"])]
+
+
+def build_schedule(protocol: Protocol, item_id: str,
+                   time_scale: float = 1.0) -> List[Cue]:
+    """Every cue of one take of `item_id`, in order.
+
+    `time_scale` multiplies every duration. It exists for rehearsals and
+    tests (`--time-scale 0.25`); a real session runs at 1.0, and the scale
+    is written to session.json so a scaled folder is never mistaken for one.
+    """
+    if not (time_scale > 0):
+        raise ValueError(f"time_scale must be above 0, got {time_scale!r}")
+    item = protocol.item(item_id)
+    if protocol.name == FLEXION:
+        return flexion_cues(item, time_scale)
+    if protocol.name == SEQUENCES:
+        return sequence_cues(item, protocol.data["hold_s"], time_scale)
+    raise ProtocolError(f"{protocol.path}: Set A ({protocol.name}) has no cue "
+                        "schedule here; it is recorded by "
+                        "scripts/leap/record_poses.py --protocol")
+
+
+def schedule_seconds(cues: Sequence[Cue]) -> float:
+    return float(sum(c.hold_s for c in cues))
+
+
+def cue_offsets(cues: Sequence[Cue]) -> List[float]:
+    """Seconds from the start of the take to each cue."""
+    out, t = [], 0.0
+    for c in cues:
+        out.append(t)
+        t += c.hold_s
+    return out
+
+
+# Beep pitches (Hz), as `scripts/leap/finger_sweep.py` cues them: higher to
+# bend, lower to straighten. Hold and rest get their own softer tones so the
+# four phases of a cycle can be told apart with the eyes closed.
+PITCH_FLEX, PITCH_HOLD, PITCH_EXTEND, PITCH_REST = 1200, 1000, 800, 650
+
+
+def cue_pitch(cue: Cue, previous: Optional[Cue] = None) -> int:
+    """The beep for one cue.
+
+    Set B by phase. Set C by what the step asks the hand to do relative to
+    the step before it: any finger that has to flex gets the high tone (the
+    movement to make), a step that only straightens gets the low one, and a
+    step that changes nothing (the first "open hand", or "+little" followed
+    by "full fist") gets the neutral one.
+    """
+    if cue.phase is not None:
+        return {BEND: PITCH_FLEX, HOLD: PITCH_HOLD, STRAIGHTEN: PITCH_EXTEND,
+                REST: PITCH_REST}[cue.phase]
+    before = set(previous.flexed) if previous is not None else set()
+    now = set(cue.flexed)
+    if now - before:
+        return PITCH_FLEX
+    if before - now:
+        return PITCH_EXTEND
+    return PITCH_HOLD
+
+
+def still_cue(cues: Sequence[Cue]) -> int:
+    """Which cue the take's one still is taken in (its index).
+
+    Set B: the hold of the middle cycle, so the still shows the cued finger
+    bent. Set C: the middle step. Either way the hand is settled and the take
+    is not yet over, which is when a picture says most about the take.
+    """
+    if not cues:
+        raise ValueError("no cues")
+    holds = [i for i, c in enumerate(cues) if c.phase == HOLD]
+    if holds:
+        return holds[(len(holds) - 1) // 2]
+    return len(cues) // 2
+
+
+# --- the order of the takes --------------------------------------------------
+def rounds(items: Sequence[str], takes_per_item: int, seed=None,
+           shuffle: bool = False) -> List[List[str]]:
+    """One list of item ids per round; every round records every item once.
+
+    Unshuffled, every round is the protocol's order. Shuffled, each round is
+    a permutation drawn from `random.Random(seed)`, so the same seed always
+    gives the same session plan; and no item closes one round and opens the
+    next, because two takes of a sequence back to back are not independent
+    repetitions.
+    """
+    items = list(items)
+    if not items:
+        raise ValueError("no items to record")
+    if len(set(items)) != len(items):
+        raise ValueError(f"an item is listed twice: {items}")
+    n = int(takes_per_item)
+    if n < 1:
+        raise ValueError(f"takes_per_item must be at least 1, got {n}")
+    if not shuffle:
+        return [list(items) for _ in range(n)]
+    rng = random.Random(seed)
+    out: List[List[str]] = []
+    for _ in range(n):
+        order = list(items)
+        rng.shuffle(order)
+        if out and len(order) > 1 and order[0] == out[-1][-1]:
+            k = rng.randrange(1, len(order))
+            order[0], order[k] = order[k], order[0]
+        out.append(order)
+    return out
+
+
+def take_name(item: str, hand: str, take: int, stamp: str) -> str:
+    """`<item>_<hand>_take<N>_<YYYYMMDD_HHMMSS>` (contract section 1)."""
+    return f"{item}_{hand}_take{int(take)}_{stamp}"
+
+
+# --- events ------------------------------------------------------------------
+class EventLog:
+    """The take's events file: one JSON object per line, flushed per line.
+
+    `t` is `time.time()` unless given, the same clock as `wall_time` in the
+    frame files, so a cue can be laid over the glove trace with no offset.
+    Opened for appending when `append` is set: the operator's redo is a
+    decision written after the take's own.
+    """
+
+    def __init__(self, path, append: bool = False):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "a" if append else "w", encoding="utf-8")
+
+    def write(self, kind: str, t: Optional[float] = None, **fields) -> dict:
+        if self._fh is None:
+            raise RuntimeError(f"{self.path} is closed")
+        row = {"t": round(float(time.time() if t is None else t), 6),
+               "kind": kind}
+        row.update(fields)
+        self._fh.write(json.dumps(row) + "\n")
+        self._fh.flush()
+        return row
+
+    def close(self) -> None:
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+def append_event(path, kind: str, t: Optional[float] = None,
+                 **fields) -> dict:
+    """Append one event to an existing events file."""
+    with EventLog(path, append=True) as log:
+        return log.write(kind, t=t, **fields)
+
+
+def read_events(path) -> List[dict]:
+    """The events file back as a list of dicts. Raises ValueError on a bad
+    line, naming it: a torn events file is not something to guess past."""
+    out = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"{path} line {n}: not JSON ({e.msg})") from None
+            if not isinstance(row, dict) or "t" not in row or "kind" not in row:
+                raise ValueError(f"{path} line {n}: an event needs 't' and "
+                                 "'kind'")
+            out.append(row)
+    return out
+
+
+def cue_events(events: Sequence[Mapping]) -> List[Mapping]:
+    return [e for e in events if e.get("kind") == "cue"]
+
+
+def take_window(events: Sequence[Mapping]) -> Tuple[Optional[float],
+                                                     Optional[float]]:
+    """(take_start t, take_end t) from an events list; None where missing."""
+    start = next((float(e["t"]) for e in events
+                  if e.get("kind") == "take_start"), None)
+    end = next((float(e["t"]) for e in reversed(list(events))
+                if e.get("kind") == "take_end"), None)
+    return start, end
+
+
+# --- small statistics --------------------------------------------------------
+def median(values: Iterable[float]) -> Optional[float]:
+    xs = sorted(float(v) for v in values)
+    if not xs:
+        return None
+    mid = len(xs) // 2
+    return xs[mid] if len(xs) % 2 else 0.5 * (xs[mid - 1] + xs[mid])
+
+
+def percentile(values: Iterable[float], q: float) -> Optional[float]:
+    """Linear-interpolated percentile (numpy's default), None when empty."""
+    xs = sorted(float(v) for v in values)
+    if not xs:
+        return None
+    if len(xs) == 1:
+        return xs[0]
+    pos = (len(xs) - 1) * float(q) / 100.0
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (pos - lo)
+
+
+def _r(v: Optional[float], nd: int = 4) -> Optional[float]:
+    return None if v is None else round(float(v), nd)
+
+
+def _fmt(v: float) -> str:
+    """Two decimals, and never "-0.00" for a value that rounds to zero."""
+    return f"{round(float(v), 2) + 0.0:.2f}"
+
+
+# --- the warm-up -------------------------------------------------------------
+def fraction(open_: float, fist: float, curl: float) -> Optional[float]:
+    """How far bent, in the finger's own warm-up range, clipped.
+
+    0 = the warm-up open palm, 1 = the warm-up fist, clipped to
+    FRACTION_CLIP. None when the two endpoints are equal: there is no range
+    to be a fraction of.
+    """
+    span = float(open_) - float(fist)
+    if abs(span) < MIN_SPAN:
+        return None
+    f = (float(open_) - float(curl)) / span
+    lo, hi = FRACTION_CLIP
+    return max(lo, min(hi, f))
+
+
+def window_endpoints(samples: Iterable[Tuple[float, Sequence[float]]],
+                     t_open: Sequence[float],
+                     t_fist: Sequence[float]) -> Optional[dict]:
+    """Per-finger medians over the open and the fist window, and the span.
+
+    `samples` are (time, five curls) in the hand's finger order. A sample
+    counts for a window when t0 <= t <= t1. Returns None when either window
+    has no sample: an endpoint nobody measured is not an endpoint.
+    """
+    opened, fisted = [], []
+    for t, curls in samples:
+        t = float(t)
+        if t_open[0] <= t <= t_open[1]:
+            opened.append(list(curls))
+        elif t_fist[0] <= t <= t_fist[1]:
+            fisted.append(list(curls))
+    if not opened or not fisted:
+        return None
+    out = {"open": {}, "fist": {}, "span": {},
+           "frames": len(opened) + len(fisted)}
+    for i, f in enumerate(FINGERS):
+        o = median(c[i] for c in opened)
+        k = median(c[i] for c in fisted)
+        out["open"][f] = _r(o)
+        out["fist"][f] = _r(k)
+        out["span"][f] = _r(o - k)
+    return out
+
+
+def warmup_refusal(glove: Optional[Mapping]) -> Optional[str]:
+    """Why the session cannot go on after this warm-up, or None.
+
+    The contract's rule: a glove span under REFUSE_SPAN on any of the four
+    fingers refuses. The thumb is left out on purpose (the glove senses its
+    flexion only, and its range is small on every session so far).
+    """
+    if not glove:
+        return ("the glove sent no frames of this hand during the open palm "
+                "or the fist, so there are no endpoints to measure against")
+    low = [f for f in REFUSE_FINGERS
+           if glove["span"].get(f) is None or glove["span"][f] < REFUSE_SPAN]
+    if not low:
+        return None
+    parts = ", ".join(f"{FINGER_WORDS[f]} {_fmt(glove['span'][f])}"
+                      if glove["span"].get(f) is not None
+                      else f"{FINGER_WORDS[f]} (no value)" for f in low)
+    return (f"the glove barely moved between the open palm and the fist "
+            f"(span {parts}; each needs at least {REFUSE_SPAN:.2f}). Open "
+            "fully, then close into a full fist, and check the gloves are "
+            "calibrated in XR Trainer")
+
+
+def warmup_record(hand: str, t_open: Sequence[float], t_fist: Sequence[float],
+                  glove_samples, camera_samples=None,
+                  settle_s: Optional[float] = None) -> dict:
+    """The warmup.json dict (contract section 4), refusal included.
+
+    `camera_samples` None means the session ran with no camera, and the
+    camera block is null; a camera that ran but saw nothing gives a null
+    block too, which is what it measured.
+    """
+    glove = window_endpoints(glove_samples, t_open, t_fist)
+    camera = (None if camera_samples is None
+              else window_endpoints(camera_samples, t_open, t_fist))
+    out = {"hand": hand,
+           "t_open": [round(float(t_open[0]), 6), round(float(t_open[1]), 6)],
+           "t_fist": [round(float(t_fist[0]), 6), round(float(t_fist[1]), 6)],
+           "glove": glove, "camera": camera,
+           "refused": warmup_refusal(glove)}
+    if settle_s is not None:
+        out["settle_s"] = round(float(settle_s), 6)
+    return out
+
+
+# --- reading a take back -----------------------------------------------------
+def read_curls(path, hand: Optional[str] = None
+               ) -> List[Tuple[float, List[float]]]:
+    """A recorded glove (or camera) JSONL -> [(time, five curls)], in order.
+
+    Read exactly as `leap_hand.pose_check.read_take` reads a take, so the
+    quick check measures the same quantity the reports print. The time is
+    `capture_time` where the line has one (when the packet arrived) and
+    `wall_time` otherwise.
+    """
+    from cam_hand.features import flexion_features
+    from xr_hand.keypoints21 import frame_to_keypoints21
+    from xr_hand.recorder import FrameRecorder
+
+    path = Path(path)
+    if not path.is_file():
+        return []
+    with open(path, "r", encoding="utf-8") as fh:
+        rows = [json.loads(line) for line in fh if line.strip()]
+    out = []
+    for row, (frame, wall) in zip(rows, FrameRecorder.load(path)):
+        if hand is not None and frame.hand_side != hand:
+            continue
+        stamp = row.get("capture_time")
+        t = float(stamp) if stamp is not None else float(wall)
+        out.append((t, list(flexion_features(frame_to_keypoints21(frame)))))
+    return out
+
+
+# --- the quick check ---------------------------------------------------------
+@dataclass
+class CheckResult:
+    """The recorder's verdict on one take, and everything behind it.
+
+    `reason` is empty when accepted. `notes` are information for the
+    operator and the session file (coupling, a cycle count that does not
+    match), never a reason to reject. `details` is JSON-ready.
+    """
+
+    accepted: bool
+    reason: str = ""
+    notes: List[str] = field(default_factory=list)
+    details: dict = field(default_factory=dict)
+
+    def as_dict(self) -> dict:
+        return {"accepted": self.accepted, "reason": self.reason,
+                "notes": list(self.notes), **self.details}
+
+
+def _endpoints(glove: Mapping, finger: str) -> Tuple[float, float]:
+    return float(glove["open"][finger]), float(glove["fist"][finger])
+
+
+def fractions_of(curls: Sequence[Tuple[float, Sequence[float]]],
+                 glove: Mapping, finger: str,
+                 t0: Optional[float] = None,
+                 t1: Optional[float] = None) -> List[float]:
+    """One finger's fraction per frame inside [t0, t1] (None = open end)."""
+    i = FINGERS.index(finger)
+    o, k = _endpoints(glove, finger)
+    out = []
+    for t, c in curls:
+        if t0 is not None and t < t0:
+            continue
+        if t1 is not None and t > t1:
+            continue
+        f = fraction(o, k, c[i])
+        if f is not None:
+            out.append(f)
+    return out
+
+
+def span_fraction(fracs: Sequence[float]) -> Optional[float]:
+    """How much of its range a finger covered: p95 - p5 of its fractions."""
+    if not fracs:
+        return None
+    return percentile(fracs, SPAN_PERCENTILES[1]) - percentile(
+        fracs, SPAN_PERCENTILES[0])
+
+
+def count_peaks(values: Sequence[float], low: float = PEAK_LOW,
+                high: float = PEAK_HIGH,
+                min_range: float = PEAK_MIN_RANGE) -> int:
+    """Bend peaks in a fraction trace, with hysteresis.
+
+    The thresholds sit at `low` and `high` of the trace's OWN range (5th to
+    95th percentile), not at fixed fractions: a glove that creeps, or reads
+    too open on the day, still shows its cycles, and whether it reached the
+    band is the span gate's question, not this one's. A peak is counted when
+    the trace rises above the high mark after having been below the low one;
+    a take that starts bent does not count that first plateau.
+    """
+    xs = [float(v) for v in values if v is not None and math.isfinite(v)]
+    if len(xs) < 3:
+        return 0
+    p_lo = percentile(xs, SPAN_PERCENTILES[0])
+    p_hi = percentile(xs, SPAN_PERCENTILES[1])
+    rng = p_hi - p_lo
+    if rng < min_range:
+        return 0
+    lo_mark, hi_mark = p_lo + low * rng, p_lo + high * rng
+    peaks = 0
+    armed = xs[0] < hi_mark
+    for x in xs:
+        if armed and x > hi_mark:
+            peaks += 1
+            armed = False
+        elif not armed and x < lo_mark:
+            armed = True
+    return peaks
+
+
+def check_flexion_take(curls: Sequence[Tuple[float, Sequence[float]]],
+                       events: Sequence[Mapping], glove: Mapping,
+                       finger: str, cycles: int,
+                       span_gate: float = SPAN_GATE) -> CheckResult:
+    """Set B's acquisition gate for one take.
+
+    Rejects only when the cued finger covered less than `span_gate` of its
+    warm-up range. The other four fingers' spans are measured and reported,
+    never failed on (the glove senses flexion only and the ring really does
+    drag its neighbours). The cycles are counted from the cued events and
+    from the curl peaks; a mismatch is a note for the checker, not a reject.
+    """
+    t0, t1 = take_window(events)
+    words = FINGER_WORDS[finger]
+    fracs = fractions_of(curls, glove, finger, t0, t1)
+    in_take = [c for t, c in curls if (t0 is None or t >= t0)
+               and (t1 is None or t <= t1)]
+    cycles_events = len({e.get("cycle") for e in cue_events(events)
+                         if e.get("phase") == BEND})
+    details = {"finger": finger, "frames": len(in_take),
+               "cycles_expected": int(cycles),
+               "cycles_from_events": cycles_events}
+    o, k = _endpoints(glove, finger)
+    if abs(o - k) < MIN_SPAN:
+        return CheckResult(False, f"the {words} has no warm-up range to "
+                           f"measure against (open {o:.3f}, fist {k:.3f})",
+                           details=details)
+    if not in_take:
+        return CheckResult(False, "no glove frames of this hand during the "
+                           "take", details=details)
+    span = span_fraction(fracs)
+    others = {}
+    for f in FINGERS:
+        if f == finger:
+            continue
+        s = span_fraction(fractions_of(curls, glove, f, t0, t1))
+        others[f] = _r(s, 3)
+    peaks = count_peaks(fracs)
+    details.update({"span_fraction": _r(span, 3), "other_spans": others,
+                    "cycles_from_peaks": peaks})
+    notes = []
+    if peaks != cycles_events or cycles_events != int(cycles):
+        notes.append(f"cycles: {cycles} cued in the protocol, "
+                     f"{cycles_events} in the events, {peaks} peaks in the "
+                     f"{words} curl")
+    details["cycles_match"] = (peaks == cycles_events == int(cycles))
+    moved = [f"{FINGER_WORDS[f]} {_fmt(v)}" for f, v in others.items()
+             if v is not None and v >= span_gate]
+    if moved:
+        notes.append("other fingers that moved with it (span as a fraction "
+                     "of their range): " + ", ".join(moved))
+    if span is None or span < span_gate:
+        return CheckResult(False,
+                           f"the {words} moved only {_fmt(span or 0.0)} of its "
+                           f"warm-up range (needs {span_gate:.2f})",
+                           notes=notes, details=details)
+    return CheckResult(True, "", notes=notes, details=details)
+
+
+def step_windows(events: Sequence[Mapping], window_s: float
+                 ) -> List[Tuple[Mapping, float, float]]:
+    """(cue event, t0, t1) for the check window at the end of each step.
+
+    The window ends where the step really ended (the next cue, or the end of
+    the take), not where the schedule said it would, and starts `window_s`
+    before that, but never before the step's own cue.
+    """
+    cues = cue_events(events)
+    _, t_end = take_window(events)
+    out = []
+    for k, cue in enumerate(cues):
+        start = float(cue["t"])
+        if k + 1 < len(cues):
+            end = float(cues[k + 1]["t"])
+        elif t_end is not None:
+            end = t_end
+        else:
+            end = start + float(cue.get("hold_s", 0.0))
+        out.append((cue, max(start, end - float(window_s)), end))
+    return out
+
+
+def check_sequence_take(curls: Sequence[Tuple[float, Sequence[float]]],
+                        events: Sequence[Mapping], glove: Mapping,
+                        window_s: float,
+                        flexed_above: float = FLEXED_ABOVE,
+                        straight_below: float = STRAIGHT_BELOW) -> CheckResult:
+    """Set C's check: every step, all five fingers, in the hold window.
+
+    For each step the median fraction over the last `window_s` of its hold:
+    a finger the step says is flexed must read above `flexed_above`, a
+    finger it says is straight below `straight_below`. All five fingers are
+    checked on every step and every miss is reported, but the take is
+    rejected only for the two misses that mean the step was not done: a
+    flexed finger that is not flexed, or a straight finger that reads
+    flexed. A straight finger in between is coupling, reported as a note.
+    """
+    steps = []
+    failures: List[Tuple[Mapping, str]] = []
+    coupling: List[str] = []
+    for cue, t0, t1 in step_windows(events, window_s):
+        want = set(cue.get("flexed") or [])
+        values = {}
+        fail, loose = [], []
+        frames = sum(1 for t, _c in curls if t0 <= t <= t1)
+        for f in FINGERS:
+            v = median(fractions_of(curls, glove, f, t0, t1))
+            values[f] = _r(v, 3)
+            words = FINGER_WORDS[f]
+            if frames == 0:
+                continue
+            if v is None:
+                fail.append(f"the {words} has no warm-up range to measure "
+                            "against")
+            elif f in want and not v > flexed_above:
+                fail.append(f"{words} read {_fmt(v)} of its range, should be "
+                            f"flexed (above {flexed_above:.2f})")
+            elif f not in want and v > flexed_above:
+                fail.append(f"{words} read flexed ({_fmt(v)}) but should be "
+                            f"straight")
+            elif f not in want and not v < straight_below:
+                loose.append(f"{words} {_fmt(v)}")
+        if frames == 0:
+            fail.append("no glove frames in the hold window")
+        tag = f"step {cue.get('step')} ({cue.get('label')})"
+        if loose:
+            coupling.append(f"{tag}: {', '.join(loose)}")
+        for text in fail:
+            failures.append((cue, f"{tag}: {text}"))
+        steps.append({"step": cue.get("step"), "label": cue.get("label"),
+                      "flexed": sorted(want, key=FINGERS.index),
+                      "window": [round(t0, 6), round(t1, 6)],
+                      "frames": frames, "fractions": values,
+                      "pass": not fail, "fail": fail, "coupling": loose})
+    details = {"steps_total": len(steps),
+               "steps_pass": sum(1 for s in steps if s["pass"]),
+               "steps": steps}
+    notes = []
+    if coupling:
+        notes.append("straight fingers between the bands (coupling, not a "
+                     "failure): " + "; ".join(coupling))
+    if not steps:
+        return CheckResult(False, "the events file has no cues", notes,
+                           details)
+    if failures:
+        first = failures[0][1]
+        more = len({c.get("step") for c, _ in failures}) - 1
+        reason = first + (f"; {more} more step(s) failed" if more > 0 else "")
+        return CheckResult(False, reason, notes, details)
+    return CheckResult(True, "", notes, details)
+
+
+def check_take(protocol: Protocol, item_id: str,
+               curls: Sequence[Tuple[float, Sequence[float]]],
+               events: Sequence[Mapping], glove: Mapping,
+               time_scale: float = 1.0) -> CheckResult:
+    """The quick check for one take of `item_id`, by the protocol's set."""
+    item = protocol.item(item_id)
+    if protocol.name == FLEXION:
+        return check_flexion_take(curls, events, glove, item["finger"],
+                                  int(item["cycles"]))
+    if protocol.name == SEQUENCES:
+        return check_sequence_take(
+            curls, events, glove,
+            float(protocol.data["check_window_s"]) * time_scale)
+    raise ProtocolError(f"{protocol.path}: no quick check for {protocol.name}")

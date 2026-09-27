@@ -1,0 +1,256 @@
+"""The static interval and its medoid, on synthetic takes with known answers.
+
+Every take here is built from `MockLeapStream` hands, so the joints are a
+real hand's geometry, then moved on purpose: a hand that drifts into place
+for a second and then holds, one that creeps at the end, one that drops out,
+one the tracker re-acquires. The window and the summary frame have to land
+where the construction says they must.
+"""
+import dataclasses
+import importlib.util
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from leap_hand.mock import MockLeapStream
+from leap_hand.static_interval import (
+    TakeSummary,
+    label_counts,
+    medoid_in_window,
+    operator_label,
+    reacquisitions,
+    row_frame,
+    static_interval,
+    summarise_take,
+    tracked_fraction,
+)
+from leap_hand.to_openxr import to_hand_frame
+from xr_hand.recorder import _frame_to_dict
+
+HZ = 90.0
+T0 = 1_000_000.0
+
+
+def make_rows(seconds=5.0, side="left", shift=None, noise_mm=0.1, seed=3,
+              hand_id=None, pose="fist"):
+    """A take of one hand at 90 Hz, as the JSONL lines LeapRecorder writes.
+
+    `shift(t)` -> metres added to x of every joint at t seconds into the
+    take: the whole hand translating, which is motion the static interval
+    has to see.
+    """
+    mock = MockLeapStream(pose=pose, noise_mm=noise_mm, dropout_every=0,
+                          reacquire_every=0, seed=seed)
+    n = int(round(seconds * HZ))
+    hands = [lh for s, lh in mock.generate(n) if s == side]
+    rows = []
+    for k, lh in enumerate(hands):
+        t = k / HZ
+        dx = shift(t) if shift else 0.0
+        abs26 = [[p[0] + dx, p[1], p[2]] for p in lh.abs26]
+        palm = [lh.palm_pos[0] + dx, lh.palm_pos[1], lh.palm_pos[2]]
+        moved = dataclasses.replace(lh, abs26=abs26, palm_pos=palm)
+        d = _frame_to_dict(to_hand_frame(moved), wall_time=T0 + t)
+        d.update({"hand_id": hand_id if hand_id is not None else lh.hand_id,
+                  "framerate": HZ, "grab_strength": lh.grab_strength,
+                  "pinch_strength": lh.pinch_strength,
+                  "abs26": [list(p) for p in abs26]})
+        rows.append(d)
+    return rows
+
+
+def drift_then_hold(t):
+    """150 mm/s toward the rest position for the first second, then still."""
+    return 0.15 * max(0.0, 1.0 - t)
+
+
+def load_record_frame():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "leap" / "record_frame.py"
+    spec = importlib.util.spec_from_file_location("record_frame_for_medoid", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# --- the window ---------------------------------------------------------------
+def test_a_hand_that_drifts_then_holds_gets_a_window_inside_the_hold():
+    rows = make_rows(5.0, shift=drift_then_hold)
+    t0, t1 = static_interval(rows, 2.0)
+    assert t1 - t0 == pytest.approx(2.0)
+    assert t0 >= T0 + 1.0 - 1e-9, "the window must not include the drift"
+    assert t1 <= rows[-1]["wall_time"] + 1e-9, "the window lies inside the take"
+
+
+def test_a_hand_that_creeps_at_the_end_gets_a_window_before_the_creep():
+    rows = make_rows(5.0, shift=lambda t: 0.15 * max(0.0, t - 4.0))
+    t0, t1 = static_interval(rows, 2.0)
+    assert t0 >= rows[0]["wall_time"]
+    assert t1 <= T0 + 4.0 + 1e-9
+
+
+def test_a_perfectly_still_take_takes_the_last_window():
+    """On an exact tie the later window wins: the final configuration."""
+    rows = make_rows(4.0, noise_mm=0.0)
+    t0, t1 = static_interval(rows, 2.0)
+    last = rows[-1]["wall_time"]
+    assert last - t1 < 1.0 / HZ + 1e-9
+
+
+def test_a_take_shorter_than_the_window_is_one_window():
+    rows = make_rows(1.0)
+    assert static_interval(rows, 2.0) == (rows[0]["wall_time"], rows[-1]["wall_time"])
+
+
+def test_no_tracked_hand_means_no_window():
+    rows = make_rows(1.0)
+    for r in rows:
+        r["status"] = 0
+    assert static_interval(rows, 2.0) is None
+    assert static_interval([], 2.0) is None
+
+
+def test_the_window_uses_the_operators_hand_not_the_other_one():
+    """The other hand waving about must not move the window."""
+    held = make_rows(5.0, side="left", shift=drift_then_hold)
+    other = make_rows(5.0, side="right", noise_mm=0.1,
+                      shift=lambda t: 0.15 * max(0.0, t - 2.0))
+    other = other[: len(held) // 2]                 # fewer frames: not the operator's
+    t0, _t1 = static_interval(held + other, 2.0)
+    assert t0 >= T0 + 1.0 - 1e-9
+
+
+# --- the medoid -----------------------------------------------------------------
+def test_the_medoid_is_a_real_untouched_frame_inside_the_window():
+    rows = make_rows(5.0, shift=drift_then_hold)
+    t0, t1 = static_interval(rows, 2.0)
+    row, index = medoid_in_window(rows, t0, t1)
+    assert rows[index] is row, "the very line passed in, not a copy or a mean"
+    assert t0 <= row["wall_time"] <= t1
+
+
+def test_the_medoid_applies_record_frames_rule_inside_the_window():
+    rows = make_rows(5.0, shift=drift_then_hold, noise_mm=0.4)
+    t0, t1 = static_interval(rows, 2.0)
+    inside = [(i, r) for i, r in enumerate(rows) if t0 <= r["wall_time"] <= t1]
+    record_frame = load_record_frame()
+    k = record_frame.medoid_index([row_frame(r) for _i, r in inside])
+    _row, index = medoid_in_window(rows, t0, t1)
+    assert index == inside[k][0]
+
+
+def test_the_medoid_is_not_pulled_by_the_drift():
+    """Over the whole take the medoid would sit nearer the drift's mean."""
+    rows = make_rows(5.0, shift=drift_then_hold)
+    t0, t1 = static_interval(rows, 2.0)
+    row, _index = medoid_in_window(rows, t0, t1)
+    wrist = np.asarray(row["abs26"][1])
+    rest = np.asarray(rows[-1]["abs26"][1])
+    assert np.linalg.norm(wrist - rest) < 0.002     # within 2 mm of the held place
+
+
+def test_an_empty_window_has_no_medoid():
+    rows = make_rows(1.0)
+    assert medoid_in_window(rows, T0 + 50.0, T0 + 52.0) is None
+
+
+# --- which hand -----------------------------------------------------------------
+def test_labels_are_counted_and_the_most_tracked_label_is_the_hand():
+    left = make_rows(1.0, side="left")
+    right = make_rows(1.0, side="right")[:20]
+    rows = left + right
+    assert label_counts(rows) == {"left": len(left), "right": 20}
+    assert operator_label(rows) == "left"
+    assert operator_label(rows, prefer="right") == "left", "prefer only breaks ties"
+
+
+def test_a_tie_goes_to_the_preferred_label():
+    rows = make_rows(1.0, side="left") + make_rows(1.0, side="right")
+    assert operator_label(rows, prefer="right") == "right"
+    assert operator_label(rows) == "left"
+
+
+def test_the_tracker_calling_the_left_hand_right_does_not_empty_the_take():
+    """The label filters nothing: the operator's left hand labelled right."""
+    rows = make_rows(3.0, side="right")
+    s = summarise_take(rows, 3.0, prefer="left")
+    assert s.hand_label == "right"
+    assert s.passed, s.gate_reason
+    assert s.medoid_row is not None
+
+
+# --- the gate -------------------------------------------------------------------
+def test_a_clean_take_passes_the_gate_with_the_contract_numbers():
+    rows = make_rows(5.0, shift=drift_then_hold)
+    s = summarise_take(rows, 5.0, 2.0, prefer="left")
+    assert isinstance(s, TakeSummary)
+    assert s.passed, s.gate_reason
+    assert s.frames == len(rows)
+    assert s.tracked_fraction == pytest.approx(1.0, abs=0.01)
+    assert s.reacquisitions == 0
+    assert s.interval[0] >= T0 + 1.0 - 1e-9
+    assert set(s.curls) == {"thumb", "index", "middle", "ring", "pinky"}
+    assert s.grab_strength == pytest.approx(1.0)    # the mock's fist
+    assert s.medoid_wall_time == s.medoid_row["wall_time"]
+
+
+def test_status_zero_frames_are_frames_that_were_not_tracked():
+    rows = make_rows(5.0)
+    for k, r in enumerate(rows):
+        if k % 10 < 3:                      # 30 % of the lines untracked
+            r["status"] = 0
+    fraction, tracked, expected = tracked_fraction(rows, 5.0)
+    assert fraction == pytest.approx(0.7, abs=0.01)
+    assert expected == len(rows)
+    s = summarise_take(rows, 5.0)
+    assert not s.passed
+    assert "tracked 70 %" in s.gate_reason
+
+
+def test_frames_the_tracker_never_reported_count_against_the_take():
+    """A real dropout leaves no line at all; the tracker's rate says how many."""
+    rows = make_rows(5.0)
+    kept = [r for k, r in enumerate(rows) if not (200 <= k < 300)]   # 100 lines gone
+    fraction, tracked, expected = tracked_fraction(kept, 5.0)
+    assert expected == len(rows)
+    assert tracked == len(kept)
+    assert fraction == pytest.approx(len(kept) / len(rows))
+    s = summarise_take(kept, 5.0)
+    assert not s.passed and "gate needs 90 %" in s.gate_reason
+
+
+def test_ninety_percent_is_enough():
+    rows = make_rows(5.0)
+    kept = rows[: int(len(rows) * 0.92)]
+    assert summarise_take(kept, 5.0).passed
+
+
+def test_a_reacquisition_inside_the_static_interval_fails_the_gate():
+    rows = make_rows(5.0, shift=drift_then_hold)
+    t0, t1 = static_interval(rows, 2.0)
+    switch = (t0 + t1) / 2.0            # a new id changes no position, so
+    for r in rows:                      # the window stays where it was
+        if r["wall_time"] >= switch:
+            r["hand_id"] = 999
+    s = summarise_take(rows, 5.0, 2.0)
+    assert s.interval == (t0, t1)
+    assert not s.passed
+    assert "re-acquired" in s.gate_reason and "-> 999" in s.gate_reason
+
+
+def test_a_reacquisition_outside_the_static_interval_is_counted_not_failed():
+    rows = make_rows(5.0, shift=drift_then_hold)
+    for r in rows:
+        if r["wall_time"] >= T0 + 0.5:
+            r["hand_id"] = 999              # during the drift, before the hold
+    s = summarise_take(rows, 5.0, 2.0)
+    assert s.reacquisitions == 1
+    assert s.interval_reacquisitions == []
+    assert s.passed, s.gate_reason
+    assert len(reacquisitions(rows)) == 1
+
+
+def test_no_hand_at_all_fails_the_gate_with_a_reason():
+    s = summarise_take([], 5.0)
+    assert not s.passed and "no hand" in s.gate_reason
+    assert s.frames == 0 and s.labels == {}

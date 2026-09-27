@@ -1,0 +1,22 @@
+{
+  "name": "finger_flexion",
+  "version": 1,
+  "description": "Set B: one finger at a time, gloves on, camera as the reference. Each cycle is bend, hold at full flexion, straighten, rest; every phase is cued by a beep and written to the events file. Five cycles per finger at the normal speed, then the index slow and the index fast. One take per item, one hand per session.",
+  "takes_per_item": 1,
+  "items": [
+    {"id": "thumb", "label": "thumb", "finger": "thumb",
+     "cycles": 5, "bend_s": 4.0, "hold_s": 1.0, "straighten_s": 4.0, "rest_s": 1.0},
+    {"id": "index", "label": "index", "finger": "index",
+     "cycles": 5, "bend_s": 4.0, "hold_s": 1.0, "straighten_s": 4.0, "rest_s": 1.0},
+    {"id": "middle", "label": "middle", "finger": "middle",
+     "cycles": 5, "bend_s": 4.0, "hold_s": 1.0, "straighten_s": 4.0, "rest_s": 1.0},
+    {"id": "ring", "label": "ring", "finger": "ring",
+     "cycles": 5, "bend_s": 4.0, "hold_s": 1.0, "straighten_s": 4.0, "rest_s": 1.0},
+    {"id": "pinky", "label": "little finger", "finger": "pinky",
+     "cycles": 5, "bend_s": 4.0, "hold_s": 1.0, "straighten_s": 4.0, "rest_s": 1.0},
+    {"id": "index_slow", "label": "index, slow", "finger": "index",
+     "cycles": 5, "bend_s": 6.0, "hold_s": 1.0, "straighten_s": 6.0, "rest_s": 1.0},
+    {"id": "index_fast", "label": "index, fast", "finger": "index",
+     "cycles": 8, "bend_s": 1.0, "hold_s": 0.5, "straighten_s": 1.0, "rest_s": 0.5}
+  ]
+}
