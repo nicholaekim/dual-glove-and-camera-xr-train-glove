@@ -40,9 +40,16 @@ CONTRACT_LABELS = {
                           "middle extend", "ring flex", "ring extend",
                           "little flex", "little extend"],
 }
-GRASP_IDS = ["cylindrical", "spherical", "hook", "lateral_key", "tip_pinch",
-             "tripod", "palmar_pinch", "extension_plate", "lateral_tripod",
-             "power_sphere", "precision_disc", "writing_tripod"]
+GRASP_IDS = [
+    "p1_cylindrical", "p1_hook", "p1_lateral", "p1_palmar", "p1_spherical", "p1_tip",
+    "p2_s01_power_grasp", "p2_s02_power_grasp_ball", "p2_s03_power_grasp_finger_side",
+    "p2_s04_fingertip_grasp", "p2_s05_fingertip_grasp_side_support", "p2_s06_tripod_grasp",
+    "p2_s07_directional_power_side", "p2_s08_directional_power_tips",
+    "p2_s09_directional_power_side_and_tips", "p2_s10_power_grasp_dexterous",
+    "p3_circular_power", "p3_prismatic_power_medium_wrap", "p3_prismatic_power_heavy_wrap",
+    "p3_circular_precision_thumb_4_fingers", "p3_circular_precision_thumb_2_fingers",
+    "p3_circular_precision_thumb_1_finger", "p3_prismatic_precision",
+]
 
 
 def load(name):
@@ -59,7 +66,8 @@ def write(tmp_path, data, name="p.json"):
 def test_protocol_files_load_and_hash():
     for name in ("finger_flexion", "sequences", "grasps"):
         p = load(name)
-        assert p.name == name and p.version == 1
+        assert p.name == name
+        assert p.version == (2 if name == "grasps" else 1)
         assert p.sha256 == hashlib.sha256(
             (PROTOCOLS / f"{name}.json").read_bytes()).hexdigest()
         assert isinstance(p.data["description"], str) and p.data["description"]
@@ -104,18 +112,27 @@ def test_sequences_match_the_contract_step_by_step():
                ["steps"])
 
 
-def test_grasps_placeholder_set():
+def test_grasps_from_the_three_papers():
     p = load("grasps")
-    assert p.data["status"] == "placeholder until the reference papers are in hand"
+    assert "reference papers" in p.data["status"]
     assert p.takes_per_item == 3
     assert p.data["duration_s"] == 5.0 and p.data["prep_s"] == 5.0
     assert p.ids == GRASP_IDS
+    assert len(p.ids) == 23
+    ids = set(p.ids)
     for it in p.items:
-        assert it["source"] is None and it["figure"] is None
+        assert it["source"].startswith(("p1 ", "p2 ", "p3 ")), it["id"]
+        assert it["figure"].strip(), it["id"]
         assert it["shape"].strip() and "\n" not in it["shape"]
         assert isinstance(it["object_implied"], bool)
-    assert p.item("cylindrical")["object_implied"] is True
-    assert p.item("tip_pinch")["object_implied"] is False
+        assert it["object"].strip(), it["id"]
+        for other in it["same_as"]:
+            assert other in ids and other != it["id"], (it["id"], other)
+    # the six Schlesinger grasps, the ten scenarios, the seven Cutkosky classes
+    assert sum(i.startswith("p1_") for i in p.ids) == 6
+    assert sum(i.startswith("p2_") for i in p.ids) == 10
+    assert sum(i.startswith("p3_") for i in p.ids) == 7
+    assert "p2_s01_power_grasp" in p.item("p1_cylindrical")["same_as"]
 
 
 # --- validation ------------------------------------------------------------
@@ -244,7 +261,7 @@ def test_time_scale_scales_every_duration():
     with pytest.raises(ValueError):
         rp.build_schedule(p, "seq3_alternating", time_scale=0)
     with pytest.raises(rp.ProtocolError, match="record_poses"):
-        rp.build_schedule(load("grasps"), "cylindrical")
+        rp.build_schedule(load("grasps"), "p1_cylindrical")
 
 
 def test_event_fields_per_set():

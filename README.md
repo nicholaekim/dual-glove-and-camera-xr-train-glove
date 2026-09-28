@@ -110,8 +110,9 @@ that names the hardware setup of every step:
 
 - Set A, static grasp-type poses from the reference papers, camera only,
   bare left hand: `scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left`
-  (runbook `docs/grasp_recording.md`). The grasp list in `protocols/grasps.json`
-  is a placeholder until the papers are in hand.
+  (runbook `docs/grasp_recording.md`). The 23 grasps in `protocols/grasps.json`
+  carry the three reference papers' own names and figure references; the
+  papers and the picture sheet to copy from stay outside the repo.
 - Set B, single-finger flexion (5 cycles per finger, index also slow and
   fast) and Set C, the seven cued finger sequences, gloves on with the camera
   as the reference, one hand per run: `scripts/record_protocol.py --set

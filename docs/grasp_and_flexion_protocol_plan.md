@@ -145,23 +145,34 @@ D9. One session per set is the deliverable. A second-day repeat of Sets B
     fault is session-dependent and only a repeat separates repeatability
     from noise; it is not required for the hand-in.
 
-## 3. Grasp list for Set A (placeholder until the papers are in hand)
+## 3. Grasp list for Set A (from the three papers, 2026-09-28)
 
-The professor's message refers to figures in reference papers that are not
-in this repo or on this machine. First step: get the papers (or the figure
-pages) from his message and copy the exact grasp names and figure numbers
-into `protocols/grasps.json`. Until then the working list is the classic
-six plus the common additions from the Feix GRASP taxonomy:
+The professor supplied three papers; they are kept outside the repo in
+`xr trainer\reference\grasp papers\` (paper1.pdf, paper2.pdf, paper3.pdf)
+with a two-page `grasp sheet.pdf` that shows the figure panel to copy for
+every id. `protocols/grasps.json` (version 2) holds 23 grasps under the
+papers' own names:
 
-cylindrical, spherical, hook, lateral (key), tip pinch (thumb to index),
-tripod (three-jaw chuck), palmar pinch (thumb pad to index pad), extension
-(plate), lateral tripod, power sphere, precision disc, writing tripod.
+- Paper 1, Heumer et al. 2007 (Schlesinger's taxonomy, Figure 1, Table 1):
+  cylindrical, hook, lateral, palmar, spherical, tip. Six.
+- Paper 2, de Souza et al. 2015 (Table 1, Fig. 13): scenarios 1 to 10:
+  power grasp (cylinder), power grasp (ball), power grasp including finger
+  side, fingertip grasp, fingertip grasp with side support, tripod grasp,
+  directional power grasp with thumb and finger side, with thumb and finger
+  tips, with thumb, finger side and finger tips, power grasp with dexterous
+  ability. Ten.
+- Paper 3, Cobos et al. 2009 (Figure 4, Cutkosky classification, Figure 5):
+  circular power; prismatic power medium wrap and heavy wrap; circular
+  precision with thumb and 4, 2 or 1 fingers; prismatic precision. Seven.
 
-Each entry: label, source paper, figure or panel, one line describing the
-hand shape, whether an object is implied. The label is the paper's own
-term, verbatim; the placeholder names above are never substituted for a
-paper's name once the papers are in hand, and a grasp that appears in two
-papers under different names keeps both in the entry.
+Grasps that are the same hand shape under two papers' names (cylindrical =
+scenario 1 = medium wrap; spherical = scenario 2 = circular power; tip =
+scenario 4 = thumb and 1 finger; tripod = thumb and 2 fingers; lateral ~
+scenario 7; palmar ~ thumb and 4 fingers) are still recorded under each
+label, and the `same_as` field links them so the analysis can merge them.
+23 grasps x 3 takes = 69 takes, about 25 minutes of recording. Every paper
+shows its grasps on an object; the plan records them mimed (D1) until the
+professor asks for an object pass.
 
 ## 4. Quality rules (what makes a take acceptable)
 
