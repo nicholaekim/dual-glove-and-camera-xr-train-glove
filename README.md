@@ -124,6 +124,15 @@ that names the hardware setup of every step:
   `scripts/package_professor_set.py` builds the hand-in folder (JSONL, the
   professor's 21-landmark text format, summaries, README, no images).
 
+Joint frames, as in the Cobos et al. 2009 figures: `scripts/joint_frames_view.py
+--live` draws every one of the 26 joints' x y z axes on the IR image (camera
+only, bare hand; `--glove` adds the glove), and `--take` / `--session` write
+each summary frame's 26 rows (position in the wrist frame in mm, orientation,
+axes, flexion, abduction and twist from the parent joint) as CSV, plus one
+PDF per session with the paper's 24 named angles, which the packager hands
+in beside the CSVs. Axis and sign conventions and how to read the 24 names:
+`docs/joint_frames.md`.
+
 Plan and decisions: `docs/grasp_and_flexion_protocol_plan.md`. File formats
 shared by the tools: `docs/protocol_formats.md`. Every tool runs without
 hardware with `--mock` / `--mock-glove --mock-leap`, and mock sessions land in
@@ -1650,6 +1659,11 @@ scripts/package_professor_set.py  builds the hand-in folder, no images
 src/cam_hand/recording_protocol.py  schedules, rounds, events, quick checks
 src/cam_hand/protocol_check.py      the checker's rules and the report
 src/leap_hand/static_interval.py    quietest window of a take and its medoid
+src/xr_hand/joint_frames.py  26 joint frames: wrist-frame positions, local axes,
+                             flexion/abduction/twist to the parent, the paper's
+                             24 named angles (docs/joint_frames.md)
+scripts/joint_frames_view.py live axes on the camera image; --take / --session
+                             export CSV, PNG and one PDF for the hand-in
 archive/summer-xr-trainer/   July glove-only repo, merged with history: the
                              42-take July dataset, REPORT.txt, technical PDF,
                              record_frame.ps1 (frozen, see archive/README.md)

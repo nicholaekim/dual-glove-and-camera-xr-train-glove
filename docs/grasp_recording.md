@@ -105,7 +105,7 @@ next countdown ends, fix the cause:
   high beep to the low beep and keep the hand over the middle of the module.
 
 After 3 failed attempts the recorder moves on to the next take. The end
-table then lists that grasp as short of its takes, and step 5 below records
+table then lists that grasp as short of its takes, and step 6 below records
 what is missing.
 
 ## Steps
@@ -138,7 +138,23 @@ No line may say FAIL. Line 7 says WARN while no hand is over the camera,
 which is fine. If a line says FAIL, do what that line says, then run this
 step again.
 
-### Step 4. Camera only, bare left hand: record the grasps
+### Step 4. Camera only, bare left hand: see the joint frames live
+
+```
+.venv\Scripts\python.exe scripts\joint_frames_view.py --live
+```
+
+Hold the left hand over the module. The window draws a small x y z triad
+(x red, y green, z blue, 1 cm long) at each of the 26 joints and lists, on
+the right, every joint's position in millimetres from the wrist and its
+flexion and abduction, then the paper's 24 angles (Cobos et al. 2009). Close
+a fist slowly: the PIP numbers climb toward 90. Press n to highlight one
+finger at a time, s to save a picture of the window into
+`recordings\joint_frames\`, q to close it. What the numbers mean:
+`docs\joint_frames.md`. The window only reads the camera, so it can also
+stay open while you record.
+
+### Step 5. Camera only, bare left hand: record the grasps
 
 Before you press Enter: the module flat on the table with the lenses up, no
 sunlight on it, your right hand resting on the table away from the module,
@@ -153,7 +169,7 @@ each. Plan on about 15 minutes of recording plus your time at the reviews.
 At the end it prints the table (grasp, take, accepted, tracked %, grab,
 pinch) and the folder, and opens the folder in Explorer.
 
-### Step 5. Camera only, bare left hand: record the takes the table says are missing
+### Step 6. Camera only, bare left hand: record the takes the table says are missing
 
 Do this step only when a line under the table starts with
 `Short of 3 kept takes`. Below that line, after "Record the missing takes
@@ -168,7 +184,7 @@ Copy the printed command, not this example. It adds the missing takes to
 the same session folder and carries the take numbers on, so Set A stays one
 session (plan D9).
 
-### Step 6. No hardware: look at the session folder
+### Step 7. No hardware: look at the session folder
 
 ```
 explorer recordings\protocol\grasps
@@ -177,3 +193,17 @@ explorer recordings\protocol\grasps
 Open the newest folder. Every grasp should have 3 files in `leap\`,
 `stills\`, `keypoints\` and `meta\`. The stills stay on this machine: they
 are for our own checking and are not handed in.
+
+### Step 8. No hardware: write the joint frames of the session
+
+```
+.venv\Scripts\python.exe scripts\joint_frames_view.py --session recordings\protocol\grasps\20260928_140501_left
+```
+
+Put your session's folder name in place of `20260928_140501_left`: it is
+the newest folder you opened in step 7. For every kept take the script
+writes the summary frame's 26 joints (position, axes, angles) to
+`joint_frames\<take>.csv` inside the session folder, a drawing of it to
+`joint_frames\<take>.png`, and one `joint_frames\joint_frames.pdf` with a
+page per take. The packager later copies the CSVs and the PDF into the
+hand-in folder, never the PNGs.

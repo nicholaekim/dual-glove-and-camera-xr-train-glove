@@ -31,6 +31,13 @@ WHAT GOES IN, AND WHAT DOES NOT
                   in camera millimetres, the Wrist line giving the measured
                   wrist position
 
+  Joint frames, when `scripts/joint_frames_view.py --session` has been run
+  on a session: its `joint_frames/<take>.csv` (and `camera_<take>.csv`) for
+  the accepted takes, renamed like the take's other files, and the one
+  `joint_frames.pdf`, into a `joint_frames` folder beside the set's files.
+  Never its PNGs: the PDF is the drawing's hand-in form. Without that
+  folder the set packages exactly as before.
+
   No photograph goes in: the hand-cropped stills are for our own checking.
   Before anything is written, every file the plan would put in the folder is
   checked by name and, for copies, by its first bytes; one image and nothing
@@ -277,6 +284,50 @@ SUMMARY_COLUMNS = ["grasp", "label", "source", "figure", "take", "hand",
     "orientation_note", "session"]
 
 
+JOINT_FRAMES_DIR = "joint_frames"          # scripts/joint_frames_view.py --session
+JOINT_FRAMES_PDF = "joint_frames.pdf"
+
+
+def plan_joint_frames(session: pc.Session, folder: Path,
+                      names: Sequence[Tuple[str, str]],
+                      pdf_name: str = JOINT_FRAMES_PDF
+                      ) -> Tuple[List[Output], List[str]]:
+    """The session's joint-frame exports, when it has them.
+
+    `names` pairs each handed-in take's session name with its name in the
+    hand-in folder. A CSV of a take that is not handed in stays out, with a
+    line saying so; a PNG is never looked at. Returns ([], []) for a session
+    without a joint_frames folder, which then packages as before.
+    """
+    src = session.path / JOINT_FRAMES_DIR
+    if not src.is_dir():
+        return [], []
+    wanted: Dict[str, str] = {}
+    for name, stem in names:
+        wanted[f"{name}.csv"] = f"{stem}.csv"
+        wanted[f"camera_{name}.csv"] = f"camera_{stem}.csv"
+    plan: List[Output] = []
+    notes: List[str] = []
+    for p in sorted(src.glob("*.csv")):
+        dest = wanted.get(p.name)
+        if dest is None:
+            notes.append(f"{session.name}/{JOINT_FRAMES_DIR}/{p.name}: not an "
+                         "accepted take, not handed in")
+            continue
+        plan.append(Output(folder / JOINT_FRAMES_DIR / dest, source=p))
+    pdf = src / JOINT_FRAMES_PDF
+    if pdf.is_file():
+        plan.append(Output(folder / JOINT_FRAMES_DIR / pdf_name, source=pdf))
+    return plan, notes
+
+
+def joint_frame_counts(plan: Sequence[Output]) -> Tuple[int, int]:
+    """(joint-frame CSVs, joint-frame PDFs) among planned outputs."""
+    frames = [o for o in plan if o.dest.parent.name == JOINT_FRAMES_DIR]
+    return (sum(1 for o in frames if o.dest.suffix == ".csv"),
+            sum(1 for o in frames if o.dest.suffix == ".pdf"))
+
+
 def plan_grasps(session: pc.Session, exporter) -> Tuple[List[Output], dict]:
     hand = session.hand
     plan: List[Output] = []
@@ -284,12 +335,14 @@ def plan_grasps(session: pc.Session, exporter) -> Tuple[List[Output], dict]:
     by_item: Dict[str, List[Tuple[int, Path]]] = {}
     missing: List[str] = []
     static_s: List[float] = []
+    names: List[Tuple[str, str]] = []
     for t in accepted(session):
         stem = f"{t.item}_{hand}_take{t.take}"
         leap = t.path("leap")
         if leap is None:
             missing.append(f"{t.name}: no camera file, take not handed in")
             continue
+        names.append((t.name, stem))
         plan.append(Output(Path("grasps") / f"{stem}.jsonl", source=leap))
         by_item.setdefault(t.item, []).append((int(t.take or 0), leap))
         if t.path("keypoints"):
@@ -344,9 +397,14 @@ def plan_grasps(session: pc.Session, exporter) -> Tuple[List[Output], dict]:
                 w.writerow({k: pc.csv_value(v) for k, v in r.items()})
     plan.append(Output(Path("grasps") / "grasps_summary.csv",
                        write=write_summary))
+    frames, notes = plan_joint_frames(session, Path("grasps"), names)
+    plan += frames
+    missing += notes
+    csvs, pdfs = joint_frame_counts(frames)
     static = sorted(static_s)[len(static_s) // 2] if static_s else None
     return plan, {"takes": len(rows), "items": len(by_item),
-                  "missing": missing, "static_s": static}
+                  "missing": missing, "static_s": static,
+                  "joint_frames": csvs, "joint_frames_pdf": pdfs}
 
 
 # --- Sets B and C --------------------------------------------------------------------
@@ -369,16 +427,19 @@ def check_for(session: pc.Session) -> Tuple[List[Dict[str, str]], str, str]:
             "checked while packaging (fixed bands)")
 
 
-def plan_glove_takes(session: pc.Session, kind: str, exporter
+def plan_glove_takes(session: pc.Session, kind: str, exporter,
+                     pdf_name: str = JOINT_FRAMES_PDF
                      ) -> Tuple[List[Output], List[str]]:
     folder = Path(kind) / session.hand
     plan: List[Output] = []
     missing: List[str] = []
+    names: List[Tuple[str, str]] = []
     for t in accepted(session):
         glove = t.path("glove")
         if glove is None:
             missing.append(f"{t.name}: no glove file, take not handed in")
             continue
+        names.append((t.name, t.name))
         plan.append(Output(folder / f"{t.name}.jsonl", source=glove))
         plan.append(Output(
             folder / f"{t.name}.txt",
@@ -392,7 +453,8 @@ def plan_glove_takes(session: pc.Session, kind: str, exporter
                                source=t.path("events")))
         else:
             missing.append(f"{t.name}: no events file")
-    return plan, missing
+    frames, notes = plan_joint_frames(session, folder, names, pdf_name)
+    return plan + frames, missing + notes
 
 
 def _j(row: Dict[str, str], key: str):
@@ -502,10 +564,20 @@ def _coupling_text(step: dict, sensor: str) -> str:
 def plan_glove_set(sessions: List[pc.Session], kind: str, exporter
                    ) -> Tuple[List[Output], dict]:
     plan: List[Output] = []
-    info = {"takes": 0, "missing": [], "hands": {}}
+    info = {"takes": 0, "missing": [], "hands": {}, "joint_frames": 0,
+            "joint_frames_pdf": 0}
     by_hand: Dict[str, List[Tuple[pc.Session, list, str, str]]] = {}
+    per_hand: Dict[str, int] = {}
     for session in sessions:
-        takes, missing = plan_glove_takes(session, kind, exporter)
+        per_hand[session.hand] = per_hand.get(session.hand, 0) + 1
+    for session in sessions:
+        # two sessions of one hand share a folder: their PDFs keep apart
+        pdf_name = (JOINT_FRAMES_PDF if per_hand[session.hand] == 1 else
+                    f"joint_frames_{session.name}.pdf")
+        takes, missing = plan_glove_takes(session, kind, exporter, pdf_name)
+        csvs, pdfs = joint_frame_counts(takes)
+        info["joint_frames"] += csvs
+        info["joint_frames_pdf"] += pdfs
         plan.extend(takes)
         info["missing"].extend(missing)
         n = sum(1 for o in takes if o.dest.suffix == ".txt")
@@ -613,6 +685,66 @@ def setup_lines(kind: str, sessions: List[pc.Session],
     ]
 
 
+def joint_frame_contents(kind: str, info: dict) -> List[str]:
+    """CONTENTS lines for a set's joint_frames folder, when it has one."""
+    if not (info.get("joint_frames") or info.get("joint_frames_pdf")):
+        return []
+    where = "" if kind == pc.GRASPS else "<hand>\\"
+    out = [f"      {where}joint_frames\\<take>.csv   the take's summary "
+           "frame: every joint's position (mm),",
+           "          orientation, axes and angles in the wrist frame "
+           "(JOINT FRAMES below)"]
+    if kind != pc.GRASPS:
+        out.append(f"      {where}joint_frames\\camera_<take>.csv   the same "
+                   "from the camera file of the take")
+    out.append(f"      {where}joint_frames\\joint_frames.pdf   one page per "
+               "summary frame: the hand drawn with every")
+    out.append("          joint's x y z axes, the paper's 24 angles and the "
+               "26-row table")
+    return out
+
+
+JOINT_FRAMES_SECTION = (
+    ["JOINT FRAMES AND THE PAPER'S 24 ANGLES", "-" * 78]
+    + wrapped(
+        "Each joint_frames CSV holds one frame of a take, its summary frame "
+        "(Set A: the medoid of the static interval, as in _keypoints.txt; "
+        "Sets B and C: the medoid of the whole take), one row per OpenXR "
+        "joint, 26 rows. x_mm y_mm z_mm is the joint's position in the "
+        "wrist frame, in millimetres: the origin at the wrist joint and the "
+        "axes those of the wrist joint's own orientation. For the camera "
+        "that orientation is the tracker's forearm bone, so a bent wrist "
+        "turns the whole hand in this frame; the PDF prints the "
+        "forearm-to-palm angle on every camera page. qx qy qz qw and the "
+        "axis_x_*, axis_y_*, axis_z_* columns are the joint's orientation "
+        "and its three unit axes in the same frame: z runs along the bone "
+        "back toward the wrist, y out of the back of the hand, x across it "
+        "(x = y cross z). bone_len_mm is the distance to the parent joint.",
+        "  ", "  ")
+    + [""]
+    + wrapped(
+        "flex_deg, abd_deg and twist_deg are the rotation from the parent "
+        "joint's frame to this joint's, taken about x, then the new y, then "
+        "the new z. Flexion is positive toward the palm, abduction positive "
+        "toward the thumb, twist positive when the back of the bone turns "
+        "toward the little finger; the signs are the same for both hands "
+        "and both sensors.", "  ", "  ")
+    + [""]
+    + wrapped(
+        "The 24 angles of Cobos et al. 2009 (Table 1) are cells of this "
+        "table. Fingers I, M, R, L (index, middle, ring, little): CMC = "
+        "flex_deg of the METACARPAL row, MCP_fe and MCP_aa = flex_deg and "
+        "abd_deg of the PROXIMAL row, PIP = flex_deg of INTERMEDIATE, DIP = "
+        "flex_deg of DISTAL. Thumb T: TMC_fe and TMC_aa = flex_deg and "
+        "abd_deg of THUMB_METACARPAL (they include the thumb's resting "
+        "position, so they are not zero with the hand open), MCP_fe = "
+        "flex_deg of THUMB_PROXIMAL, IP = flex_deg of THUMB_DISTAL. "
+        "joint_frames.pdf lists the 24 for every summary frame. The glove "
+        "senses flexion only: its CMC, abduction and TMC values come from "
+        "its own hand model; the camera measures them.", "  ", "  ")
+    + [""])
+
+
 def readme_text(packaged: Dict[str, List[pc.Session]], infos: Dict[str, dict],
                 operator: str, built: str) -> str:
     L: List[str] = []
@@ -666,6 +798,7 @@ def readme_text(packaged: Dict[str, List[pc.Session]], infos: Dict[str, dict],
                      "fractions and pass/fail, glove and camera; "
                      "flexed = the fingers the step flexes, empty = "
                      "open hand")
+        L += joint_frame_contents(kind, infos.get(kind, {}))
     L.append("")
 
     L += ["SETUP", "-" * 78]
@@ -754,6 +887,10 @@ def readme_text(packaged: Dict[str, List[pc.Session]], infos: Dict[str, dict],
           "1 = fist. curl = fingertip-",
           "    to-wrist distance over palm length.",
           ""]
+
+    if any(infos.get(k, {}).get("joint_frames") or
+           infos.get(k, {}).get("joint_frames_pdf") for k in pc.SETS):
+        L += JOINT_FRAMES_SECTION
 
     L += ["KNOWN GLOVE LIMITS (reported as such, not hidden)", "-" * 78]
     for x in KNOWN_LIMITS:
@@ -920,7 +1057,11 @@ def main(argv=None) -> int:
         per_hand = (" (" + ", ".join(f"{h} {n}" for h, n in
                                      sorted(hands.items())) + ")"
                     if hands else "")
-        print(f"{kind}: {info['takes']} take(s){per_hand}")
+        frames = (f", joint frames {info['joint_frames']} CSV and "
+                  f"{info['joint_frames_pdf']} PDF"
+                  if info.get("joint_frames") or info.get("joint_frames_pdf")
+                  else "")
+        print(f"{kind}: {info['takes']} take(s){per_hand}{frames}")
         for m in info.get("missing", []):
             print(f"  not handed in: {m}")
     print(f"wrote {len(plan)} file(s) to {out}")

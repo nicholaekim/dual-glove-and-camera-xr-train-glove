@@ -347,3 +347,82 @@ def test_a_deep_out_folder_past_max_path(sessions, tmp_path):
     assert len(pkg.images_in(out)) == 1
     assert pkg.main(["--out", str(out), "--flexion",
                      str(sessions["flexion"])]) == 1
+
+
+# --- joint frames (scripts/joint_frames_view.py --session) ---------------------------
+
+def _with_joint_frames(src: Path, dst: Path) -> Path:
+    """A copy of a session with a joint_frames folder as --session leaves it:
+    a CSV and a PNG per accepted take (and per camera file for B/C), one PDF,
+    plus a CSV of a take that was not accepted."""
+    import shutil
+    shutil.copytree(src, dst)
+    session = pc.load_session(dst)
+    out = dst / "joint_frames"
+    out.mkdir()
+    for t in session.takes:
+        stems = [t.name] if session.set == pc.GRASPS else [
+            t.name, f"camera_{t.name}"]
+        for stem in stems:
+            (out / f"{stem}.csv").write_text(
+                "joint,parent,x_mm\nWRIST,,0.00\n", encoding="utf-8")
+            (out / f"{stem}.png").write_bytes(b"\x89PNG fake drawing")
+    (out / "joint_frames.pdf").write_bytes(b"%PDF-1.4 fake\n%%EOF\n")
+    return dst
+
+
+def test_joint_frames_go_in_as_csv_and_pdf_never_png(sessions, tmp_path,
+                                                     capsys):
+    grasps = _with_joint_frames(sessions["grasps"], tmp_path / "a" / "g")
+    flexion = _with_joint_frames(sessions["flexion"], tmp_path / "b" / "f")
+    out = tmp_path / "out"
+    assert pkg.main(["--out", str(out), "--grasps", str(grasps),
+                     "--flexion", str(flexion)]) == 0
+    text = capsys.readouterr().out
+    assert "joint frames 6 CSV and 1 PDF" in text          # 2 grasps x 3 takes
+    # Set A: renamed like the take's other hand-in files
+    g = out / "grasps" / "joint_frames"
+    want = {f"{item}_left_take{n}.csv" for item in ("cylindrical", "tip_pinch")
+            for n in (1, 2, 3)} | {"joint_frames.pdf"}
+    assert {p.name for p in g.iterdir()} == want
+    assert (g / "joint_frames.pdf").read_bytes() == (
+        grasps / "joint_frames" / "joint_frames.pdf").read_bytes()
+    # Set B: glove and camera CSVs of the accepted takes, and the PDF
+    f = out / "finger_flexion" / "left" / "joint_frames"
+    accepted_names = [t.name for t in pc.load_session(flexion).takes
+                      if t.accepted]
+    assert {p.name for p in f.iterdir()} == {
+        n for name in accepted_names
+        for n in (f"{name}.csv", f"camera_{name}.csv")} | {"joint_frames.pdf"}
+    # the rejected attempt's CSV stays out, and is named
+    assert "middle_left_take1_20260928_140001.csv: not an accepted take" in text
+    # never a PNG
+    assert not list(out.rglob("*.png")) and pkg.images_in(out) == []
+    readme = (out / "README.txt").read_text(encoding="utf-8")
+    for needle in ("JOINT FRAMES AND THE PAPER'S 24 ANGLES",
+                   "joint_frames\\<take>.csv", "<hand>\\joint_frames\\camera_",
+                   "joint_frames.pdf", "positive toward the palm",
+                   "positive toward the thumb", "Cobos et al. 2009",
+                   "MCP_aa", "TMC_fe", "forearm", "millimetres"):
+        assert needle in readme, needle
+    assert "\u2014" not in readme
+
+
+def test_a_session_without_joint_frames_still_packages(package):
+    rc, out = package
+    assert rc == 0
+    assert not [p for p in out.rglob("joint_frames*")]
+    assert "JOINT FRAMES" not in (out / "README.txt").read_text(
+        encoding="utf-8")
+
+
+def test_an_image_renamed_into_joint_frames_is_still_refused(sessions,
+                                                            tmp_path, capsys):
+    flexion = _with_joint_frames(sessions["flexion"], tmp_path / "f")
+    take = next(t for t in pc.load_session(flexion).takes if t.accepted)
+    (flexion / "joint_frames" / f"{take.name}.csv").write_bytes(
+        b"\x89PNG a drawing saved under the wrong name")
+    out = tmp_path / "out"
+    assert pkg.main(["--out", str(out), "--flexion", str(flexion)]) == 1
+    assert "REFUSED" in capsys.readouterr().out
+    assert not out.exists()

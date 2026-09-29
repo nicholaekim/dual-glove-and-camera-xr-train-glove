@@ -237,5 +237,11 @@ fails a rule, 0 otherwise.
              <take>.events.jsonl, <take>.txt (professor format, all frames),
              flexion_report.txt
       sequences\<hand>\ same layout, sequence_check.csv
+      <set>\joint_frames\<take>.csv and joint_frames.pdf   when the session
+             was exported with scripts/joint_frames_view.py --session:
+             26 rows per take (position in the wrist frame in mm,
+             orientation, local axes, bone length, flexion, abduction and
+             twist to the parent) and one PDF with the drawing and the
+             table per take; the PNG drawings stay in the repo.
 
 No PNG or other image anywhere in the folder.
