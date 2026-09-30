@@ -192,7 +192,11 @@ position (not forced to zero, unlike the glove files).
 
     {"item": "cylindrical", "take": 1, "hand": "left",
      "frames": 452, "tracked_fraction": 0.98, "reacquisitions": 0,
-     "gate": {"reacquisitions_in_static_interval": 0, ...},
+     "gate": {"reacquisitions_in_static_interval": 0, "loss_gap_s": 0.1,
+              "losses": [{"t": ..., "duration_s": 1.4, "height_cm": 49,
+                          "offset_cm": 8, "view_deg": 20, "cause": "too high",
+                          "fix": "keep the palm 25 to 35 cm above the module"}],
+              ...},
      "tracker_hand_labels": {"left": 3, "right": 449},
      "static_interval": [t0, t1], "medoid_wall_time": t,
      "grab_strength": 0.91, "pinch_strength": 0.12,

@@ -228,6 +228,23 @@ python scripts\leap\camera_view.py --hand left
 
 `--no-view` turns it off; the mocks never open it.
 
+**When the camera loses the hand.** The tracking service is healthy (90 Hz,
+no dropped frames), so a loss comes from the moment: the hand too high, too
+low or at the edge of the field, the palm turned away, a closed hand seen
+from below, a fast move, sunlight or another infrared source, smudged
+lenses. `docs/tracking_quality.md` has the physical checklist and a 60
+second coached test (camera only, bare hand) that records every loss with
+where the hand was and why, and ends on a `VERDICT:` line naming the fix to
+try first:
+
+```powershell
+.venv\Scripts\python.exe scripts\leap\tracking_quality.py --hand left
+```
+
+The same classifier (`leap_hand.tracking_quality`) drives the camera
+window's `tracking:` line and names the losses in the grasp recorder's
+reject reasons and in each take's `gate.losses`.
+
 Full plan, phases and acceptance: `docs/ultraleap_ir170_plan.md`. This section
 is the operating procedure.
 

@@ -283,7 +283,7 @@ def test_a_take_under_90_percent_tracked_is_rejected_with_its_reason(
     for entry in takes:
         assert entry["accepted"] is False
         assert entry["decided_by"] == "gate"
-        assert "tracked" in entry["reason"] and "90 %" in entry["reason"]
+        assert "tracked" in entry["reason"] and "90 percent" in entry["reason"]
         assert entry["tracked_fraction"] < 0.9
         name = entry["name"]
         # a rejected attempt keeps the number it was trying to become
@@ -304,6 +304,59 @@ def test_a_take_under_90_percent_tracked_is_rejected_with_its_reason(
     for kind in ("leap", "stills", "keypoints", "meta"):
         d = folder / kind
         assert not d.is_dir() or not any(d.iterdir()), kind
+
+
+LOSS_REASON_RE = re.compile(
+    r"tracked (?P<pct>\d+) percent: lost (?P<n>\d+) times?, "
+    r"(?:for|longest) (?P<secs>\d+\.\d) s(?: \(not back by the end\))? "
+    r"with the hand at (?P<cm>\d+) cm \((?P<cause>[a-z ]+(?: \([^)]*\))?): (?P<fix>[^)]+)\); "
+    r"the gate needs 90 percent")
+
+
+def test_a_mock_dropout_reject_reason_names_the_losses_and_the_meta_lists_them(
+        rp, monkeypatch, tmp_path, protocol_file):
+    """The reason says how many losses, the longest, where the hand was and
+    why; `gate.losses` in the meta holds every one of them."""
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--retries", "0", "--mock-dropout", "0.3"))
+    folder = session_dir(out)
+    entry = read_json(folder / "session.json")["takes"][0]
+    assert entry["accepted"] is False and entry["decided_by"] == "gate"
+    m = LOSS_REASON_RE.fullmatch(entry["reason"])
+    assert m, entry["reason"]
+    assert int(m["pct"]) == round(entry["tracked_fraction"] * 100)
+    # the mock hand hovers 25 cm up, over the module, palm to the lens: none
+    # of the measured causes fits, and the reason says so rather than guessing
+    assert m["cm"] == "25" and m["cause"] == "unexplained"
+
+    meta = read_json(folder / entry["files"]["meta"])
+    gate = meta["gate"]
+    assert gate["reason"] == entry["reason"] == meta["reason"]
+    assert gate["loss_gap_s"] == pytest.approx(0.1)
+    losses = gate["losses"]
+    assert len(losses) == int(m["n"]) >= 1
+    longest = max(losses, key=lambda d: d["duration_s"])
+    assert f"{longest['duration_s']:.1f}" == m["secs"]
+    # --mock-dropout 0.3 drops 27 frames of every 90: a 0.3 s hole
+    assert longest["duration_s"] == pytest.approx(0.3, abs=0.03) or not longest["recovered"]
+    for d in losses:
+        assert d["height_cm"] == pytest.approx(25.0, abs=1.0)
+        assert d["cause"] == d["causes"][0] and d["fix"]
+        assert 0.0 <= d["start_s"] <= meta["duration_s"] + 0.1
+    reason_txt = (folder / entry["files"]["reason"]).read_text(encoding="utf-8")
+    assert reason_txt.splitlines()[0] == entry["reason"]
+
+
+def test_a_kept_take_lists_no_losses_in_the_meta(rp, monkeypatch, tmp_path,
+                                                 protocol_file):
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook"))
+    meta = read_json(next((session_dir(out) / "meta").glob("*.json")))
+    assert meta["accepted"] is True and meta["gate"]["reason"] == ""
+    assert meta["gate"]["losses"] == []
 
 
 def test_the_operator_can_redo_a_take_and_the_decision_is_timed(

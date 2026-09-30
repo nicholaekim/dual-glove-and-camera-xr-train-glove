@@ -13,6 +13,14 @@ Usage:
   python camera_view.py --band 18,28         # target height band in cm
   python camera_view.py --still full         # per-take stills of the whole frame
 
+One line near the bottom, `tracking: 90 Hz, lost 2 times this minute, last:
+too high`, is the loss classifier of `leap_hand.tracking_quality` run on
+this window's own stream: every time the hand is gone for more than 100 ms
+or comes back under a new id, it says why (height, edge of the field, palm
+turned away, closed hand, speed, frame rate, IR brightness, device status).
+It is fed from the SDK's callback at a few microseconds a frame, so the
+window does not lag for it.
+
 Other scripts start it for you and feed it a caption through --status-file.
 The still a recorder asks for there (`snap=<path>`) is cropped to the tracked
 hand, which reduces what it shows to the hand and a margin around it (a hand
@@ -29,6 +37,8 @@ from leapc_cffi import ffi, libleapc
 
 from leap_hand.protocol import (NO_TRACKED_HAND, QUIT, hand_crop_box, image_banner, parse_status,
                                 skipped_still_path, skipped_still_text)
+from leap_hand.tracking_quality import (HandState, LiveLossTracker, Sample, decode_device_status,
+                                        image_stats)
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--hand", choices=["left", "right", "both"], default="both")
@@ -62,6 +72,14 @@ state = {"img": None, "img_t": None, "images": 0,
          "px": [], "px_t": 0.0}
 HANDS_FRESH_S = 0.25              # older tracking than this is drawn as no hand
 
+# The "tracking:" line. The tracker is fed on the SDK's thread; `tq` holds the
+# newest IR brightness (measured ten times a second) and device status flags,
+# both written and read on that same thread; `tq_lock` guards the tracker
+# against compose() reading its line on the main thread.
+tracker = LiveLossTracker(prefer=None if args.hand == "both" else args.hand)
+tq_lock = threading.Lock()
+tq = {"image": None, "image_t": 0.0, "status": None}
+
 
 def image_to_numpy(image):
     c = image.c_data; p = c.properties
@@ -85,6 +103,13 @@ class Listener(leap.Listener):
             state["img"] = img
             state["img_t"] = time.time()       # a picture IS here, whatever
             state["images"] += 1               # the policy reply said
+        now = time.time()
+        if now - tq["image_t"] >= 0.1:
+            try:
+                tq["image"] = image_stats(img)
+                tq["image_t"] = now
+            except Exception:
+                pass
 
     def on_tracking_event(self, e):
         hands = []
@@ -99,10 +124,45 @@ class Listener(leap.Listener):
             r = np.array([-p[0], -p[1], -p[2]]); r = r / (np.linalg.norm(r) or 1.0)
             ang = math.degrees(math.acos(max(-1.0, min(1.0, float(np.dot(np.array(n), r))))))
             hands.append(dict(side=side, id=h.id, palm=p, wrist=vec(h.arm.next_joint), elbow=vec(h.arm.prev_joint),
-                              chains=chains, view_deg=ang, visible=h.visible_time / 1e6))
+                              chains=chains, view_deg=ang, visible=h.visible_time / 1e6,
+                              grab=float(h.grab_strength), pinch=float(h.pinch_strength)))
         with lock:
             state["hands"] = hands; state["hands_t"] = time.time()
             state["fps"] = float(e.framerate or 0.0); state["frames"] += 1
+        self.track(e, hands)
+
+    @staticmethod
+    def track(e, hands):
+        """Feed this frame to the "tracking:" line's loss classifier."""
+        try:
+            img = tq["image"] if time.time() - tq["image_t"] < 0.25 else None
+            states = tuple(HandState(side=d["side"], hand_id=int(d["id"]),
+                                     palm=(d["palm"][0] / 1000.0, d["palm"][1] / 1000.0, d["palm"][2] / 1000.0),
+                                     view_deg=d["view_deg"], grab=d["grab"], pinch=d["pinch"],
+                                     visible_s=d["visible"]) for d in hands)
+            sample = Sample(t=float(e.timestamp) / 1e6, hands=states, framerate=float(e.framerate or 0.0) or None,
+                            image_mean=None if img is None else img[0],
+                            image_saturated=None if img is None else img[1], status=tq["status"])
+            with tq_lock:
+                tracker.add(sample)
+        except Exception:
+            pass                               # the line is a help; it must never stop the window
+
+    @staticmethod
+    def device_status(e):
+        try:
+            tq["status"] = decode_device_status(e.c_data.status)
+        except Exception:
+            pass
+
+    def on_device_event(self, e):
+        self.device_status(e)
+
+    def on_device_status_change_event(self, e):
+        self.device_status(e)
+
+    def on_device_failure_event(self, e):
+        self.device_status(e)
 
 
 conn = leap.Connection(listeners=[Listener()])
@@ -243,6 +303,9 @@ def compose():
     border = (80, 255, 80) if (ok_all and seen) else (60, 60, 255)
     cv2.rectangle(frame, (0, 0), (size - 1, size - 1), border, 6)
     put(frame, f"tracking {fps:4.1f} Hz   target {LOW:.0f}-{HIGH:.0f} cm   q / Esc closes", (14, size - 16), 0.5, (200, 200, 200), 1)
+    with tq_lock:
+        tline = tracker.line(); lost = tracker.lost_in_window()
+    put(frame, tline, (14, size - 72), 0.5, (0, 190, 255) if lost else (200, 200, 200), 1)
     banner = image_banner(time.time(), img_t, STARTED)
     if banner:
         put(frame, banner, (14, size - 44), 0.5, (0, 190, 255), 1)

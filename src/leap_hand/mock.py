@@ -22,6 +22,22 @@ hand-id change every `reacquire_every` frames — 5 s by default, which is what
 a real re-acquisition looks like: new id, `visible_time` back to zero.
 `scripts/leap/stats.py` counts both.
 
+Dropouts that mean something. A periodic dropout at a fixed hover height
+tells the analysis nothing about WHY the camera lost the hand, and
+`leap_hand.tracking_quality` exists to answer exactly that. So a `script`
+can drive the generator frame by frame: a callable `script(i)` that returns
+None (nothing changes) or a dict with any of
+
+  drop          True: no hand this frame, a dropout WHERE the script puts it
+  origin_mm     (x, y, z) wrist position in camera millimetres
+  roll_deg      turn about the forearm axis; 90 is the palm edge-on
+  curl          0 open .. 1 fist (grab_strength follows it)
+  framerate     the tracking rate the event reports
+  id_offset     added to the hand id: a re-acquisition, with or without a gap
+
+and `sides` limits the generator to one hand, the way the protocol is run.
+With no script the frames are exactly what they were before.
+
 Geometry is a plausible cartoon of a hand, not a calibrated one: segment
 lengths are typical adult values and the joint angles come from two
 parameters (curl, spread). It exists to exercise conversion, recording,
@@ -84,6 +100,11 @@ def _rot_y(a: float) -> np.ndarray:
     return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
 
 
+def _rot_z(a: float) -> np.ndarray:
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
 _FORWARD = np.array([0.0, 0.0, -1.0])   # a bone points along its local -z
 
 
@@ -100,6 +121,8 @@ class MockLeapStream:
         dropout_frames: int = 20,
         reacquire_every: int = 450,
         cycle_seconds: float = 4.0,
+        sides: Tuple[str, ...] = ("left", "right"),
+        script=None,
     ):
         self.hz = float(hz)
         self.pose = pose
@@ -108,6 +131,8 @@ class MockLeapStream:
         self.dropout_frames = int(dropout_frames)
         self.reacquire_every = int(reacquire_every)
         self.cycle_frames = max(1, int(cycle_seconds * hz))
+        self.sides = tuple(sides)
+        self.script = script             # see the module docstring
         self._rng = random.Random(seed)
         self._i = 0                      # frames generated so far
         self._buffer: deque = deque()
@@ -166,8 +191,11 @@ class MockLeapStream:
             if (self.dropout_every
                     and (i % self.dropout_every) >= self.dropout_every - self.dropout_frames):
                 continue  # hand not reported at all — a real tracking dropout
-            for side in ("left", "right"):
-                out.append((side, self._hand(side, i)))
+            extra = self.script(i) if self.script is not None else None
+            if extra and extra.get("drop"):
+                continue  # a scripted dropout: the script chose where it happens
+            for side in self.sides:
+                out.append((side, self._hand(side, i, extra)))
                 self.hands_emitted += 1
         return out
 
@@ -187,13 +215,30 @@ class MockLeapStream:
             return pose, 0.15, 0.30, sweep
         return "open_palm", 0.0, 1.0, 0.0           # open_palm and anything else
 
-    def _hand(self, side: str, i: int) -> LeapHand:
+    def _hand(self, side: str, i: int, extra: Optional[dict] = None) -> LeapHand:
         _, curl, spread, opposition = self._pose_params(i)
+        extra = extra or {}
+        if "curl" in extra:
+            curl = max(0.0, min(1.0, float(extra["curl"])))
+            spread = 1.0 - curl
+            opposition = 0.85 * curl
         mirror = -1.0 if side == "left" else 1.0
-        origin = np.array([_HAND_X[side], _HAND_Y, _HAND_Z])
+        origin = (np.array([float(v) for v in extra["origin_mm"]])
+                  if "origin_mm" in extra
+                  else np.array([_HAND_X[side], _HAND_Y, _HAND_Z]))
+        # A turn about the forearm axis (+z, wrist to elbow), applied to the
+        # whole hand about the wrist. None, not the identity, when there is
+        # none, so an unscripted frame is computed exactly as it always was.
+        roll = math.radians(float(extra.get("roll_deg", 0.0)))
+        turn = _rot_z(roll) if roll else None
+
+        def orient(rot: np.ndarray) -> np.ndarray:
+            return rot if turn is None else turn @ rot
 
         def place(local) -> np.ndarray:
             v = np.array([local[0] * mirror, local[1], local[2]])
+            if turn is not None:
+                v = turn @ v
             return origin + v
 
         abs26: List[np.ndarray] = [None] * 26       # type: ignore[list-item]
@@ -202,7 +247,7 @@ class MockLeapStream:
         # PALM / WRIST. Palm down, fingers away from the user: the hand frame
         # coincides with the camera frame, so both are the identity rotation
         # (mirrored hands included — the mirror lives in the x offsets).
-        hand_rot = np.eye(3)
+        hand_rot = orient(np.eye(3))
         abs26[0] = place(_PALM_CENTRE)
         quat26[0] = mat3_to_quat(hand_rot)
         abs26[1] = place(_WRIST)
@@ -211,9 +256,9 @@ class MockLeapStream:
         # Thumb: yaw swings it across the palm, pitch drops it toward the palm.
         yaw = (0.75 - 0.55 * opposition) * mirror
         pitch = -0.15 - 0.85 * opposition - 0.55 * curl
-        p = np.array([_THUMB_CMC[0] * mirror, _THUMB_CMC[1], _THUMB_CMC[2]]) + origin
+        p = place(_THUMB_CMC)
         for k, length in enumerate(_THUMB_LENGTHS):
-            rot = _rot_y(yaw) @ _rot_x(pitch - 0.35 * k * (opposition + curl))
+            rot = orient(_rot_y(yaw) @ _rot_x(pitch - 0.35 * k * (opposition + curl)))
             abs26[2 + k] = p
             quat26[2 + k] = mat3_to_quat(rot)
             p = p + rot @ _FORWARD * length
@@ -226,14 +271,14 @@ class MockLeapStream:
             j = 6 + f * 5
             abs26[j] = place(spec["base"])            # METACARPAL
             knuckle = place(spec["knuckle"])
-            metacarpal_rot = _rot_y(spec["spread"] * spread * mirror)
+            metacarpal_rot = orient(_rot_y(spec["spread"] * spread * mirror))
             quat26[j] = mat3_to_quat(metacarpal_rot)
 
             p = knuckle
             angle = 0.0
             for k, length in enumerate(spec["lengths"]):
                 angle -= curl * (0.95 if k == 0 else 1.05)
-                rot = _rot_y(spec["spread"] * spread * mirror) @ _rot_x(angle)
+                rot = orient(_rot_y(spec["spread"] * spread * mirror) @ _rot_x(angle))
                 abs26[j + 1 + k] = p
                 quat26[j + 1 + k] = mat3_to_quat(rot)
                 p = p + rot @ _FORWARD * length
@@ -262,6 +307,7 @@ class MockLeapStream:
         generation = i // self.reacquire_every if self.reacquire_every else 0
         since_reacquire = i - generation * self.reacquire_every if self.reacquire_every else i
         base_id = 1001 if side == "right" else 2001
+        base_id += int(extra.get("id_offset", 0))
 
         # This generator's LeapC clock IS the wall clock: `_t0_us` is
         # `time.time()` at start(), and frame i sits one interval after it. So
@@ -278,7 +324,8 @@ class MockLeapStream:
             hand_id=base_id + generation,
             timestamp_us=timestamp_us,
             frame_id=i,
-            framerate=self.hz + self._rng.gauss(0.0, 0.4),
+            framerate=(float(extra["framerate"]) if "framerate" in extra
+                       else self.hz + self._rng.gauss(0.0, 0.4)),
             visible_time_us=int(since_reacquire * 1e6 / self.hz),
             pinch_strength=round(min(1.0, opposition * 0.9 + curl * 0.1), 3),
             grab_strength=round(curl, 3),

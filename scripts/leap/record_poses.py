@@ -72,7 +72,13 @@ What changes from the plain session, and why:
   Two decisions per take. The acquisition gate is automatic: at least 90 %
   of the take's frames tracked and no re-acquisition inside the static
   interval, or the attempt moves to `rejected/` with its reason and is
-  retried (`--retries`). The gate is a minimum, not the acceptance: a take
+  retried (`--retries`). The reason names the losses behind a rejection
+  (`leap_hand.tracking_quality`): how many, and for the longest, where the
+  hand was and the likely cause with its fix, for example "tracked 72
+  percent: lost 3 times, longest 1.4 s with the hand at 49 cm (too high:
+  keep the palm 25 to 35 cm above the module)". Every loss, kept take or
+  not, is written to the meta as `gate.losses`. The gate is a minimum, not
+  the acceptance: a take
   can be 95 % tracked with one fingertip wrong. So the recorder then shows
   the still with the numbers and the operator keeps it (Enter or space),
   redoes it (r) or ends the session (q). The decision and its time are
@@ -113,6 +119,7 @@ from leap_hand.recorder import LeapRecorder
 from leap_hand.static_interval import (DEFAULT_STATIC_S, MIN_TRACKED_FRACTION,
                                        row_frame, summarise_take)
 from leap_hand.stream import LeapUnavailable, open_stream
+from leap_hand.tracking_quality import LOSS_GAP_S, take_losses, take_reason
 from xr_hand.recorder import finalize_pose_name, hand_tag, pose_filename, slugify
 
 # The same list the glove records, so the two datasets are comparable pose for
@@ -1110,17 +1117,25 @@ class ProtocolSession(Session):
         rows = read_rows(leap_path)
         summary = summarise_take(rows, t_stop - t_start, self.static_s,
                                  prefer=self.hand, min_tracked=MIN_TRACKED)
+        # Every loss of the operator's hand in the take, with where the hand
+        # was and why: the evidence a bare "tracked 72 %" does not carry.
+        losses = take_losses(rows, summary.hand_label, t_start, t_stop)
+        gate_text = take_reason(summary.gate_reason, summary.tracked_fraction,
+                                MIN_TRACKED, summary.interval_reacquisitions,
+                                summary.medoid_row is not None, losses.losses,
+                                losses.head_s)
         still, missing = self._still_result(still_path)
         lines = self.review_lines(item, n, attempt, summary, t_start)
         for line in lines[1:]:
             print(f"      {line}")
 
         if not summary.passed:
-            print(f"      REJECTED by the gate: {summary.gate_reason}")
+            print(f"      REJECTED by the gate: {gate_text}")
             return self._conclude(item, n, attempt, name, summary,
                                   (t_start, t_stop), missing,
-                                  accepted=False, reason=summary.gate_reason,
-                                  by="gate", decided_at=time.time())
+                                  accepted=False, reason=gate_text,
+                                  by="gate", decided_at=time.time(),
+                                  losses=losses, gate_text=gate_text)
 
         self._caption(f"REVIEW {label} take {n}: Enter keep, r redo, q quit")
         try:
@@ -1130,23 +1145,23 @@ class ProtocolSession(Session):
             self._conclude(item, n, attempt, name, summary, (t_start, t_stop),
                            missing, accepted=False,
                            reason="interrupted (Ctrl+C) at the review",
-                           by="operator", decided_at=time.time())
+                           by="operator", decided_at=time.time(), losses=losses)
             raise
         if action == "accept":
             print(f"      KEPT ({by})\n")
             return self._conclude(item, n, attempt, name, summary,
                                   (t_start, t_stop), missing,
                                   accepted=True, reason="", by=by,
-                                  decided_at=when)
+                                  decided_at=when, losses=losses)
         if action == "redo":
             return self._conclude(item, n, attempt, name, summary,
                                   (t_start, t_stop), missing,
                                   accepted=False, reason="operator redo",
-                                  by="operator", decided_at=when)
+                                  by="operator", decided_at=when, losses=losses)
         self._conclude(item, n, attempt, name, summary, (t_start, t_stop),
                        missing, accepted=False,
                        reason="the operator quit the session at the review",
-                       by="operator", decided_at=when)
+                       by="operator", decided_at=when, losses=losses)
         raise QuitSession()
 
     def _record(self, recorder, t_start: float, label: str,
@@ -1206,8 +1221,14 @@ class ProtocolSession(Session):
     def _conclude(self, item: dict, n: int, attempt: int, name: str, summary,
                   span: Tuple[float, float], still_missing: Optional[str],
                   accepted: bool, reason: str, by: str,
-                  decided_at: float) -> Attempt:
-        """Write the keypoints and the meta, move a refused attempt, log it."""
+                  decided_at: float, losses=None,
+                  gate_text: Optional[str] = None) -> Attempt:
+        """Write the keypoints and the meta, move a refused attempt, log it.
+
+        `losses` is the take's `tracking_quality.TakeLosses` (None when the
+        take never got that far) and `gate_text` the gate's reason with the
+        losses named, when the gate is what refused it.
+        """
         iid = str(item["id"])
         rejected = not accepted
         leap_src = self.folder(LEAP_DIR) / f"{name}.jsonl"
@@ -1256,7 +1277,8 @@ class ProtocolSession(Session):
             files["reason"] = self.rel(note)
 
         meta = self.meta_dict(item, n, attempt, name, summary, span, files,
-                              still_missing, accepted, reason, by, decided_at)
+                              still_missing, accepted, reason, by, decided_at,
+                              losses=losses, gate_text=gate_text)
         write_json(meta_path, meta)
         if rejected:
             note.parent.mkdir(parents=True, exist_ok=True)
@@ -1286,7 +1308,8 @@ class ProtocolSession(Session):
     def meta_dict(self, item: dict, n: int, attempt: int, name: str, s,
                   span: Tuple[float, float], files: dict,
                   still_missing: Optional[str], accepted: bool, reason: str,
-                  by: str, decided_at: float) -> dict:
+                  by: str, decided_at: float, losses=None,
+                  gate_text: Optional[str] = None) -> dict:
         """Contract section 7, every field, then what else is known."""
         row = None if s is None else s.medoid_row
         interval = None if s is None or s.interval is None else [
@@ -1329,12 +1352,19 @@ class ProtocolSession(Session):
             "static_s": self.static_s,
             "gate": {
                 "passed": bool(s is not None and s.passed),
-                "reason": "" if s is None else s.gate_reason,
+                "reason": (gate_text if gate_text is not None
+                           else "" if s is None else s.gate_reason),
                 "min_tracked_fraction": MIN_TRACKED,
                 "tracked_frames": None if s is None else s.tracked_frames,
                 "expected_frames": None if s is None else s.expected_frames,
                 "reacquisitions_in_static_interval": (
                     None if s is None else len(s.interval_reacquisitions)),
+                # Every loss of the operator's hand (gone longer than
+                # loss_gap_s, or a new hand id), kept take or not, with where
+                # the hand was, the likely causes and the fix; start_s is from
+                # the start of the take. See leap_hand.tracking_quality.
+                "loss_gap_s": LOSS_GAP_S if losses is None else losses.gap_s,
+                "losses": [] if losses is None else losses.to_list(),
             },
             # The tracker label whose frames were taken as the operator's
             # hand (the one with the most frames), and the summary frame's

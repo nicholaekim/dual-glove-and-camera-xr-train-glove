@@ -93,9 +93,12 @@ and its height reads OK. The other line saying NO HAND is expected.
 
 ## When a take is rejected
 
-The console prints `REJECTED by the gate:` and the reason, for example
-`tracked 72 % of the take's frames (324 of 450); the gate needs 90 %`. The
-attempt's files move to `rejected\` beside a `<take>.reason.txt`, and the
+The console prints `REJECTED by the gate:` and the reason, which names the
+losses behind it, for example `tracked 72 percent: lost 3 times, longest
+1.4 s with the hand at 49 cm (too high: keep the palm 25 to 35 cm above the
+module); the gate needs 90 percent`. Every loss is also listed in the take's
+meta file under `gate.losses`, and `docs\tracking_quality.md` explains each
+cause. The attempt's files move to `rejected\` beside a `<take>.reason.txt`, and the
 recorder counts down to the same take again, up to 2 more times. Before the
 next countdown ends, fix the cause:
 
@@ -105,7 +108,7 @@ next countdown ends, fix the cause:
   high beep to the low beep and keep the hand over the middle of the module.
 
 After 3 failed attempts the recorder moves on to the next take. The end
-table then lists that grasp as short of its takes, and step 6 below records
+table then lists that grasp as short of its takes, and step 7 below records
 what is missing.
 
 ## Steps
@@ -154,7 +157,23 @@ finger at a time, s to save a picture of the window into
 `docs\joint_frames.md`. The window only reads the camera, so it can also
 stay open while you record.
 
-### Step 5. Camera only, bare left hand: record the grasps
+### Step 5. Camera only, bare left hand: run the 60 second tracking test
+
+Go through the physical checklist at the top of `docs\tracking_quality.md`
+first (module flat, lenses up and wiped, cable straight into the laptop, no
+sunlight, one hand over the module). Then:
+
+```
+.venv\Scripts\python.exe scripts\leap\tracking_quality.py --hand left
+```
+
+Follow the instructions it prints and shows in the camera window for one
+minute, slowly. It ends with a line that starts with `VERDICT:`. If the
+verdict names a cause, apply its fix and run this step again. Go on to the
+next step when the verdict says no losses, or when the only losses are the
+ones you caused on purpose (50 cm, the far side, the palm turned away).
+
+### Step 6. Camera only, bare left hand: record the grasps
 
 Before you press Enter: the module flat on the table with the lenses up, no
 sunlight on it, your right hand resting on the table away from the module,
@@ -169,7 +188,7 @@ each. Plan on about 15 minutes of recording plus your time at the reviews.
 At the end it prints the table (grasp, take, accepted, tracked %, grab,
 pinch) and the folder, and opens the folder in Explorer.
 
-### Step 6. Camera only, bare left hand: record the takes the table says are missing
+### Step 7. Camera only, bare left hand: record the takes the table says are missing
 
 Do this step only when a line under the table starts with
 `Short of 3 kept takes`. Below that line, after "Record the missing takes
@@ -184,7 +203,7 @@ Copy the printed command, not this example. It adds the missing takes to
 the same session folder and carries the take numbers on, so Set A stays one
 session (plan D9).
 
-### Step 7. No hardware: look at the session folder
+### Step 8. No hardware: look at the session folder
 
 ```
 explorer recordings\protocol\grasps
@@ -194,14 +213,14 @@ Open the newest folder. Every grasp should have 3 files in `leap\`,
 `stills\`, `keypoints\` and `meta\`. The stills stay on this machine: they
 are for our own checking and are not handed in.
 
-### Step 8. No hardware: write the joint frames of the session
+### Step 9. No hardware: write the joint frames of the session
 
 ```
 .venv\Scripts\python.exe scripts\joint_frames_view.py --session recordings\protocol\grasps\20260928_140501_left
 ```
 
 Put your session's folder name in place of `20260928_140501_left`: it is
-the newest folder you opened in step 7. For every kept take the script
+the newest folder you opened in step 8. For every kept take the script
 writes the summary frame's 26 joints (position, axes, angles) to
 `joint_frames\<take>.csv` inside the session folder, a drawing of it to
 `joint_frames\<take>.png`, and one `joint_frames\joint_frames.pdf` with a
