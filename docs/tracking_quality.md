@@ -42,20 +42,24 @@ cd "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer"
 .venv\Scripts\python.exe scripts\leap\tracking_quality.py --hand left
 ```
 
-It prints the plan, opens the camera window, gives you 3 seconds to put the
-hand over the module, then beeps and runs for 60 seconds. A beep marks each
-new instruction, and the instruction is also the caption of the camera
-window, so keep your eyes on the window. Do each one slowly:
+Keep your eyes on the camera window. It shows the move in large letters at
+the top, a bar under it that runs down to the next move, your hand with its
+skeleton, and one tracking line at the bottom. Every new move is a beep and
+the move spoken aloud. The terminal prints one setup line, then one line as
+each move starts, then the report.
 
-| From | What to do |
-|------|------------|
-| 0 s  | hold the hand open, palm toward the lenses, 30 cm above the middle of the module, and keep it still |
-| 10 s | move the hand slowly up to 50 cm, then slowly back down to 30 cm |
-| 20 s | at 30 cm, move slowly out to the left and back, then out to the right and back |
-| 30 s | turn the palm slowly away from the lenses, then back |
-| 38 s | close the hand slowly into a fist, then open it |
-| 43 s | pinch the thumb and index slowly, then open |
-| 48 s | hold each of the paper grasps you like, one after another, slowly |
+First the window says "Get ready: hand 30 cm up" for 3 seconds. Then come
+six moves, 10 seconds each. Do each one slowly.
+
+Setup for all six: camera only, bare left hand, module flat on the desk,
+lenses up.
+
+1. Hand open, hold still. 30 cm above the middle of the module, palm to the lenses.
+2. Slowly up, then back down. Up to about 50 cm, then back to 30 cm.
+3. Slowly left, then right. Out to the left and back, then out to the right and back.
+4. Turn the palm away, then back. Turn it slowly away from the lenses.
+5. Slow fist, then open. Close the hand slowly, then open it.
+6. Three grasp shapes, slowly. Three of the paper grasps, one after another.
 
 Some of these are meant to lose the hand (50 cm, the far side, the palm
 turned away): the test finds out where your camera's limits are, so the
@@ -69,8 +73,13 @@ report:
                                    brightness and the device status
     tracking_quality_<stamp>.txt   the report, the same text as printed
 
-The last line starts with `VERDICT:`. Ctrl+C stops early and still writes
-both files.
+The last line starts with `VERDICT:`. Ctrl+C in the terminal, or q or Esc
+in the window, stops early and still writes both files.
+
+`--no-voice` keeps the voice quiet, `--no-beep` turns the beeps off and
+`--no-view` keeps the window shut; the terminal prints the same lines
+either way. On a computer without the Windows voice the test simply runs
+without it. `--seconds` sets the whole run; the six moves share it evenly.
 
 ## Reading the report
 
@@ -143,12 +152,14 @@ from the tracking frames instead.
 ### Step 1. No hardware: rehearse the test on a scripted hand
 
 ```
-.venv\Scripts\python.exe scripts\leap\tracking_quality.py --mock --seconds 60 --no-view
+.venv\Scripts\python.exe scripts\leap\tracking_quality.py --mock --seconds 60 --hand left --no-view
 ```
 
-The mock hand is lost on purpose in every way the report can explain, so
-this shows what a report with every cause looks like. Nothing in it is
-evidence about the real camera, and the report says so.
+You hear the same beeps and voice and see the same terminal lines as in the
+real test; there is no window. The mock hand is lost on purpose in every
+way the report can explain, so this shows what a report with every cause
+looks like. Nothing in it is evidence about the real camera, and the report
+says so.
 
 ### Step 2. No hardware: print the report of an earlier run again
 

@@ -4,12 +4,17 @@ The classifier is the evidence for "the camera does not register sometimes",
 so every cause is tested with a synthetic series built to produce exactly
 that cause and nothing else, the loss definition is pinned at its edge
 (a 100 ms hole is not a loss, a 150 ms hole is), and the 60 second test is
-run end to end on the scripted mock the way the operator runs it.
+run end to end on the scripted mock the way the operator runs it. The
+coaching is pinned too: six short moves, the window's phrase, bar, status
+and skeleton, a voice that fails silently, and a console that prints one
+setup line, one line per move and the report, nothing repeated.
 """
 import csv
+import gc
 import importlib.util
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -343,25 +348,141 @@ def test_the_reject_reason_names_the_losses_like_the_example():
                           []) == "no hand was tracked during the take"
 
 
+# --- the coaching: six moves, a beep and a voice, one window -------------------------------
+SIX_MOVES = (
+    "Hand open, hold still",
+    "Slowly up, then back down",
+    "Slowly left, then right",
+    "Turn the palm away, then back",
+    "Slow fist, then open",
+    "Three grasp shapes, slowly",
+)
+
+
+def test_six_short_moves_split_the_run_evenly():
+    script = load_script()
+    assert script.MOVES == SIX_MOVES
+    assert all(len(p.split()) <= 6 for p in script.MOVES + (script.GET_READY,))
+    assert script.scaled_steps(60.0) == [(10.0 * k, p) for k, p in enumerate(SIX_MOVES)]
+    assert [script.move_index(t, 60.0) for t in (0.0, 9.99, 10.0, 35.0, 59.99, 60.0)] == [
+        0, 0, 1, 3, 5, 5]
+    # --seconds 5: every move is 5/6 s, and every one of them still comes up
+    assert {script.move_index(k * 5.0 / 6 + 0.01, 5.0) for k in range(6)} == set(range(6))
+    assert script.setup_line("left") == (
+        "Camera only, bare left hand. Module flat on the desk, lenses up.")
+    assert script.move_line(1) == "Move 2 of 6: Slowly up, then back down"
+
+
+def test_the_window_shows_the_phrase_the_bar_the_status_and_the_skeleton():
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+    from leap_hand.mock import MockLeapStream
+    script = load_script()
+    lh = [h for _s, h in MockLeapStream(hz=HZ, dropout_every=0, reacquire_every=0,
+                                       sides=("left",)).generate(3)][-1]
+
+    def to_px(p):                       # a plain pinhole, the mock has no LeapC
+        x, y, z = p
+        return None if y <= 5 else (int(384 - 700 * (x - 32) / y), int(384 + 700 * z / y))
+
+    top, size = script.VIEW_TOP, script.VIEW_SIZE
+    picture = np.full((384, 384), 4, np.uint8)
+    frame = script.compose_frame(picture, [lh], SIX_MOVES[3], 0.5, "hand seen   tracked 99 %",
+                                 to_px, hand_now=True)
+    assert frame.shape == (top + size + script.VIEW_BOTTOM, size, 3)
+    white = (frame >= 200).all(axis=2)
+    assert white[:80].sum() > 2000                          # the phrase, large, at the top
+    scale = script.phrase_scale(cv2)
+    assert scale >= 1.2
+    for p in SIX_MOVES:                                     # and every phrase fits
+        assert cv2.getTextSize(p, 0, scale, 3)[0][0] <= size - 48
+    amber = tuple(script._AMBER)
+    bar_y = 98                                              # the countdown bar, half left
+    assert tuple(frame[bar_y, 24 + 180]) == amber
+    assert tuple(frame[bar_y, 24 + 540]) != amber
+    empty = script.compose_frame(picture, [], SIX_MOVES[3], 0.0, "NO HAND", to_px)
+    assert not (empty[84:112] == amber).all(axis=2).any()
+    assert (frame[top + size:] > 100).any(axis=2).sum() > 200   # the status line
+    cyan = ((frame[..., 0] > 200) & (frame[..., 1] > 170) & (frame[..., 2] < 90))
+    no_hand = ((empty[..., 0] > 200) & (empty[..., 1] > 170) & (empty[..., 2] < 90))
+    assert cyan[top:top + size].sum() > 200 and no_hand.sum() == 0   # the skeleton
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
+def test_the_voice_fails_silently(capfd):
+    script = load_script()
+    off = script.Voice(["no-such-program-for-the-voice"])
+    assert not off.on
+    off.say("Hand open, hold still")
+    off.close()
+    gone = script.Voice([sys.executable, "-c", "import sys; sys.stderr.write('x'); sys.exit(3)"])
+    gone._proc.wait(timeout=30)                 # a voice that died at start-up
+    gone.say("Hand open, hold still")
+    gone.say("Slowly up, then back down")
+    assert not gone.on
+    gone.close()
+    del gone
+    gc.collect()                                # nothing left to complain at exit
+    assert script.Voice(None).on is False
+    out, err = capfd.readouterr()
+    assert out == "" and err == ""
+
+
+@pytest.mark.skipif(shutil.which("powershell") is None, reason="no Windows PowerShell")
+def test_the_voice_script_runs_in_powershell():
+    """The real PowerShell loop, with the sound sent nowhere."""
+    script = load_script()
+    loop = script.VOICE_LOOP.replace("$voice.Speak($line)",
+                                     "$voice.SetOutputToNull(); $voice.Speak($line)")
+    assert loop != script.VOICE_LOOP
+    voice = script.Voice(list(script.VOICE_COMMAND[:-1]) + [loop])
+    if not voice.on:
+        pytest.skip("PowerShell would not start")
+    proc = voice._proc
+    for phrase in SIX_MOVES:
+        voice.say(phrase)
+    voice.close()
+    assert proc.wait(timeout=60) == 0
+
+
+def test_the_doc_lists_the_six_moves():
+    text = (REPO / "docs" / "tracking_quality.md").read_text(encoding="utf-8")
+    for k, phrase in enumerate(SIX_MOVES, 1):
+        assert re.search(rf"^{k}\. {re.escape(phrase)}\b", text, re.M), phrase
+    assert chr(0x2014) not in text
+
+
 # --- the 60 second test, end to end on the mock ---------------------------------------------
 def test_the_mock_run_end_to_end(tmp_path):
     out = tmp_path / "diag"
     done = subprocess.run(
-        [sys.executable, str(SCRIPT), "--mock", "--seconds", "3", "--no-view",
-         "--out", str(out)],
+        [sys.executable, str(SCRIPT), "--mock", "--seconds", "5", "--no-view",
+         "--no-voice", "--no-beep", "--out", str(out)],
         cwd=REPO, capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stdout + done.stderr
     printed = [x for x in done.stdout.splitlines() if x.strip()]
-    assert printed[-1].startswith("VERDICT: too high (2 of 4 losses)"), printed[-5:]
+    assert printed[-1].startswith("VERDICT: too high (2 of 7 losses)"), printed[-5:]
     csvs = list(out.glob("tracking_quality_*.csv"))
     txts = list(out.glob("tracking_quality_*.txt"))
     assert len(csvs) == 1 and len(txts) == 1
     report = txts[0].read_text(encoding="utf-8").splitlines()
     assert report[-1] == printed[-1]
     assert any(x.startswith("Mock run:") for x in report)
+    # The console: one setup line, one line per move, then the report. No
+    # plan, no status line repeated many times a second (universal newlines
+    # turn a "\r" rewrite into lines of its own, so it would show up here).
+    before = printed[:next(i for i, x in enumerate(printed)
+                           if x.startswith("Per-frame series:"))]
+    assert before == ["Camera only, bare hand. Module flat on the desk, lenses up."] + [
+        f"Move {k} of 6: {p}" for k, p in enumerate(SIX_MOVES, 1)]
+    for phrase in SIX_MOVES:
+        assert done.stdout.count(phrase) == 1, phrase
+    lines = done.stdout.splitlines()
+    assert len(lines) == len(before) + 4 + len(report), lines[:20]
+    assert "s left" not in done.stdout
     with open(csvs[0], encoding="utf-8", newline="") as fh:
         rows = list(csv.DictReader(fh))
-    assert len(rows) == pytest.approx(3 * HZ, abs=10)
+    assert len(rows) == pytest.approx(5 * HZ, abs=10)
     assert list(rows[0]) == list(tq.SERIES_COLUMNS)
     assert {r["tracked"] for r in rows} == {"0", "1"}
 
