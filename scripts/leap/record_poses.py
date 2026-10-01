@@ -84,6 +84,16 @@ What changes from the plain session, and why:
   redoes it (r) or ends the session (q). The decision and its time are
   written by the recorder, never by hand. `--auto-accept` skips the prompt.
 
+  The picture to copy is on screen. The protocol's `images_dir` and each
+  item's `image` name the panel cut from the paper's figure (made by
+  `make_panels.py` beside the papers). Through the countdown and the take
+  it fills a window titled COPY THIS, under the grasp's label, the take
+  number and the countdown or HOLD STILL with the seconds left. The review
+  then appears in that same window, the paper's picture beside the still,
+  and the next countdown brings the next grasp's picture back. A missing
+  picture is replaced by the grasp's shape text, and the console says so
+  once. `--no-panel` turns the window off for headless runs.
+
   One session per set (plan D9). A grasp still short of its takes at the
   end is recorded with `--resume <session folder>`, which adds the missing
   takes to that same folder and carries the take numbering on, instead of
@@ -698,8 +708,13 @@ class Reviewer:
         self._keys = keys
 
     def decide(self, still: Optional[Path], lines: List[str],
-               pump=None) -> Tuple[str, float, str]:
-        """("accept" | "redo" | "quit", when, "auto" | "operator")."""
+               pump=None, screen=None, reference=None) -> Tuple[str, float, str]:
+        """("accept" | "redo" | "quit", when, "auto" | "operator").
+
+        `screen` is the session's COPY THIS window: when it is open the
+        review is shown in it, with `reference` (the paper's picture of the
+        grasp) beside the still, and the window stays open afterwards.
+        """
         if self.auto:
             return "accept", time.time(), "auto"
         if self._keys is not None:
@@ -707,6 +722,8 @@ class Reviewer:
             return self.ACTIONS.get(key.lower(), "quit"), time.time(), "operator"
         print(f"      {REVIEW_KEYS}")
         try:
+            if screen is not None and screen.enabled:
+                return self._in_screen(screen, still, lines, pump, reference)
             return self._window(still, lines, pump)
         except Exception as e:                     # no GUI: fall back to the console
             print(f"      (review window unavailable: {e})")
@@ -750,15 +767,55 @@ class Reviewer:
             except Exception:
                 pass
 
+    def _in_screen(self, screen, still, lines, pump, reference) -> Tuple[str, float, str]:
+        """The review in the COPY THIS window, read from it or the console."""
+        image = self.compose(still, lines, reference)
+        try:
+            msvcrt = __import__("msvcrt")
+        except ImportError:
+            msvcrt = None
+        # Keys typed into the console during the countdown or the take are
+        # stale: one of them must not keep or redo this take unseen.
+        while msvcrt is not None and msvcrt.kbhit():
+            msvcrt.getwch()
+        while True:
+            code = screen.show(image)
+            if not screen.enabled:
+                raise RuntimeError("the COPY THIS window could not be shown")
+            key = chr(code & 0xFF) if code != -1 else ""
+            if not key and msvcrt is not None and msvcrt.kbhit():
+                key = msvcrt.getwch()
+            action = self.ACTIONS.get(key.lower()) if key else None
+            if action:
+                return action, time.time(), "operator"
+            if pump is not None:
+                pump()
+            time.sleep(0.03)
+
     @staticmethod
-    def compose(still: Optional[Path], lines: List[str]):
-        """The still (or a note that there is none) above the numbers."""
+    def compose(still: Optional[Path], lines: List[str], reference=None):
+        """The still (or a note that there is none) above the numbers, and
+        the paper's picture of the grasp beside the still when given."""
         import cv2
         import numpy as np
 
         width = 720
         img = cv2.imread(str(still)) if still is not None and Path(still).is_file() else None
-        if img is None:
+        if reference is not None:
+            ref_w = 250
+            ref = _fit_into(reference, ref_w, 480)
+            box_w = width - ref_w - 30
+            if img is None:
+                left = np.zeros((120, box_w, 3), np.uint8)
+                cv2.putText(left, "no still for this take", (6, 70),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 190, 255), 2, cv2.LINE_AA)
+            else:
+                left = _fit_into(img, box_w, 480)
+            top = np.zeros((max(left.shape[0], ref.shape[0]), width, 3), np.uint8)
+            top[:left.shape[0], 10:10 + left.shape[1]] = left
+            x = width - 10 - ref.shape[1]
+            top[:ref.shape[0], x:x + ref.shape[1]] = ref
+        elif img is None:
             top = np.zeros((120, width, 3), np.uint8)
             cv2.putText(top, "no still for this take", (16, 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 190, 255), 2, cv2.LINE_AA)
@@ -775,6 +832,315 @@ class Reviewer:
             cv2.putText(panel, text, (14, 26 + 34 * k), cv2.FONT_HERSHEY_SIMPLEX,
                         0.62 if k else 0.8, colour, 2 if k == 0 else 1, cv2.LINE_AA)
         return np.vstack([top, panel])
+
+
+# --- the picture to copy ------------------------------------------------------------
+# For every grasp the protocol names a picture: `images_dir` at the top of the
+# file, `image` on each item, the panel cut from the paper's figure by
+# `make_panels.py` beside the papers. It fills the COPY THIS window through the
+# countdown and the take, so the operator never has to look for it on a sheet.
+COPY_WINDOW = "COPY THIS"
+COPY_W = 720                  # drawing width of the window
+COPY_BAND_H = 170             # the label and the status line, above the picture
+COPY_PANEL_H = 700            # the picture, drawn this tall when its width allows
+COPY_H = COPY_BAND_H + COPY_PANEL_H + 10
+COPY_REFRESH_S = 0.04         # redrawn at most 25 times a second
+COPY_X = 800                  # beside the camera window, where the review was
+_BG, _WHITE, _GREY = (32, 32, 32), (255, 255, 255), (200, 200, 200)
+_STATUS_COLOURS = {"GET READY": (0, 220, 255), "HOLD STILL": (70, 70, 255)}
+
+
+def panel_dir(protocol: dict, protocol_path=None) -> Optional[Path]:
+    """The protocol's `images_dir`, a relative one taken from the protocol
+    file's folder; None when the file has none."""
+    folder = protocol.get("images_dir")
+    if not folder:
+        return None
+    folder = Path(str(folder))
+    if not folder.is_absolute() and protocol_path is not None:
+        folder = Path(protocol_path).resolve().parent / folder
+    return folder
+
+
+def panel_path(protocol: dict, item: dict, protocol_path=None) -> Optional[Path]:
+    """Where `item`'s picture should be, `images_dir` / `image`, or None when
+    either key is absent. Whether the file exists is not checked here."""
+    folder = panel_dir(protocol, protocol_path)
+    name = item.get("image")
+    if folder is None or not name:
+        return None
+    return folder / str(name)
+
+
+def _fit_into(img, width: int, height: int):
+    """`img` scaled to fit width x height, aspect kept; as is when it fits exactly."""
+    import cv2
+
+    h, w = img.shape[:2]
+    f = min(width / w, height / h)
+    size = (max(1, int(round(w * f))), max(1, int(round(h * f))))
+    if size == (w, h):
+        return img
+    return cv2.resize(img, size, interpolation=cv2.INTER_AREA if f < 1 else cv2.INTER_CUBIC)
+
+
+def _wrap_text(text: str, scale: float, thick: int, width: int) -> List[str]:
+    """Words wrapped to `width` pixels in OpenCV's plain font at `scale`."""
+    import cv2
+
+    lines, line = [], ""
+    for word in str(text).split():
+        trial = f"{line} {word}".strip()
+        if line and cv2.getTextSize(trial, cv2.FONT_HERSHEY_SIMPLEX, scale,
+                                    thick)[0][0] > width:
+            lines.append(line)
+            line = word
+        else:
+            line = trial
+    return lines + ([line] if line else [])
+
+
+def _fit_text(text: str, width: int, max_lines: int, scales, thick: int):
+    """(lines, scale): the largest of `scales` at which `text` takes at most
+    `max_lines` lines, else the smallest, with every line."""
+    for scale in scales:
+        lines = _wrap_text(text, scale, thick, width)
+        if len(lines) <= max_lines:
+            break
+    return lines, scale
+
+
+def status_text(status: str, seconds: Optional[float]) -> str:
+    """'GET READY  3', 'HOLD STILL  2.4 s', or the status alone."""
+    if seconds is None:
+        return status
+    if status == "GET READY":
+        return f"{status}  {max(0, math.ceil(seconds - 1e-9))}"
+    return f"{status}  {max(0.0, seconds):.1f} s"
+
+
+def compose_copy(item: dict, panel, take: int, takes: int, status: str,
+                 seconds: Optional[float] = None):
+    """One frame of the COPY THIS window, and what is on it.
+
+    The grasp's label in large letters, the take number and the countdown
+    ("GET READY 3") or "HOLD STILL 2.4 s" above the paper's picture, drawn
+    700 px tall (narrower when the picture is wide). Without a picture
+    (`panel` None) the grasp's shape is written in its place, large, with
+    where it is in the papers. Returns (image, info): info["lines"] is
+    every text drawn, info["label"] the label's lines, info["status"] the
+    status text, info["panel_box"] the picture's (x, y, w, h) or None, and
+    info["label_bottom"] and info["status_top"] the rows where the label's
+    letters end and the status line's begin.
+    """
+    import cv2
+    import numpy as np
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    img = np.full((COPY_H, COPY_W, 3), _BG, np.uint8)
+    drawn: List[str] = []
+
+    def put(text, org, scale, colour, thick):
+        cv2.putText(img, text, org, font, scale, colour, thick, cv2.LINE_AA)
+        drawn.append(text)
+
+    # The label on one line as large as 1.2, else on two lines no larger
+    # than 1.0, which is what leaves the status line room below it.
+    label = str(item.get("label") or item.get("id"))
+    lines, scale = _fit_text(label, COPY_W - 32, 1, (1.2, 1.1, 1.0), 2)
+    if len(lines) > 1:
+        lines, scale = _fit_text(label, COPY_W - 32, 2,
+                                 (1.0, 0.9, 0.8, 0.7, 0.6), 2)
+    label_lines = list(lines)
+    label_bottom = 0
+    for k, line in enumerate(lines):
+        y = 14 + int(30 * scale) + k * int(42 * scale)
+        put(line, (16, y), scale, _WHITE, 2)
+        label_bottom = max(label_bottom,
+                           y + cv2.getTextSize(line, font, scale, 2)[1] + 2)
+    y_status = COPY_BAND_H - 20
+    put(f"take {take}/{takes}", (16, y_status), 1.0, _GREY, 2)
+    text = status_text(status, seconds)
+    (width, height), _base = cv2.getTextSize(text, font, 1.4, 3)
+    put(text, (COPY_W - 16 - width, y_status), 1.4,
+        _STATUS_COLOURS.get(status, _GREY), 3)
+    status_top = y_status - max(height, cv2.getTextSize(
+        f"take {take}/{takes}", font, 1.0, 2)[0][1]) - 2
+
+    box = None
+    if panel is not None:
+        pic = _fit_into(panel, COPY_W - 20, COPY_PANEL_H)
+        h, w = pic.shape[:2]
+        x = (COPY_W - w) // 2
+        img[COPY_BAND_H:COPY_BAND_H + h, x:x + w] = pic
+        box = (x, COPY_BAND_H, w, h)
+    else:
+        y = COPY_BAND_H + 30
+        put("no picture for this grasp: copy this shape", (16, y), 0.7,
+            (0, 160, 255), 2)
+        shape = str(item.get("shape") or label)
+        lines, scale = _fit_text(shape, COPY_W - 32, 8,
+                                 (1.3, 1.2, 1.1, 1.0, 0.9, 0.8), 2)
+        y += 30
+        for line in lines:
+            y += cv2.getTextSize(line, font, scale, 2)[0][1] + 22
+            put(line, (16, y), scale, _WHITE, 2)
+        where = ", ".join(str(item[k]) for k in ("source", "figure") if item.get(k))
+        if where:
+            y += 40
+            for line in _wrap_text(f"in the papers: {where}", 0.65, 1, COPY_W - 32):
+                y += 30
+                put(line, (16, y), 0.65, _GREY, 1)
+    return img, {"lines": drawn, "label": label_lines, "status": text,
+                 "panel_box": box, "label_bottom": label_bottom,
+                 "status_top": status_top}
+
+
+def _screen_size() -> Optional[Tuple[int, int]]:
+    """The primary screen's (width, height), or None off Windows."""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
+    except Exception:
+        return None
+
+
+class CopyWindow:
+    """The COPY THIS window: the paper's picture of the grasp being recorded.
+
+    Shown through the preparation countdown and the take; the take's review
+    then appears in the same window (`Reviewer.decide(screen=...)`), and the
+    next countdown brings the next grasp's picture back. A grasp whose
+    picture is missing gets its shape text instead, and the console says so
+    once. A machine that cannot open a window turns it off with one line on
+    the console and the session carries on.
+    """
+
+    def __init__(self, protocol: dict, protocol_path=None,
+                 items: Optional[List[dict]] = None):
+        self.enabled = True
+        self.protocol = protocol
+        self.protocol_path = protocol_path
+        self.folder = panel_dir(protocol, protocol_path)
+        self._panels = {}
+        self._size = None          # the drawing size the window was fitted to
+        self._open = False
+        self._next = 0.0
+        self.items = list(items if items is not None else protocol.get("items") or [])
+
+    def describe(self) -> str:
+        """The session header's line about the pictures."""
+        if self.folder is None:
+            return ("the protocol file has no images_dir: the COPY THIS window "
+                    "shows each grasp's shape text instead of its picture")
+        found = sum(1 for it in self.items
+                    if (p := panel_path(self.protocol, it, self.protocol_path))
+                    is not None and p.is_file())
+        return (f"{found} of {len(self.items)} pictures found in {self.folder} "
+                "(COPY THIS window)")
+
+    def panel(self, item: dict):
+        """The item's picture, fitted to the window once and kept; None when
+        there is none, which the console is told the first time."""
+        iid = str(item.get("id"))
+        if iid not in self._panels:
+            import cv2
+
+            path = panel_path(self.protocol, item, self.protocol_path)
+            img = None
+            if path is not None and path.is_file():
+                img = cv2.imread(str(path))
+            if img is None and self.folder is not None:
+                why = ("its item has no image" if path is None else
+                       f"{path} is missing" if not path.is_file() else
+                       f"{path} cannot be read")
+                print(f"      no picture for {iid}: {why}; the COPY THIS window "
+                      "shows its shape text instead")
+            self._panels[iid] = (None if img is None
+                                 else _fit_into(img, COPY_W - 20, COPY_PANEL_H))
+        return self._panels[iid]
+
+    def show_copy(self, item: dict, take: int, takes: int, status: str,
+                  seconds: Optional[float] = None, force: bool = False) -> None:
+        """Redraw the window for this moment of the take; at most 25 times a
+        second unless `force`."""
+        if not self.enabled:
+            return
+        now = time.time()
+        if not force and now < self._next:
+            return
+        self._next = now + COPY_REFRESH_S
+        img, _info = compose_copy(item, self.panel(item), take, takes, status, seconds)
+        self.show(img)
+
+    def show(self, img) -> int:
+        """Put `img` in the window, without waiting; the key pressed or -1.
+
+        Smaller pictures (the review) are drawn on the window's own size, so
+        the window does not jump between the countdown and the review.
+        """
+        if not self.enabled:
+            return -1
+        try:
+            import cv2
+            import numpy as np
+
+            h, w = img.shape[:2]
+            if h < COPY_H or w < COPY_W:
+                canvas = np.full((max(h, COPY_H), max(w, COPY_W), 3), _BG, np.uint8)
+                canvas[:h, (canvas.shape[1] - w) // 2:(canvas.shape[1] - w) // 2 + w] = img
+                img = canvas
+            if not self._visible():
+                cv2.namedWindow(COPY_WINDOW, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+                self._open, self._size = True, None
+                try:
+                    cv2.setWindowProperty(COPY_WINDOW, cv2.WND_PROP_TOPMOST, 1)
+                except Exception:
+                    pass
+            if self._size != img.shape[:2]:
+                self._size = img.shape[:2]
+                self._place(*self._size)
+            cv2.imshow(COPY_WINDOW, img)
+            return cv2.pollKey()
+        except Exception as e:
+            self.enabled = False
+            print(f"      (COPY THIS window unavailable: {e}; carrying on without it)")
+            return -1
+
+    def _visible(self) -> bool:
+        if not self._open:
+            return False
+        import cv2
+        try:
+            return cv2.getWindowProperty(COPY_WINDOW, cv2.WND_PROP_VISIBLE) >= 1
+        except Exception:
+            return False
+
+    @staticmethod
+    def _place(h: int, w: int) -> None:
+        """Sized to fit the screen, beside the camera window when there is room."""
+        import cv2
+
+        screen = _screen_size()
+        f = 1.0 if screen is None else min(1.0, 0.95 * screen[0] / w,
+                                           0.88 * screen[1] / h)
+        cv2.resizeWindow(COPY_WINDOW, int(w * f), int(h * f))
+        x = COPY_X if screen is None else max(0, min(COPY_X, screen[0] - int(w * f) - 10))
+        try:
+            cv2.moveWindow(COPY_WINDOW, x, 0)
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        if self._open:
+            self._open = False
+            try:
+                import cv2
+                cv2.destroyWindow(COPY_WINDOW)
+                cv2.waitKey(1)
+            except Exception:
+                pass
 
 
 # --- the session ------------------------------------------------------------------
@@ -851,7 +1217,7 @@ class ProtocolSession(Session):
                  still: str, reviewer: Reviewer, view=None, mock: bool = False,
                  raw: bool = False, note: str = "", operator: Optional[str] = None,
                  auto_accept: bool = False,
-                 resume: Optional[Tuple[Path, dict]] = None):
+                 resume: Optional[Tuple[Path, dict]] = None, panel=None):
         self.session_dir = (Path(resume[0]) if resume is not None
                             else make_session_dir(out_root, hand))
         super().__init__(_Tap(source), hz=None, out_dir=self.session_dir, raw=raw)
@@ -872,6 +1238,8 @@ class ProtocolSession(Session):
         self.note = note or ""
         self.operator = operator
         self.auto_accept = bool(auto_accept)
+        self.panel = panel                     # the COPY THIS window, or None
+        self._now: Optional[Tuple[dict, int]] = None   # (item, take) on screen
         self.entries: List[dict] = []          # session.json "takes"
         self.attempts: List[Attempt] = []
         self.accepted = {str(it["id"]): 0 for it in items}
@@ -969,6 +1337,14 @@ class ProtocolSession(Session):
         if self.view is not None:
             self.view.caption(text, band=ENVELOPE_BAND_CM)
 
+    # --- the COPY THIS window -----------------------------------------------
+    def _copy(self, status: str, seconds: Optional[float] = None,
+              force: bool = False) -> None:
+        """The current grasp's picture with this status, in COPY THIS."""
+        if self.panel is not None and self._now is not None:
+            item, n = self._now
+            self.panel.show_copy(item, n, self.takes, status, seconds, force=force)
+
     # --- one grasp ----------------------------------------------------------
     def announce(self, item: dict, index: int, count: int) -> None:
         print("=" * 62)
@@ -1048,6 +1424,7 @@ class ProtocolSession(Session):
                 if whole <= 3:
                     print(f"      {whole}...")
                     beep(660, 120)
+            self._copy("GET READY", left)
             self._consume()
             time.sleep(0.02)
 
@@ -1086,6 +1463,8 @@ class ProtocolSession(Session):
         # it cycle, which still gives the static interval something to find.
         if hasattr(self.source, "set_pose"):
             self.source.set_pose(iid if iid in ("open_palm", "fist") else None)
+        self._now = (item, n)
+        self._copy("GET READY", self.prep, force=True)
         self._countdown(label)
 
         recorder = LeapRecorder(hz=None, pose=iid, take=n)
@@ -1105,6 +1484,7 @@ class ProtocolSession(Session):
                     recorder.stop()
                     t_stop = time.time()
                     beep(500, 300)
+                    self._copy("CHECKING THE TAKE", force=True)
         except KeyboardInterrupt:
             # Nothing recorded is deleted: an interrupted attempt is kept
             # under rejected/ with the reason, like any attempt not kept.
@@ -1139,8 +1519,9 @@ class ProtocolSession(Session):
 
         self._caption(f"REVIEW {label} take {n}: Enter keep, r redo, q quit")
         try:
-            action, when, by = self.reviewer.decide(still, lines,
-                                                    pump=self._consume)
+            action, when, by = self.reviewer.decide(
+                still, lines, pump=self._consume, screen=self.panel,
+                reference=None if self.panel is None else self.panel.panel(item))
         except KeyboardInterrupt:
             self._conclude(item, n, attempt, name, summary, (t_start, t_stop),
                            missing, accepted=False,
@@ -1181,6 +1562,7 @@ class ProtocolSession(Session):
                 if whole != shown:
                     shown = whole
                     self._caption(f"HOLD: {label}   REC {whole}s")
+                self._copy("HOLD STILL", t_end - now)
                 # The still at the midpoint: the hand is settled by then and
                 # the take is not over, so it shows what the file holds.
                 if still_path is not None and now >= midpoint:
@@ -1495,6 +1877,7 @@ def run_protocol(args, parser) -> None:
     out_root = ((MOCK_PROTOCOL_OUT if args.mock else PROTOCOL_OUT)
                 if args.out_dir is None else args.out_dir)
     reviewer = Reviewer(auto=args.auto_accept)
+    panel = None if args.no_panel else CopyWindow(protocol, args.protocol, items)
     session = None
     try:
         session = ProtocolSession(
@@ -1502,7 +1885,7 @@ def run_protocol(args, parser) -> None:
             takes, duration, prep, static_s, retries, still, reviewer,
             view=view, mock=args.mock, raw=args.raw, note=args.note or "",
             operator=args.operator, auto_accept=args.auto_accept,
-            resume=resume)
+            resume=resume, panel=panel)
 
         eta = len(items) * takes * (prep + duration + 1.0)
         print("=" * 62)
@@ -1516,6 +1899,8 @@ def run_protocol(args, parser) -> None:
               f"{retries} retries")
         print("  review:  " + ("every take that passes the gate is kept "
                                "(--auto-accept)" if args.auto_accept else REVIEW_KEYS))
+        print("  picture: " + ("off (--no-panel)" if panel is None
+                               else panel.describe()))
         print(f"  folder:  {session.session_dir}")
         if resume is not None:
             kept = sum(session.accepted.values())
@@ -1539,6 +1924,8 @@ def run_protocol(args, parser) -> None:
         source.stop()
         if view is not None:
             view.close()
+        if panel is not None:
+            panel.close()
         if session is not None:
             session.finish()
             session.print_table()
@@ -1598,6 +1985,9 @@ def main() -> None:
                         "file's static_s, else 2)")
     g.add_argument("--auto-accept", action="store_true",
                    help="keep every take that passes the gate without asking")
+    g.add_argument("--no-panel", action="store_true",
+                   help="no COPY THIS window with the paper's picture of each "
+                        "grasp (headless runs); the review opens its own window")
     g.add_argument("--no-open", action="store_true",
                    help="do not open the session folder at the end")
     g.add_argument("--note", default=None,
@@ -1618,6 +2008,7 @@ def main() -> None:
         ("--resume", args.resume),
         ("--retries", args.retries), ("--static-s", args.static_s),
         ("--auto-accept", args.auto_accept), ("--no-open", args.no_open),
+        ("--no-panel", args.no_panel),
         ("--note", args.note), ("--operator", args.operator),
         ("--mock-dropout", args.mock_dropout)) if value not in (None, False)]
     if protocol_only:

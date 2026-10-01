@@ -6,31 +6,296 @@
   "takes_per_item": 3,
   "duration_s": 5.0,
   "prep_s": 5.0,
+  "images_dir": "C:/Users/nkim2/OneDrive/Desktop/xr trainer/reference/grasp papers/panels",
   "items": [
-    {"id": "p1_cylindrical", "label": "Cylindrical (paper 1, Schlesinger)", "source": "p1 Heumer et al. 2007", "figure": "Figure 1, panel 1; Table 1", "shape": "all four fingers and the thumb wrap around a vertical cylinder, palm on the object, thumb opposing the fingers", "object": "bottle, hammer, flower pot, coffee jug", "object_implied": true, "same_as": ["p2_s01_power_grasp", "p3_prismatic_power_medium_wrap"]},
-    {"id": "p1_hook", "label": "Hook (paper 1, Schlesinger)", "source": "p1 Heumer et al. 2007", "figure": "Figure 1, panel 2; Table 1", "shape": "four fingers curled into a hook carrying a handle, thumb straight and out of the way, palm not touching", "object": "plastic case, toolbox, backpack, bag", "object_implied": true, "same_as": []},
-    {"id": "p1_lateral", "label": "Lateral (paper 1, Schlesinger)", "source": "p1 Heumer et al. 2007", "figure": "Figure 1, panel 3; Table 1", "shape": "thumb pad presses a flat thin object against the side of the bent index finger (key grasp)", "object": "floppy disk, key, ID card, CD cover", "object_implied": true, "same_as": ["p2_s07_directional_power_side"]},
-    {"id": "p1_palmar", "label": "Palmar (paper 1, Schlesinger)", "source": "p1 Heumer et al. 2007", "figure": "Figure 1, panel 4; Table 1", "shape": "a small box held between the thumb pad and the pads of the fingers, fingers nearly straight, palm open", "object": "small box, matchbox, tape roller, PDA", "object_implied": true, "same_as": ["p3_circular_precision_thumb_4_fingers"]},
-    {"id": "p1_spherical", "label": "Spherical (paper 1, Schlesinger)", "source": "p1 Heumer et al. 2007", "figure": "Figure 1, panel 5; Table 1", "shape": "fingers and thumb spread around a ball, all fingertips and the palm on the surface", "object": "tennis ball, egg-shaped case, bowl, mouse", "object_implied": true, "same_as": ["p2_s02_power_grasp_ball", "p3_circular_power"]},
-    {"id": "p1_tip", "label": "Tip (paper 1, Schlesinger)", "source": "p1 Heumer et al. 2007", "figure": "Figure 1, panel 6; Table 1", "shape": "a small object held between the tips of the thumb and the index finger only, other fingers curled away", "object": "nail, pencil, small eraser, PDA", "object_implied": true, "same_as": ["p2_s04_fingertip_grasp", "p3_circular_precision_thumb_1_finger"]},
-
-    {"id": "p2_s01_power_grasp", "label": "Scenario 1: Power grasp (paper 2)", "source": "p2 de Souza et al. 2015", "figure": "Table 1 scenario 1; Fig. 13 first image", "shape": "a large cylinder encaged by all fingers and the thumb and grasped firmly, palm on the object", "object": "large cylinder (can)", "object_implied": true, "same_as": ["p1_cylindrical"]},
-    {"id": "p2_s02_power_grasp_ball", "label": "Scenario 2: Power grasp on a ball (paper 2)", "source": "p2 de Souza et al. 2015", "figure": "Table 1 scenario 2; Fig. 13 second image", "shape": "a ball encaged by all fingers and the thumb and grasped firmly", "object": "ball", "object_implied": true, "same_as": ["p1_spherical"]},
-    {"id": "p2_s03_power_grasp_finger_side", "label": "Scenario 3: Power grasp including finger side (paper 2)", "source": "p2 de Souza et al. 2015", "figure": "Table 1 scenario 3; Fig. 13 third image", "shape": "a box encaged and grasped firmly, with the side of the index finger also on the object", "object": "box", "object_implied": true, "same_as": []},
-    {"id": "p2_s04_fingertip_grasp", "label": "Scenario 4: Fingertip grasp (paper 2)", "source": "p2 de Souza et al. 2015", "figure": "Table 1 scenario 4; Fig. 13 fourth image", "shape": "a small ball held by the fingertips and the thumb tip only, palm clear of the object", "object": "small ball", "object_implied": true, "same_as": ["p1_tip"]},
-    {"id": "p2_s05_fingertip_grasp_side_support", "label": "Scenario 5: Fingertip grasp with side support (paper 2)", "source": "p2 de Souza et al. 2015", "figure": "Table 1 scenario 5; Fig. 13 fifth image", "shape": "fingertip grasp of a small object with the side of the index finger giving support", "object": "small object", "object_implied": true, "same_as": []},
-    {"id": "p2_s06_tripod_grasp", "label": "Scenario 6: Tripod grasp (paper 2)", "source": "p2 de Souza et al. 2015", "figure": "Table 1 scenario 6; Fig. 13 sixth image", "shape": "a pen held by the thumb tip, the index fingertip and the side of the middle finger", "object": "marker pen", "object_implied": true, "same_as": ["p3_circular_precision_thumb_2_fingers"]},
-    {"id": "p2_s07_directional_power_side", "label": "Scenario 7: Directional power grasp, thumb and finger side (paper 2)", "source": "p2 de Souza et al. 2015", "figure": "Table 1 scenario 7; Fig. 13 seventh image", "shape": "a tool handle wrapped by the fingers with the thumb pressing along the side of the index finger to point the tool", "object": "screwdriver", "object_implied": true, "same_as": ["p1_lateral"]},
-    {"id": "p2_s08_directional_power_tips", "label": "Scenario 8: Directional power grasp, thumb and finger tips (paper 2)", "source": "p2 de Souza et al. 2015", "figure": "Table 1 scenario 8; Fig. 13 eighth image", "shape": "a glass wrapped by the fingers with the thumb and the fingertips giving the direction", "object": "glass", "object_implied": true, "same_as": []},
-    {"id": "p2_s09_directional_power_side_and_tips", "label": "Scenario 9: Directional power grasp, thumb, finger side and finger tips (paper 2)", "source": "p2 de Souza et al. 2015", "figure": "Table 1 scenario 9; Fig. 13 ninth image", "shape": "a tool handle wrapped firmly with the thumb, the side of the index finger and the fingertips all on the handle", "object": "tool handle", "object_implied": true, "same_as": []},
-    {"id": "p2_s10_power_grasp_dexterous", "label": "Scenario 10: Power grasp with dexterous ability (paper 2)", "source": "p2 de Souza et al. 2015", "figure": "Table 1 scenario 10; Fig. 13 tenth image", "shape": "a spray bottle wrapped by the lower fingers while the thumb and the index fingertip stay free to press the trigger", "object": "spray bottle", "object_implied": true, "same_as": []},
-
-    {"id": "p3_circular_power", "label": "Circular power grasp (paper 3, Cutkosky)", "source": "p3 Cobos et al. 2009", "figure": "Figure 4, Power > Circular; Figure 5 a and b", "shape": "the hand wraps a ball with the palm and all fingers, fingers spread around it", "object": "tennis ball, big ball", "object_implied": true, "same_as": ["p1_spherical", "p2_s02_power_grasp_ball"]},
-    {"id": "p3_prismatic_power_medium_wrap", "label": "Prismatic power grasp, medium wrap (paper 3, Cutkosky)", "source": "p3 Cobos et al. 2009", "figure": "Figure 4, Power > Prismatic > Medium wrap; Figure 5 c", "shape": "fingers and thumb wrap a handle of medium diameter, thumb closed over the fingers", "object": "hammer", "object_implied": true, "same_as": ["p1_cylindrical", "p2_s01_power_grasp"]},
-    {"id": "p3_prismatic_power_heavy_wrap", "label": "Prismatic power grasp, heavy wrap (paper 3, Cutkosky)", "source": "p3 Cobos et al. 2009", "figure": "Figure 4, Power > Prismatic > Heavy wrap", "shape": "fingers wrap a large-diameter object with the thumb pressing alongside, a heavier wrap than the medium one", "object": "large handle or bar", "object_implied": true, "same_as": []},
-    {"id": "p3_circular_precision_thumb_4_fingers", "label": "Circular precision grasp, thumb and 4 fingers (paper 3, Cutkosky)", "source": "p3 Cobos et al. 2009", "figure": "Figure 4, Precision > Circular > Thumb 4 fingers", "shape": "a disk held by the thumb pad and the pads of all four fingers, palm not touching", "object": "disk or lid", "object_implied": true, "same_as": ["p1_palmar"]},
-    {"id": "p3_circular_precision_thumb_2_fingers", "label": "Circular precision grasp, thumb and 2 fingers (paper 3, Cutkosky)", "source": "p3 Cobos et al. 2009", "figure": "Figure 4, Precision > Circular > Thumb 2 fingers", "shape": "a small round object held by the thumb, index and middle fingertips (tripod)", "object": "small round object", "object_implied": true, "same_as": ["p2_s06_tripod_grasp"]},
-    {"id": "p3_circular_precision_thumb_1_finger", "label": "Circular precision grasp, thumb and 1 finger (paper 3, Cutkosky)", "source": "p3 Cobos et al. 2009", "figure": "Figure 4, Precision > Circular > Thumb 1 finger; Figure 5 d", "shape": "a coin held between the thumb tip and the index fingertip", "object": "coin", "object_implied": true, "same_as": ["p1_tip", "p2_s04_fingertip_grasp"]},
-    {"id": "p3_prismatic_precision", "label": "Prismatic precision grasp (paper 3, Cutkosky)", "source": "p3 Cobos et al. 2009", "figure": "Figure 4, Precision > Prismatic; Figure 5 e", "shape": "a pen held along the fingers by the thumb pad and the pads of the index and middle fingers, as for writing", "object": "pen", "object_implied": true, "same_as": []}
+    {
+      "id": "p1_cylindrical",
+      "label": "Cylindrical (paper 1, Schlesinger)",
+      "source": "p1 Heumer et al. 2007",
+      "figure": "Figure 1, panel 1; Table 1",
+      "shape": "all four fingers and the thumb wrap around a vertical cylinder, palm on the object, thumb opposing the fingers",
+      "object": "bottle, hammer, flower pot, coffee jug",
+      "object_implied": true,
+      "same_as": [
+        "p2_s01_power_grasp",
+        "p3_prismatic_power_medium_wrap"
+      ],
+      "image": "p1_cylindrical.png"
+    },
+    {
+      "id": "p1_hook",
+      "label": "Hook (paper 1, Schlesinger)",
+      "source": "p1 Heumer et al. 2007",
+      "figure": "Figure 1, panel 2; Table 1",
+      "shape": "four fingers curled into a hook carrying a handle, thumb straight and out of the way, palm not touching",
+      "object": "plastic case, toolbox, backpack, bag",
+      "object_implied": true,
+      "same_as": [],
+      "image": "p1_hook.png"
+    },
+    {
+      "id": "p1_lateral",
+      "label": "Lateral (paper 1, Schlesinger)",
+      "source": "p1 Heumer et al. 2007",
+      "figure": "Figure 1, panel 3; Table 1",
+      "shape": "thumb pad presses a flat thin object against the side of the bent index finger (key grasp)",
+      "object": "floppy disk, key, ID card, CD cover",
+      "object_implied": true,
+      "same_as": [
+        "p2_s07_directional_power_side"
+      ],
+      "image": "p1_lateral.png"
+    },
+    {
+      "id": "p1_palmar",
+      "label": "Palmar (paper 1, Schlesinger)",
+      "source": "p1 Heumer et al. 2007",
+      "figure": "Figure 1, panel 4; Table 1",
+      "shape": "a small box held between the thumb pad and the pads of the fingers, fingers nearly straight, palm open",
+      "object": "small box, matchbox, tape roller, PDA",
+      "object_implied": true,
+      "same_as": [
+        "p3_circular_precision_thumb_4_fingers"
+      ],
+      "image": "p1_palmar.png"
+    },
+    {
+      "id": "p1_spherical",
+      "label": "Spherical (paper 1, Schlesinger)",
+      "source": "p1 Heumer et al. 2007",
+      "figure": "Figure 1, panel 5; Table 1",
+      "shape": "fingers and thumb spread around a ball, all fingertips and the palm on the surface",
+      "object": "tennis ball, egg-shaped case, bowl, mouse",
+      "object_implied": true,
+      "same_as": [
+        "p2_s02_power_grasp_ball",
+        "p3_circular_power"
+      ],
+      "image": "p1_spherical.png"
+    },
+    {
+      "id": "p1_tip",
+      "label": "Tip (paper 1, Schlesinger)",
+      "source": "p1 Heumer et al. 2007",
+      "figure": "Figure 1, panel 6; Table 1",
+      "shape": "a small object held between the tips of the thumb and the index finger only, other fingers curled away",
+      "object": "nail, pencil, small eraser, PDA",
+      "object_implied": true,
+      "same_as": [
+        "p2_s04_fingertip_grasp",
+        "p3_circular_precision_thumb_1_finger"
+      ],
+      "image": "p1_tip.png"
+    },
+    {
+      "id": "p2_s01_power_grasp",
+      "label": "Scenario 1: Power grasp (paper 2)",
+      "source": "p2 de Souza et al. 2015",
+      "figure": "Table 1 scenario 1; Fig. 13 first image",
+      "shape": "a large cylinder encaged by all fingers and the thumb and grasped firmly, palm on the object",
+      "object": "large cylinder (can)",
+      "object_implied": true,
+      "same_as": [
+        "p1_cylindrical"
+      ],
+      "image": "p2_s01_power_grasp.png"
+    },
+    {
+      "id": "p2_s02_power_grasp_ball",
+      "label": "Scenario 2: Power grasp on a ball (paper 2)",
+      "source": "p2 de Souza et al. 2015",
+      "figure": "Table 1 scenario 2; Fig. 13 second image",
+      "shape": "a ball encaged by all fingers and the thumb and grasped firmly",
+      "object": "ball",
+      "object_implied": true,
+      "same_as": [
+        "p1_spherical"
+      ],
+      "image": "p2_s02_power_grasp_ball.png"
+    },
+    {
+      "id": "p2_s03_power_grasp_finger_side",
+      "label": "Scenario 3: Power grasp including finger side (paper 2)",
+      "source": "p2 de Souza et al. 2015",
+      "figure": "Table 1 scenario 3; Fig. 13 third image",
+      "shape": "a box encaged and grasped firmly, with the side of the index finger also on the object",
+      "object": "box",
+      "object_implied": true,
+      "same_as": [],
+      "image": "p2_s03_power_grasp_finger_side.png"
+    },
+    {
+      "id": "p2_s04_fingertip_grasp",
+      "label": "Scenario 4: Fingertip grasp (paper 2)",
+      "source": "p2 de Souza et al. 2015",
+      "figure": "Table 1 scenario 4; Fig. 13 fourth image",
+      "shape": "a small ball held by the fingertips and the thumb tip only, palm clear of the object",
+      "object": "small ball",
+      "object_implied": true,
+      "same_as": [
+        "p1_tip"
+      ],
+      "image": "p2_s04_fingertip_grasp.png"
+    },
+    {
+      "id": "p2_s05_fingertip_grasp_side_support",
+      "label": "Scenario 5: Fingertip grasp with side support (paper 2)",
+      "source": "p2 de Souza et al. 2015",
+      "figure": "Table 1 scenario 5; Fig. 13 fifth image",
+      "shape": "fingertip grasp of a small object with the side of the index finger giving support",
+      "object": "small object",
+      "object_implied": true,
+      "same_as": [],
+      "image": "p2_s05_fingertip_grasp_side_support.png"
+    },
+    {
+      "id": "p2_s06_tripod_grasp",
+      "label": "Scenario 6: Tripod grasp (paper 2)",
+      "source": "p2 de Souza et al. 2015",
+      "figure": "Table 1 scenario 6; Fig. 13 sixth image",
+      "shape": "a pen held by the thumb tip, the index fingertip and the side of the middle finger",
+      "object": "marker pen",
+      "object_implied": true,
+      "same_as": [
+        "p3_circular_precision_thumb_2_fingers"
+      ],
+      "image": "p2_s06_tripod_grasp.png"
+    },
+    {
+      "id": "p2_s07_directional_power_side",
+      "label": "Scenario 7: Directional power grasp, thumb and finger side (paper 2)",
+      "source": "p2 de Souza et al. 2015",
+      "figure": "Table 1 scenario 7; Fig. 13 seventh image",
+      "shape": "a marker wrapped by the fingers like a tool handle, the thumb pressing along the side of the index finger to point it",
+      "object": "marker pen, held like a tool",
+      "object_implied": true,
+      "same_as": [
+        "p1_lateral"
+      ],
+      "image": "p2_s07_directional_power_side.png"
+    },
+    {
+      "id": "p2_s08_directional_power_tips",
+      "label": "Scenario 8: Directional power grasp, thumb and finger tips (paper 2)",
+      "source": "p2 de Souza et al. 2015",
+      "figure": "Table 1 scenario 8; Fig. 13 eighth image",
+      "shape": "a glass wrapped by the fingers with the thumb and the fingertips giving the direction",
+      "object": "glass",
+      "object_implied": true,
+      "same_as": [],
+      "image": "p2_s08_directional_power_tips.png"
+    },
+    {
+      "id": "p2_s09_directional_power_side_and_tips",
+      "label": "Scenario 9: Directional power grasp, thumb, finger side and finger tips (paper 2)",
+      "source": "p2 de Souza et al. 2015",
+      "figure": "Table 1 scenario 9; Fig. 13 ninth image",
+      "shape": "a screwdriver handle wrapped firmly with the thumb, the side of the index finger and the fingertips all on the handle",
+      "object": "screwdriver",
+      "object_implied": true,
+      "same_as": [],
+      "image": "p2_s09_directional_power_side_and_tips.png"
+    },
+    {
+      "id": "p2_s10_power_grasp_dexterous",
+      "label": "Scenario 10: Power grasp with dexterous ability (paper 2)",
+      "source": "p2 de Souza et al. 2015",
+      "figure": "Table 1 scenario 10; Fig. 13 tenth image",
+      "shape": "a spray bottle wrapped by the lower fingers while the thumb and the index fingertip stay free to press the trigger",
+      "object": "spray bottle",
+      "object_implied": true,
+      "same_as": [],
+      "image": "p2_s10_power_grasp_dexterous.png"
+    },
+    {
+      "id": "p3_circular_power",
+      "label": "Circular power grasp (paper 3, Cutkosky)",
+      "source": "p3 Cobos et al. 2009",
+      "figure": "Figure 4, Power > Circular; Figure 5 a and b",
+      "shape": "the hand wraps a ball with the palm and all fingers, fingers spread around it",
+      "object": "tennis ball, big ball",
+      "object_implied": true,
+      "same_as": [
+        "p1_spherical",
+        "p2_s02_power_grasp_ball"
+      ],
+      "image": "p3_circular_power.png"
+    },
+    {
+      "id": "p3_prismatic_power_medium_wrap",
+      "label": "Prismatic power grasp, medium wrap (paper 3, Cutkosky)",
+      "source": "p3 Cobos et al. 2009",
+      "figure": "Figure 4, Power > Prismatic > Medium wrap; Figure 5 c",
+      "shape": "fingers and thumb wrap a handle of medium diameter, thumb closed over the fingers",
+      "object": "hammer",
+      "object_implied": true,
+      "same_as": [
+        "p1_cylindrical",
+        "p2_s01_power_grasp"
+      ],
+      "image": "p3_prismatic_power_medium_wrap.png"
+    },
+    {
+      "id": "p3_prismatic_power_heavy_wrap",
+      "label": "Prismatic power grasp, heavy wrap (paper 3, Cutkosky)",
+      "source": "p3 Cobos et al. 2009",
+      "figure": "Figure 4, Power > Prismatic > Heavy wrap",
+      "shape": "fingers wrap a large-diameter object with the thumb pressing alongside, a heavier wrap than the medium one",
+      "object": "large handle or bar",
+      "object_implied": true,
+      "same_as": [],
+      "image": "p3_prismatic_power_heavy_wrap.png"
+    },
+    {
+      "id": "p3_circular_precision_thumb_4_fingers",
+      "label": "Circular precision grasp, thumb and 4 fingers (paper 3, Cutkosky)",
+      "source": "p3 Cobos et al. 2009",
+      "figure": "Figure 4, Precision > Circular > Thumb 4 fingers",
+      "shape": "a disk held by the thumb pad and the pads of all four fingers, palm not touching",
+      "object": "disk or lid",
+      "object_implied": true,
+      "same_as": [
+        "p1_palmar"
+      ],
+      "image": "p3_circular_precision_thumb_4_fingers.png"
+    },
+    {
+      "id": "p3_circular_precision_thumb_2_fingers",
+      "label": "Circular precision grasp, thumb and 2 fingers (paper 3, Cutkosky)",
+      "source": "p3 Cobos et al. 2009",
+      "figure": "Figure 4, Precision > Circular > Thumb 2 fingers",
+      "shape": "a small round object held by the thumb, index and middle fingertips (tripod)",
+      "object": "small round object",
+      "object_implied": true,
+      "same_as": [
+        "p2_s06_tripod_grasp"
+      ],
+      "image": "p3_circular_precision_thumb_2_fingers.png"
+    },
+    {
+      "id": "p3_circular_precision_thumb_1_finger",
+      "label": "Circular precision grasp, thumb and 1 finger (paper 3, Cutkosky)",
+      "source": "p3 Cobos et al. 2009",
+      "figure": "Figure 4, Precision > Circular > Thumb 1 finger; Figure 5 d",
+      "shape": "a coin held between the thumb tip and the index fingertip",
+      "object": "coin",
+      "object_implied": true,
+      "same_as": [
+        "p1_tip",
+        "p2_s04_fingertip_grasp"
+      ],
+      "image": "p3_circular_precision_thumb_1_finger.png"
+    },
+    {
+      "id": "p3_prismatic_precision",
+      "label": "Prismatic precision grasp (paper 3, Cutkosky)",
+      "source": "p3 Cobos et al. 2009",
+      "figure": "Figure 4, Precision > Prismatic; Figure 5 e",
+      "shape": "a pen held along the fingers by the thumb pad and the pads of the index and middle fingers, as for writing",
+      "object": "pen",
+      "object_implied": true,
+      "same_as": [],
+      "image": "p3_prismatic_precision.png"
+    }
   ]
 }

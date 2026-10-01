@@ -28,8 +28,19 @@ A take is named `<grasp>_left_take<N>_<YYYYMMDD_HHMMSS>`, for example
 4. A low beep: recording stops.
 5. The recorder checks the take against the acquisition gate (below). A take
    that fails is moved to `rejected\` and recorded again on its own.
-6. A take that passes opens the review window: the still of your hand and
-   the numbers. You decide with one key.
+6. A take that passes shows the review in the COPY THIS window: the still
+   of your hand and the numbers. You decide with one key.
+
+## The COPY THIS window
+
+For each grasp, the picture to copy, cut from the paper's figure, appears
+large in a window titled COPY THIS, with the grasp's name, the take number
+and the countdown, then HOLD STILL and the seconds left while the take
+records. After the take the same window shows the review, the paper's
+picture beside your still, and then the next grasp's picture. The sheet
+`grasp sheet.pdf` beside the papers is only a backup. If a picture is
+missing, the window shows the grasp's shape in words instead and the
+console says so.
 
 ## The orientation envelope
 
@@ -82,7 +93,7 @@ can be 95 % tracked with one fingertip wrong. Then press one key:
 | r | records the take again; this attempt goes to `rejected\` with the reason "operator redo" |
 | q | ends the session; this attempt goes to `rejected\` |
 
-If a key does nothing, click the review window once and press it again. The
+If a key does nothing, click the COPY THIS window once and press it again. The
 key and the time you pressed it are written to the meta file and to
 session.json.
 
@@ -180,8 +191,8 @@ ones you caused on purpose (50 cm, the far side, the palm turned away).
 ### Step 6. Camera only, bare left hand: record the grasps
 
 Before you press Enter: the module flat on the table with the lenses up, no
-sunlight on it, your right hand resting on the table away from the module,
-and the paper's figures in front of you.
+sunlight on it, and your right hand resting on the table away from the
+module. The picture of each grasp appears in the COPY THIS window.
 
 ```
 .venv\Scripts\python.exe scripts\leap\record_poses.py --protocol protocols\grasps.json --hand left --operator "N Kim"

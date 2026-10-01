@@ -43,8 +43,49 @@ def load_script():
     return module
 
 
+class Gui:
+    """OpenCV's window calls, recorded instead of opening windows."""
+
+    def __init__(self):
+        self.calls = []          # (call, window name)
+        self.shown = []          # the window name of every imshow
+        self.last = {}           # window name -> the last image shown in it
+        self.keys = []           # codes pollKey and waitKey return, then -1
+
+
 @pytest.fixture
-def rp(monkeypatch):
+def gui(monkeypatch):
+    """No test opens a real window: the COPY THIS window, on by default,
+    is drawn into this recorder instead."""
+    import cv2
+
+    g = Gui()
+
+    def record(name):
+        def call(*a, **_k):
+            g.calls.append((name, a[0] if a else None))
+        return call
+
+    for name in ("namedWindow", "setWindowProperty", "moveWindow",
+                 "resizeWindow", "destroyWindow"):
+        monkeypatch.setattr(cv2, name, record(name))
+
+    def imshow(win, img):
+        g.shown.append(win)
+        g.last[win] = img
+
+    def key(*_a):
+        return g.keys.pop(0) if g.keys else -1
+
+    monkeypatch.setattr(cv2, "imshow", imshow)
+    monkeypatch.setattr(cv2, "getWindowProperty", lambda *a: 1.0)
+    monkeypatch.setattr(cv2, "pollKey", key)
+    monkeypatch.setattr(cv2, "waitKey", key)
+    return g
+
+
+@pytest.fixture
+def rp(monkeypatch, gui):
     module = load_script()
     monkeypatch.setattr(module, "beep", lambda *a, **k: None)      # quiet, fast
     monkeypatch.setattr(module.os, "startfile", lambda *a, **k: None,
@@ -497,6 +538,248 @@ def test_the_protocol_hash_is_of_the_file_bytes(rp, protocol_file):
     data, sha = rp.load_protocol(protocol_file)
     assert sha == hashlib.sha256(protocol_file.read_bytes()).hexdigest()
     assert data["takes_per_item"] == 3 and data["duration_s"] == 5.0
+
+
+# --- the picture to copy: the COPY THIS window ---------------------------------------
+GREEN = (40, 200, 60)                       # BGR of the fixture picture
+RED = (0, 0, 255)
+
+
+def fixture_picture(path: Path, size=(300, 450)):
+    """A stand-in for a paper's panel: green, a red square near its top left."""
+    import cv2
+    import numpy as np
+
+    img = np.full((size[1], size[0], 3), GREEN, np.uint8)
+    cv2.rectangle(img, (20, 20), (120, 120), RED, -1)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    assert cv2.imwrite(str(path), img)
+    return img
+
+
+@pytest.fixture
+def with_pictures(tmp_path, protocol_file):
+    """The fixture protocol with `images_dir` and an `image` per item, and a
+    picture for each in a temporary folder (never the private papers folder)."""
+    data = read_json(protocol_file)
+    folder = tmp_path / "panels"
+    data["images_dir"] = str(folder)
+    for it in data["items"]:
+        it["image"] = f"{it['id']}.png"
+        fixture_picture(folder / it["image"])
+    path = tmp_path / "grasps_with_pictures.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    return path
+
+
+def spy_frames(rp, monkeypatch):
+    """(item id, status, picture given) for every COPY THIS frame drawn."""
+    seen = []
+    real = rp.compose_copy
+
+    def spy(item, panel, take, takes, status, seconds=None):
+        seen.append((item["id"], status, panel is not None))
+        return real(item, panel, take, takes, status, seconds)
+
+    monkeypatch.setattr(rp, "compose_copy", spy)
+    return seen
+
+
+def test_the_picture_is_images_dir_joined_with_the_items_image(rp, tmp_path):
+    item = {"id": "hook", "label": "Hook", "image": "hook.png"}
+    folder = tmp_path / "pictures"
+    assert rp.panel_path({"images_dir": str(folder)}, item) == folder / "hook.png"
+    # a relative images_dir is read from the protocol file's folder, not the
+    # folder the recorder happens to be started in
+    proto = tmp_path / "protocols" / "grasps.json"
+    assert rp.panel_path({"images_dir": "pictures"}, item, proto) == (
+        (tmp_path / "protocols").resolve() / "pictures" / "hook.png")
+    # either key absent: no picture, and no guess
+    assert rp.panel_path({}, item, proto) is None
+    assert rp.panel_path({"images_dir": str(folder)}, {"id": "hook", "label": "Hook"}) is None
+
+
+def test_the_grasp_list_names_a_picture_for_every_grasp(rp):
+    data, _sha = rp.load_protocol(REPO / "protocols" / "grasps.json")
+    assert Path(data["images_dir"]).is_absolute()
+    for it in data["items"]:
+        assert rp.panel_path(data, it) == Path(data["images_dir"]) / f"{it['id']}.png"
+
+
+def test_the_copy_frame_shows_the_label_the_take_the_countdown_and_the_picture(
+        rp, tmp_path):
+    import numpy as np
+
+    pic = fixture_picture(tmp_path / "hook.png")             # 300 x 450, tall
+    item = {"id": "hook", "label": "Hook (paper 1, Schlesinger)",
+            "shape": "four fingers curled into a hook"}
+    img, info = rp.compose_copy(item, pic, 2, 3, "GET READY", 2.3)
+    assert img.shape[:2] == (rp.COPY_H, rp.COPY_W)
+    assert " ".join(info["label"]) == item["label"]
+    assert info["lines"][:len(info["label"])] == info["label"]   # drawn first, on top
+    assert "take 2/3" in info["lines"]
+    assert info["status"] == "GET READY  3" and "GET READY  3" in info["lines"]
+    # the picture, 700 px tall, below the band, unchanged but for the scaling
+    x, y, w, h = info["panel_box"]
+    assert h == rp.COPY_PANEL_H == 700 and w == round(300 * 700 / 450)
+    assert y == rp.COPY_BAND_H and 0 <= x and x + w <= rp.COPY_W
+    placed = img[y:y + h, x:x + w].astype(int)
+    assert np.abs(placed[300:, :] - GREEN).max() <= 2         # below the square
+    assert np.abs(placed[60:150, 60:150] - RED).max() <= 2    # the square, top left
+    # the label's letters are in the band above the picture, white on dark
+    band = img[:rp.COPY_BAND_H]
+    assert int((band == 255).all(axis=2).sum()) > 300
+    assert not (band == GREEN).all(axis=2).any()
+    # during the take: HOLD STILL and the seconds left
+    _img, info = rp.compose_copy(item, pic, 1, 3, "HOLD STILL", 2.44)
+    assert info["status"] == "HOLD STILL  2.4 s" and "take 1/3" in info["lines"]
+
+
+def test_no_grasp_label_runs_into_the_status_line(rp):
+    """Every real label, long ones on two lines, ends above the take number
+    and the countdown, and is drawn whole."""
+    data, _sha = rp.load_protocol(REPO / "protocols" / "grasps.json")
+    for it in data["items"]:
+        for status, secs in (("GET READY", 5.0), ("HOLD STILL", 4.96),
+                             ("CHECKING THE TAKE", None)):
+            _img, info = rp.compose_copy(it, None, 3, 3, status, secs)
+            assert " ".join(info["label"]) == it["label"], it["id"]
+            assert len(info["label"]) <= 2, it["id"]
+            assert info["label_bottom"] < info["status_top"], (it["id"], status)
+            assert info["status_top"] > 0 and info["status_top"] < rp.COPY_BAND_H
+
+
+def test_a_missing_picture_shows_the_shape_text_and_is_reported_once(
+        rp, tmp_path, capsys, gui):
+    item = {"id": "hook", "label": "Hook", "image": "hook.png",
+            "shape": "four fingers curled into a hook carrying a handle, "
+                     "thumb straight and out of the way",
+            "source": "p1 Heumer et al. 2007", "figure": "Figure 1, panel 2"}
+    window = rp.CopyWindow({"images_dir": str(tmp_path / "nowhere"), "items": [item]})
+    assert window.describe().startswith("0 of 1 pictures found")
+    for _ in range(3):
+        window.show_copy(item, 1, 3, "GET READY", 3.0, force=True)
+    out = capsys.readouterr().out
+    assert out.count("no picture for hook") == 1
+    assert "hook.png is missing" in out
+    assert gui.shown == [rp.COPY_WINDOW] * 3
+
+    _img, info = rp.compose_copy(item, window.panel(item), 1, 3, "GET READY", 3.0)
+    assert info["panel_box"] is None
+    assert info["label"] == ["Hook"]
+    assert item["shape"] in " ".join(info["lines"])        # every word, in order
+    assert any("Figure 1, panel 2" in line for line in info["lines"])
+
+    # no images_dir at all: said once in the header, not once per grasp
+    bare = rp.CopyWindow({"items": [item]})
+    assert "no images_dir" in bare.describe()
+    assert bare.panel(item) is None
+    assert "no picture for" not in capsys.readouterr().out
+
+
+def test_a_mock_session_shows_each_grasps_picture_in_copy_this(
+        rp, monkeypatch, tmp_path, with_pictures, gui, capsys):
+    import numpy as np
+
+    frames = spy_frames(rp, monkeypatch)
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(with_pictures, out, "--auto-accept",
+                                    "--takes", "1", "--prep", "0.3"))
+    session = read_json(session_dir(out) / "session.json")
+    assert [(t["item"], t["accepted"]) for t in session["takes"]] == [
+        (i, True) for i in ITEMS]
+    printed = capsys.readouterr().out
+    assert "3 of 3 pictures found" in printed and "no picture for" not in printed
+
+    # every grasp: its picture through the countdown and the take, in order
+    assert all(found for _iid, _status, found in frames)
+    for iid in ITEMS:
+        statuses = [s for i, s, _f in frames if i == iid]
+        assert statuses[0] == "GET READY" and "HOLD STILL" in statuses
+        assert statuses.index("HOLD STILL") > statuses.index("GET READY")
+    assert [i for i, _s, _f in frames] == sorted(
+        (i for i, _s, _f in frames), key=ITEMS.index)
+    # one window, COPY THIS, holding the picture; closed at the end
+    assert set(gui.shown) == {rp.COPY_WINDOW}
+    assert ("namedWindow", rp.COPY_WINDOW) in gui.calls
+    assert gui.calls[-1] == ("destroyWindow", rp.COPY_WINDOW)
+    last = gui.last[rp.COPY_WINDOW]
+    assert (np.abs(last.astype(int) - GREEN).max(axis=2) <= 2).sum() > 100_000
+
+
+def test_a_mock_session_runs_without_the_pictures_folder(
+        rp, monkeypatch, tmp_path, protocol_file, gui, capsys):
+    """No images_dir in the file, then an images_dir whose folder is gone:
+    both sessions run, with the shape text in place of the pictures."""
+    frames = spy_frames(rp, monkeypatch)
+    out = tmp_path / "no_dir"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept", "--takes", "1"))
+    assert all(t["accepted"] for t in read_json(session_dir(out) / "session.json")["takes"])
+    printed = capsys.readouterr().out
+    assert "no images_dir" in printed and "no picture for" not in printed
+    assert frames and not any(found for _i, _s, found in frames)
+    assert gui.shown and set(gui.shown) == {rp.COPY_WINDOW}
+
+    data = read_json(protocol_file)
+    data["images_dir"] = str(tmp_path / "deleted_panels")
+    for it in data["items"]:
+        it["image"] = f"{it['id']}.png"
+    gone = tmp_path / "gone.json"
+    gone.write_text(json.dumps(data), encoding="utf-8")
+    out = tmp_path / "gone"
+    run(rp, monkeypatch, *mock_args(gone, out, "--auto-accept", "--takes", "1"))
+    assert all(t["accepted"] for t in read_json(session_dir(out) / "session.json")["takes"])
+    printed = capsys.readouterr().out
+    assert "0 of 3 pictures found" in printed
+    for iid in ITEMS:                         # once per grasp, not once per frame
+        assert printed.count(f"no picture for {iid}:") == 1
+
+
+def test_no_panel_opens_no_window(rp, monkeypatch, tmp_path, with_pictures, gui,
+                                  capsys):
+    frames = spy_frames(rp, monkeypatch)
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(with_pictures, out, "--auto-accept",
+                                    "--takes", "1", "--no-panel"))
+    assert all(t["accepted"] for t in read_json(session_dir(out) / "session.json")["takes"])
+    assert "picture: off (--no-panel)" in capsys.readouterr().out
+    assert frames == [] and gui.shown == [] and gui.calls == []
+
+
+def test_no_panel_only_applies_with_a_protocol(rp, monkeypatch):
+    with pytest.raises(SystemExit):
+        run(rp, monkeypatch, "--mock", "--no-panel")
+
+
+def test_the_review_appears_in_copy_this_beside_the_paper_and_it_stays_open(
+        rp, tmp_path, gui):
+    import numpy as np
+
+    fixture_picture(tmp_path / "pics" / "hook.png")
+    item = {"id": "hook", "label": "Hook", "image": "hook.png"}
+    window = rp.CopyWindow({"images_dir": str(tmp_path / "pics"), "items": [item]})
+    window.show_copy(item, 1, 3, "HOLD STILL", 0.5, force=True)
+    countdown = gui.last[rp.COPY_WINDOW]
+
+    gui.keys = [-1, -1, ord("r")]              # nothing pressed, then r
+    pumped = []
+    got, _when, by = rp.Reviewer().decide(
+        None, ["Hook   take 1/3, attempt 1", "tracked 100 %"],
+        pump=lambda: pumped.append(1), screen=window,
+        reference=window.panel(item))
+    assert (got, by) == ("redo", "operator")
+    assert pumped, "the tracker queue is drained while waiting"
+    assert set(gui.shown) == {rp.COPY_WINDOW}, "no second window"
+    assert ("destroyWindow", rp.COPY_WINDOW) not in gui.calls
+    review = gui.last[rp.COPY_WINDOW]
+    assert review.shape == countdown.shape, "the window keeps its size"
+    assert not np.array_equal(review, countdown)
+    # the paper's picture in the top right, beside where the still goes
+    right = review[:400, rp.COPY_W - 260:].astype(int)
+    assert (np.abs(right - GREEN).max(axis=2) <= 2).sum() > 20_000
+    # and back to the picture for the next take
+    window.show_copy(item, 2, 3, "GET READY", 3.0, force=True)
+    assert gui.last[rp.COPY_WINDOW].shape == countdown.shape
 
 
 # --- the plain session is unchanged --------------------------------------------------
