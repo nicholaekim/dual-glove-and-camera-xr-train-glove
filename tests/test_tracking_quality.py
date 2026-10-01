@@ -348,6 +348,22 @@ def test_the_reject_reason_names_the_losses_like_the_example():
                           []) == "no hand was tracked during the take"
 
 
+def test_a_hand_fitted_as_the_other_hand_keeps_its_reason():
+    """`static_interval.summarise_take` rejects a take whose hand the tracker
+    fitted as the other hand; the hand was tracked, so its losses are not
+    the reason and nothing is put in front of it."""
+    loss = only_loss(series(state=hand(height_cm=30.0), gap_s=0.4))
+    for reason, has_frame in (
+            ("the tracker fitted the hand as a right hand for the whole take; "
+             "the left hand cannot be measured from that", False),
+            ("the tracker fitted the hand as a right hand for most of the static "
+             "interval (36 of 180 frames as left); the left hand cannot be "
+             "measured from that", True)):
+        assert tq.FITTED_AS_OTHER in reason
+        assert tq.take_reason(reason, 0.98, 0.9, [], has_frame, [loss]) == reason
+        assert tq.take_reason(reason, 0.98, 0.9, [], has_frame, []) == reason
+
+
 # --- the coaching: six moves, a beep and a voice, one window -------------------------------
 SIX_MOVES = (
     "Hand open, hold still",

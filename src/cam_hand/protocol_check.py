@@ -1244,7 +1244,19 @@ def check_grasp_take(ref: TakeRef) -> Tuple[dict, List[str], List[str]]:
     if in_interval is None or int(in_interval) > 0:
         failures.append(f"{in_interval} re-acquisition(s) inside the static "
                         "interval")
+    # The tracker's label on the summary frame: a skeleton fitted as the
+    # other hand is a mirrored model of the operator's, whatever was
+    # measured from it.
+    label, hand = meta.get("operator_hand_label"), meta.get("hand")
+    if isinstance(label, str) and isinstance(hand, str) and label != hand:
+        failures.append(f"summary frame is the tracker's {label} hand "
+                        f"(operator's hand {hand})")
     notes = []
+    others = meta.get("other_hand_ids")
+    if others:
+        ids = [str(i) for i in others] if isinstance(others, list) else [str(others)]
+        notes.append(f"another hand in view ({'id' if len(ids) == 1 else 'ids'} "
+                     f"{', '.join(ids)}), ignored")
     if reacq is not None and in_interval is not None and             int(reacq) > int(in_interval):
         notes.append(f"{int(reacq) - int(in_interval)} re-acquisition(s) "
                      "outside the static interval")

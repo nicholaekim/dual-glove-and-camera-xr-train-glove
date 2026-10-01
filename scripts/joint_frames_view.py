@@ -125,19 +125,38 @@ def static_medoid_line(lines: Sequence[dict], meta: dict,
                        prefer: Optional[str]) -> Tuple[dict, int, str]:
     """Set A: the summary frame the recorder chose, found again in the take.
 
-    The meta stores `medoid_wall_time`; the line of the operator's label
-    with that wall_time is the one. When the meta has no usable time the
+    The meta stores `medoid_line`, the line's number in the file: that line
+    is the one when it exists and carries the meta's `medoid_wall_time`.
+    Else the line with that wall_time of the meta's `medoid_hand_id` (of the
+    operator's label when the meta has no id: the label alone is ambiguous
+    now that the recorder follows a hand whose label may flip, with the
+    other hand in the same file). When the meta has no usable time the
     static interval and its medoid are recomputed with the recorder's own
     functions.
     """
     from leap_hand.static_interval import (DEFAULT_STATIC_S, medoid_in_window,
                                            operator_label, static_interval)
-    side = operator_label(lines, prefer)
     t = meta.get("medoid_wall_time")
+    n = meta.get("medoid_line")
+    if isinstance(n, int) and not isinstance(n, bool) and 0 <= n < len(lines):
+        line = lines[n]
+        try:
+            same_time = (t is None
+                         or abs(float(line.get("wall_time")) - float(t)) <= 1e-6)
+        except (TypeError, ValueError):
+            same_time = False
+        if same_time:
+            return line, n, "the recorder's static-interval medoid (meta line)"
+    side = operator_label(lines, prefer)
+    hid = meta.get("medoid_hand_id")
     if t is not None:
         for i, line in enumerate(lines):
-            if str(line.get("hand_side")) == side and \
-                    abs(float(line.get("wall_time", -1e18)) - float(t)) < 1e-6:
+            if hid is not None:
+                mine = (line.get("hand_id") is not None
+                        and int(line["hand_id"]) == int(hid))
+            else:
+                mine = str(line.get("hand_side")) == side
+            if mine and abs(float(line.get("wall_time", -1e18)) - float(t)) < 1e-6:
                 return line, i, "the recorder's static-interval medoid (meta)"
     interval = meta.get("static_interval")
     if not (isinstance(interval, list) and len(interval) == 2

@@ -528,6 +528,45 @@ def test_session_export_grasps(sessions, capsys):
     assert "the recorder's static-interval medoid" in capsys.readouterr().out
 
 
+def test_the_summary_frame_is_the_meta_line_first():
+    """The recorder's `medoid_line` is the summary frame when that line has
+    the meta's wall time; else the wall-time search of the meta's hand id;
+    else the recompute. Two hands share every wall time in a take, so the
+    label alone could pick the other hand's line."""
+    stream = MockLeapStream(pose="fist", seed=2, dropout_every=0,
+                            reacquire_every=0)
+    lines = []
+    for k, (side, lh) in enumerate(stream.generate(40)):
+        line = jf.line_from_hand_frame(to_hand_frame(lh))
+        line.update(wall_time=1_790_000_000.0 + (k // 2) / 90.0, status=1,
+                    source="leap", units="m", abs26=lh.abs26,
+                    hand_id=lh.hand_id)
+        lines.append(line)
+    right = next(i for i in range(20, 40) if lines[i]["hand_side"] == "right")
+    left = right - 1                     # the same frame's other hand
+    assert lines[left]["hand_side"] == "left"
+    assert lines[left]["wall_time"] == lines[right]["wall_time"]
+    t = lines[right]["wall_time"]
+    meta = {"medoid_line": right, "medoid_wall_time": t,
+            "medoid_hand_id": lines[right]["hand_id"],
+            "static_interval": [t - 0.05, t + 0.05]}
+    line, i, how = view.static_medoid_line(lines, meta, "left")
+    assert i == right and line is lines[right]
+    assert how == "the recorder's static-interval medoid (meta line)"
+    # a line number that no longer matches its time: the hand id decides
+    line, i, how = view.static_medoid_line(lines, {**meta, "medoid_line": 3},
+                                           "left")
+    assert i == right and how == "the recorder's static-interval medoid (meta)"
+    # no line number, no id: the operator's label, as before
+    old = {"medoid_wall_time": t, "static_interval": meta["static_interval"]}
+    line, i, how = view.static_medoid_line(lines, old, "left")
+    assert i == left and how == "the recorder's static-interval medoid (meta)"
+    # a line number out of range is ignored
+    line, i, _how = view.static_medoid_line(lines, {**meta, "medoid_line": 400},
+                                            "left")
+    assert i == right
+
+
 def test_session_export_flexion_has_glove_and_camera(sessions):
     session = sessions["flexion"]
     result = view.export_session(session)

@@ -34,6 +34,9 @@ None (nothing changes) or a dict with any of
   curl          0 open .. 1 fist (grab_strength follows it)
   framerate     the tracking rate the event reports
   id_offset     added to the hand id: a re-acquisition, with or without a gap
+  per_side      {"left": {...}, "right": {...}}: keys for one hand only, on
+                top of the rest (`drop` is not one of them: a dropout is
+                the whole frame's)
 
 and `sides` limits the generator to one hand, the way the protocol is run.
 With no script the frames are exactly what they were before.
@@ -221,9 +224,17 @@ class MockLeapStream:
             if extra and extra.get("drop"):
                 continue  # a scripted dropout: the script chose where it happens
             for side in self.sides:
-                out.append((side, self._hand(side, i, extra)))
+                out.append((side, self._hand(side, i, self._side_extra(extra, side))))
                 self.hands_emitted += 1
         return out
+
+    @staticmethod
+    def _side_extra(extra: Optional[dict], side: str) -> Optional[dict]:
+        """One hand's script keys: `extra` with its `per_side[side]` on top."""
+        if not extra or "per_side" not in extra:
+            return extra
+        own = (extra.get("per_side") or {}).get(side) or {}
+        return {**{k: v for k, v in extra.items() if k != "per_side"}, **own}
 
     # --- one hand -------------------------------------------------------
     def _pose_params(self, i: int) -> Tuple[str, float, float, float]:
@@ -390,17 +401,35 @@ class CoachedActor:
     lost; an attempt ends at "hold" or "idle". A hand that comes back after
     a loss carries a new hand id, as LeapC gives a re-acquired hand.
 
+    `operator` is the hand doing all that. The stream shows both hands, and
+    `other_hand` says what the other one does: "same" (the default, and
+    what this actor always did) copies the operator's hand 11 cm beside
+    it; "open" holds it as an open palm 25 cm to the side at the same
+    height, never closing and never turned, the way the operator held the
+    idle right hand in view on 2026-10-01 to help the tracker tell left from
+    right. A scripted dropout still drops the whole frame, both hands.
+
     Each phase is kept with the frame it started at, so a frame generated
     after a phase change but belonging to the time before it is still
     acted out as the phase it belongs to.
     """
 
+    OTHER_HAND_MODES = ("same", "open")
+
     def __init__(self, hz: float = 90.0, lose_forming: int = 0,
                  grasp_curl: float = 0.6, close_s: float = 1.0,
                  lose_at_s: float = 0.6, lost_roll_deg: float = 85.0,
                  absent_open_s: float = 0.0, hold_dropout: float = 0.0,
-                 period: int = 90):
+                 period: int = 90, operator: str = "left",
+                 other_hand: str = "same"):
+        if operator not in ("left", "right"):
+            raise ValueError(f"operator must be left or right, not {operator!r}")
+        if other_hand not in self.OTHER_HAND_MODES:
+            raise ValueError(f"other_hand must be one of {self.OTHER_HAND_MODES}, "
+                             f"not {other_hand!r}")
         self.hz = float(hz)
+        self.operator = operator
+        self.other_hand = other_hand
         self.lose_forming = max(0, int(lose_forming))
         self.grasp_curl = float(grasp_curl)
         self.close_s = float(close_s)
@@ -440,6 +469,18 @@ class CoachedActor:
         return None
 
     def __call__(self, i: int) -> Optional[dict]:
+        extra = self._act(i)
+        if self.other_hand == "same" or (extra and extra.get("drop")):
+            return extra
+        other = "right" if self.operator == "left" else "left"
+        sign = 1.0 if other == "right" else -1.0
+        out = dict(extra or {})
+        out["per_side"] = {other: {"curl": 0.0, "roll_deg": 0.0,
+                                   "origin_mm": [sign * 250.0, 250.0, -100.0]}}
+        return out
+
+    def _act(self, i: int) -> Optional[dict]:
+        """The operator's hand at frame i (both hands' with other_hand "same")."""
         seg = self._segment(i)
         if seg is None:
             return None

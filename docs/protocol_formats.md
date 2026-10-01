@@ -101,6 +101,14 @@ the set of fingers flexed at that moment; a finger not listed is straight):
 `source` and `figure` are filled from the papers; until then they are null
 and `status` says so. Labels become the papers' own terms when known.
 
+An item may carry `orientation`: text telling the operator how to turn the
+hand for that grasp, shown during MAKE THE GRASP and written to each take's
+meta as `orientation_hint` (an item without one gets "palm toward the
+camera"). It must be text. A session recorded before the hints were added
+can still be resumed when adding them, each as an `"orientation": "...",`
+line of its own, is the only change to the file (`session.json` then notes
+it under `protocol_changes`).
+
 ## 3. `session.json`
 
     {"set": "finger_flexion",
@@ -212,6 +220,64 @@ inside the static interval that came after the hand was really gone (a hole
 longer than `loss_gap_s`), which is the number the acquisition gate and the
 checker judge on; `gate.id_changes_in_static_interval` counts all id changes
 there, including re-labelling with no hole, which does not fail a take.
+
+Which hand. The coached recorder follows the hand OPEN HAND acquired by
+the tracker's hand id: a new id within 10 cm of where that hand last was,
+in a frame without it, is the same hand (a chirality flip or a
+re-acquisition); an id in the same tracking frame, or further away, is
+another hand. Without coaching (and in files written before it), the
+operator's hand is the label with the most tracked frames. The static
+interval and the summary frame are chosen from the operator's frames that
+carry the label of the session's `hand` only.
+
+    "operator_hand_ids": [25]          hand ids followed as the operator's
+                                       hand, in the order they were taken on
+    "other_hand_ids": [24]             other hands in the take's frames:
+                                       their lines stay in the leap file,
+                                       never measured
+    "operator_hand_labels": {"left": 242, "right": 43}
+                                       the operator's frames per tracker label
+    "operator_hand_label": "left"      the tracker's label on the summary
+                                       frame (with no summary frame: the
+                                       majority label of the operator's
+                                       frames)
+    "gate": {"interval_label_frames": 180, "interval_expected_frames": 180, ...}
+                                       frames labelled `hand` inside the
+                                       static interval, and the frames the
+                                       tracker produced over its length
+                                       (median framerate times static_s, or
+                                       the take when shorter); fewer than half
+                                       rejects the take
+
+After the tracked fraction and the losses inside the static interval, the
+gate rejects a take with "the tracker fitted the hand as a <label> hand for
+the whole take; the <hand> hand cannot be measured from that" when no frame
+of the operator's hand carries `hand`, and with "... for most of the static
+interval (n of m frames as <hand>) ..." when they are under half. The
+checker fails a take whose `operator_hand_label` is not `hand`, and notes
+`other_hand_ids`.
+
+`coaching` (null with `--no-coach`) says how the hand got into the grasp:
+
+    "coaching": {"acquire_s": 2.5,              seconds of OPEN HAND, summed
+                 "acquire_rounds_s": [2.5],     each OPEN HAND of the attempt
+                 "acquired": [{"height_cm": 26.1, "view_angle_deg": 11.9,
+                               "offset_cm": 3.2, "hand_label": "left",
+                               "hand_id": 25}],  the hand each OPEN HAND took
+                 "lost_while_forming": 0,
+                 "forming_losses": [{"after_s": 0.6, "height_cm": 25.0,
+                                     "view_angle_deg": 73.0, "grab": 0.4,
+                                     "hand_label": "left",
+                                     "cause": "palm turned away",
+                                     "fix": "..."}],
+                 "form_s": 4.0,                 MAKE THE GRASP seconds
+                 "followed_ids": [25],          ids followed through MAKE
+                                                THE GRASP, once it was kept
+                 "other_hands": [24]}           ids taken as another hand
+
+`acquire_missing` (what was still wrong) is added when OPEN HAND timed out.
+`offset_cm` and `hand_id` in `acquired`, `followed_ids` and `other_hands`
+are absent in takes recorded before the recorder followed the hand.
 
 Mock sessions (any recorder run with `--mock`, `--mock-glove` or
 `--mock-leap`) carry `"mock": true` in `session.json` and are written under

@@ -10,6 +10,7 @@ runs, with a scripted key sequence standing in for the keyboard.
 """
 import importlib.util
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -1172,6 +1173,160 @@ def test_the_form_watch_calls_a_hole_a_loss_but_not_a_slow_drain(rp):
     for _sd, lh in other.generate(60):
         w.add(lh, 30.5)
     assert w.lost(30.5) is not None
+
+
+def test_the_open_hand_watch_never_acquires_a_hand_off_to_the_side(rp):
+    """2026-10-01 13:40:28: OPEN HAND acquired the idle right hand, held off
+    to the side 21 cm up. A palm 24 cm to the side at 21 cm is in the band
+    and within the palm angle, and is still never acquired; the same hand
+    5 cm to the side is."""
+    from leap_hand.mock import MockLeapStream
+
+    def hands(side_cm, n=90):
+        # the mock's left palm centre is 2 mm right of the wrist and 42 mm
+        # further from the user: put the PALM at side_cm, 21 cm up, z = 0
+        x = -side_cm * 10.0 - 2.0
+        s = MockLeapStream(dropout_every=0, reacquire_every=0, noise_mm=0.0,
+                           sides=("left",),
+                           script=lambda i: {"origin_mm": (x, 210.0, 42.0),
+                                             "curl": 0.0})
+        return [lh for _sd, lh in s.generate(n)]
+
+    off = hands(24.0)
+    seen = rp.hand_seen(off[0], 0.0)
+    assert seen.height_cm == pytest.approx(21.0, abs=0.1)
+    assert seen.offset_cm == pytest.approx(24.0, abs=0.1)
+    assert seen.angle_deg <= rp.OPEN_MAX_ANGLE_DEG, "only the centring fails"
+    w = rp.OpenHandWatch(prefer="left")
+    for k, lh in enumerate(off):
+        w.add(lh, 100.0 + k / 90)
+    assert w.acquired() is None
+    now = 100.0 + 89 / 90
+    assert w.status(now) == "centre it over the module (now 24 cm to the side)"
+    assert w.need(now) == "centre it over the module"
+
+    near = hands(5.0)
+    assert rp.hand_seen(near[0], 0.0).offset_cm == pytest.approx(5.0, abs=0.1)
+    w = rp.OpenHandWatch(prefer="left")
+    for k, lh in enumerate(near):
+        w.add(lh, 200.0 + k / 90)
+    assert w.acquired() is not None
+    assert w.status(200.0 + 89 / 90).startswith("hold it there")
+
+
+def test_the_form_watch_follows_one_hand_by_id_and_place(rp):
+    import dataclasses
+
+    from leap_hand.mock import MockLeapStream
+
+    s = MockLeapStream(dropout_every=0, reacquire_every=0, sides=("left",))
+    lhs = [lh for _sd, lh in s.generate(20)]
+    w = rp.FormWatch(rp.hand_seen(lhs[0], 10.0), others=set())
+    assert w.mine == {lhs[0].hand_id}
+
+    def as_id(lh, hid, dx=0.0):
+        palm = [lh.palm_pos[0] + dx, lh.palm_pos[1], lh.palm_pos[2]]
+        return dataclasses.replace(lh, hand_id=hid, palm_pos=palm)
+
+    # a second id in the same tracking frame is another hand, however near
+    w.add(lhs[1], 10.0)
+    w.add(as_id(lhs[1], 777), 10.0)
+    assert 777 in w.others and w.hid == lhs[0].hand_id
+    w.add(as_id(lhs[2], 777), 10.0)                # and stays one
+    assert w.hid == lhs[0].hand_id and w.last.lh.frame_id == lhs[1].frame_id
+    # a new id near where the hand was, without it in that frame: the same
+    # hand under a new id (a flip, a re-acquisition)
+    w.add(as_id(lhs[3], 778, dx=0.03), 10.0)
+    assert w.hid == 778 and 778 in w.mine and w.new_ids == 1
+    # a new id far from it: another hand
+    w.add(as_id(lhs[4], 779, dx=0.30), 10.0)
+    assert 779 in w.others and w.hid == 778
+    # a line of an id already followed is always taken, even beside another
+    # of ours in the same frame and far away
+    w.add(as_id(lhs[5], 778), 10.0)
+    w.add(as_id(lhs[5], lhs[0].hand_id, dx=0.40), 10.0)
+    assert w.hid == lhs[0].hand_id and w.new_ids == 1
+    hid, others, palm = w.follow_start
+    assert hid == lhs[0].hand_id and others == [777, 779]
+    assert palm == pytest.approx([lhs[5].palm_pos[0] + 0.40, *lhs[5].palm_pos[1:]])
+    assert w.lost(10.0) is None
+
+
+def test_a_mock_session_with_the_other_hand_open_to_the_side(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """The idle hand open in view 25 cm to the side: OPEN HAND acquires the
+    operator's hand only, the take follows it, and the idle hand's frames
+    stay in the file, listed and never measured."""
+    actors = actor_with(monkeypatch)
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--mock-other-hand"))
+    (actor,) = actors
+    assert actor.operator == "left" and actor.other_hand == "open"
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    assert entry["accepted"] is True, entry["reason"]
+    meta = read_json(folder / entry["files"]["meta"])
+    lines = read_lines(folder / entry["files"]["leap"])
+    ours = meta["operator_hand_ids"]
+    assert len(ours) == 1
+    assert {x["hand_side"] for x in lines if x["hand_id"] in ours} == {"left"}
+    others = meta["other_hand_ids"]
+    assert others and not set(others) & set(ours)
+    idle = [x for x in lines if x["hand_id"] in others]
+    assert idle and {x["hand_side"] for x in idle} == {"right"}
+    assert all(math.hypot(x["palm_abs"][0], x["palm_abs"][2]) > 0.20 for x in idle)
+    assert max(x["grab_strength"] for x in idle) == 0.0
+    assert set(meta["tracker_hand_labels"]) == {"left", "right"}
+    assert meta["operator_hand_label"] == "left"
+    assert meta["operator_hand_labels"] == {
+        "left": sum(1 for x in lines if x["hand_id"] in ours)}
+    assert meta["medoid_hand_id"] in ours
+    assert meta["grab_strength"] == pytest.approx(0.6, abs=0.01)
+    gate = meta["gate"]
+    assert gate["interval_label_frames"] >= 0.5 * gate["interval_expected_frames"]
+    coaching = meta["coaching"]
+    assert coaching["other_hands"] and set(coaching["other_hands"]) == set(others)
+    assert coaching["followed_ids"] == ours
+    (acq,) = coaching["acquired"]
+    assert acq["hand_label"] == "left" and acq["hand_id"] in ours
+    assert acq["offset_cm"] < 0.6 * acq["height_cm"]
+    printed = capsys.readouterr().out
+    assert (f"hand: id {ours[0]}, tracker label left; another hand in view "
+            f"(id {others[0]}) ignored") in printed
+
+
+def test_the_plain_mock_follows_the_left_hand_beside_the_right(
+        rp, monkeypatch, tmp_path, protocol_file):
+    """The plain mock shows both hands 11 cm apart: OPEN HAND takes the left
+    one by the operator's label, and the right one is the other hand."""
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    meta = read_json(folder / entry["files"]["meta"])
+    lines = read_lines(folder / entry["files"]["leap"])
+    by_id = {}
+    for x in lines:
+        by_id.setdefault(x["hand_id"], set()).add(x["hand_side"])
+    assert [by_id[h] for h in meta["operator_hand_ids"]] == [{"left"}]
+    assert [by_id[h] for h in meta["other_hand_ids"]] == [{"right"}]
+    assert meta["coaching"]["acquired"][0]["hand_label"] == "left"
+    assert meta["operator_hand_label"] == "left"
+
+
+def test_mock_other_hand_needs_the_mock_and_the_coached_take(
+        rp, monkeypatch, tmp_path, protocol_file):
+    for argv in (["--protocol", protocol_file, "--hand", "left",
+                  "--mock-other-hand", "--out-dir", tmp_path / "a"],
+                 mock_args(protocol_file, tmp_path / "b", "--no-coach",
+                           "--mock-other-hand"),
+                 ["--mock", "--mock-other-hand"]):
+        with pytest.raises(SystemExit):
+            run(rp, monkeypatch, *argv)
+    assert not (tmp_path / "a").exists() and not (tmp_path / "b").exists()
 
 
 def test_resume_carries_on_across_a_hint_only_protocol_change(

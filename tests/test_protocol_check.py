@@ -978,6 +978,29 @@ def test_grasp_gate_counts_reacquisitions_inside_the_static_interval(
     assert rows[3]["verdict"] == pc.FAIL
 
 
+def test_a_summary_frame_fitted_as_the_other_hand_fails_the_grasp(tmp_path):
+    """2026-10-01 13:40:28: the recorder measured the idle right hand of a
+    left session. The meta names the tracker's label on the summary frame,
+    and a label that is not the operator's hand fails the take; another
+    hand in view beside the operator's is only a note."""
+    session = make_grasp_session(tmp_path, rejected=False, meta_overrides={
+        "cylindrical_left_take1": {"operator_hand_label": "right",
+                                   "other_hand_ids": [25]},
+        "cylindrical_left_take2": {"operator_hand_label": "left",
+                                   "operator_hand_ids": [25],
+                                   "other_hand_ids": [24]},
+        "cylindrical_left_take3": {"operator_hand_label": None}})
+    rows = {r["take"]: r for r in pc.check_session(session).rows
+            if r["item"] == "cylindrical"}
+    assert rows[1]["verdict"] == pc.FAIL
+    assert ("summary frame is the tracker's right hand (operator's hand left)"
+            in rows[1]["failures"])
+    assert rows[2]["verdict"] == pc.PASS, rows[2]["failures"]
+    assert "another hand in view (id 24), ignored" in rows[2]["notes"]
+    assert not any("another hand" in n for n in rows[3]["notes"])
+    assert rows[3]["verdict"] == pc.PASS, rows[3]["failures"]
+
+
 def test_step_window_keeps_its_share_of_a_scaled_hold():
     from types import SimpleNamespace
     t = 1000.0

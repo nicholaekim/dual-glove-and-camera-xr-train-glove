@@ -29,7 +29,10 @@ WHAT GOES IN, AND WHAT DOES NOT
     grasp takes   the recorder's own medoid file (`keypoints/`) copied, plus
                   every frame of the item's takes in `<item>_<hand>_all_frames`
                   in camera millimetres, the Wrist line giving the measured
-                  wrist position
+                  wrist position; the operator's hand is the hand ids the
+                  recorder followed (`operator_hand_ids` in the meta), else,
+                  for a take recorded before it followed one, the tracker
+                  label `protocol_check.choose_camera_label` picks
 
   Joint frames, when `scripts/joint_frames_view.py --session` has been run
   on a session: its `joint_frames/<take>.csv` (and `camera_<take>.csv`) for
@@ -155,14 +158,26 @@ def glove_blocks(src: Path, hand: str, exporter):
                                        float(d["wall_time"]))
 
 
-def camera_blocks(srcs: Sequence[Path], hand: str, exporter):
+def camera_blocks(srcs: Sequence[Tuple[Path, Optional[Sequence[int]]]],
+                  hand: str, exporter):
     """Every frame of the operator's hand in camera mm, take after take.
 
-    Which tracker label holds the operator's hand is chosen per take by
+    `srcs` are (leap file, the hand ids its meta says were the operator's,
+    or None). With ids, the operator's frames are the lines of those ids,
+    whatever the tracker called them: the recorder followed that hand by
+    id, and the other hand in view is in the same file under other ids.
+    Without (a take recorded before the recorder followed a hand), which
+    tracker label holds the operator's hand is chosen per take by
     `protocol_check.choose_camera_label`, the same rule the checker uses.
     """
-    for src in srcs:
+    for src, ids in srcs:
         frames, _bad = pc.read_frames(src)
+        if ids:
+            wanted = {int(i) for i in ids}
+            for d, frame in frames:
+                if d.get("hand_id") is not None and int(d["hand_id"]) in wanted:
+                    yield exporter.frame_block(frame, float(d["wall_time"]))
+            continue
         counts: Dict[str, int] = {}
         for d, _f in frames:
             counts[d.get("hand_side")] = counts.get(d.get("hand_side"), 0) + 1
@@ -282,7 +297,7 @@ SUMMARY_COLUMNS = ["grasp", "label", "source", "figure", "take", "hand",
                    "grab_strength", "pinch_strength"] + [
     f"curl_{f}" for f in pc.FINGERS] + [
     "static_interval_start", "static_interval_end", "medoid_wall_time",
-    "orientation_note", "session"]
+    "operator_hand_label", "other_hand_in_view", "orientation_note", "session"]
 
 
 JOINT_FRAMES_DIR = "joint_frames"          # scripts/joint_frames_view.py --session
@@ -333,7 +348,7 @@ def plan_grasps(session: pc.Session, exporter) -> Tuple[List[Output], dict]:
     hand = session.hand
     plan: List[Output] = []
     rows: List[dict] = []
-    by_item: Dict[str, List[Tuple[int, Path]]] = {}
+    by_item: Dict[str, List[Tuple[int, Path, Optional[List[int]]]]] = {}
     missing: List[str] = []
     static_s: List[float] = []
     names: List[Tuple[str, str]] = []
@@ -345,14 +360,16 @@ def plan_grasps(session: pc.Session, exporter) -> Tuple[List[Output], dict]:
             continue
         names.append((t.name, stem))
         plan.append(Output(Path("grasps") / f"{stem}.jsonl", source=leap))
-        by_item.setdefault(t.item, []).append((int(t.take or 0), leap))
+        meta = pc.read_json(t.path("meta")) if t.path("meta") else None
+        meta = meta if isinstance(meta, dict) else {}
+        ids = meta.get("operator_hand_ids")
+        ids = [int(i) for i in ids] if isinstance(ids, list) and ids else None
+        by_item.setdefault(t.item, []).append((int(t.take or 0), leap, ids))
         if t.path("keypoints"):
             plan.append(Output(Path("grasps") / f"{stem}_keypoints.txt",
                                source=t.path("keypoints")))
         else:
             missing.append(f"{t.name}: no keypoints file from the recorder")
-        meta = pc.read_json(t.path("meta")) if t.path("meta") else None
-        meta = meta if isinstance(meta, dict) else {}
         cfg = session.item(t.item) or {}
         interval = meta.get("static_interval") or [None, None]
         if len(interval) > 1 and None not in interval[:2]:
@@ -381,10 +398,15 @@ def plan_grasps(session: pc.Session, exporter) -> Tuple[List[Output], dict]:
             "static_interval_start": interval[0],
             "static_interval_end": interval[1] if len(interval) > 1 else None,
             "medoid_wall_time": meta.get("medoid_wall_time"),
+            # the tracker's label on the summary frame, and whether another
+            # hand was in view (its frames are in the take's JSONL, never in
+            # the keypoints or the all-frames file)
+            "operator_hand_label": meta.get("operator_hand_label"),
+            "other_hand_in_view": bool(meta.get("other_hand_ids")),
             "orientation_note": meta.get("orientation_note", ""),
             "session": session.name})
     for item, takes in sorted(by_item.items()):
-        srcs = [p for _n, p in sorted(takes)]
+        srcs = [(p, ids) for _n, p, ids in sorted(takes, key=lambda x: x[:2])]
         plan.append(Output(
             Path("grasps") / f"{item}_{hand}_all_frames.txt",
             write=lambda dest, srcs=srcs: write_blocks(
@@ -649,6 +671,8 @@ def reason_kind(reason: str) -> str:
         return "operator quit at the review"
     if low.startswith("interrupted"):
         return "interrupted (Ctrl+C)"
+    if "fitted the hand as" in low:
+        return "tracker fitted it as the other hand"
     if "not back by the end" in low:
         return "hand lost during the take, not back by the end"
     if "inside the static interval" in low:

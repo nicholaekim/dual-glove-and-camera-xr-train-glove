@@ -131,6 +131,45 @@ def test_grasp_all_frames_are_camera_millimetres(package):
     assert len(list(parse_text(path.read_text(encoding="utf-8")))) == 270
 
 
+def test_all_frames_follow_the_recorders_hand_ids(sessions, tmp_path):
+    """A take whose meta names the hand ids the recorder followed exports
+    the lines of those ids only, whatever their label; one without them
+    keeps the label rule. The summary says which label the summary frame
+    had and whether another hand was in view."""
+    import shutil
+    src = tmp_path / "20260928_101500_left"
+    shutil.copytree(sessions["grasps"], src)
+    (meta_path,) = (src / "meta").glob("cylindrical_left_take1_*.json")
+    lines = [json.loads(x) for x in (src / "leap" / (meta_path.stem + ".jsonl"))
+             .read_text(encoding="utf-8").splitlines() if x.strip()]
+    right_ids = sorted({x["hand_id"] for x in lines if x["hand_side"] == "right"})
+    left_ids = sorted({x["hand_id"] for x in lines if x["hand_side"] == "left"})
+    assert len(right_ids) == 1 and len(left_ids) == 1
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    # the tracker called the operator's hand "right" in this take: the ids
+    # decide, not the label
+    meta.update(operator_hand_ids=right_ids, other_hand_ids=left_ids,
+                operator_hand_label="right")
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    out = tmp_path / "out"
+    assert pkg.main(["--out", str(out), "--grasps", str(src)]) == 0
+    blocks = blocks_of(out / "grasps" / "cylindrical_left_all_frames.txt")
+    assert len(blocks) == 3 * 90
+    assert all("Hand ID: right" in b[0] for b in blocks[:90])
+    assert all("Hand ID: left" in b[0] for b in blocks[90:])
+    with open(out / "grasps" / "grasps_summary.csv", encoding="utf-8",
+              newline="") as f:
+        rows = {r["name"]: r for r in csv.DictReader(f)}
+    assert {"operator_hand_label", "other_hand_in_view"} <= set(
+        next(iter(rows.values())))
+    first = rows[meta_path.stem]
+    assert first["operator_hand_label"] == "right"
+    assert first["other_hand_in_view"] == "true"
+    rest = [r for name, r in rows.items() if name != meta_path.stem]
+    assert all(r["other_hand_in_view"] == "false" for r in rest)
+    assert all(r["operator_hand_label"] == "" for r in rest)
+
+
 def test_rejected_takes_and_stills_stay_out(package):
     _rc, out = package
     files = [p for p in out.rglob("*") if p.is_file()]
@@ -308,6 +347,12 @@ def test_reject_reasons_are_grouped_by_kind():
         "operator redo": "operator redo",
         "the operator quit the session at the review": "operator quit at the review",
         "fingertip wrong": "fingertip wrong",
+        "the tracker fitted the hand as a right hand for the whole take; the "
+        "left hand cannot be measured from that":
+            "tracker fitted it as the other hand",
+        "the tracker fitted the hand as a right hand for most of the static "
+        "interval (36 of 180 frames as left); the left hand cannot be measured "
+        "from that": "tracker fitted it as the other hand",
     }
     for reason, kind in kinds.items():
         assert pkg.reason_kind(reason) == kind, reason

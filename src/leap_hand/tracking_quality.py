@@ -862,6 +862,12 @@ class LiveLossTracker:
 
 
 # --- recorded takes (record_poses --protocol) -------------------------------------
+# The words of `static_interval.summarise_take`'s reasons for a hand the
+# tracker fitted as the other hand ("the tracker fitted the hand as a right
+# hand for ..."), which `take_reason` passes through untouched.
+FITTED_AS_OTHER = "fitted the hand as"
+
+
 def row_clock(rows: Sequence[dict]) -> str:
     """The best clock a take's lines share: capture, then LeapC, then write."""
     for key in ("capture_time", "timestamp"):
@@ -977,12 +983,17 @@ def take_reason(gate_reason: str, tracked_fraction: float, min_tracked: float,
     """The acquisition gate's reason with the losses named, or "" if it passed.
 
     Built from the same facts `static_interval.summarise_take` decided on,
-    in the same order, so the text never disagrees with the decision.
+    in the same order, so the text never disagrees with the decision. A
+    take rejected because the tracker fitted the hand as the other hand
+    (`FITTED_AS_OTHER` in the reason) keeps its reason as it is: the hand
+    was tracked, and its losses are not why it was rejected.
     """
     if not gate_reason:
         return ""
     if tracked_fraction <= 0 and not losses:
         return gate_reason                      # no hand at all: nothing to name
+    if FITTED_AS_OTHER in gate_reason:
+        return gate_reason
     text = loss_sentence(losses)
     if head_s is not None and head_s > 2.5 * LOSS_GAP_S:
         text += f"; first tracked {head_s:.1f} s after the start"

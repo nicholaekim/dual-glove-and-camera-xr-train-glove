@@ -61,8 +61,15 @@ What changes from the plain session, and why:
 
   The operator's hand is `--hand`, and it is what the files are named after.
   The tracker's own left/right label is written on every line and counted
-  in the meta, but it filters nothing: it called the left hand "right" in 20
-  of 21 poses on 2026-09-23.
+  in the meta, but it does not decide whose hand a frame is: it called the
+  left hand "right" in 20 of 21 poses on 2026-09-23. The coached take
+  follows the hand OPEN HAND acquired by the tracker's hand id (a new id
+  the tracker gives that same hand in the same place is followed too), and
+  is measured on its frames labelled `--hand`; a take whose hand the tracker
+  fitted as the other hand for most of the static interval is rejected with
+  that reason. The other hand may be in view, open and at least 20 cm to
+  the side of the module: it is ignored, and listed in the meta under
+  `other_hand_ids`.
 
   The orientation is measured, not remembered. Plan D3 turns palm-down
   grasps only as far as the camera needs and asks for the rotation used, so
@@ -105,8 +112,10 @@ What changes from the plain session, and why:
   September:
     OPEN HAND       "OPEN HAND, palm to the camera" until one hand has been
                     18 to 40 cm above the module, palm within 50 degrees of
-                    the lens, for 0.5 s without a break; a beep. Not within
-                    30 s: rejected, "no open hand acquired in 30 s".
+                    the lens, centred over the module (nearer its axis than
+                    0.6 times its height), for 0.5 s without a break; a
+                    beep. Not within 30 s: rejected, "no open hand acquired
+                    in 30 s".
     MAKE THE GRASP  a high beep, the paper's picture, the grasp's
                     orientation hint, 4 s (`--prep`) to close the hand while
                     it stays tracked. Gone for more than 0.3 s: a low beep,
@@ -130,14 +139,16 @@ What changes from the plain session, and why:
   python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left --resume recordings/protocol/grasps/<session>
   python scripts/leap/record_poses.py --mock --protocol protocols/grasps.json --hand left --auto-accept --takes 1 --duration 1 --prep 0.5 --no-open
   python scripts/leap/record_poses.py --mock --protocol protocols/grasps.json --hand left --items p1_tip --takes 1 --duration 2 --auto-accept --no-open --mock-lose-forming 1
+  python scripts/leap/record_poses.py --mock --protocol protocols/grasps.json --hand left --items p1_tip --takes 1 --duration 2 --auto-accept --no-open --mock-other-hand
 
 A --mock session is written to recordings/protocol_mock/grasps/ instead, with
 the same layout, so a rehearsal on synthetic hands can never be collected
 with the real sessions. The mock acts the coached take out
 (`leap_hand.mock.CoachedActor`): an open palm, then the hand closing, then
 the grasp held; `--mock-lose-forming N` loses the hand while it closes on
-the first N tries of every attempt, the way the camera did. The runbook is
-docs/grasp_recording.md.
+the first N tries of every attempt, the way the camera did, and
+`--mock-other-hand` holds the other hand open 25 cm to the side instead of
+copying the operator's. The runbook is docs/grasp_recording.md.
 """
 import argparse
 import hashlib
@@ -154,11 +165,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
-from leap_hand.protocol import (hand_view_angle_deg, palm_height_cm,
+from leap_hand.protocol import (LATERAL_FRACTION_MAX, hand_view_angle_deg,
+                                lateral_offset_cm, palm_height_cm,
                                 row_height_cm, row_view_angle_deg)
 from leap_hand.recorder import LeapRecorder
-from leap_hand.static_interval import (DEFAULT_STATIC_S, MIN_TRACKED_FRACTION,
-                                       row_frame, summarise_take)
+from leap_hand.static_interval import (DEFAULT_STATIC_S, FOLLOW_RADIUS_M,
+                                       MIN_TRACKED_FRACTION, row_frame,
+                                       summarise_take)
 from leap_hand.stream import LeapUnavailable, open_stream
 from leap_hand.tracking_quality import (LOSS_GAP_S, cause_label, causes_for,
                                         fix_for, state_from_leaphand,
@@ -1355,25 +1368,33 @@ class HandSeen:
     ts: float                  # the tracker's own time of the frame, seconds
     height_cm: float
     angle_deg: Optional[float]  # 0 = palm square to the lens, 90 = edge-on
+    offset_cm: float = 0.0      # from the module's vertical axis
 
 
 def hand_seen(lh, now: float) -> HandSeen:
     ts = getattr(lh, "timestamp_us", None)
     return HandSeen(lh=lh, wall=now, ts=now if ts is None else ts / 1e6,
                     height_cm=palm_height_cm(lh.palm_pos),
-                    angle_deg=hand_view_angle_deg(lh))
+                    angle_deg=hand_view_angle_deg(lh),
+                    offset_cm=lateral_offset_cm(lh.palm_pos))
 
 
 class OpenHandWatch:
     """OPEN HAND: has a hand been open over the module long enough?
 
-    A hand counts while its palm is `band` cm above the module and within
-    `max_angle` degrees of facing the lens, and it is acquired once it has
-    counted for `hold_s` without a hole longer than `gap_s`. Both are timed
-    on the tracker's own clock, so a slow window redraw can neither cut the
-    hold short nor stretch it. Every hand id is followed on its own; the
-    operator's label wins a tie, but no label is required, because the
-    tracker calls the left hand "right" often enough.
+    A hand counts while its palm is `band` cm above the module, within
+    `max_angle` degrees of facing the lens and centred over the module (its
+    offset from the module's axis at most `LATERAL_FRACTION_MAX` of its
+    height, i.e. within about 31 degrees of the axis, the rule
+    `leap_hand.protocol.acquire_failures` uses), and it is acquired once it
+    has counted for `hold_s` without a hole longer than `gap_s`. Both are
+    timed on the tracker's own clock, so a slow window redraw can neither
+    cut the hold short nor stretch it. Every hand id is followed on its own;
+    the operator's label wins a tie, but no label is required, because the
+    tracker calls the left hand "right" often enough. The centring is what
+    keeps the other hand, held open off to the side to help the tracker,
+    from ever being the one acquired: on 2026-10-01 the idle right hand was
+    acquired (21 cm up, 15 degrees from the lens), and the take measured it.
     """
 
     def __init__(self, band=OPEN_BAND_CM, max_angle: float = OPEN_MAX_ANGLE_DEG,
@@ -1389,7 +1410,13 @@ class OpenHandWatch:
 
     def fits(self, h: HandSeen) -> bool:
         return (self.band[0] <= h.height_cm <= self.band[1]
-                and h.angle_deg is not None and h.angle_deg <= self.max_angle)
+                and h.angle_deg is not None and h.angle_deg <= self.max_angle
+                and self.centred(h))
+
+    @staticmethod
+    def centred(h: HandSeen) -> bool:
+        """Over the module: nearer its axis than 0.6 times the height."""
+        return h.offset_cm <= LATERAL_FRACTION_MAX * h.height_cm
 
     def add(self, lh, now: float) -> None:
         h = hand_seen(lh, now)
@@ -1437,6 +1464,9 @@ class OpenHandWatch:
             fixes.append(f"raise it to {lo:g} to {hi:g} cm (now {h.height_cm:.0f} cm)")
         elif h.height_cm > hi:
             fixes.append(f"lower it to {lo:g} to {hi:g} cm (now {h.height_cm:.0f} cm)")
+        if not self.centred(h):
+            fixes.append(f"centre it over the module (now {h.offset_cm:.0f} cm "
+                         "to the side)")
         if h.angle_deg is None or h.angle_deg > self.max_angle:
             now_deg = "" if h.angle_deg is None else f" (now {h.angle_deg:.0f} degrees)"
             fixes.append(f"turn the palm to the camera{now_deg}")
@@ -1456,6 +1486,8 @@ class OpenHandWatch:
             return "raise it"
         if h.height_cm > self.band[1]:
             return "lower it"
+        if not self.centred(h):
+            return "centre it over the module"
         if h.angle_deg is None or h.angle_deg > self.max_angle:
             return "turn the palm to the camera"
         return "hold it there"
@@ -1464,31 +1496,46 @@ class OpenHandWatch:
 class FormWatch:
     """MAKE THE GRASP: is the acquired hand still tracked?
 
-    The hand is the id acquired at OPEN HAND. An id the tracker gives it
-    afterwards is followed too (a re-acquisition), but never one that was
-    already in view at OPEN HAND as another hand. Lost means no frame of it
-    for more than `lost_s`: between two of its frames on the tracker's own
-    clock, or since the last drain that brought one. The queue is drained
-    before each judgement, so a slow redraw or a blocking beep is not a
-    loss: the frames that queued behind it arrive first.
+    The hand is the id acquired at OPEN HAND (`mine`). An id the tracker
+    gives it afterwards is followed too (a re-acquisition, or a chirality
+    flip, which LeapC also reports as a new id), but never one that was
+    already in view at OPEN HAND as another hand, one seen in the same
+    tracking frame as the followed hand (two hands at once cannot both be
+    the operator's) or one further than `FOLLOW_RADIUS_M` from where the
+    followed hand last was; those are other hands from then on (`others`).
+    Lost means no frame of it for more than `lost_s`: between two of its
+    frames on the tracker's own clock, or since the last drain that brought
+    one. The queue is drained before each judgement, so a slow redraw or a
+    blocking beep is not a loss: the frames that queued behind it arrive
+    first. `follow_start` hands the hand over to the take's analysis
+    (`leap_hand.static_interval.follow_hand`).
     """
 
     def __init__(self, start: HandSeen, others: Set[int],
                  lost_s: float = FORM_LOST_S):
         self.hid = int(start.lh.hand_id)
+        self.mine = {self.hid}
         self.last = start
-        self.others = set(others) - {self.hid}
+        self.others = set(others) - self.mine
         self.lost_s = float(lost_s)
         self.hole: Optional[HandSeen] = None
         self.new_ids = 0
 
     def add(self, lh, now: float) -> None:
         hid = int(lh.hand_id)
-        if hid != self.hid:
+        if hid not in self.mine:
             if hid in self.others:
                 return
-            self.hid = hid
+            frame = getattr(lh, "frame_id", None)
+            if frame is not None and frame == getattr(self.last.lh, "frame_id", None):
+                self.others.add(hid)         # seen beside the followed hand
+                return
+            if math.dist(lh.palm_pos, self.last.lh.palm_pos) > FOLLOW_RADIUS_M:
+                self.others.add(hid)         # somewhere else: another hand
+                return
+            self.mine.add(hid)
             self.new_ids += 1
+        self.hid = hid
         h = hand_seen(lh, now)
         if self.hole is None and h.ts - self.last.ts > self.lost_s:
             self.hole = self.last
@@ -1501,6 +1548,12 @@ class FormWatch:
         if now - self.last.wall > self.lost_s:
             return self.last
         return None
+
+    @property
+    def follow_start(self) -> Tuple[int, List[int], List[float]]:
+        """(hand id, other hands' ids, last palm position in metres): what
+        `summarise_take(follow=...)` follows through the take."""
+        return self.hid, sorted(self.others), [float(v) for v in self.last.lh.palm_pos]
 
 
 def form_loss(h: HandSeen, t0: float) -> dict:
@@ -1528,6 +1581,26 @@ def forming_reason(losses: List[dict]) -> str:
     n = len(losses)
     return (f"lost the hand {n} time{'' if n == 1 else 's'} while forming the "
             f"grasp, the last {form_loss_where(losses[-1])}")
+
+
+def hand_line(s) -> str:
+    """`hand: id 25, tracker label left; another hand in view (id 24)
+    ignored; called right on 43 of 285 frames`, or "" with no hand."""
+    if not s.hand_ids or not s.hand_labels:
+        return ""
+    line = (f"hand: id {'+'.join(str(h) for h in s.hand_ids)}, "
+            f"tracker label {s.hand_label}")
+    if len(s.other_ids) == 1:
+        line += f"; another hand in view (id {s.other_ids[0]}) ignored"
+    elif s.other_ids:
+        line += (f"; other hands in view (ids "
+                 f"{', '.join(str(h) for h in s.other_ids)}) ignored")
+    if len(s.hand_labels) > 1:
+        total = sum(s.hand_labels.values())
+        for label, n in s.hand_labels.items():
+            if label != s.hand_label:
+                line += f"; called {label} on {n} of {total} frames"
+    return line
 
 
 # --- the session ------------------------------------------------------------------
@@ -1643,6 +1716,9 @@ class ProtocolSession(Session):
         self.coach = bool(coach)
         self.acquire_timeout = float(acquire_timeout)
         self._coaching: Optional[dict] = None  # this attempt's, for its meta
+        # (hand id, other ids, last palm) of the hand the coaching acquired
+        # and kept through MAKE THE GRASP; None with --no-coach
+        self._follow: Optional[Tuple[int, List[int], List[float]]] = None
         self.protocol_changes: List[dict] = []
         self._now: Optional[Tuple[dict, int]] = None   # (item, take) on screen
         self.entries: List[dict] = []          # session.json "takes"
@@ -1812,7 +1888,9 @@ class ProtocolSession(Session):
                 "height_cm": round(got.height_cm, 1),
                 "view_angle_deg": (None if got.angle_deg is None
                                    else round(got.angle_deg, 1)),
-                "hand_label": got.lh.hand_side})
+                "offset_cm": round(got.offset_cm, 1),
+                "hand_label": got.lh.hand_side,
+                "hand_id": int(got.lh.hand_id)})
             loss = self._make_grasp(got, others)
             if loss is None:
                 return True, ""
@@ -1858,7 +1936,9 @@ class ProtocolSession(Session):
 
     def _make_grasp(self, start: HandSeen, others: Set[int]) -> Optional[dict]:
         """MAKE THE GRASP: `prep` seconds to close the hand while it stays
-        tracked. None when it did, else where it was lost (`form_loss`)."""
+        tracked. None when it did, else where it was lost (`form_loss`).
+        Kept, the hand it followed is what the take follows (`_follow`),
+        and the coaching record names its ids and the other hands'."""
         label = str(self._now[0]["label"]) if self._now else ""
         # The seconds start with the high beep, the operator's cue to close.
         t0 = time.time()
@@ -1874,9 +1954,14 @@ class ProtocolSession(Session):
             self._watch(lambda lh: watch.add(lh, now))
             gone = watch.lost(now)
             if gone is not None:
+                self._follow = None
                 return form_loss(gone, t0)
             left = t_end - now
             if left <= 0:
+                self._follow = watch.follow_start
+                if self._coaching is not None:
+                    self._coaching["followed_ids"] = sorted(watch.mine)
+                    self._coaching["other_hands"] = sorted(watch.others)
                 return None
             whole = math.ceil(left)
             if whole != shown:
@@ -2006,6 +2091,7 @@ class ProtocolSession(Session):
             self.source.set_pose(iid if iid in ("open_palm", "fist") else None)
         self._now = (item, n)
         self._coaching = None
+        self._follow = None              # stays None with --no-coach
         if self.coach:
             ok, why = self._coach(item)
             if not ok:
@@ -2051,11 +2137,16 @@ class ProtocolSession(Session):
             raise
 
         rows = read_rows(leap_path)
+        # The hand the coaching acquired, followed by id (with --no-coach the
+        # label with the most frames), measured on its frames labelled as
+        # the operator's hand.
         summary = summarise_take(rows, t_stop - t_start, self.static_s,
-                                 prefer=self.hand, min_tracked=MIN_TRACKED)
+                                 prefer=self.hand, min_tracked=MIN_TRACKED,
+                                 follow=self._follow, require_label=self.hand)
         # Every loss of the operator's hand in the take, with where the hand
         # was and why: the evidence a bare "tracked 72 %" does not carry.
-        losses = take_losses(rows, summary.hand_label, t_start, t_stop)
+        # Its lines under any label: a chirality flip is the same hand.
+        losses = take_losses(summary.operator_rows, None, t_start, t_stop)
         gate_text = take_reason(summary.gate_reason, summary.tracked_fraction,
                                 MIN_TRACKED, summary.interval_losses,
                                 summary.medoid_row is not None, losses.losses,
@@ -2139,6 +2230,9 @@ class ProtocolSession(Session):
                      f"id changes {s.reacquisitions} "
                      f"({len(s.interval_reacquisitions)} in the static interval, "
                      f"{len(s.interval_losses)} with the hand really gone)")
+        hand = hand_line(s)
+        if hand:
+            lines.append(hand)
         if s.medoid_row is not None:
             lines.append(f"grab {_num(s.grab_strength)}   "
                          f"pinch {_num(s.pinch_strength)}")
@@ -2303,6 +2397,13 @@ class ProtocolSession(Session):
                     None if s is None else len(s.interval_losses)),
                 "id_changes_in_static_interval": (
                     None if s is None else len(s.interval_reacquisitions)),
+                # the static interval's frames labelled as the operator's
+                # hand, and the frames the tracker produced over its length;
+                # under half of those rejects the take
+                "interval_label_frames": (
+                    None if s is None else s.interval_label_frames),
+                "interval_expected_frames": (
+                    None if s is None else s.interval_expected_frames),
                 # Every loss of the operator's hand (gone longer than
                 # loss_gap_s, or a new hand id), kept take or not, with where
                 # the hand was, the likely causes and the fix; start_s is from
@@ -2310,10 +2411,16 @@ class ProtocolSession(Session):
                 "loss_gap_s": LOSS_GAP_S if losses is None else losses.gap_s,
                 "losses": [] if losses is None else losses.to_list(),
             },
-            # The tracker label whose frames were taken as the operator's
-            # hand (the one with the most frames), and the summary frame's
-            # own identity: its line in the leap file, counted from 0.
+            # The tracker's label on the summary frame (else the majority
+            # label of the operator's frames), the hand ids followed as the
+            # operator's hand, the ids of other hands in view (their frames
+            # stay in the leap file, never measured), and the operator's
+            # frames per tracker label; then the summary frame's own
+            # identity: its line in the leap file, counted from 0.
             "operator_hand_label": None if s is None else s.hand_label,
+            "operator_hand_ids": [] if s is None else list(s.hand_ids),
+            "other_hand_ids": [] if s is None else list(s.other_ids),
+            "operator_hand_labels": {} if s is None else dict(s.hand_labels),
             "medoid_line": None if s is None else s.medoid_index,
             "medoid_frame_id": None if row is None else row.get("frame_id"),
             "medoid_hand_id": None if row is None else row.get("hand_id"),
@@ -2368,14 +2475,17 @@ class ProtocolSession(Session):
 
 
 def make_mock_source(dropout: float = 0.0, coach: bool = True,
-                     lose_forming: int = 0):
+                     lose_forming: int = 0, hand: str = "left",
+                     other_hand: str = "same"):
     """The synthetic camera behind `--mock`, started.
 
-    Coached, the hand acts the take out (`leap_hand.mock.CoachedActor`):
+    Coached, the `hand` acts the take out (`leap_hand.mock.CoachedActor`):
     an open palm at OPEN HAND, closing at MAKE THE GRASP (lost on the first
     `lose_forming` tries of every attempt), the grasp held at HOLD STILL;
     `dropout` then drops frames during the hold only, so a rehearsal of the
-    gate's rejection still reaches the take. With `coach` off it is the
+    gate's rejection still reaches the take. `other_hand` "open"
+    (`--mock-other-hand`) holds the other hand open 25 cm to the side
+    instead of copying the operator's. With `coach` off it is the
     plain mock it always was. Either way it is clean otherwise: the default
     mock drops 20 frames in 300 and changes hand id every 5 s, so a 1 s
     rehearsal take would fail the gate at random.
@@ -2384,7 +2494,9 @@ def make_mock_source(dropout: float = 0.0, coach: bool = True,
     if coach:
         source = MockLeapStream(dropout_every=0, reacquire_every=0,
                                 script=CoachedActor(lose_forming=lose_forming,
-                                                    hold_dropout=dropout))
+                                                    hold_dropout=dropout,
+                                                    operator=hand,
+                                                    other_hand=other_hand))
     elif dropout > 0:
         source = MockLeapStream(dropout_every=90, reacquire_every=0,
                                 dropout_frames=max(1, min(89, round(90 * dropout))))
@@ -2424,6 +2536,12 @@ def run_protocol(args, parser) -> None:
                          "drop --no-coach")
         if args.mock_lose_forming < 0:
             parser.error("--mock-lose-forming cannot be negative")
+    if args.mock_other_hand:
+        if not args.mock:
+            parser.error("--mock-other-hand only applies with --mock")
+        if not coach:
+            parser.error("--mock-other-hand acts out the coached take; "
+                         "drop --no-coach")
 
     protocol, sha = load_protocol(args.protocol)
     resume = None
@@ -2461,9 +2579,12 @@ def run_protocol(args, parser) -> None:
 
     if args.mock:
         # --mock-dropout puts a dropout back on purpose, to rehearse the
-        # gate's rejection; --mock-lose-forming rehearses LOST YOU.
+        # gate's rejection; --mock-lose-forming rehearses LOST YOU;
+        # --mock-other-hand puts the idle hand in view, off to the side.
         source = make_mock_source(args.mock_dropout or 0.0, coach,
-                                  args.mock_lose_forming or 0)
+                                  args.mock_lose_forming or 0, hand=args.hand,
+                                  other_hand=("open" if args.mock_other_hand
+                                              else "same"))
     else:
         try:
             source = open_stream(mode=args.mode)
@@ -2499,10 +2620,12 @@ def run_protocol(args, parser) -> None:
         if coach:
             print(f"  coach:   OPEN HAND ({OPEN_BAND_CM[0]:g} to "
                   f"{OPEN_BAND_CM[1]:g} cm up, palm within "
-                  f"{OPEN_MAX_ANGLE_DEG:g} degrees of the lens, "
-                  f"{OPEN_HOLD_S:g} s; {OPEN_HAND_TIMEOUT_S:g} s to get "
-                  f"there), MAKE THE GRASP {prep:g} s, HOLD STILL "
-                  f"{duration:g} s")
+                  f"{OPEN_MAX_ANGLE_DEG:g} degrees of the lens, centred "
+                  f"over the module, {OPEN_HOLD_S:g} s; "
+                  f"{OPEN_HAND_TIMEOUT_S:g} s to get there), MAKE THE "
+                  f"GRASP {prep:g} s, HOLD STILL {duration:g} s")
+            print("  other:   the other hand may be in view, open and at "
+                  "least 20 cm to the side; it is ignored")
         else:
             print(f"  coach:   off (--no-coach): a {prep:g} s GET READY "
                   "countdown")
@@ -2521,7 +2644,9 @@ def run_protocol(args, parser) -> None:
         if protocol.get("status"):
             print(f"  status:  {protocol['status']}")
         if args.mock:
-            print("  Mock mode: synthetic hands, no camera; the stills say MOCK.")
+            print("  Mock mode: synthetic hands, no camera; the stills say MOCK."
+                  + (" The other hand is open 25 cm to the side."
+                     if args.mock_other_hand else ""))
         print("=" * 62 + "\n")
 
         if not args.mock:
@@ -2580,7 +2705,10 @@ def main() -> None:
                    help="also write LeapC's own .lmt recording beside each take")
     g = p.add_argument_group("the professor's grasp set (Set A)")
     g.add_argument("--protocol", type=Path, default=None,
-                   help="protocol file, e.g. protocols/grasps.json")
+                   help="protocol file, e.g. protocols/grasps.json. The other "
+                        "hand may be in view, open and at least 20 cm to the "
+                        "side of the module; it is ignored and listed in each "
+                        "take's meta under other_hand_ids")
     g.add_argument("--hand", choices=("left", "right"), default=None,
                    help="the operator's hand; required with --protocol")
     g.add_argument("--items", default=None,
@@ -2620,6 +2748,10 @@ def main() -> None:
                    help="with --mock: lose the hand while it closes into the "
                         "grasp on the first N tries of every attempt, to "
                         "rehearse LOST YOU (3 or more rejects every attempt)")
+    g.add_argument("--mock-other-hand", action="store_true",
+                   help="with --mock: the other hand stays open 25 cm to the "
+                        "side instead of copying the operator's hand, to "
+                        "rehearse a take with the idle hand in view")
     args = p.parse_args()
 
     if args.protocol is not None:
@@ -2634,7 +2766,8 @@ def main() -> None:
         ("--note", args.note), ("--operator", args.operator),
         ("--no-coach", args.no_coach),
         ("--mock-dropout", args.mock_dropout),
-        ("--mock-lose-forming", args.mock_lose_forming))
+        ("--mock-lose-forming", args.mock_lose_forming),
+        ("--mock-other-hand", args.mock_other_hand))
         if value not in (None, False)]
     if protocol_only:
         p.error(f"{', '.join(protocol_only)} only apply with --protocol")

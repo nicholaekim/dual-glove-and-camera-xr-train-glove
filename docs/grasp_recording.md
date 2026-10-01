@@ -36,11 +36,12 @@ A take is named `<grasp>_left_take<N>_<YYYYMMDD_HHMMSS>`, for example
 The camera can follow an open hand into a grasp, but it cannot pick up a
 hand that is already closed. That is why the hand opens first, every time.
 
-OPEN HAND waits until the palm has been 18 to 40 cm above the module and
-within 50 degrees of facing the lens for half a second without a break. The
-COPY THIS window says what is still wrong ("lower it", "turn the palm to the
-camera"). If no open hand is seen within 30 seconds, the attempt is rejected
-with "no open hand acquired in 30 s" and starts again.
+OPEN HAND waits until the palm has been 18 to 40 cm above the module, within
+50 degrees of facing the lens and over the middle of the module for half a
+second without a break. The COPY THIS window says what is still wrong
+("lower it", "centre it over the module", "turn the palm to the camera"). If
+no open hand is seen within 30 seconds, the attempt is rejected with "no
+open hand acquired in 30 s" and starts again.
 
 MAKE THE GRASP gives you 4 seconds. If the camera loses your hand for more
 than 0.3 seconds while you close it, you hear a low beep and the window says
@@ -52,6 +53,16 @@ Each take's meta file records how it went under `coaching`: `acquire_s`
 (seconds to find the open hand) and `lost_while_forming` (how often the
 hand was lost while you closed it), with the height and palm angle of every
 loss. `--no-coach` brings back the old 5 second countdown without OPEN HAND.
+
+Your other hand. You may hold your right hand open in view, palm to the
+camera, at least 20 cm to the side of the module at about the same height,
+if that helps the camera tell left from right. OPEN HAND only takes a hand
+within about 31 degrees of the module's axis (nearer the axis than 0.6
+times its height), so the hand off to the side is never the one acquired.
+The take follows the hand OPEN HAND acquired by the tracker's id, including
+a new id the tracker gives that same hand in the same place. The other
+hand's frames stay in the take's file and are listed in the meta under
+`other_hand_ids`; they are never measured.
 
 ## The COPY THIS window
 
@@ -114,7 +125,16 @@ Checked automatically after every take:
   the tracker finds it again. The tracker also re-labels a hand it never
   stopped seeing (a new hand id with no hole in the data; seven of nine
   "losses" in the 60 s test of 2026-09-30 were that); those are counted in
-  the review line and the meta but do not reject the take.
+  the review line and the meta but do not reject the take. A label flip
+  (the tracker calling your left hand "right" under a new id) with no hole
+  in the data is not a loss either: the take follows the hand, whatever it
+  is called;
+- the hand fitted as your hand. The static interval and the summary frame
+  are chosen from the frames the tracker labelled as your hand, because a
+  skeleton fitted as the other hand is a mirror image of yours. A take with
+  no such frame, or with them in under half of the static interval, is
+  rejected with "the tracker fitted the hand as a right hand for the whole
+  take" or "... for most of the static interval".
 
 The gate is the minimum for a usable take, not the decision. That is yours,
 at the review.
@@ -124,6 +144,9 @@ at the review.
 It shows the still, the grasp's name and these numbers:
 
 - tracked %: the share of the take's frames in which the hand was tracked;
+- hand: the tracker's id of the hand that was measured and its label on the
+  summary frame, another hand in view (ignored) and how many frames the
+  tracker called it the other hand;
 - grab and pinch: the tracker's own 0 to 1 values for the summary frame;
 - curls: one number per finger, the same curl every other report in this
   repo uses;
@@ -148,7 +171,8 @@ The live IR picture with the tracked skeleton drawn on it. Use it to put
 your hand inside the envelope during OPEN HAND. It has a LEFT line and a
 RIGHT line: that label is the tracker's guess, and it often calls the left
 hand "right". Ignore the label. What matters is that one line says tracked
-and its height reads OK. The other line saying NO HAND is expected.
+and its height reads OK. The other line saying NO HAND is expected, or
+tracked when you hold the other hand in view.
 
 ## When a take is rejected
 
@@ -165,7 +189,10 @@ the next high beep, fix the cause:
   view, and turn the hand so no finger is edge-on;
 - the hand was lost inside the static interval: hold the grasp still from
   the beep that starts the recording to the low beep and keep the hand
-  over the middle of the module, 25 to 35 cm up.
+  over the middle of the module, 25 to 35 cm up;
+- the tracker fitted the hand as a right hand: hold your right hand open in
+  view, 20 cm or more to the side (Your other hand, above), and keep the
+  left palm toward the camera while you close it.
 
 Two rejections happen before anything is recorded, and the console prints
 `REJECTED:` with the reason:
@@ -259,7 +286,8 @@ ones you caused on purpose (50 cm, the far side, the palm turned away).
 
 Before you press Enter: the module flat on the table with the lenses up, no
 sunlight on it, and your right hand resting on the table away from the
-module. Each take starts with OPEN HAND; the picture of each grasp appears
+module, or held open at least 20 cm to the side of it (Your other hand,
+above). Each take starts with OPEN HAND; the picture of each grasp appears
 in the COPY THIS window at the high beep.
 
 ```
