@@ -52,10 +52,13 @@ file.
 Checked automatically after every take:
 
 - at least 90 % of the take's frames tracked;
-- no re-acquisition inside the static interval. The static interval is the
+- the hand not lost inside the static interval. The static interval is the
   2 seconds of the take in which the hand moved least; the summary frame is
-  chosen from it. A re-acquisition is the tracker losing the hand and
-  finding it again.
+  chosen from it. Lost means gone from the data for more than 0.1 s before
+  the tracker finds it again. The tracker also re-labels a hand it never
+  stopped seeing (a new hand id with no hole in the data; seven of nine
+  "losses" in the 60 s test of 2026-09-30 were that); those are counted in
+  the review line and the meta but do not reject the take.
 
 The gate is the minimum for a usable take, not the decision. That is yours,
 at the review.
@@ -104,8 +107,9 @@ next countdown ends, fix the cause:
 
 - tracked under 90 %: bring the hand inside 20 to 40 cm, keep the wrist in
   view, and turn the hand so no finger is edge-on;
-- re-acquired inside the static interval: hold the grasp still from the
-  high beep to the low beep and keep the hand over the middle of the module.
+- the hand was lost inside the static interval: hold the grasp still from
+  the high beep to the low beep and keep the hand over the middle of the
+  module, 25 to 35 cm up.
 
 After 3 failed attempts the recorder moves on to the next take. The end
 table then lists that grasp as short of its takes, and step 7 below records

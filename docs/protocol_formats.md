@@ -206,9 +206,12 @@ position (not forced to zero, unlike the glove files).
 
 Static interval: the `static_s` (default 2.0 s) window inside the take with
 the smallest mean joint speed, computed on the tracked frames of the
-operator's hand. `reacquisitions` counts the whole take;
-`gate.reacquisitions_in_static_interval` is the number the acquisition gate
-and the checker judge on.
+operator's hand. `reacquisitions` counts every hand-id change in the whole
+take; `gate.reacquisitions_in_static_interval` counts only the id changes
+inside the static interval that came after the hand was really gone (a hole
+longer than `loss_gap_s`), which is the number the acquisition gate and the
+checker judge on; `gate.id_changes_in_static_interval` counts all id changes
+there, including re-labelling with no hole, which does not fail a take.
 
 Mock sessions (any recorder run with `--mock`, `--mock-glove` or
 `--mock-leap`) carry `"mock": true` in `session.json` and are written under

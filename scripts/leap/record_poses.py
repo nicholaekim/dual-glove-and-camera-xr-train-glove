@@ -1121,7 +1121,7 @@ class ProtocolSession(Session):
         # was and why: the evidence a bare "tracked 72 %" does not carry.
         losses = take_losses(rows, summary.hand_label, t_start, t_stop)
         gate_text = take_reason(summary.gate_reason, summary.tracked_fraction,
-                                MIN_TRACKED, summary.interval_reacquisitions,
+                                MIN_TRACKED, summary.interval_losses,
                                 summary.medoid_row is not None, losses.losses,
                                 losses.head_s)
         still, missing = self._still_result(still_path)
@@ -1198,8 +1198,9 @@ class ProtocolSession(Session):
         """What the operator reads before deciding: the label and the numbers."""
         lines = [f"{item['label']}   take {n}/{self.takes}, attempt {attempt}"]
         lines.append(f"tracked {s.tracked_fraction * 100:.0f} %   "
-                     f"re-acquisitions {s.reacquisitions} "
-                     f"({len(s.interval_reacquisitions)} in the static interval)")
+                     f"id changes {s.reacquisitions} "
+                     f"({len(s.interval_reacquisitions)} in the static interval, "
+                     f"{len(s.interval_losses)} with the hand really gone)")
         if s.medoid_row is not None:
             lines.append(f"grab {_num(s.grab_strength)}   "
                          f"pinch {_num(s.pinch_strength)}")
@@ -1357,7 +1358,12 @@ class ProtocolSession(Session):
                 "min_tracked_fraction": MIN_TRACKED,
                 "tracked_frames": None if s is None else s.tracked_frames,
                 "expected_frames": None if s is None else s.expected_frames,
+                # real losses (hand gone longer than loss_gap_s) inside the
+                # static interval: the number the gate judges on; id changes
+                # with no hole in the data are counted beside it, not failed
                 "reacquisitions_in_static_interval": (
+                    None if s is None else len(s.interval_losses)),
+                "id_changes_in_static_interval": (
                     None if s is None else len(s.interval_reacquisitions)),
                 # Every loss of the operator's hand (gone longer than
                 # loss_gap_s, or a new hand id), kept take or not, with where

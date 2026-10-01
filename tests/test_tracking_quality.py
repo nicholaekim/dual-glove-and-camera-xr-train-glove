@@ -340,9 +340,9 @@ def test_the_reject_reason_names_the_losses_like_the_example():
     assert text == ("tracked 72 percent: lost 3 times, longest 1.4 s with the hand at "
                     "49 cm (too high: keep the palm 25 to 35 cm above the module); "
                     "the gate needs 90 percent")
-    reacq = tq.take_reason("re-acquired", 0.95, 0.9, [(1.0, 5, 6)], True, losses[:1])
-    assert reacq.startswith("re-acquired inside the static interval (id 5 -> 6): "
-                            "lost 1 time, for 0.4 s with the hand at 30 cm")
+    reacq = tq.take_reason("re-acquired", 0.95, 0.9, [(1.0, 5, 6, 0.4)], True, losses[:1])
+    assert reacq.startswith("the hand was lost for 0.40 s inside the static interval "
+                            "(id 5 -> 6): lost 1 time, for 0.4 s with the hand at 30 cm")
     assert tq.take_reason("", 1.0, 0.9, [], True, []) == ""
     assert tq.take_reason("no hand was tracked during the take", 0.0, 0.9, [], False,
                           []) == "no hand was tracked during the take"

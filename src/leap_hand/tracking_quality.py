@@ -971,7 +971,7 @@ def loss_sentence(losses: Sequence[Loss]) -> str:
 
 
 def take_reason(gate_reason: str, tracked_fraction: float, min_tracked: float,
-                interval_reacquisitions: Sequence[Tuple[float, int, int]],
+                interval_reacquisitions: Sequence[tuple],
                 has_summary_frame: bool, losses: Sequence[Loss],
                 head_s: Optional[float] = None) -> str:
     """The acquisition gate's reason with the losses named, or "" if it passed.
@@ -990,8 +990,11 @@ def take_reason(gate_reason: str, tracked_fraction: float, min_tracked: float,
         return (f"tracked {tracked_fraction * 100:.0f} percent: {text}; the gate "
                 f"needs {min_tracked * 100:.0f} percent")
     if interval_reacquisitions:
-        _t, old, new = interval_reacquisitions[0]
-        return f"re-acquired inside the static interval (id {old} -> {new}): {text}"
+        first = interval_reacquisitions[0]
+        _t, old, new = first[0], first[1], first[2]
+        gap = f" for {first[3]:.2f} s" if len(first) > 3 else ""
+        return (f"the hand was lost{gap} inside the static interval "
+                f"(id {old} -> {new}): {text}")
     if not has_summary_frame:
         return f"no tracked frame inside the static interval: {text}"
     return f"{gate_reason}: {text}"

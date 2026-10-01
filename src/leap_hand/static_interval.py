@@ -67,6 +67,8 @@ from xr_hand.recorder import _dict_to_frame
 
 DEFAULT_STATIC_S = 2.0
 MIN_TRACKED_FRACTION = 0.90
+LOSS_GAP_S = 0.100   # an id change after a hole longer than this is a real loss
+                     # (the same number as leap_hand.tracking_quality.LOSS_GAP_S)
 
 
 # --- one line of a take -------------------------------------------------------
@@ -259,22 +261,40 @@ def reacquisitions(frames: Sequence[dict], t0: Optional[float] = None,
                    ) -> List[Tuple[float, int, int]]:
     """Every change of LeapC hand id between consecutive lines of one hand.
 
-    (wall_time of the first line under the new id, old id, new id). With a
-    window, only changes whose new id first appears strictly after t0 and
-    at or before t1 count: a window that starts on a hand re-acquired just
-    before it holds one id throughout.
+    (wall_time of the first line under the new id, old id, new id, gap_s):
+    gap_s is the time since the previous line of that hand, so a change
+    that arrives with no hole in the data (the tracker re-labelled a hand it
+    never stopped seeing) has a gap of one frame, and a change after the
+    hand was really gone has a gap of that absence. With a window, only
+    changes whose new id first appears strictly after t0 and at or before
+    t1 count: a window that starts on a hand re-acquired just before it
+    holds one id throughout.
+
+    The 60 s tracking test of 2026-09-30 is why the gap is carried: 99 % of
+    the minute tracked, nine id changes, seven of them with no hole at all.
+    Rejecting a take for those would reject a hand the camera saw the
+    whole time.
     """
     out = []
     prev = None
+    prev_t = None
     for _i, row in hand_rows(frames, hand):
         hid = row.get("hand_id")
+        t = row_time(row)
         if prev is not None and hid is not None and prev != hid:
-            t = row_time(row)
             if (t0 is None or t > t0) and (t1 is None or t <= t1):
-                out.append((t, int(prev), int(hid)))
+                gap = 0.0 if (prev_t is None or t is None) else max(0.0, t - prev_t)
+                out.append((t, int(prev), int(hid), gap))
         if hid is not None:
             prev = hid
+        if t is not None:
+            prev_t = t
     return out
+
+
+def real_losses(changes, gap_s: float):
+    """The id changes that came with the hand actually gone: gap above gap_s."""
+    return [c for c in changes if c[3] > gap_s]
 
 
 def tracked_fraction(frames: Sequence[dict], duration_s: float,
@@ -313,7 +333,9 @@ class TakeSummary:
     tracked_fraction: float = 0.0
     reacquisitions: int = 0                           # whole take
     interval: Optional[Tuple[float, float]] = None
-    interval_reacquisitions: List[Tuple[float, int, int]] = field(default_factory=list)
+    interval_reacquisitions: List[Tuple[float, int, int, float]] = field(default_factory=list)
+    # the ones with the hand really gone (gap above LOSS_GAP_S); only these fail
+    interval_losses: List[Tuple[float, int, int, float]] = field(default_factory=list)
     medoid_index: Optional[int] = None                # line number in the file, from 0
     medoid_row: Optional[dict] = None
     grab_strength: Optional[float] = None
@@ -354,6 +376,7 @@ def summarise_take(frames: Sequence[dict], duration_s: float,
     if s.interval is not None:
         t0, t1 = s.interval
         s.interval_reacquisitions = reacquisitions(frames, t0, t1, s.hand_label)
+        s.interval_losses = real_losses(s.interval_reacquisitions, LOSS_GAP_S)
         found = medoid_in_window(frames, t0, t1, s.hand_label)
         if found is not None:
             s.medoid_row, s.medoid_index = found
@@ -371,10 +394,10 @@ def summarise_take(frames: Sequence[dict], duration_s: float,
                          f"take's frames ({s.tracked_frames} of "
                          f"{s.expected_frames}); the gate needs "
                          f"{min_tracked * 100:.0f} %")
-    elif s.interval_reacquisitions:
-        t, old, new = s.interval_reacquisitions[0]
-        s.gate_reason = (f"the tracker re-acquired the hand inside the static "
-                         f"interval (id {old} -> {new})")
+    elif s.interval_losses:
+        t, old, new, gap = s.interval_losses[0]
+        s.gate_reason = (f"the tracker lost the hand for {gap:.2f} s inside the "
+                         f"static interval and re-acquired it (id {old} -> {new})")
     elif s.medoid_row is None:
         s.gate_reason = "no tracked frame inside the static interval"
     return s
