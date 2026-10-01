@@ -44,6 +44,7 @@
       "same_as": [
         "p2_s07_directional_power_side"
       ],
+      "orientation": "turn the forearm so the palm and the fingertips face the camera; same fingers, different angle",
       "image": "p1_lateral.png"
     },
     {
@@ -57,6 +58,7 @@
       "same_as": [
         "p3_circular_precision_thumb_4_fingers"
       ],
+      "orientation": "turn the forearm so the palm and the fingertips face the camera; same fingers, different angle",
       "image": "p1_palmar.png"
     },
     {
@@ -85,6 +87,7 @@
         "p2_s04_fingertip_grasp",
         "p3_circular_precision_thumb_1_finger"
       ],
+      "orientation": "turn the forearm so the palm and the fingertips face the camera; same fingers, different angle",
       "image": "p1_tip.png"
     },
     {
@@ -135,6 +138,7 @@
       "same_as": [
         "p1_tip"
       ],
+      "orientation": "turn the forearm so the palm and the fingertips face the camera; same fingers, different angle",
       "image": "p2_s04_fingertip_grasp.png"
     },
     {
@@ -146,6 +150,7 @@
       "object": "small object",
       "object_implied": true,
       "same_as": [],
+      "orientation": "turn the forearm so the palm and the fingertips face the camera; same fingers, different angle",
       "image": "p2_s05_fingertip_grasp_side_support.png"
     },
     {
@@ -159,6 +164,7 @@
       "same_as": [
         "p3_circular_precision_thumb_2_fingers"
       ],
+      "orientation": "turn the forearm so the palm and the fingertips face the camera; same fingers, different angle",
       "image": "p2_s06_tripod_grasp.png"
     },
     {
@@ -257,6 +263,7 @@
       "same_as": [
         "p1_palmar"
       ],
+      "orientation": "turn the forearm so the palm and the fingertips face the camera; same fingers, different angle",
       "image": "p3_circular_precision_thumb_4_fingers.png"
     },
     {
@@ -270,6 +277,7 @@
       "same_as": [
         "p2_s06_tripod_grasp"
       ],
+      "orientation": "turn the forearm so the palm and the fingertips face the camera; same fingers, different angle",
       "image": "p3_circular_precision_thumb_2_fingers.png"
     },
     {
@@ -284,6 +292,7 @@
         "p1_tip",
         "p2_s04_fingertip_grasp"
       ],
+      "orientation": "turn the forearm so the palm and the fingertips face the camera; same fingers, different angle",
       "image": "p3_circular_precision_thumb_1_finger.png"
     },
     {
@@ -295,6 +304,7 @@
       "object": "pen",
       "object_implied": true,
       "same_as": [],
+      "orientation": "turn the forearm so the palm and the fingertips face the camera; same fingers, different angle",
       "image": "p3_prismatic_precision.png"
     }
   ]

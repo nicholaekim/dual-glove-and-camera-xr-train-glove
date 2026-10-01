@@ -38,6 +38,15 @@ None (nothing changes) or a dict with any of
 and `sides` limits the generator to one hand, the way the protocol is run.
 With no script the frames are exactly what they were before.
 
+A take that is acted out. `CoachedActor` is a script that follows the coached
+grasp take of `scripts/leap/record_poses.py --protocol` (OPEN HAND, MAKE THE
+GRASP, HOLD STILL): the recorder calls `act(phase)` on the stream as it moves
+from phase to phase, and the actor shows an open palm, closes it, and holds
+the grasp. Asked to, it loses the hand while it closes, the way the camera
+lost the operator's hand on 2026-10-01: the forearm turns until the palm is
+edge-on to the lens, then the hand is gone and stays gone until the next
+OPEN HAND, where it comes back under a new hand id.
+
 Geometry is a plausible cartoon of a hand, not a calibrated one: segment
 lengths are typical adult values and the joint angles come from two
 parameters (curl, spread). It exists to exercise conversion, recording,
@@ -157,6 +166,23 @@ class MockLeapStream:
     def set_pose(self, pose: Optional[str]) -> None:
         """Hold one pose (or None to keep cycling). Used by record_poses."""
         self.pose = pose
+
+    def act(self, phase: Optional[str]) -> None:
+        """Tell a phase-aware `script` (`CoachedActor`) where the recorder is.
+
+        The phase starts at the frame that belongs to this wall-clock
+        instant, not at the next frame generated: frames are generated
+        lazily at the next `drain`, and the ones covering the time before
+        this call must not be acted out as the new phase. Nothing happens
+        without such a script.
+        """
+        if self.script is None or not hasattr(self.script, "phase"):
+            return
+        import time
+        i = self._i
+        if self._clock is not None:
+            i += max(0, int((time.time() - self._clock) * self.hz))
+        self.script.phase(phase, i)
 
     # --- generation -----------------------------------------------------
     def drain(self, max_items: int = 16) -> List[Tuple[str, LeapHand]]:
@@ -336,3 +362,107 @@ class MockLeapStream:
             frame_age_us=None,   # no LeapC clock behind a mock
             capture_time=timestamp_us / 1e6,
         )
+
+
+class CoachedActor:
+    """A `MockLeapStream` script that acts out the coached grasp take.
+
+    `scripts/leap/record_poses.py --protocol` calls `MockLeapStream.act`
+    with the phase it is in, and the hand does what the operator is asked:
+
+      "open"   an open palm square to the lens where the stream puts it, 25 cm
+               up. Absent for the first `absent_open_s` of every OPEN HAND,
+               which makes the recorder wait for it (or time out, when that
+               is longer than the recorder's timeout).
+      "form"   the fingers close to `grasp_curl` over `close_s`, the palm
+               kept toward the lens. On a try that is to be lost the forearm
+               also rolls the palm edge-on to the lens (`lost_roll_deg`)
+               over `lose_at_s`, as the hand turns when a grasp is copied
+               with the fingertips down, and from then on no hand is
+               reported until the next phase.
+      "hold"   the grasp held, palm toward the lens. `hold_dropout` (0 to 1)
+               drops that share of every `period` frames, counted from the
+               start of the hold, so a rehearsal of the gate's rejection
+               still gets through OPEN HAND and MAKE THE GRASP.
+      anything else ("idle", None)  nothing scripted: the stream's own pose.
+
+    The first `lose_forming` tries at MAKE THE GRASP of every attempt are
+    lost; an attempt ends at "hold" or "idle". A hand that comes back after
+    a loss carries a new hand id, as LeapC gives a re-acquired hand.
+
+    Each phase is kept with the frame it started at, so a frame generated
+    after a phase change but belonging to the time before it is still
+    acted out as the phase it belongs to.
+    """
+
+    def __init__(self, hz: float = 90.0, lose_forming: int = 0,
+                 grasp_curl: float = 0.6, close_s: float = 1.0,
+                 lose_at_s: float = 0.6, lost_roll_deg: float = 85.0,
+                 absent_open_s: float = 0.0, hold_dropout: float = 0.0,
+                 period: int = 90):
+        self.hz = float(hz)
+        self.lose_forming = max(0, int(lose_forming))
+        self.grasp_curl = float(grasp_curl)
+        self.close_s = float(close_s)
+        self.lose_at_s = float(lose_at_s)
+        self.lost_roll_deg = float(lost_roll_deg)
+        self.absent_open_s = float(absent_open_s)
+        self.period = max(2, int(period))
+        self.hold_drop_frames = (
+            0 if hold_dropout <= 0
+            else max(1, min(self.period - 1, round(self.period * float(hold_dropout)))))
+        self._segments: List[Tuple[int, Optional[str], bool, int]] = []
+        self._tries = 0                  # MAKE THE GRASP tries in this attempt
+        self._id_offset = 0
+        self.lost = 0                    # tries acted out as lost, all attempts
+        self.phases: List[Optional[str]] = []   # every phase asked for, in order
+
+    def phase(self, name: Optional[str], i: int) -> None:
+        """The recorder moved to phase `name` at frame `i`."""
+        losing = False
+        if name == "form":
+            self._tries += 1
+            losing = self._tries <= self.lose_forming
+            self.lost += int(losing)
+        elif name == "open":
+            if self._segments and self._segments[-1][2]:
+                self._id_offset += 1     # the hand comes back as a new hand
+        else:
+            self._tries = 0              # "hold" or "idle": the attempt is over
+        self.phases.append(name)
+        self._segments.append((int(i), name, losing, self._id_offset))
+        del self._segments[:-8]
+
+    def _segment(self, i: int):
+        for seg in reversed(self._segments):
+            if seg[0] <= i:
+                return seg
+        return None
+
+    def __call__(self, i: int) -> Optional[dict]:
+        seg = self._segment(i)
+        if seg is None:
+            return None
+        start, name, losing, offset = seg
+        t = (i - start) / self.hz
+        if name == "open":
+            if t < self.absent_open_s:
+                return {"drop": True}
+            return {"curl": 0.0, "id_offset": offset}
+        if name == "form":
+            w = min(1.0, t / self.close_s) if self.close_s > 0 else 1.0
+            curl = self.grasp_curl * w * w * (3.0 - 2.0 * w)
+            if not losing:
+                return {"curl": curl, "id_offset": offset}
+            if t >= self.lose_at_s:
+                return {"drop": True}
+            turn = t / self.lose_at_s if self.lose_at_s > 0 else 1.0
+            return {"curl": curl, "roll_deg": self.lost_roll_deg * turn,
+                    "id_offset": offset}
+        if name == "hold":
+            k = i - start
+            if (self.hold_drop_frames
+                    and k % self.period >= self.period - self.hold_drop_frames):
+                return {"drop": True}
+            return {"curl": self.grasp_curl, "id_offset": offset}
+        return {"id_offset": offset} if offset else None

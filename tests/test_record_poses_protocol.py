@@ -679,12 +679,15 @@ def test_a_missing_picture_shows_the_shape_text_and_is_reported_once(
 
 def test_a_mock_session_shows_each_grasps_picture_in_copy_this(
         rp, monkeypatch, tmp_path, with_pictures, gui, capsys):
+    """The plain countdown (--no-coach); the coached take has its own test,
+    test_a_coached_session_shows_open_hand_then_the_picture_with_the_hint."""
     import numpy as np
 
     frames = spy_frames(rp, monkeypatch)
     out = tmp_path / "grasps"
     run(rp, monkeypatch, *mock_args(with_pictures, out, "--auto-accept",
-                                    "--takes", "1", "--prep", "0.3"))
+                                    "--takes", "1", "--prep", "0.3",
+                                    "--no-coach"))
     session = read_json(session_dir(out) / "session.json")
     assert [(t["item"], t["accepted"]) for t in session["takes"]] == [
         (i, True) for i in ITEMS]
@@ -780,6 +783,438 @@ def test_the_review_appears_in_copy_this_beside_the_paper_and_it_stays_open(
     # and back to the picture for the next take
     window.show_copy(item, 2, 3, "GET READY", 3.0, force=True)
     assert gui.last[rp.COPY_WINDOW].shape == countdown.shape
+
+
+# --- the coached take: OPEN HAND, MAKE THE GRASP, HOLD STILL --------------------------
+HINT = ("turn the forearm so the palm and the fingertips face the camera; "
+        "same fingers, different angle")
+FINGERTIPS_DOWN = {
+    "p1_tip", "p1_lateral", "p2_s04_fingertip_grasp",
+    "p2_s05_fingertip_grasp_side_support", "p2_s06_tripod_grasp",
+    "p3_circular_precision_thumb_1_finger",
+    "p3_circular_precision_thumb_2_fingers", "p3_prismatic_precision",
+    "p1_palmar", "p3_circular_precision_thumb_4_fingers"}
+FORMING_REASON_RE = re.compile(
+    r"lost the hand (?P<n>\d+) times? while forming the grasp, the last at "
+    r"(?P<cm>\d+) cm with the palm (?P<deg>\d+) degrees from the lens "
+    r"\((?P<cause>[a-z ]+): (?P<fix>.+)\)")
+
+
+def actor_with(monkeypatch, **options):
+    """Every `CoachedActor` the mock builds gets these options on top of the
+    recorder's; the actors built are returned, to read what they acted."""
+    import leap_hand.mock as mock
+
+    real = mock.CoachedActor
+    made = []
+
+    def build(**kw):
+        actor = real(**{**kw, **options})
+        made.append(actor)
+        return actor
+
+    monkeypatch.setattr(mock, "CoachedActor", build)
+    return made
+
+
+def spy_timeline(rp, monkeypatch):
+    """Every COPY THIS frame in order: ("copy", item, status, picture given,
+    info) from compose_copy, ("open", item, status, lost, info) from
+    compose_open."""
+    seen = []
+    real_copy, real_open = rp.compose_copy, rp.compose_open
+
+    def copy(item, panel, take, takes, status, seconds=None):
+        img, info = real_copy(item, panel, take, takes, status, seconds)
+        seen.append(("copy", item["id"], status, panel is not None, info))
+        return img, info
+
+    def open_(item, take, takes, state, seconds=None, lost=False,
+              status=rp.OPEN_STATUS):
+        img, info = real_open(item, take, takes, state, seconds, lost, status)
+        seen.append(("open", item["id"], status, lost, info))
+        return img, info
+
+    monkeypatch.setattr(rp, "compose_copy", copy)
+    monkeypatch.setattr(rp, "compose_open", open_)
+    return seen
+
+
+def phases(timeline):
+    """The statuses in order, repeats collapsed: the flow as the operator saw it."""
+    out = []
+    for kind, _iid, status, _x, info in timeline:
+        name = status + (" (lost)" if kind == "open" and info["lost"]
+                         and status == "OPEN HAND" else "")
+        if not out or out[-1] != name:
+            out.append(name)
+    return out
+
+
+def test_the_grasp_list_hints_the_fingertips_down_grasps(rp):
+    data, _sha = rp.load_protocol(REPO / "protocols" / "grasps.json")
+    hinted = {it["id"] for it in data["items"] if "orientation" in it}
+    assert hinted == FINGERTIPS_DOWN
+    for it in data["items"]:
+        want = HINT if it["id"] in FINGERTIPS_DOWN else "palm toward the camera"
+        assert rp.orientation_text(it) == want, it["id"]
+
+
+def test_an_orientation_that_is_not_text_is_refused(rp, tmp_path, protocol_file):
+    data = read_json(protocol_file)
+    data["items"][0]["orientation"] = 12
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(SystemExit, match="'orientation' must be text"):
+        rp.load_protocol(bad)
+
+
+def test_the_make_the_grasp_frame_has_the_hint_under_the_status_line(rp, tmp_path):
+    pic = fixture_picture(tmp_path / "tip.png")
+    hinted = {"id": "p1_tip", "label": "Tip (paper 1, Schlesinger)",
+              "orientation": HINT}
+    plain = {"id": "p1_hook", "label": "Hook (paper 1, Schlesinger)"}
+    _img, info = rp.compose_copy(hinted, pic, 1, 3, "MAKE THE GRASP", 3.2)
+    assert info["status"] == "MAKE THE GRASP  4"
+    assert " ".join(info["hint"]) == HINT and len(info["hint"]) <= 2
+    assert info["label_bottom"] < info["status_top"]
+    # the hint sits below the status line, the picture below the hint
+    x, y, w, h = info["panel_box"]
+    assert y > rp.COPY_BAND_H + 40 and y + h <= rp.COPY_H
+    _img, info = rp.compose_copy(plain, pic, 1, 3, "MAKE THE GRASP", 1.0)
+    assert info["hint"] == ["palm toward the camera"]
+    # outside MAKE THE GRASP, no hint and the picture where it always was
+    _img, info = rp.compose_copy(hinted, pic, 1, 3, "HOLD STILL", 2.0)
+    assert info["hint"] == [] and info["panel_box"][1] == rp.COPY_BAND_H
+
+
+def test_the_open_hand_frame_says_open_hand_and_hides_the_picture(rp):
+    data, _sha = rp.load_protocol(REPO / "protocols" / "grasps.json")
+    for it in data["items"]:
+        _img, info = rp.compose_open(it, 2, 3, "no hand seen", 29.5)
+        assert " ".join(info["big"]) == "OPEN HAND, palm to the camera"
+        assert info["status"] == "OPEN HAND" and info["panel_box"] is None
+        assert info["lost"] == [] and "no hand seen" in info["lines"]
+        assert " ".join(info["label"]) == it["label"]
+        assert info["label_bottom"] < info["status_top"], it["id"]
+        _img, info = rp.compose_open(it, 2, 3, "", lost=True, status="LOST YOU")
+        assert " ".join(info["lost"]) == ("LOST YOU: open the hand, then close "
+                                          "it slower")
+        assert info["status"] == "LOST YOU"
+        _img, info = rp.compose_copy(it, None, 3, 3, "MAKE THE GRASP", 4.0)
+        assert info["label_bottom"] < info["status_top"], it["id"]
+
+
+def test_coached_open_hand_waits_for_the_hand(rp, monkeypatch, tmp_path,
+                                              protocol_file, capsys):
+    """No hand for the first second: OPEN HAND waits, says so, and the meta
+    has the time it took; then the grasp, then the take."""
+    actors = actor_with(monkeypatch, absent_open_s=1.0)
+    timeline = spy_timeline(rp, monkeypatch)
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--prep", "0.5"))
+    folder = session_dir(out)
+    session = read_json(folder / "session.json")
+    (entry,) = session["takes"]
+    assert entry["accepted"] is True
+    assert session["coach"] is True and session["prep_s"] == 0.5
+    assert session["coaching"]["open_band_cm"] == [18.0, 40.0]
+    assert session["coaching"]["open_max_angle_deg"] == 50.0
+    meta = read_json(folder / entry["files"]["meta"])
+    coaching = meta["coaching"]
+    # 1 s with no hand, then 0.5 s of open palm in the band
+    assert 1.4 <= coaching["acquire_s"] <= 3.0, coaching
+    assert coaching["lost_while_forming"] == 0
+    assert coaching["acquire_rounds_s"] == [coaching["acquire_s"]]
+    (acq,) = coaching["acquired"]
+    assert 18.0 <= acq["height_cm"] <= 40.0 and acq["view_angle_deg"] <= 50.0
+    assert meta["orientation_hint"] == "palm toward the camera"
+    # the mock was walked through the take, phase by phase
+    (actor,) = actors
+    assert actor.phases == ["open", "form", "hold", "idle"]
+    # COPY THIS: OPEN HAND (no picture yet), then the grasp, then the take
+    assert phases(timeline)[:3] == ["OPEN HAND", "MAKE THE GRASP", "HOLD STILL"]
+    opens = [x for x in timeline if x[0] == "open"]
+    assert opens and all(x[4]["panel_box"] is None for x in opens)
+    assert any(line.startswith("no hand seen") for x in opens
+               for line in x[4]["lines"])
+    printed = capsys.readouterr().out
+    assert printed.count("OPEN HAND, palm to the camera") == 1
+    assert "MAKE THE GRASP, keep the palm toward the camera" in printed
+
+
+def test_coached_open_hand_times_out_with_the_reason(rp, monkeypatch, tmp_path,
+                                                     protocol_file):
+    """No open hand at all: after the timeout the attempt is rejected with
+    "no open hand acquired in 30 s" (here 1 s) and retried as usual."""
+    assert (f"no open hand acquired in {rp.OPEN_HAND_TIMEOUT_S:g} s"
+            == "no open hand acquired in 30 s")
+    monkeypatch.setattr(rp, "OPEN_HAND_TIMEOUT_S", 1.0)
+    actor_with(monkeypatch, absent_open_s=99.0)
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--retries", "1"))
+    folder = session_dir(out)
+    takes = read_json(folder / "session.json")["takes"]
+    assert len(takes) == 2, "one attempt plus the usual retry"
+    for entry in takes:
+        assert entry["accepted"] is False and entry["decided_by"] == "coach"
+        assert entry["reason"] == "no open hand acquired in 1 s"
+        assert entry["tracked_fraction"] == 0.0
+        assert entry["files"]["leap"] is None and entry["files"]["still"] is None
+        assert entry["files"]["meta"].startswith("rejected/meta/")
+        meta = read_json(folder / entry["files"]["meta"])
+        assert META_FIELDS <= set(meta)
+        assert meta["reason"] == entry["reason"]
+        assert meta["still_missing_reason"] == "not_recorded"
+        coaching = meta["coaching"]
+        assert coaching["acquire_s"] == pytest.approx(1.0, abs=0.3)
+        assert coaching["lost_while_forming"] == 0
+        assert coaching["acquire_missing"].startswith("no hand seen")
+        reason = (folder / entry["files"]["reason"]).read_text(encoding="utf-8")
+        assert reason.splitlines()[0] == entry["reason"]
+    assert not list(folder.glob("leap/*")) and not list(folder.glob("rejected/leap/*"))
+
+
+def test_coached_loss_while_forming_goes_back_to_open_hand_and_is_counted(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """The mock loses the hand as it closes on the first try (palm turned
+    edge-on, then gone) and keeps it on the second: LOST YOU, back to OPEN
+    HAND, and the kept take's meta counts the loss and says where it was."""
+    actors = actor_with(monkeypatch)
+    timeline = spy_timeline(rp, monkeypatch)
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "tip_pinch",
+                                    "--prep", "1.5", "--mock-lose-forming", "1"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    assert entry["accepted"] is True and entry["attempt"] == 1
+    meta = read_json(folder / entry["files"]["meta"])
+    assert meta["tracked_fraction"] >= 0.9
+    coaching = meta["coaching"]
+    assert coaching["lost_while_forming"] == 1
+    assert len(coaching["acquire_rounds_s"]) == 2 and len(coaching["acquired"]) == 2
+    assert coaching["acquire_s"] == pytest.approx(sum(coaching["acquire_rounds_s"]),
+                                                  abs=0.02)
+    (loss,) = coaching["forming_losses"]
+    assert loss["view_angle_deg"] > 60.0 and loss["cause"] == "palm turned away"
+    assert loss["height_cm"] == pytest.approx(25.0, abs=1.5)
+    assert 0.0 < loss["after_s"] < 1.5 and loss["fix"]
+    (actor,) = actors
+    assert actor.lost == 1
+    assert actor.phases == ["open", "form", "open", "form", "hold", "idle"]
+    # what the operator saw: the loss, then OPEN HAND again with LOST YOU on it
+    assert phases(timeline) == ["OPEN HAND", "MAKE THE GRASP", "LOST YOU",
+                                "OPEN HAND (lost)", "MAKE THE GRASP",
+                                "HOLD STILL", "CHECKING THE TAKE"]
+    printed = capsys.readouterr().out
+    assert printed.count("LOST YOU: open the hand, then close it slower") == 1
+    assert printed.count("OPEN HAND, palm to the camera:") == 2
+    # the take is the hold only: the open palm and the loss are not in it
+    lines = read_lines(folder / entry["files"]["leap"])
+    assert min(x["grab_strength"] for x in lines) == pytest.approx(0.6, abs=0.01)
+
+
+def test_coached_three_losses_reject_with_the_reason(rp, monkeypatch, tmp_path,
+                                                     protocol_file, capsys):
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "tip_pinch",
+                                    "--prep", "1.5", "--retries", "0",
+                                    "--mock-lose-forming", "3"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    assert entry["accepted"] is False and entry["decided_by"] == "coach"
+    m = FORMING_REASON_RE.fullmatch(entry["reason"])
+    assert m, entry["reason"]
+    assert m["n"] == "3" and m["cause"] == "palm turned away"
+    assert m["cm"] == "25" and int(m["deg"]) > 60
+    meta = read_json(folder / entry["files"]["meta"])
+    assert meta["reason"] == entry["reason"] and meta["accepted"] is False
+    coaching = meta["coaching"]
+    assert coaching["lost_while_forming"] == 3
+    assert len(coaching["forming_losses"]) == 3
+    assert len(coaching["acquire_rounds_s"]) == 3
+    assert entry["files"]["leap"] is None, "nothing was recorded"
+    reason = (folder / entry["files"]["reason"]).read_text(encoding="utf-8")
+    assert reason.splitlines()[0] == entry["reason"]
+    printed = capsys.readouterr().out
+    assert printed.count("LOST YOU: open the hand, then close it slower") == 3
+    assert "REJECTED: lost the hand 3 times while forming the grasp" in printed
+
+
+def test_no_coach_keeps_the_plain_countdown(rp, monkeypatch, tmp_path,
+                                            with_pictures, capsys):
+    actors = actor_with(monkeypatch)
+    timeline = spy_timeline(rp, monkeypatch)
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(with_pictures, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--prep", "0.3", "--no-coach"))
+    folder = session_dir(out)
+    session = read_json(folder / "session.json")
+    (entry,) = session["takes"]
+    assert entry["accepted"] is True
+    assert session["coach"] is False and session["coaching"] is None
+    assert session["prep_s"] == 0.3
+    meta = read_json(folder / entry["files"]["meta"])
+    assert meta["coaching"] is None
+    assert actors == [], "the plain mock, not the actor"
+    assert phases(timeline) == ["GET READY", "HOLD STILL", "CHECKING THE TAKE"]
+    assert not [x for x in timeline if x[0] == "open"]
+    printed = capsys.readouterr().out
+    assert "OPEN HAND" not in printed and "MAKE THE GRASP" not in printed
+    assert "coach:   off (--no-coach)" in printed
+    # the LOST YOU rehearsal is the coached take's
+    with pytest.raises(SystemExit):
+        run(rp, monkeypatch, *mock_args(with_pictures, tmp_path / "x",
+                                        "--no-coach", "--mock-lose-forming", "1"))
+    # the printed resume command keeps the session's mode
+    from types import SimpleNamespace
+    plain = SimpleNamespace(protocol_path=with_pictures, mock=True, hand="left",
+                            session_dir=folder, coach=False)
+    assert rp.ProtocolSession.resume_command(plain).endswith(" --no-coach")
+    plain.coach = True
+    assert "--no-coach" not in rp.ProtocolSession.resume_command(plain)
+
+
+def test_a_coached_session_shows_open_hand_then_the_picture_with_the_hint(
+        rp, monkeypatch, tmp_path, with_pictures, gui, capsys):
+    data = read_json(with_pictures)
+    data["items"][1]["orientation"] = HINT                 # tip_pinch
+    hinted = tmp_path / "hinted.json"
+    hinted.write_text(json.dumps(data), encoding="utf-8")
+    timeline = spy_timeline(rp, monkeypatch)
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(hinted, out, "--auto-accept", "--takes", "2",
+                                    "--items", "hook,tip_pinch", "--prep", "0.3"))
+    session = read_json(session_dir(out) / "session.json")
+    assert [t["accepted"] for t in session["takes"]] == [True] * 4
+    for iid in ("hook", "tip_pinch"):
+        mine = [x for x in timeline if x[1] == iid]
+        assert phases(mine)[:3] == ["OPEN HAND", "MAKE THE GRASP", "HOLD STILL"]
+        # the picture only once the grasp is asked for
+        assert all(x[3] for x in mine if x[0] == "copy")
+        assert all(x[4]["panel_box"] is None for x in mine if x[0] == "open")
+        hints = {" ".join(x[4]["hint"]) for x in mine
+                 if x[0] == "copy" and x[2] == "MAKE THE GRASP"}
+        assert hints == ({HINT} if iid == "tip_pinch" else {"palm toward the camera"})
+    assert set(gui.shown) == {rp.COPY_WINDOW}
+    printed = capsys.readouterr().out
+    # the hint on the console once per grasp, not once per take
+    assert printed.count(HINT) == 1
+    assert printed.count("angle:  palm toward the camera") == 1
+    metas = [read_json(session_dir(out) / t["files"]["meta"])
+             for t in session["takes"]]
+    assert [m["orientation_hint"] for m in metas] == (
+        ["palm toward the camera"] * 2 + [HINT] * 2)
+
+
+def test_the_open_hand_watch_needs_half_a_second_in_the_band(rp):
+    """Height, palm angle and an unbroken half second, on the tracker's clock."""
+    from leap_hand.mock import MockLeapStream
+
+    def hands(script, n, side="left"):
+        s = MockLeapStream(dropout_every=0, reacquire_every=0, script=script)
+        return [lh for sd, lh in s.generate(n) if sd == side]
+
+    w = rp.OpenHandWatch(prefer="left")
+    for k, lh in enumerate(hands(None, 44)):             # 0.48 s of open palm
+        w.add(lh, 100.0 + k / 90)
+    assert w.acquired() is None
+    assert w.status(100.5).startswith("hold it there")
+    for k, lh in enumerate(hands(None, 50)[44:]):
+        w.add(lh, 100.5 + k / 90)
+    assert w.acquired() is not None and w.acquired().lh.hand_side == "left"
+    # too high, then palm edge-on: never acquired, and the status says why
+    for script, words in ((lambda i: {"origin_mm": (0.0, 450.0, 40.0)}, "lower it"),
+                          (lambda i: {"roll_deg": 85.0}, "turn the palm")):
+        w = rp.OpenHandWatch(prefer="left")
+        for k, lh in enumerate(hands(script, 120)):
+            w.add(lh, 200.0 + k / 90)
+        assert w.acquired() is None
+        assert w.status(200.0 + 119 / 90).startswith(words)
+    # a hole longer than 0.1 s starts the half second again
+    w = rp.OpenHandWatch(prefer="left")
+    gap = lambda i: {"drop": True} if 30 <= i < 45 else None
+    for k, lh in enumerate(hands(gap, 80)):
+        w.add(lh, 300.0 + k / 90)
+    assert w.acquired() is None                         # 35 frames since the hole
+    assert rp.OpenHandWatch().status(0.0).startswith("no hand seen")
+
+
+def test_the_form_watch_calls_a_hole_a_loss_but_not_a_slow_drain(rp):
+    from leap_hand.mock import MockLeapStream
+
+    s = MockLeapStream(dropout_every=0, reacquire_every=0, sides=("left",))
+    lhs = [lh for _sd, lh in s.generate(200)]
+    start = rp.hand_seen(lhs[0], 10.0)
+    w = rp.FormWatch(start, others=set())
+    # 0.5 s with no drain at all, then the backlog: not a loss
+    for lh in lhs[1:46]:
+        w.add(lh, 10.5)
+    assert w.lost(10.5) is None
+    # nothing for 0.31 s of wall clock: lost, at its last frame
+    assert w.lost(10.81).lh.frame_id == lhs[45].frame_id
+    # a hole of 0.33 s inside the data, even with the hand back: lost
+    w = rp.FormWatch(rp.hand_seen(lhs[0], 20.0), others=set())
+    for lh in lhs[1:10] + lhs[40:60]:
+        w.add(lh, 20.7)
+    assert w.lost(20.7).lh.frame_id == lhs[9].frame_id
+    # another hand already in view at OPEN HAND does not stand in for ours
+    w = rp.FormWatch(rp.hand_seen(lhs[0], 30.0), others={999})
+    other = MockLeapStream(dropout_every=0, reacquire_every=0, sides=("right",),
+                           script=lambda i: {"id_offset": 999 - 1001})
+    for _sd, lh in other.generate(60):
+        w.add(lh, 30.5)
+    assert w.lost(30.5) is not None
+
+
+def test_resume_carries_on_across_a_hint_only_protocol_change(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """Adding orientation hints changes the file's bytes; a session recorded
+    before them can still be resumed, and says so. Any other change cannot."""
+    data = read_json(protocol_file)
+    proto = tmp_path / "grasps_lines.json"
+    proto.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    real = rp.Reviewer
+    monkeypatch.setattr(rp, "Reviewer",
+                        lambda auto=False: real(auto=auto, keys=iter(["\r", "q"])))
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(proto, out, "--items", "hook", "--takes", "2"))
+    folder = session_dir(out)
+    first = read_json(folder / "session.json")
+    old_sha = first["protocol_sha256"]
+
+    text = proto.read_text(encoding="utf-8")
+    hinted = text.replace('"id": "hook",\n', '"id": "hook",\n      "orientation": '
+                          + json.dumps(HINT) + ',\n')
+    assert hinted != text
+    proto.write_text(hinted, encoding="utf-8")
+    assert rp.sha256_without_hints(proto.read_bytes()) == old_sha
+    run(rp, monkeypatch, "--mock", "--protocol", proto, "--hand", "left",
+        "--resume", folder, "--auto-accept", "--no-open")
+    session = read_json(folder / "session.json")
+    assert [(t["take"], t["accepted"]) for t in session["takes"]] == [
+        (1, True), (2, False), (2, True)]
+    import hashlib
+    new_sha = hashlib.sha256(proto.read_bytes()).hexdigest()
+    assert session["protocol_sha256"] == new_sha
+    (change,) = session["protocol_changes"]
+    assert change["from_sha256"] == old_sha and change["to_sha256"] == new_sha
+    assert "only by per-grasp orientation hints" in capsys.readouterr().out
+    meta = read_json(folder / session["takes"][2]["files"]["meta"])
+    assert meta["orientation_hint"] == HINT
+
+    # a label changed as well: refused, as any other change always was
+    proto.write_text(hinted.replace("hook grasp", "hook grip"), encoding="utf-8")
+    with pytest.raises(SystemExit, match="protocol file has changed"):
+        run(rp, monkeypatch, "--mock", "--protocol", proto, "--hand", "left",
+            "--resume", folder, "--auto-accept", "--no-open")
 
 
 # --- the plain session is unchanged --------------------------------------------------

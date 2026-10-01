@@ -94,6 +94,31 @@ What changes from the plain session, and why:
   picture is replaced by the grasp's shape text, and the console says so
   once. `--no-panel` turns the window off for headless runs.
 
+  The take is coached, because the plain countdown failed. On 2026-10-01
+  the operator formed each grasp during the 5 s GET READY exactly as the
+  paper's photo shows it, which for the tip, fingertip, tripod and lateral
+  grasps points the fingertips at the lens with the palm edge-on; the
+  tracker lost the hand as the shape formed and could not pick up a hand
+  that was already closed (45 of 69 attempts rejected, 15 with no hand at
+  all), while kept takes of the same grasps tracked 99 to 100 %. So every
+  attempt now goes, as `scripts/record_simultaneous.py` learned in
+  September:
+    OPEN HAND       "OPEN HAND, palm to the camera" until one hand has been
+                    18 to 40 cm above the module, palm within 50 degrees of
+                    the lens, for 0.5 s without a break; a beep. Not within
+                    30 s: rejected, "no open hand acquired in 30 s".
+    MAKE THE GRASP  a high beep, the paper's picture, the grasp's
+                    orientation hint, 4 s (`--prep`) to close the hand while
+                    it stays tracked. Gone for more than 0.3 s: a low beep,
+                    "LOST YOU: open the hand, then close it slower", and back
+                    to OPEN HAND; the third loss rejects the attempt, naming
+                    the losses and where the hand was.
+    HOLD STILL      the take, exactly as before: beep, file, gate, review.
+  Each take's meta says how it went in `coaching` (`acquire_s`,
+  `lost_while_forming`, and where every loss happened). An item's optional
+  `orientation` text in the protocol file is its hint ("palm toward the
+  camera" without one). `--no-coach` restores the plain countdown.
+
   One session per set (plan D9). A grasp still short of its takes at the
   end is recorded with `--resume <session folder>`, which adds the missing
   takes to that same folder and carries the take numbering on, instead of
@@ -104,10 +129,15 @@ What changes from the plain session, and why:
   python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left --items hook,lateral_key --takes 1
   python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left --resume recordings/protocol/grasps/<session>
   python scripts/leap/record_poses.py --mock --protocol protocols/grasps.json --hand left --auto-accept --takes 1 --duration 1 --prep 0.5 --no-open
+  python scripts/leap/record_poses.py --mock --protocol protocols/grasps.json --hand left --items p1_tip --takes 1 --duration 2 --auto-accept --no-open --mock-lose-forming 1
 
 A --mock session is written to recordings/protocol_mock/grasps/ instead, with
 the same layout, so a rehearsal on synthetic hands can never be collected
-with the real sessions. The runbook is docs/grasp_recording.md.
+with the real sessions. The mock acts the coached take out
+(`leap_hand.mock.CoachedActor`): an open palm, then the hand closing, then
+the grasp held; `--mock-lose-forming N` loses the hand while it closes on
+the first N tries of every attempt, the way the camera did. The runbook is
+docs/grasp_recording.md.
 """
 import argparse
 import hashlib
@@ -122,14 +152,17 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
-from leap_hand.protocol import row_height_cm, row_view_angle_deg
+from leap_hand.protocol import (hand_view_angle_deg, palm_height_cm,
+                                row_height_cm, row_view_angle_deg)
 from leap_hand.recorder import LeapRecorder
 from leap_hand.static_interval import (DEFAULT_STATIC_S, MIN_TRACKED_FRACTION,
                                        row_frame, summarise_take)
 from leap_hand.stream import LeapUnavailable, open_stream
-from leap_hand.tracking_quality import LOSS_GAP_S, take_losses, take_reason
+from leap_hand.tracking_quality import (LOSS_GAP_S, cause_label, causes_for,
+                                        fix_for, state_from_leaphand,
+                                        take_losses, take_reason)
 from xr_hand.recorder import finalize_pose_name, hand_tag, pose_filename, slugify
 
 # The same list the glove records, so the two datasets are comparable pose for
@@ -182,16 +215,20 @@ class Session:
         self._skipped_young = 0
 
     # --- stream plumbing ------------------------------------------------
-    def _consume(self, recorder=None) -> int:
+    def _consume(self, recorder=None, observe=None) -> int:
         """Drain pending hands: count everything, record if asked.
 
         Runs during the countdowns too (recorder=None) so the queue stays
         fresh and a stale hand from the previous pose never leaks into a take.
-        Returns how many hands were drained.
+        `observe(hand)` sees every hand drained, young ones included (the
+        coached take watches the hand this way). Returns how many hands were
+        drained.
         """
         seen = 0
         for _side, lh in self.source.drain(64):
             seen += 1
+            if observe is not None:
+                observe(lh)
             previous = self._ids.get(lh.hand_side)
             if previous is not None and previous != lh.hand_id:
                 self._reacquired += 1
@@ -379,6 +416,30 @@ REJECTED_DIR = "rejected"
 # file-name safe and must not contain the `_take` that the name is split on.
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
+# --- the coached take (see the module docstring for why) -----------------------
+OPEN_HAND_TEXT = "OPEN HAND, palm to the camera"
+MAKE_TEXT = "MAKE THE GRASP, keep the palm toward the camera"
+LOST_TEXT = "LOST YOU: open the hand, then close it slower"
+OPEN_STATUS, MAKE_STATUS, LOST_STATUS = "OPEN HAND", "MAKE THE GRASP", "LOST YOU"
+# An item's `orientation` text in the protocol file, or this.
+DEFAULT_ORIENTATION = "palm toward the camera"
+OPEN_BAND_CM = (18.0, 40.0)    # palm height above the module that counts
+OPEN_MAX_ANGLE_DEG = 50.0      # the palm within this of facing the lens
+OPEN_HOLD_S = 0.5              # both, without a break, for this long
+OPEN_GAP_S = LOSS_GAP_S        # a longer hole in the hand starts the 0.5 s again
+OPEN_HAND_TIMEOUT_S = 30.0     # no open hand by then: the attempt is rejected
+FORM_S = 4.0                   # MAKE THE GRASP, unless --prep says otherwise
+FORM_LOST_S = 0.3              # gone longer than this while forming: LOST YOU
+FORM_MAX_LOSSES = 3            # the third loss in one attempt rejects it
+NOT_RECORDED = "not_recorded"  # still_missing_reason of an attempt never recorded
+BEEP_ACQUIRED = (880, 120)
+BEEP_MAKE = (1400, 200)        # the high beep
+BEEP_LOST = (300, 450)         # the low beep
+# A protocol file line holding nothing but an item's orientation hint.
+_HINT_LINE = re.compile(
+    rb'^[ \t]*"orientation"[ \t]*:[ \t]*"(?:[^"\\\r\n]|\\.)*"[ \t]*,[ \t]*\r?\n',
+    re.MULTILINE)
+
 
 class QuitSession(Exception):
     """The operator pressed q at a take's review."""
@@ -422,6 +483,10 @@ def load_protocol(path: Path) -> Tuple[dict, str]:
                 f"{path} is a finger flexion or sequence protocol (item "
                 f"{iid!r} has steps or cycles). Record it with "
                 "scripts/record_protocol.py; this recorder is for grasps.")
+        hint = item.get("orientation")
+        if hint is not None and (not isinstance(hint, str) or not hint.strip()):
+            raise SystemExit(f"item {iid!r} of {path}: 'orientation' must be "
+                             "text (the hint shown while the grasp is made)")
     for key, default in PROTOCOL_DEFAULTS.items():
         value = data.get(key, default)
         try:
@@ -429,6 +494,24 @@ def load_protocol(path: Path) -> Tuple[dict, str]:
         except (TypeError, ValueError):
             raise SystemExit(f"{key} in {path} must be a number, not {value!r}")
     return data, hashlib.sha256(raw).hexdigest()
+
+
+def sha256_without_hints(raw: bytes) -> str:
+    """sha256 of a protocol file with every `"orientation": "...",` line
+    taken out.
+
+    What the file hashed to before the per-grasp hints were added, when
+    adding them on lines of their own is all that changed: `--resume` uses
+    it to carry on a session recorded before the hints existed, and refuses
+    every other change as before.
+    """
+    return hashlib.sha256(_HINT_LINE.sub(b"", raw)).hexdigest()
+
+
+def orientation_text(item: dict) -> str:
+    """The grasp's orientation hint, or "palm toward the camera"."""
+    hint = item.get("orientation")
+    return hint.strip() if isinstance(hint, str) and hint.strip() else DEFAULT_ORIENTATION
 
 
 def select_items(protocol: dict, only: Optional[str]) -> List[dict]:
@@ -847,7 +930,12 @@ COPY_H = COPY_BAND_H + COPY_PANEL_H + 10
 COPY_REFRESH_S = 0.04         # redrawn at most 25 times a second
 COPY_X = 800                  # beside the camera window, where the review was
 _BG, _WHITE, _GREY = (32, 32, 32), (255, 255, 255), (200, 200, 200)
-_STATUS_COLOURS = {"GET READY": (0, 220, 255), "HOLD STILL": (70, 70, 255)}
+_HINT, _RED = (0, 200, 255), (60, 60, 255)
+_STATUS_COLOURS = {"GET READY": (0, 220, 255), "HOLD STILL": (70, 70, 255),
+                   OPEN_STATUS: (255, 210, 60), MAKE_STATUS: (90, 230, 90),
+                   LOST_STATUS: _RED}
+# Statuses that count down in whole seconds; HOLD STILL shows tenths.
+_WHOLE_SECONDS = ("GET READY", MAKE_STATUS)
 
 
 def panel_dir(protocol: dict, protocol_path=None) -> Optional[Path]:
@@ -911,39 +999,25 @@ def _fit_text(text: str, width: int, max_lines: int, scales, thick: int):
 
 
 def status_text(status: str, seconds: Optional[float]) -> str:
-    """'GET READY  3', 'HOLD STILL  2.4 s', or the status alone."""
+    """'GET READY  3', 'MAKE THE GRASP  3', 'HOLD STILL  2.4 s', or the
+    status alone."""
     if seconds is None:
         return status
-    if status == "GET READY":
+    if status in _WHOLE_SECONDS:
         return f"{status}  {max(0, math.ceil(seconds - 1e-9))}"
     return f"{status}  {max(0.0, seconds):.1f} s"
 
 
-def compose_copy(item: dict, panel, take: int, takes: int, status: str,
-                 seconds: Optional[float] = None):
-    """One frame of the COPY THIS window, and what is on it.
+def _draw_band(put, item: dict, take: int, takes: int, status: str,
+               seconds: Optional[float]):
+    """The band above the picture: the label, the take, the status.
 
-    The grasp's label in large letters, the take number and the countdown
-    ("GET READY 3") or "HOLD STILL 2.4 s" above the paper's picture, drawn
-    700 px tall (narrower when the picture is wide). Without a picture
-    (`panel` None) the grasp's shape is written in its place, large, with
-    where it is in the papers. Returns (image, info): info["lines"] is
-    every text drawn, info["label"] the label's lines, info["status"] the
-    status text, info["panel_box"] the picture's (x, y, w, h) or None, and
-    info["label_bottom"] and info["status_top"] the rows where the label's
-    letters end and the status line's begin.
+    Returns (label lines, status text, label_bottom, status_top), the rows
+    where the label's letters end and the status line's begin.
     """
     import cv2
-    import numpy as np
 
     font = cv2.FONT_HERSHEY_SIMPLEX
-    img = np.full((COPY_H, COPY_W, 3), _BG, np.uint8)
-    drawn: List[str] = []
-
-    def put(text, org, scale, colour, thick):
-        cv2.putText(img, text, org, font, scale, colour, thick, cv2.LINE_AA)
-        drawn.append(text)
-
     # The label on one line as large as 1.2, else on two lines no larger
     # than 1.0, which is what leaves the status line room below it.
     label = str(item.get("label") or item.get("id"))
@@ -966,16 +1040,60 @@ def compose_copy(item: dict, panel, take: int, takes: int, status: str,
         _STATUS_COLOURS.get(status, _GREY), 3)
     status_top = y_status - max(height, cv2.getTextSize(
         f"take {take}/{takes}", font, 1.0, 2)[0][1]) - 2
+    return label_lines, text, label_bottom, status_top
+
+
+def compose_copy(item: dict, panel, take: int, takes: int, status: str,
+                 seconds: Optional[float] = None):
+    """One frame of the COPY THIS window, and what is on it.
+
+    The grasp's label in large letters, the take number and the countdown
+    ("GET READY 3", "MAKE THE GRASP 3") or "HOLD STILL 2.4 s" above the
+    paper's picture, drawn 700 px tall (narrower when the picture is wide).
+    During MAKE THE GRASP the grasp's orientation hint (`orientation_text`)
+    sits under the status line and the picture gives up the room it takes.
+    Without a picture (`panel` None) the grasp's shape is written in its
+    place, large, with where it is in the papers. Returns (image, info):
+    info["lines"] is every text drawn, info["label"] the label's lines,
+    info["status"] the status text, info["hint"] the hint's lines (empty
+    outside MAKE THE GRASP), info["panel_box"] the picture's (x, y, w, h)
+    or None, and info["label_bottom"] and info["status_top"] the rows where
+    the label's letters end and the status line's begin.
+    """
+    import cv2
+    import numpy as np
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    img = np.full((COPY_H, COPY_W, 3), _BG, np.uint8)
+    drawn: List[str] = []
+
+    def put(text, org, scale, colour, thick):
+        cv2.putText(img, text, org, font, scale, colour, thick, cv2.LINE_AA)
+        drawn.append(text)
+
+    label_lines, text, label_bottom, status_top = _draw_band(
+        put, item, take, takes, status, seconds)
+    label = str(item.get("label") or item.get("id"))
+    top = COPY_BAND_H
+    hint_lines: List[str] = []
+    if status == MAKE_STATUS:
+        hint_lines, hscale = _fit_text(orientation_text(item), COPY_W - 32, 2,
+                                       (0.9, 0.85, 0.8, 0.75, 0.7, 0.65), 2)
+        y = top + 6
+        for line in hint_lines:
+            y += cv2.getTextSize(line, font, hscale, 2)[0][1] + 14
+            put(line, (16, y), hscale, _HINT, 2)
+        top = y + 18
 
     box = None
     if panel is not None:
-        pic = _fit_into(panel, COPY_W - 20, COPY_PANEL_H)
+        pic = _fit_into(panel, COPY_W - 20, min(COPY_PANEL_H, COPY_H - 10 - top))
         h, w = pic.shape[:2]
         x = (COPY_W - w) // 2
-        img[COPY_BAND_H:COPY_BAND_H + h, x:x + w] = pic
-        box = (x, COPY_BAND_H, w, h)
+        img[top:top + h, x:x + w] = pic
+        box = (x, top, w, h)
     else:
-        y = COPY_BAND_H + 30
+        y = top + 30
         put("no picture for this grasp: copy this shape", (16, y), 0.7,
             (0, 160, 255), 2)
         shape = str(item.get("shape") or label)
@@ -992,8 +1110,79 @@ def compose_copy(item: dict, panel, take: int, takes: int, status: str,
                 y += 30
                 put(line, (16, y), 0.65, _GREY, 1)
     return img, {"lines": drawn, "label": label_lines, "status": text,
-                 "panel_box": box, "label_bottom": label_bottom,
-                 "status_top": status_top}
+                 "hint": hint_lines, "panel_box": box,
+                 "label_bottom": label_bottom, "status_top": status_top}
+
+
+def compose_open(item: dict, take: int, takes: int, state: str,
+                 seconds: Optional[float] = None, lost: bool = False,
+                 status: str = OPEN_STATUS):
+    """One frame of COPY THIS while the open hand is being acquired.
+
+    The band as always (the grasp coming up, the take, OPEN HAND or LOST
+    YOU), then "OPEN HAND, palm to the camera" in the largest letters that
+    fit, what the camera sees of the hand now (`state`), and the seconds
+    left. `lost` puts "LOST YOU: open the hand, then close it slower" in
+    red above it, for the OPEN HAND that follows a loss. The paper's
+    picture is deliberately NOT drawn: copying it before the hand is
+    tracked is exactly what lost the hand on 2026-10-01; it comes with
+    MAKE THE GRASP. Returns (image, info) like `compose_copy`, with
+    info["big"] the large lines and info["lost"] the red ones.
+    """
+    import cv2
+    import numpy as np
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    img = np.full((COPY_H, COPY_W, 3), _BG, np.uint8)
+    drawn: List[str] = []
+
+    def put(text, org, scale, colour, thick):
+        cv2.putText(img, text, org, font, scale, colour, thick, cv2.LINE_AA)
+        drawn.append(text)
+
+    label_lines, text, label_bottom, status_top = _draw_band(
+        put, item, take, takes, status, None)
+    y = COPY_BAND_H + 20
+    lost_lines: List[str] = []
+    if lost:
+        lost_lines, lscale = _fit_text(LOST_TEXT, COPY_W - 32, 2,
+                                       (1.1, 1.0, 0.9, 0.8), 2)
+        for line in lost_lines:
+            y += cv2.getTextSize(line, font, lscale, 2)[0][1] + 18
+            put(line, (16, y), lscale, _RED, 2)
+        y += 20
+    head, tail = OPEN_HAND_TEXT.split(", ", 1)
+    big = [head + ",", tail]
+    bscale = 1.2
+    for s in (2.6, 2.4, 2.2, 2.0, 1.8, 1.6, 1.4, 1.2):
+        if max(cv2.getTextSize(b, font, s, 5)[0][0] for b in big) <= COPY_W - 32:
+            bscale = s
+            break
+    y += 30
+    for line in big:
+        (w, h), _b = cv2.getTextSize(line, font, bscale, 5)
+        y += h + 30
+        put(line, ((COPY_W - w) // 2, y), bscale,
+            _STATUS_COLOURS[OPEN_STATUS], 5)
+    y += 40
+    if state:
+        for line in _wrap_text(state, 0.9, 2, COPY_W - 32):
+            y += 42
+            put(line, (16, y), 0.9, _WHITE, 2)
+    y += 30
+    notes = [f"{OPEN_BAND_CM[0]:g} to {OPEN_BAND_CM[1]:g} cm above the module, "
+             f"palm within {OPEN_MAX_ANGLE_DEG:g} degrees of the lens, "
+             f"held {OPEN_HOLD_S:g} s",
+             "the grasp's picture comes after the beep"]
+    if seconds is not None:
+        notes.append(f"{max(0, math.ceil(seconds - 1e-9))} s left")
+    for note in notes:
+        for line in _wrap_text(note, 0.65, 1, COPY_W - 32):
+            y += 30
+            put(line, (16, y), 0.65, _GREY, 1)
+    return img, {"lines": drawn, "label": label_lines, "status": text,
+                 "big": big, "lost": lost_lines, "panel_box": None,
+                 "label_bottom": label_bottom, "status_top": status_top}
 
 
 def _screen_size() -> Optional[Tuple[int, int]]:
@@ -1074,6 +1263,19 @@ class CopyWindow:
         img, _info = compose_copy(item, self.panel(item), take, takes, status, seconds)
         self.show(img)
 
+    def show_open(self, item: dict, take: int, takes: int, state: str,
+                  seconds: Optional[float] = None, lost: bool = False,
+                  status: str = OPEN_STATUS, force: bool = False) -> None:
+        """The OPEN HAND frame (`compose_open`), throttled like `show_copy`."""
+        if not self.enabled:
+            return
+        now = time.time()
+        if not force and now < self._next:
+            return
+        self._next = now + COPY_REFRESH_S
+        img, _info = compose_open(item, take, takes, state, seconds, lost, status)
+        self.show(img)
+
     def show(self, img) -> int:
         """Put `img` in the window, without waiting; the key pressed or -1.
 
@@ -1143,6 +1345,191 @@ class CopyWindow:
                 pass
 
 
+# --- the coached take: watching the hand -----------------------------------------
+@dataclass
+class HandSeen:
+    """One tracked hand as the coached take judges it."""
+
+    lh: object                 # the LeapHand
+    wall: float                # when it was drained, time.time()
+    ts: float                  # the tracker's own time of the frame, seconds
+    height_cm: float
+    angle_deg: Optional[float]  # 0 = palm square to the lens, 90 = edge-on
+
+
+def hand_seen(lh, now: float) -> HandSeen:
+    ts = getattr(lh, "timestamp_us", None)
+    return HandSeen(lh=lh, wall=now, ts=now if ts is None else ts / 1e6,
+                    height_cm=palm_height_cm(lh.palm_pos),
+                    angle_deg=hand_view_angle_deg(lh))
+
+
+class OpenHandWatch:
+    """OPEN HAND: has a hand been open over the module long enough?
+
+    A hand counts while its palm is `band` cm above the module and within
+    `max_angle` degrees of facing the lens, and it is acquired once it has
+    counted for `hold_s` without a hole longer than `gap_s`. Both are timed
+    on the tracker's own clock, so a slow window redraw can neither cut the
+    hold short nor stretch it. Every hand id is followed on its own; the
+    operator's label wins a tie, but no label is required, because the
+    tracker calls the left hand "right" often enough.
+    """
+
+    def __init__(self, band=OPEN_BAND_CM, max_angle: float = OPEN_MAX_ANGLE_DEG,
+                 hold_s: float = OPEN_HOLD_S, gap_s: float = OPEN_GAP_S,
+                 prefer: Optional[str] = None):
+        self.band = tuple(band)
+        self.max_angle = float(max_angle)
+        self.hold_s = float(hold_s)
+        self.gap_s = float(gap_s)
+        self.prefer = prefer
+        self.runs: Dict[int, List[float]] = {}    # hand id -> [first ts, last ts]
+        self.latest: Dict[int, HandSeen] = {}
+
+    def fits(self, h: HandSeen) -> bool:
+        return (self.band[0] <= h.height_cm <= self.band[1]
+                and h.angle_deg is not None and h.angle_deg <= self.max_angle)
+
+    def add(self, lh, now: float) -> None:
+        h = hand_seen(lh, now)
+        hid = int(lh.hand_id)
+        self.latest[hid] = h
+        if not self.fits(h):
+            self.runs.pop(hid, None)
+            return
+        run = self.runs.get(hid)
+        if run is None or h.ts - run[1] > self.gap_s + 1e-6 or h.ts < run[1]:
+            self.runs[hid] = [h.ts, h.ts]
+        else:
+            run[1] = h.ts
+
+    def acquired(self) -> Optional[HandSeen]:
+        """The newest frame of the acquired hand, or None yet."""
+        done = [hid for hid, (a, b) in self.runs.items()
+                if b - a >= self.hold_s - 1e-6]
+        if not done:
+            return None
+        done.sort(key=lambda hid: (self.latest[hid].lh.hand_side != self.prefer,
+                                   self.runs[hid][0] - self.runs[hid][1]))
+        return self.latest[done[0]]
+
+    def others(self, hid: int, now: float, window: float = 0.5) -> Set[int]:
+        """Hand ids other than `hid` seen in the last `window` seconds."""
+        return {k for k, h in self.latest.items()
+                if k != hid and now - h.wall <= window}
+
+    def _current(self, now: float) -> Optional[HandSeen]:
+        fresh = [h for h in self.latest.values() if now - h.wall <= FORM_LOST_S]
+        if not fresh:
+            return None
+        fresh.sort(key=lambda h: (h.lh.hand_side != self.prefer, -h.wall))
+        return fresh[0]
+
+    def status(self, now: float) -> str:
+        """What the camera sees of the hand now, and what to change."""
+        lo, hi = self.band
+        h = self._current(now)
+        if h is None:
+            return f"no hand seen: hold the open hand {lo:g} to {hi:g} cm above the module"
+        fixes = []
+        if h.height_cm < lo:
+            fixes.append(f"raise it to {lo:g} to {hi:g} cm (now {h.height_cm:.0f} cm)")
+        elif h.height_cm > hi:
+            fixes.append(f"lower it to {lo:g} to {hi:g} cm (now {h.height_cm:.0f} cm)")
+        if h.angle_deg is None or h.angle_deg > self.max_angle:
+            now_deg = "" if h.angle_deg is None else f" (now {h.angle_deg:.0f} degrees)"
+            fixes.append(f"turn the palm to the camera{now_deg}")
+        if fixes:
+            return "; ".join(fixes)
+        run = self.runs.get(int(h.lh.hand_id))
+        held = 0.0 if run is None else run[1] - run[0]
+        return f"hold it there: {min(held, self.hold_s):.1f} of {self.hold_s:g} s"
+
+    def need(self, now: float) -> str:
+        """`status` in a few words without numbers, for the camera window's
+        caption, whose file is rewritten only when the words change."""
+        h = self._current(now)
+        if h is None:
+            return "no hand"
+        if h.height_cm < self.band[0]:
+            return "raise it"
+        if h.height_cm > self.band[1]:
+            return "lower it"
+        if h.angle_deg is None or h.angle_deg > self.max_angle:
+            return "turn the palm to the camera"
+        return "hold it there"
+
+
+class FormWatch:
+    """MAKE THE GRASP: is the acquired hand still tracked?
+
+    The hand is the id acquired at OPEN HAND. An id the tracker gives it
+    afterwards is followed too (a re-acquisition), but never one that was
+    already in view at OPEN HAND as another hand. Lost means no frame of it
+    for more than `lost_s`: between two of its frames on the tracker's own
+    clock, or since the last drain that brought one. The queue is drained
+    before each judgement, so a slow redraw or a blocking beep is not a
+    loss: the frames that queued behind it arrive first.
+    """
+
+    def __init__(self, start: HandSeen, others: Set[int],
+                 lost_s: float = FORM_LOST_S):
+        self.hid = int(start.lh.hand_id)
+        self.last = start
+        self.others = set(others) - {self.hid}
+        self.lost_s = float(lost_s)
+        self.hole: Optional[HandSeen] = None
+        self.new_ids = 0
+
+    def add(self, lh, now: float) -> None:
+        hid = int(lh.hand_id)
+        if hid != self.hid:
+            if hid in self.others:
+                return
+            self.hid = hid
+            self.new_ids += 1
+        h = hand_seen(lh, now)
+        if self.hole is None and h.ts - self.last.ts > self.lost_s:
+            self.hole = self.last
+        self.last = h
+
+    def lost(self, now: float) -> Optional[HandSeen]:
+        """The hand's last frame before it was lost, or None if it was not."""
+        if self.hole is not None:
+            return self.hole
+        if now - self.last.wall > self.lost_s:
+            return self.last
+        return None
+
+
+def form_loss(h: HandSeen, t0: float) -> dict:
+    """Where the hand was when it was lost while forming, and the likely cause."""
+    cause = causes_for(state_from_leaphand(h.lh))[0]
+    grab = getattr(h.lh, "grab_strength", None)
+    return {"after_s": round(max(0.0, h.wall - t0), 2),
+            "height_cm": round(h.height_cm, 1),
+            "view_angle_deg": None if h.angle_deg is None else round(h.angle_deg, 1),
+            "grab": None if grab is None else round(float(grab), 3),
+            "hand_label": h.lh.hand_side,
+            "cause": cause_label(cause), "fix": fix_for(cause)}
+
+
+def form_loss_where(loss: dict) -> str:
+    """`at 25 cm with the palm 73 degrees from the lens (cause: fix)`."""
+    where = f"at {loss['height_cm']:.0f} cm"
+    if loss.get("view_angle_deg") is not None:
+        where += f" with the palm {loss['view_angle_deg']:.0f} degrees from the lens"
+    return f"{where} ({loss['cause']}: {loss['fix']})"
+
+
+def forming_reason(losses: List[dict]) -> str:
+    """The reason an attempt is rejected after the hand was lost while forming."""
+    n = len(losses)
+    return (f"lost the hand {n} time{'' if n == 1 else 's'} while forming the "
+            f"grasp, the last {form_loss_where(losses[-1])}")
+
+
 # --- the session ------------------------------------------------------------------
 @dataclass
 class Attempt:
@@ -1160,13 +1547,17 @@ class Attempt:
     by: str
 
 
-def load_session(folder: Path, hand: str, sha256: str, mock: bool) -> dict:
+def load_session(folder: Path, hand: str, sha256: str, mock: bool,
+                 raw: Optional[bytes] = None) -> dict:
     """An earlier session's session.json, checked before `--resume` adds to it.
 
     Refused when it is not a grasp session, is another hand's, was a mock
     when this run is not (or the other way round), or was recorded against
     a protocol file whose bytes have since changed: one session, one hand,
-    one version of the grasp list.
+    one version of the grasp list. The one change let through is per-grasp
+    orientation hints added on lines of their own (`sha256_without_hints`
+    of today's bytes, `raw`, is the session's sha256): the grasps, takes and
+    timings are then byte for byte the ones the session was recorded with.
     """
     path = Path(folder) / "session.json"
     try:
@@ -1183,8 +1574,12 @@ def load_session(folder: Path, hand: str, sha256: str, mock: bool) -> dict:
         raise SystemExit(f"cannot resume {folder}: it was "
                          f"{'a mock' if old.get('mock') else 'a camera'} session")
     if old.get("protocol_sha256") != sha256:
-        raise SystemExit(f"cannot resume {folder}: the protocol file has changed "
-                         "since that session was recorded; start a new session")
+        if raw is None or sha256_without_hints(raw) != old.get("protocol_sha256"):
+            raise SystemExit(f"cannot resume {folder}: the protocol file has "
+                             "changed since that session was recorded; start a "
+                             "new session")
+        print(f"note: the protocol file differs from the one {Path(folder).name} "
+              "was recorded with only by per-grasp orientation hints; resuming it")
     return old
 
 
@@ -1202,13 +1597,17 @@ def make_session_dir(root: Path, hand: str) -> Path:
 class ProtocolSession(Session):
     """Set A: one guided session over a protocol file's grasps, one hand.
 
-    Per take: announce the grasp and the orientation envelope, count down,
-    record every frame for the take's seconds, then read the file back and
-    measure it (`leap_hand.static_interval.summarise_take`). A take that
-    fails the acquisition gate moves to `rejected/` with its reason and is
-    retried up to `retries` times; one that passes is shown to the operator,
-    whose decision is final. session.json is rewritten after every decision,
-    so a crash or a Ctrl+C never loses the record of what was already kept.
+    Per take: announce the grasp and the orientation envelope, coach the
+    hand into the grasp (OPEN HAND, then MAKE THE GRASP for `prep` seconds;
+    with `coach` off, a plain `prep` second countdown), record every frame
+    for the take's seconds, then read the file back and measure it
+    (`leap_hand.static_interval.summarise_take`). An attempt the coaching
+    gives up on (no open hand in `acquire_timeout` seconds, or the hand
+    lost three times while forming) and a take that fails the acquisition
+    gate move to `rejected/` with their reason and are retried up to
+    `retries` times; a take that passes is shown to the operator, whose
+    decision is final. session.json is rewritten after every decision, so
+    a crash or a Ctrl+C never loses the record of what was already kept.
     """
 
     def __init__(self, source, out_root: Path, protocol: dict, sha256: str,
@@ -1217,7 +1616,9 @@ class ProtocolSession(Session):
                  still: str, reviewer: Reviewer, view=None, mock: bool = False,
                  raw: bool = False, note: str = "", operator: Optional[str] = None,
                  auto_accept: bool = False,
-                 resume: Optional[Tuple[Path, dict]] = None, panel=None):
+                 resume: Optional[Tuple[Path, dict]] = None, panel=None,
+                 coach: bool = True,
+                 acquire_timeout: float = OPEN_HAND_TIMEOUT_S):
         self.session_dir = (Path(resume[0]) if resume is not None
                             else make_session_dir(out_root, hand))
         super().__init__(_Tap(source), hz=None, out_dir=self.session_dir, raw=raw)
@@ -1239,6 +1640,10 @@ class ProtocolSession(Session):
         self.operator = operator
         self.auto_accept = bool(auto_accept)
         self.panel = panel                     # the COPY THIS window, or None
+        self.coach = bool(coach)
+        self.acquire_timeout = float(acquire_timeout)
+        self._coaching: Optional[dict] = None  # this attempt's, for its meta
+        self.protocol_changes: List[dict] = []
         self._now: Optional[Tuple[dict, int]] = None   # (item, take) on screen
         self.entries: List[dict] = []          # session.json "takes"
         self.attempts: List[Attempt] = []
@@ -1264,6 +1669,14 @@ class ProtocolSession(Session):
         """
         self.entries = list(old.get("takes") or [])
         self.started = old.get("started") or self.started
+        # `load_session` let a hint-only change of the protocol file through:
+        # the session now names today's bytes, and says what it was before.
+        self.protocol_changes = list(old.get("protocol_changes") or [])
+        if old.get("protocol_sha256") and old.get("protocol_sha256") != self.sha256:
+            self.protocol_changes.append({
+                "at": iso_now(), "from_sha256": old.get("protocol_sha256"),
+                "to_sha256": self.sha256,
+                "what": "per-grasp orientation hints added; nothing else changed"})
         earlier = [str(i) for i in (old.get("items") or [])]
         self.item_ids = earlier + [i for i in self.item_ids if i not in earlier]
         self.resumed = list(old.get("resumed") or []) + [iso_now()]
@@ -1299,6 +1712,7 @@ class ProtocolSession(Session):
             "protocol_name": self.protocol.get("name"),
             "protocol_version": self.protocol.get("version"),
             "protocol_sha256": self.sha256,
+            "protocol_changes": self.protocol_changes,
             "protocol_status": self.protocol.get("status"),
             "hand": self.hand,
             "operator": self.operator,
@@ -1315,7 +1729,17 @@ class ProtocolSession(Session):
             "items": self.item_ids,
             "takes_per_item": self.takes,
             "duration_s": self.duration,
+            # coached: the MAKE THE GRASP seconds; --no-coach: the countdown
             "prep_s": self.prep,
+            "coach": self.coach,
+            "coaching": None if not self.coach else {
+                "open_band_cm": list(OPEN_BAND_CM),
+                "open_max_angle_deg": OPEN_MAX_ANGLE_DEG,
+                "open_hold_s": OPEN_HOLD_S,
+                "open_timeout_s": self.acquire_timeout,
+                "form_s": self.prep,
+                "form_lost_s": FORM_LOST_S,
+                "form_max_losses": FORM_MAX_LOSSES},
             "static_s": self.static_s,
             "retries": self.retries,
             "min_tracked_fraction": MIN_TRACKED,
@@ -1345,12 +1769,129 @@ class ProtocolSession(Session):
             item, n = self._now
             self.panel.show_copy(item, n, self.takes, status, seconds, force=force)
 
+    def _copy_open(self, state: str, seconds: Optional[float] = None,
+                   lost: bool = False, status: str = OPEN_STATUS,
+                   force: bool = False) -> None:
+        """The OPEN HAND frame for the current grasp, in COPY THIS."""
+        if self.panel is not None and self._now is not None:
+            item, n = self._now
+            self.panel.show_open(item, n, self.takes, state, seconds, lost,
+                                 status, force=force)
+
+    # --- the coached take ---------------------------------------------------
+    def _act(self, phase: Optional[str]) -> None:
+        """Tell a mock that acts the take out (`CoachedActor`) where we are."""
+        if hasattr(self.source, "act"):
+            self.source.act(phase)
+
+    def _watch(self, observe) -> None:
+        """Drain everything queued, every hand shown to `observe` first."""
+        for _ in range(MAX_DRAIN_ROUNDS):
+            if self._consume(observe=observe) < 64:
+                break
+
+    def _coach(self, item: dict) -> Tuple[bool, str]:
+        """OPEN HAND, then MAKE THE GRASP, until the hand has closed into
+        the grasp without being lost. (True, "") or (False, the reason the
+        attempt is rejected); what happened is left in `self._coaching`."""
+        info = {"acquire_s": 0.0, "lost_while_forming": 0, "form_s": self.prep,
+                "acquire_rounds_s": [], "acquired": [], "forming_losses": []}
+        self._coaching = info
+        while True:
+            lost = bool(info["forming_losses"])
+            t0 = time.time()
+            got, others, missing = self._open_hand(lost)
+            info["acquire_rounds_s"].append(round(time.time() - t0, 2))
+            info["acquire_s"] = round(sum(info["acquire_rounds_s"]), 2)
+            if got is None:
+                info["acquire_missing"] = missing
+                reason = f"no open hand acquired in {self.acquire_timeout:g} s"
+                print(f"      REJECTED: {reason} ({missing})")
+                return False, reason
+            info["acquired"].append({
+                "height_cm": round(got.height_cm, 1),
+                "view_angle_deg": (None if got.angle_deg is None
+                                   else round(got.angle_deg, 1)),
+                "hand_label": got.lh.hand_side})
+            loss = self._make_grasp(got, others)
+            if loss is None:
+                return True, ""
+            info["forming_losses"].append(loss)
+            k = info["lost_while_forming"] = len(info["forming_losses"])
+            self._caption(LOST_TEXT)
+            self._copy_open("", lost=True, status=LOST_STATUS, force=True)
+            print(f"      {LOST_TEXT}")
+            print(f"        loss {k} of {FORM_MAX_LOSSES}, "
+                  f"{loss['after_s']:.1f} s into the grasp, "
+                  f"{form_loss_where(loss)}")
+            beep(*BEEP_LOST)
+            if k >= FORM_MAX_LOSSES:
+                reason = forming_reason(info["forming_losses"])
+                print(f"      REJECTED: {reason}")
+                return False, reason
+
+    def _open_hand(self, lost: bool) -> Tuple[Optional[HandSeen], Set[int], str]:
+        """OPEN HAND: wait for the open palm. (its newest frame, the other
+        hands in view, "") once acquired, or (None, set(), what was still
+        wrong) after `acquire_timeout` seconds."""
+        self._act("open")
+        lo, hi = OPEN_BAND_CM
+        print(f"      {OPEN_HAND_TEXT}: {lo:g} to {hi:g} cm above the module, "
+              "held still until the beep")
+        watch = OpenHandWatch(prefer=self.hand)
+        deadline = time.time() + self.acquire_timeout
+        need = None
+        while True:
+            now = time.time()
+            self._watch(lambda lh: watch.add(lh, now))
+            got = watch.acquired()
+            if got is not None:
+                beep(*BEEP_ACQUIRED)
+                return got, watch.others(int(got.lh.hand_id), now), ""
+            if now >= deadline:
+                return None, set(), watch.status(now)
+            if watch.need(now) != need:
+                need = watch.need(now)
+                self._caption(f"{OPEN_HAND_TEXT}: {need}")
+            self._copy_open(watch.status(now), deadline - now, lost)
+            time.sleep(0.02)
+
+    def _make_grasp(self, start: HandSeen, others: Set[int]) -> Optional[dict]:
+        """MAKE THE GRASP: `prep` seconds to close the hand while it stays
+        tracked. None when it did, else where it was lost (`form_loss`)."""
+        label = str(self._now[0]["label"]) if self._now else ""
+        # The seconds start with the high beep, the operator's cue to close.
+        t0 = time.time()
+        t_end = t0 + self.prep
+        self._act("form")
+        beep(*BEEP_MAKE)
+        print(f"      {MAKE_TEXT}: {self.prep:g} s")
+        watch = FormWatch(start, others)
+        self._copy(MAKE_STATUS, self.prep, force=True)
+        shown = None
+        while True:
+            now = time.time()
+            self._watch(lambda lh: watch.add(lh, now))
+            gone = watch.lost(now)
+            if gone is not None:
+                return form_loss(gone, t0)
+            left = t_end - now
+            if left <= 0:
+                return None
+            whole = math.ceil(left)
+            if whole != shown:
+                shown = whole
+                self._caption(f"MAKE THE GRASP: {label}   {whole}s")
+            self._copy(MAKE_STATUS, left)
+            time.sleep(0.02)
+
     # --- one grasp ----------------------------------------------------------
     def announce(self, item: dict, index: int, count: int) -> None:
         print("=" * 62)
         print(f"Grasp {index}/{count}: {item['label']}   (id {item['id']})")
         if item.get("shape"):
             print(f"  shape:  {item['shape']}")
+        print(f"  angle:  {orientation_text(item)}")
         source = ", ".join(str(item[k]) for k in ("source", "figure") if item.get(k))
         if source:
             print(f"  from:   {source}")
@@ -1464,8 +2005,21 @@ class ProtocolSession(Session):
         if hasattr(self.source, "set_pose"):
             self.source.set_pose(iid if iid in ("open_palm", "fist") else None)
         self._now = (item, n)
-        self._copy("GET READY", self.prep, force=True)
-        self._countdown(label)
+        self._coaching = None
+        if self.coach:
+            ok, why = self._coach(item)
+            if not ok:
+                # Nothing was recorded: the attempt is still written down,
+                # under rejected/ with its reason and the coaching record.
+                self._act("idle")
+                now = time.time()
+                return self._conclude(item, n, attempt, name, None, (now, now),
+                                      NOT_RECORDED, accepted=False, reason=why,
+                                      by="coach", decided_at=now)
+            self._act("hold")
+        else:
+            self._copy("GET READY", self.prep, force=True)
+            self._countdown(label)
 
         recorder = LeapRecorder(hz=None, pose=iid, take=n)
         t_start = t_stop = time.time()
@@ -1483,6 +2037,8 @@ class ProtocolSession(Session):
                 finally:
                     recorder.stop()
                     t_stop = time.time()
+                    if self.coach:
+                        self._act("idle")
                     beep(500, 300)
                     self._copy("CHECKING THE TAKE", force=True)
         except KeyboardInterrupt:
@@ -1767,6 +2323,12 @@ class ProtocolSession(Session):
             # 0 = palm square to the lens, 90 = edge-on.
             "palm_height_cm": None if height is None else round(height, 1),
             "view_angle_deg": None if angle is None else round(angle, 1),
+            # The orientation the operator was asked for (the item's hint),
+            # and how the hand got into the grasp: seconds to acquire the
+            # open hand (every OPEN HAND of the attempt summed), how often it
+            # was lost while forming the grasp and where. None with --no-coach.
+            "orientation_hint": orientation_text(item),
+            "coaching": self._coaching,
             "still": files.get("still"),
             "still_missing_reason": still_missing,
             "files": dict(files),
@@ -1801,7 +2363,40 @@ class ProtocolSession(Session):
         protocol = repo_relative(self.protocol_path).replace("/", os.sep)
         return (rf".venv\Scripts\python.exe scripts\leap\record_poses.py "
                 f"{'--mock ' if self.mock else ''}--protocol {protocol} "
-                f"--hand {self.hand} --resume \"{self.session_dir}\"")
+                f"--hand {self.hand} --resume \"{self.session_dir}\""
+                f"{'' if self.coach else ' --no-coach'}")
+
+
+def make_mock_source(dropout: float = 0.0, coach: bool = True,
+                     lose_forming: int = 0):
+    """The synthetic camera behind `--mock`, started.
+
+    Coached, the hand acts the take out (`leap_hand.mock.CoachedActor`):
+    an open palm at OPEN HAND, closing at MAKE THE GRASP (lost on the first
+    `lose_forming` tries of every attempt), the grasp held at HOLD STILL;
+    `dropout` then drops frames during the hold only, so a rehearsal of the
+    gate's rejection still reaches the take. With `coach` off it is the
+    plain mock it always was. Either way it is clean otherwise: the default
+    mock drops 20 frames in 300 and changes hand id every 5 s, so a 1 s
+    rehearsal take would fail the gate at random.
+    """
+    from leap_hand.mock import CoachedActor, MockLeapStream
+    if coach:
+        source = MockLeapStream(dropout_every=0, reacquire_every=0,
+                                script=CoachedActor(lose_forming=lose_forming,
+                                                    hold_dropout=dropout))
+    elif dropout > 0:
+        source = MockLeapStream(dropout_every=90, reacquire_every=0,
+                                dropout_frames=max(1, min(89, round(90 * dropout))))
+    else:
+        source = MockLeapStream(dropout_every=0, reacquire_every=0)
+    # Skip the mock hand past its first 0.3 s of visibility, which the
+    # recorder drops as settling: a live hand has been in view that long
+    # by the time the stream wait is over, and with --prep 0 the first
+    # take would otherwise start on a hand too young to record.
+    source.generate(int(math.ceil(MIN_VISIBLE_TIME_US / 1e6 * source.hz)) + 9)
+    source.start()
+    return source
 
 
 def run_protocol(args, parser) -> None:
@@ -1820,19 +2415,37 @@ def run_protocol(args, parser) -> None:
         parser.error("--retries cannot be negative")
     if args.mock_dropout is not None and not args.mock:
         parser.error("--mock-dropout only applies with --mock")
+    coach = not args.no_coach
+    if args.mock_lose_forming is not None:
+        if not args.mock:
+            parser.error("--mock-lose-forming only applies with --mock")
+        if not coach:
+            parser.error("--mock-lose-forming acts out the coached take; "
+                         "drop --no-coach")
+        if args.mock_lose_forming < 0:
+            parser.error("--mock-lose-forming cannot be negative")
 
     protocol, sha = load_protocol(args.protocol)
     resume = None
     # Each setting comes from the command line, else from the session being
     # resumed (a session keeps one timing throughout), else from the file.
+    # Coached, the preparation is the MAKE THE GRASP countdown, FORM_S: the
+    # file's prep_s is the plain countdown's, which also had to bring the
+    # hand over the module, the job OPEN HAND now does.
     base = {"takes_per_item": protocol["takes_per_item"],
-            "duration_s": protocol["duration_s"], "prep_s": protocol["prep_s"],
+            "duration_s": protocol["duration_s"],
+            "prep_s": FORM_S if coach else protocol["prep_s"],
             "static_s": protocol.get("static_s", DEFAULT_STATIC_S),
             "still": "hand", "items": None}
     if args.resume is not None:
-        old = load_session(args.resume, args.hand, sha, bool(args.mock))
+        old = load_session(args.resume, args.hand, sha, bool(args.mock),
+                           raw=Path(args.protocol).read_bytes())
         resume = (Path(args.resume), old)
         for key in base:
+            # A plain countdown's seconds are not a forming time, nor the
+            # other way round: prep_s carries over only within one mode.
+            if key == "prep_s" and bool(old.get("coach")) != coach:
+                continue
             if old.get(key) is not None:
                 base[key] = old[key]
     items = select_items(protocol, args.items if args.items else (
@@ -1847,23 +2460,10 @@ def run_protocol(args, parser) -> None:
                      "prep 0 or more")
 
     if args.mock:
-        # A clean mock: the default one drops 20 frames in 300 and changes
-        # hand id every 5 s, so a 1 s rehearsal take would fail the gate at
-        # random. --mock-dropout puts a dropout back on purpose, to rehearse
-        # the rejection path.
-        from leap_hand.mock import MockLeapStream
-        dropout = args.mock_dropout or 0.0
-        if dropout > 0:
-            source = MockLeapStream(dropout_every=90, reacquire_every=0,
-                                    dropout_frames=max(1, min(89, round(90 * dropout))))
-        else:
-            source = MockLeapStream(dropout_every=0, reacquire_every=0)
-        # Skip the mock hand past its first 0.3 s of visibility, which the
-        # recorder drops as settling: a live hand has been in view that long
-        # by the time the stream wait is over, and with --prep 0 the first
-        # take would otherwise start on a hand too young to record.
-        source.generate(int(math.ceil(MIN_VISIBLE_TIME_US / 1e6 * source.hz)) + 9)
-        source.start()
+        # --mock-dropout puts a dropout back on purpose, to rehearse the
+        # gate's rejection; --mock-lose-forming rehearses LOST YOU.
+        source = make_mock_source(args.mock_dropout or 0.0, coach,
+                                  args.mock_lose_forming or 0)
     else:
         try:
             source = open_stream(mode=args.mode)
@@ -1885,15 +2485,27 @@ def run_protocol(args, parser) -> None:
             takes, duration, prep, static_s, retries, still, reviewer,
             view=view, mock=args.mock, raw=args.raw, note=args.note or "",
             operator=args.operator, auto_accept=args.auto_accept,
-            resume=resume, panel=panel)
+            resume=resume, panel=panel, coach=coach,
+            acquire_timeout=OPEN_HAND_TIMEOUT_S)
 
-        eta = len(items) * takes * (prep + duration + 1.0)
+        # coached: about 2 s to show the open hand, plus the beeps
+        eta = len(items) * takes * (prep + duration + (3.0 if coach else 1.0))
         print("=" * 62)
         print(f"Grasp protocol (Set A): {protocol.get('name')} v"
               f"{protocol.get('version')}, {len(items)} grasp(s) x {takes} "
               f"take(s) x {duration:g} s  (~{eta / 60:.1f} min)")
         print(f"  hand:    {args.hand} (the operator's; the tracker's own label "
               "is recorded, not trusted)")
+        if coach:
+            print(f"  coach:   OPEN HAND ({OPEN_BAND_CM[0]:g} to "
+                  f"{OPEN_BAND_CM[1]:g} cm up, palm within "
+                  f"{OPEN_MAX_ANGLE_DEG:g} degrees of the lens, "
+                  f"{OPEN_HOLD_S:g} s; {OPEN_HAND_TIMEOUT_S:g} s to get "
+                  f"there), MAKE THE GRASP {prep:g} s, HOLD STILL "
+                  f"{duration:g} s")
+        else:
+            print(f"  coach:   off (--no-coach): a {prep:g} s GET READY "
+                  "countdown")
         print(f"  gate:    {MIN_TRACKED * 100:.0f} % of frames tracked and no "
               f"re-acquisition in the {static_s:g} s static interval; "
               f"{retries} retries")
@@ -1950,7 +2562,9 @@ def main() -> None:
                         "with --protocol, the file's duration_s)")
     p.add_argument("--prep", type=float, default=None,
                    help=f"seconds to get into the pose before each take (default: "
-                        f"{LEGACY_PREP:g}; with --protocol, the file's prep_s)")
+                        f"{LEGACY_PREP:g}; with --protocol, the MAKE THE GRASP "
+                        f"countdown, {FORM_S:g}, or with --no-coach the file's "
+                        "prep_s)")
     p.add_argument("--hz", type=float, default=None,
                    help=f"frames saved per second (default: {LEGACY_HZ:g}; 0 = keep "
                         "every frame). A protocol take always keeps every frame")
@@ -1995,9 +2609,17 @@ def main() -> None:
                         "'palm turned 30 degrees toward the lens'")
     g.add_argument("--operator", default=None,
                    help="who recorded the session, for session.json")
+    g.add_argument("--no-coach", action="store_true",
+                   help="the plain GET READY countdown instead of the coached "
+                        "take (OPEN HAND, then MAKE THE GRASP, then HOLD STILL)")
     g.add_argument("--mock-dropout", type=float, default=None,
                    help="with --mock: fraction of frames the mock drops, to "
-                        "rehearse the gate's rejection (e.g. 0.3)")
+                        "rehearse the gate's rejection (e.g. 0.3); coached, "
+                        "only during the take")
+    g.add_argument("--mock-lose-forming", type=int, default=None, metavar="N",
+                   help="with --mock: lose the hand while it closes into the "
+                        "grasp on the first N tries of every attempt, to "
+                        "rehearse LOST YOU (3 or more rejects every attempt)")
     args = p.parse_args()
 
     if args.protocol is not None:
@@ -2010,7 +2632,10 @@ def main() -> None:
         ("--auto-accept", args.auto_accept), ("--no-open", args.no_open),
         ("--no-panel", args.no_panel),
         ("--note", args.note), ("--operator", args.operator),
-        ("--mock-dropout", args.mock_dropout)) if value not in (None, False)]
+        ("--no-coach", args.no_coach),
+        ("--mock-dropout", args.mock_dropout),
+        ("--mock-lose-forming", args.mock_lose_forming))
+        if value not in (None, False)]
     if protocol_only:
         p.error(f"{', '.join(protocol_only)} only apply with --protocol")
     args.poses = ",".join(DEFAULT_POSES) if args.poses is None else args.poses

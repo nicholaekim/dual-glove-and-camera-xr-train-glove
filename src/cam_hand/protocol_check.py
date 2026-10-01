@@ -123,6 +123,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+# a per-grasp `"orientation": "...",` line on its own, as the Set A recorder
+# adds them (the same pattern as record_poses._HINT_LINE)
+_HINT_LINE = re.compile(
+    rb'^[ \t]*"orientation"[ \t]*:[ \t]*"(?:[^"\\\r\n]|\\.)*"[ \t]*,[ \t]*\r?\n',
+    re.MULTILINE)
+
 from cam_hand.features import FLEXION_NAMES, flexion_features
 from cam_hand.fusion import (
     CAPTURE_CLOCK,
@@ -308,15 +314,26 @@ def load_protocol(session_dir: Path, meta: dict) -> Tuple[Optional[dict], str]:
             continue
         data = c.read_bytes()
         want = meta.get("protocol_sha256")
+        hints_only = False
         if want and hashlib.sha256(data).hexdigest() != str(want).lower():
-            return None, (f"{rel} has changed since this session was recorded "
-                          "(sha256 differs), so its values were not used")
+            # The recorder's --resume lets a session recorded before the
+            # per-grasp orientation hints existed carry on with the hinted
+            # file (record_poses.sha256_without_hints); the same file must
+            # then count here, or a resumed session packages without its
+            # labels. Any other change is still refused.
+            if hashlib.sha256(_HINT_LINE.sub(b"", data)).hexdigest() == str(want).lower():
+                hints_only = True
+            else:
+                return None, (f"{rel} has changed since this session was recorded "
+                              "(sha256 differs), so its values were not used")
         try:
             proto = json.loads(data.decode("utf-8"))
         except ValueError:
             return None, f"{rel} is not valid JSON, so its values were not used"
         ver = proto.get("version", meta.get("protocol_version"))
-        check = "sha256 matches" if want else "no sha256 in session.json"
+        check = ("sha256 matches" if want and not hints_only
+                 else "differs only by orientation hints" if hints_only
+                 else "no sha256 in session.json")
         return proto, f"{proto.get('name', '?')} version {ver} ({rel}, {check})"
     return None, f"{rel} not found, so protocol values were not used"
 

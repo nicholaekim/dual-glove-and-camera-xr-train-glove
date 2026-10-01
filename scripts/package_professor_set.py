@@ -65,6 +65,7 @@ import csv
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import textwrap
@@ -624,6 +625,90 @@ def _item_counts(session: pc.Session) -> str:
     return ", ".join(f"{k} {v}" for k, v in counts.items()) or "none"
 
 
+def reason_kind(reason: str) -> str:
+    """What kind of rejection a recorder's reason is, without its numbers.
+
+    The reasons name the take's own numbers ("tracked 63 percent: lost 1
+    time, for 1.9 s (not back by the end) with the hand at 23 cm ..."), so
+    no two are equal; this groups them so the README can say which kind a
+    grasp was rejected for most often.
+    """
+    r = " ".join(str(reason or "").split())
+    low = r.lower()
+    if not low:
+        return "no reason recorded"
+    if low.startswith("no hand was tracked"):
+        return "no hand tracked during the take"
+    if low.startswith("no open hand acquired"):
+        return r.split(" (")[0]
+    if "while forming the grasp" in low:
+        return "hand lost while forming the grasp"
+    if low == "operator redo":
+        return "operator redo"
+    if "operator quit" in low:
+        return "operator quit at the review"
+    if low.startswith("interrupted"):
+        return "interrupted (Ctrl+C)"
+    if "not back by the end" in low:
+        return "hand lost during the take, not back by the end"
+    if "inside the static interval" in low:
+        return "hand lost inside the static interval"
+    if "no loss inside the take" in low and "first tracked" in low:
+        return "hand first tracked late in the take"
+    if "new id" in low:
+        return "tracker gave the hand a new id"
+    if low.startswith("tracked") and " lost " in low:
+        return "hand lost during the take"
+    return re.sub(r"\d+(?:\.\d+)?", "N", r.split(": ")[0])
+
+
+def short_grasp_lines(session: pc.Session) -> List[str]:
+    """The README table of the grasps short of their kept takes.
+
+    One row per grasp of the session (session.json's item list, else the
+    protocol's) with fewer kept takes than takes_per_item: kept, rejected
+    attempts, and the most common kind of rejection (`reason_kind`) with
+    how many of the rejections it was; kinds tied for most common are all
+    named. A grasp never attempted says so.
+    """
+    meta = session.meta
+    proto = session.protocol or {}
+    target = int(meta.get("takes_per_item") or proto.get("takes_per_item") or 3)
+    items = [str(i) for i in (meta.get("items") or [])] or [
+        str(it.get("id")) for it in proto.get("items", []) or []]
+    for t in session.takes:
+        if t.item not in items:
+            items.append(t.item)
+    title = f"Grasps short of {target} kept takes"
+    rows = []
+    for item in items:
+        mine = [t for t in session.takes if t.item == item]
+        kept = sum(1 for t in mine if t.accepted)
+        if kept >= target:
+            continue
+        kinds: Dict[str, int] = {}
+        for t in mine:
+            if not t.accepted:
+                k = reason_kind(t.reason)
+                kinds[k] = kinds.get(k, 0) + 1
+        rejected = sum(kinds.values())
+        if rejected:
+            most = max(kinds.values())
+            why = "; ".join(f"{k} ({n} of {rejected})"
+                            for k, n in kinds.items() if n == most)
+        else:
+            why = "not attempted"
+        rows.append((item, kept, rejected, why))
+    if not rows:
+        return [f"    {title}: none, every grasp has {target}."]
+    w = max(len("grasp id"), *(len(r[0]) for r in rows))
+    out = [f"    {title}:",
+           f"      {'grasp id':<{w}}  kept  rejected  most common reject reason"]
+    out += [f"      {item:<{w}}  {kept:>4}  {rejected:>8}  {why}"
+            for item, kept, rejected, why in rows]
+    return out
+
+
 def wrapped(text: str, first: str = "  ", rest: str = "    ") -> List[str]:
     return textwrap.wrap(text, width=96, initial_indent=first,
                          subsequent_indent=rest, break_on_hyphens=False)
@@ -828,6 +913,9 @@ def readme_text(packaged: Dict[str, List[pc.Session]], infos: Dict[str, dict],
             L.append(f"    handed in: {len(accepted(s))} take(s) "
                      f"({_item_counts(s)}); {n_rej} rejected attempt(s) kept "
                      "back with their reasons")
+            if kind == pc.GRASPS:
+                # which grasps the camera could not hold, and why
+                L += short_grasp_lines(s)
     for kind in pc.SETS:
         for m in infos.get(kind, {}).get("missing", []):
             L.append(f"  not handed in: {m}")

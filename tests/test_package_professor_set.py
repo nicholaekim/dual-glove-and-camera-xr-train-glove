@@ -227,6 +227,92 @@ def test_readme_names_the_setup_and_the_conventions(package):
     assert "\u2014" not in text
 
 
+def _short_grasp_session(src: Path, dst: Path) -> Path:
+    """A copy of the fixture's grasp session in which tip_pinch is short of
+    its takes (its third take rejected, then two attempts with no hand) and
+    the item list names a grasp that was never attempted."""
+    import shutil
+    shutil.copytree(src, dst)
+    meta = json.loads((dst / "session.json").read_text(encoding="utf-8"))
+    takes = meta["takes"]
+    third = [t for t in takes if t["item"] == "tip_pinch" and t["accepted"]][-1]
+    third["accepted"] = False
+    third["reason"] = (
+        "tracked 40 percent: lost 1 time, for 2.0 s (not back by the end) "
+        "with the hand at 21 cm (palm turned away: turn the palm back toward "
+        "the lenses; tilt it less than about 45 degrees); the gate needs 90 "
+        "percent")
+    for k in range(2):
+        takes.append({"item": "tip_pinch", "take": 3,
+                      "name": f"tip_pinch_left_take3_20260928_1450{k}0",
+                      "accepted": False,
+                      "reason": "no hand was tracked during the take",
+                      "decided_at": 1_790_300_000.0 + k, "files": {}})
+    meta["items"] = ["cylindrical", "tip_pinch", "hook"]
+    meta["takes_per_item"] = 3
+    (dst / "session.json").write_text(json.dumps(meta), encoding="utf-8")
+    return dst
+
+
+SHORT_ROW_RE = re.compile(r"^      (\S+)\s+(\d+)\s+(\d+)  (.+)$")
+
+
+def test_readme_lists_grasps_short_of_their_takes(sessions, tmp_path, package):
+    short = _short_grasp_session(sessions["grasps"],
+                                 tmp_path / "20260928_140000_left")
+    out = tmp_path / "out"
+    assert pkg.main(["--out", str(out), "--grasps", str(short)]) == 0
+    text = (out / "README.txt").read_text(encoding="utf-8")
+    lines = text.splitlines()
+    at = lines.index("    Grasps short of 3 kept takes:")
+    # right after the session's counts
+    assert lines[at - 1].startswith("    handed in: 5 take(s) (cylindrical 3, "
+                                    "tip_pinch 2); 4 rejected attempt(s)")
+    assert lines[at + 1].split() == ["grasp", "id", "kept", "rejected", "most",
+                                     "common", "reject", "reason"]
+    rows = {}
+    for line in lines[at + 2:]:
+        m = SHORT_ROW_RE.match(line)
+        if not m:
+            break
+        rows[m[1]] = (int(m[2]), int(m[3]), m[4])
+    # cylindrical has its 3 and is not listed
+    assert rows == {
+        "tip_pinch": (2, 4, "no hand tracked during the take (2 of 4)"),
+        "hook": (0, 0, "not attempted")}
+    assert text.index("Grasps short of") < text.index("QUALITY RULES")
+    assert "—" not in text
+    # a session with every grasp complete says so in one line
+    _rc, full = package
+    assert ("    Grasps short of 3 kept takes: none, every grasp has 3."
+            in (full / "README.txt").read_text(encoding="utf-8"))
+
+
+def test_reject_reasons_are_grouped_by_kind():
+    kinds = {
+        "no hand was tracked during the take": "no hand tracked during the take",
+        "tracked 63 percent: lost 1 time, for 1.9 s (not back by the end) with "
+        "the hand at 23 cm (unexplained: none of the measured causes fits: wipe "
+        "the lenses); the gate needs 90 percent":
+            "hand lost during the take, not back by the end",
+        "tracked 53 percent: lost 2 times, longest 1.2 s with the hand at 15 cm "
+        "(palm turned away: turn the palm back toward the lenses); the gate "
+        "needs 90 percent": "hand lost during the take",
+        "tracked 57 percent: no loss inside the take; first tracked 2.2 s after "
+        "the start; the gate needs 90 percent":
+            "hand first tracked late in the take",
+        "no open hand acquired in 30 s": "no open hand acquired in 30 s",
+        "lost the hand 3 times while forming the grasp, the last at 25 cm with "
+        "the palm 73 degrees from the lens (palm turned away: turn the palm "
+        "back toward the lenses)": "hand lost while forming the grasp",
+        "operator redo": "operator redo",
+        "the operator quit the session at the review": "operator quit at the review",
+        "fingertip wrong": "fingertip wrong",
+    }
+    for reason, kind in kinds.items():
+        assert pkg.reason_kind(reason) == kind, reason
+
+
 def _mocked(src: Path, dst: Path, flags: dict) -> Path:
     """A copy of a session whose session.json carries these mock flags."""
     import shutil
