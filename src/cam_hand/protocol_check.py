@@ -42,7 +42,10 @@ SET B (finger_flexion)
     the take's own range, so noise on a hold cannot count as a second bend).
     The two must agree, and when the protocol file is readable the event
     count must equal its `cycles` (the plan's "verify 5 repetitions rather
-    than assume it").
+    than assume it"). The peaks are counted by
+    `recording_protocol.count_peaks`, the function the recorder's quick
+    check rejects on, so a take the recorder accepted is not failed here
+    for a bend count it could have been redone for.
   * where the camera followed the finger (camera span >= 0.50 by
     `diagnostics.camera_range`, over the take and per cycle) the transfer
     curve, hysteresis and lag are reported, per cycle and per take, with the
@@ -139,6 +142,15 @@ from cam_hand.fusion import (
     pair_by_time,
     pairing_clock,
 )
+# Bends are counted by the recorder's own function and thresholds, imported
+# rather than copied (see the module docstring, SET B). The names after
+# each `as` are the ones this module has always used.
+from cam_hand.recording_protocol import (
+    PEAK_HIGH as PEAK_HIGH_SHARE,
+    PEAK_LOW as PEAK_LOW_SHARE,
+    PEAK_MIN_RANGE as MIN_PEAK_RANGE,
+    count_peaks,
+)
 from leap_hand.diagnostics import (
     MIN_CAMERA_RANGE,
     RANGE_PERCENTILES,
@@ -175,15 +187,9 @@ GLOVE, CAMERA = "glove", "camera"
 PAIR_MAX_DT = 0.05              # s, nearest camera frame for a glove frame
 FRACTION_CLIP = (-0.5, 1.5)     # contract section 4
 MIN_CUED_SPAN = 0.60            # plan section 4, Set B screening number
-# Schmitt trigger for counting bends in the glove trace: a peak is the
-# fraction rising past 60 % of the take's own range after having been below
-# 30 % of it. Relative to the take so a glove that reads too open still
-# counts its bends; the span rule is what judges how far it got.
-PEAK_LOW_SHARE = 0.3
-PEAK_HIGH_SHARE = 0.6
-# Below this much of its warm-up range the cued finger did not move enough
-# for its peaks to be anything but noise, and none are counted.
-MIN_PEAK_RANGE = 0.15
+# Bends in the glove trace are counted with PEAK_LOW_SHARE, PEAK_HIGH_SHARE
+# and MIN_PEAK_RANGE, imported above with `count_peaks` from
+# `recording_protocol`: one rule for the recorder and the checker.
 FLEXED_ABOVE = 0.6              # plan section 4, Set C initial bands
 STRAIGHT_BELOW = 0.3
 DEFAULT_CHECK_WINDOW_S = 1.5    # plan D7, used when the protocol is unreadable
@@ -512,34 +518,6 @@ def span_of(values) -> Optional[float]:
         return None
     lo, hi = np.percentile(v, list(RANGE_PERCENTILES))
     return float(hi - lo)
-
-
-def count_peaks(values, low_share: float = PEAK_LOW_SHARE,
-                high_share: float = PEAK_HIGH_SHARE,
-                min_range: float = MIN_PEAK_RANGE) -> int:
-    """Bends in a fraction trace (higher = more flexed), Schmitt trigger.
-
-    A bend counts when the trace rises above `high_share` of its own range
-    after having been below `low_share` of it, so a take that starts with
-    the finger already bent does not count that first bend and a wobble on
-    a hold cannot count twice.
-    """
-    v = np.asarray(values, dtype=float)
-    v = v[np.isfinite(v)]
-    if v.size < 3:
-        return 0
-    lo, hi = (float(x) for x in np.percentile(v, list(RANGE_PERCENTILES)))
-    if hi - lo < min_range:
-        return 0
-    low, high = lo + low_share * (hi - lo), lo + high_share * (hi - lo)
-    armed, n = False, 0
-    for x in v:
-        if x <= low:
-            armed = True
-        elif x >= high and armed:
-            n += 1
-            armed = False
-    return n
 
 
 def choose_camera_label(counts: Dict[str, int], operator_hand: str

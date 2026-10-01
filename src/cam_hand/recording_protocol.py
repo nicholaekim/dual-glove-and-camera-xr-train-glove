@@ -33,7 +33,12 @@ with tests, rather than inside a loop that drives hardware:
                    units, so one number means the same thing on every finger.
   quick check      the acquisition gates the recorder applies before it
                    accepts a take (plan, section 4). Set B: the cued finger
-                   has to cover at least 60 % of its range. Set C: in the
+                   has to cover at least 60 % of its range, and has to bend
+                   fully once per bend cue: its curl peaks (`count_peaks`,
+                   the count `cam_hand.protocol_check` fails a take on, which
+                   imports it from here) must number the take's bend cues,
+                   so a take is redone while the gloves are on rather than
+                   failed by the checker after the session. Set C: in the
                    last `check_window_s` of every step, a finger the step
                    says is flexed has to read above 0.6 and a finger the step
                    says is straight must not read flexed. A straight finger
@@ -55,6 +60,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
 
 from .features import FLEXION_NAMES
 
@@ -90,7 +97,9 @@ STRAIGHT_BELOW = 0.3
 SPAN_PERCENTILES = (5.0, 95.0)
 # Peak counting (Set B, "cycles counted two ways"): a peak is a rise above
 # PEAK_HIGH of the take's own range after a fall below PEAK_LOW of it. A
-# finger whose range in the take is under PEAK_MIN_RANGE has no peaks.
+# finger whose range in the take is under PEAK_MIN_RANGE has no peaks. The
+# checker imports these three and `count_peaks` from here, so the recorder
+# and the checker count the same bends.
 PEAK_LOW, PEAK_HIGH, PEAK_MIN_RANGE = 0.3, 0.6, 0.15
 # A warm-up span this close to zero is not a range at all.
 MIN_SPAN = 1e-6
@@ -723,14 +732,19 @@ class CheckResult:
     """The recorder's verdict on one take, and everything behind it.
 
     `reason` is empty when accepted. `notes` are information for the
-    operator and the session file (coupling, a cycle count that does not
-    match), never a reason to reject. `details` is JSON-ready.
+    operator and the session file (coupling, events that do not match the
+    protocol's cycle count), never a reason to reject. `details` is
+    JSON-ready. `hint` is the one line the console prints under a take
+    rejected for how the finger moved, so the retry a few seconds later is
+    not the same movement again; it is advice, not a measurement, so
+    `as_dict` (what session.json keeps) leaves it out.
     """
 
     accepted: bool
     reason: str = ""
     notes: List[str] = field(default_factory=list)
     details: dict = field(default_factory=dict)
+    hint: str = ""
 
     def as_dict(self) -> dict:
         return {"accepted": self.accepted, "reason": self.reason,
@@ -768,36 +782,71 @@ def span_fraction(fracs: Sequence[float]) -> Optional[float]:
         fracs, SPAN_PERCENTILES[0])
 
 
-def count_peaks(values: Sequence[float], low: float = PEAK_LOW,
-                high: float = PEAK_HIGH,
+def count_peaks(values, low_share: float = PEAK_LOW,
+                high_share: float = PEAK_HIGH,
                 min_range: float = PEAK_MIN_RANGE) -> int:
-    """Bend peaks in a fraction trace, with hysteresis.
+    """Bends in a fraction trace (higher = more flexed), Schmitt trigger.
 
-    The thresholds sit at `low` and `high` of the trace's OWN range (5th to
-    95th percentile), not at fixed fractions: a glove that creeps, or reads
-    too open on the day, still shows its cycles, and whether it reached the
-    band is the span gate's question, not this one's. A peak is counted when
-    the trace rises above the high mark after having been below the low one;
-    a take that starts bent does not count that first plateau.
+    The one bend count: the recorder's quick check rejects on it and
+    `cam_hand.protocol_check` imports it, so a take the recorder accepts
+    cannot fail the checker on its count. A bend counts when the trace rises
+    above `high_share` of its own range (5th to 95th percentile) after
+    having been below `low_share` of it, so a take that starts with the
+    finger already bent does not count that first bend and a wobble on a
+    hold cannot count twice. The marks sit in the take's own range, not at
+    fixed fractions: a glove that creeps, or reads too open on the day,
+    still shows its cycles, and how far the finger got is the span gate's
+    question, not this one's. Values that are None or not finite are
+    skipped.
     """
-    xs = [float(v) for v in values if v is not None and math.isfinite(v)]
-    if len(xs) < 3:
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size < 3:
         return 0
-    p_lo = percentile(xs, SPAN_PERCENTILES[0])
-    p_hi = percentile(xs, SPAN_PERCENTILES[1])
-    rng = p_hi - p_lo
-    if rng < min_range:
+    lo, hi = (float(x) for x in np.percentile(v, list(SPAN_PERCENTILES)))
+    if hi - lo < min_range:
         return 0
-    lo_mark, hi_mark = p_lo + low * rng, p_lo + high * rng
-    peaks = 0
-    armed = xs[0] < hi_mark
-    for x in xs:
-        if armed and x > hi_mark:
-            peaks += 1
-            armed = False
-        elif not armed and x < lo_mark:
+    low, high = lo + low_share * (hi - lo), lo + high_share * (hi - lo)
+    armed, n = False, 0
+    for x in v:
+        if x <= low:
             armed = True
-    return peaks
+        elif x >= high and armed:
+            n += 1
+            armed = False
+    return n
+
+
+def bends_reason(finger: str, peaks: int, cues: int) -> str:
+    """Why a take whose bend count is not its cue count is rejected.
+
+    Says what the glove saw in the operator's words and states the counting
+    rule in full, because "1 peak" alone does not tell anyone that a bend
+    which stopped short of the take's top counts as no bend at all.
+    """
+    rule = (f"a bend counts when the curl rises above "
+            f"{PEAK_HIGH * 100:.0f} percent of the take's range after being "
+            f"below {PEAK_LOW * 100:.0f} percent")
+    words = FINGER_WORDS[finger]
+    if peaks < cues:
+        times = "time" if peaks == 1 else "times"
+        return (f"the {words} bent fully only {peaks} {times} of {cues} "
+                f"({rule})")
+    return (f"the {words} bent fully {peaks} times for {cues} bend cues "
+            f"({rule})")
+
+
+def bend_hint(finger: str) -> str:
+    """What to do after a Set B take rejected for its movement, in one line.
+
+    Generic per finger on purpose: the span gate and the bend count fail
+    for the same cause (a fold that stopped short, or an opening that did),
+    and the reason above already says which and by how much. The thumb
+    crosses the palm; the others close into it.
+    """
+    where = "across the palm" if finger == "thumb" else "into the palm"
+    return (f"fold the {FINGER_WORDS[finger]} fully {where} on every bend, "
+            "then open it fully")
 
 
 def check_flexion_take(curls: Sequence[Tuple[float, Sequence[float]]],
@@ -806,11 +855,17 @@ def check_flexion_take(curls: Sequence[Tuple[float, Sequence[float]]],
                        span_gate: float = SPAN_GATE) -> CheckResult:
     """Set B's acquisition gate for one take.
 
-    Rejects only when the cued finger covered less than `span_gate` of its
-    warm-up range. The other four fingers' spans are measured and reported,
-    never failed on (the glove senses flexion only and the ring really does
-    drag its neighbours). The cycles are counted from the cued events and
-    from the curl peaks; a mismatch is a note for the checker, not a reject.
+    Rejects when the cued finger covered less than `span_gate` of its
+    warm-up range, or when it did not bend fully once per bend cue: the
+    curl peaks (`count_peaks`) must number the take's bend cues, the rule
+    the checker fails a take on. The span alone let a thumb take through on
+    2026-10-01 that folded fully on one cycle of five (span 0.78, 1 peak);
+    the checker failed it after the session, when redoing it cost a new
+    session. The other four fingers' spans are measured and reported, never
+    failed on (the glove senses flexion only and the ring really does drag
+    its neighbours). Events that disagree with the protocol's `cycles` are a
+    note, not a reject: the recorder writes one bend cue per cycle, so the
+    two differ only on a take cut short, which is rejected as interrupted.
     """
     t0, t1 = take_window(events)
     words = FINGER_WORDS[finger]
@@ -840,8 +895,11 @@ def check_flexion_take(curls: Sequence[Tuple[float, Sequence[float]]],
     peaks = count_peaks(fracs)
     details.update({"span_fraction": _r(span, 3), "other_spans": others,
                     "cycles_from_peaks": peaks})
+    short = span is None or span < span_gate
+    unbent = cycles_events > 0 and peaks != cycles_events
     notes = []
-    if peaks != cycles_events or cycles_events != int(cycles):
+    # Said once: when the bend count is the reason, a note would repeat it.
+    if cycles_events != int(cycles) or (unbent and short):
         notes.append(f"cycles: {cycles} cued in the protocol, "
                      f"{cycles_events} in the events, {peaks} peaks in the "
                      f"{words} curl")
@@ -851,11 +909,16 @@ def check_flexion_take(curls: Sequence[Tuple[float, Sequence[float]]],
     if moved:
         notes.append("other fingers that moved with it (span as a fraction "
                      "of their range): " + ", ".join(moved))
-    if span is None or span < span_gate:
+    if short:
         return CheckResult(False,
                            f"the {words} moved only {_fmt(span or 0.0)} of its "
                            f"warm-up range (needs {span_gate:.2f})",
-                           notes=notes, details=details)
+                           notes=notes, details=details,
+                           hint=bend_hint(finger))
+    if unbent:
+        return CheckResult(False, bends_reason(finger, peaks, cycles_events),
+                           notes=notes, details=details,
+                           hint=bend_hint(finger))
     return CheckResult(True, "", notes=notes, details=details)
 
 

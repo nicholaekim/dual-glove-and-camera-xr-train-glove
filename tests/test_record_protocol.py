@@ -5,7 +5,9 @@ The two runbook rehearsal commands are run exactly as documented (plus an
 checked against docs/protocol_formats.md: layout, session.json, warmup.json,
 the keys added to every frame line, and the events of every take. The
 reject path runs on `--mock-glove-ignore-cues`; the operator's redo, the
-stop key and the warm-up refusal run in-process with the keys faked.
+stop key and the warm-up refusal run in-process with the keys faked, and
+so do every Set B item on the cue-following mock and a mock hand that
+folds fully on one bend of five.
 """
 import hashlib
 import importlib.util
@@ -207,6 +209,9 @@ def test_ignored_cues_are_rejected_and_kept(tmp_path):
     assert [t["attempt"] for t in session["takes"]] == [1, 2]
     names = [t["name"] for t in session["takes"]]
     assert len(set(names)) == 2
+    assert proc.stdout.count("      what to do: fold the index fully into "
+                             "the palm on every bend, then open it "
+                             "fully\n") == 2
     for t in session["takes"]:
         assert t["accepted"] is False and t["take"] == 1
         assert t["reason"].startswith("the index moved only 0.")
@@ -342,6 +347,107 @@ def test_warmup_refusal_stops_before_any_take(tmp_path, monkeypatch):
     session = json.loads((folder / "session.json").read_text())
     assert session["stopped"].startswith("warm-up refused: the glove barely")
     assert session["takes"] == []
+
+
+# --- in-process: the bend count of a Set B take ------------------------------
+def test_the_mock_glove_passes_every_set_b_item(tmp_path, monkeypatch,
+                                                capsys):
+    """The mock hand that follows the cues folds fully on every bend, so
+    every Set B item, the slow and the fast index included, passes the quick
+    check (span and bend count) on its first attempt. Were the bend count to
+    reject it, a rehearsal could only ever rehearse the reject path."""
+    module = load_script()
+    protocol = rp.load_protocol(ROOT / "protocols" / "finger_flexion.json")
+    items = protocol.ids
+    assert {"index_slow", "index_fast"} <= set(items)
+    code = _in_process(module, monkeypatch, tmp_path, [], "--items",
+                       ",".join(items), "--retries", "0")
+    out = capsys.readouterr().out
+    assert code == 0, out
+    folder = only_session(tmp_path, "finger_flexion")
+    takes = json.loads((folder / "session.json").read_text())["takes"]
+    assert [t["item"] for t in takes] == items
+    for t in takes:
+        cycles = protocol.item(t["item"])["cycles"]
+        assert t["accepted"] is True and t["attempt"] == 1, t
+        assert t["check"]["cycles_from_events"] == cycles, t
+        assert t["check"]["cycles_from_peaks"] == cycles, t
+        assert t["check"]["span_fraction"] >= rp.SPAN_GATE, t
+    assert not (folder / "rejected").exists()
+    assert "what to do:" not in out
+
+
+def _folds_fully_once(module):
+    """The mock hand of the thumb take of 2026-10-01. On the first attempt
+    it folds the cued finger only 60 % of the way on four bends of five and
+    fully on the fifth (fast, and staying folded: the stock mock clamps a
+    bend at 1.05, so 1.5 reaches it early in the bend), which is enough
+    for the span gate on that one bend. From the sixth bend on (the retry)
+    it folds fully every time, like the stock mock."""
+
+    class Glove(module.CueFollowingGlove):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.bends = []                 # (cue time, how far it folds)
+
+        def follow(self, flexed, duration, phase=None, t=None,
+                   warmup=False):
+            super().follow(flexed, duration, phase, t=t, warmup=warmup)
+            if phase == rp.BEND:
+                n = len(self.bends)
+                self.bends.append((self._t0s[-1],
+                                   0.6 if n < 4 else 1.5 if n == 4 else 1.0))
+
+        def bend_at(self, t):
+            amount = 1.0
+            for t0, a in self.bends:
+                if t0 <= t - self.lag:
+                    amount = a
+            return {f: v * amount for f, v in super().bend_at(t).items()}
+
+    return Glove
+
+
+def test_a_take_bent_fully_once_is_rejected_and_recorded_again(
+        tmp_path, monkeypatch, capsys):
+    """2026-10-01: a thumb take covered 0.78 of its range, so the span gate
+    accepted it, but the thumb folded fully on one cycle of five; the
+    checker failed it after the session, which cost a whole new session.
+    The quick check now counts the bends with the checker's own function,
+    rejects the take as soon as it is recorded, says what to do, and the
+    retry records it again."""
+    module = load_script()
+    monkeypatch.setattr(module, "CueFollowingGlove",
+                        _folds_fully_once(module))
+    code = _in_process(module, monkeypatch, tmp_path, [], "--items",
+                       "thumb", "--retries", "1")
+    out = capsys.readouterr().out
+    assert code == 0, out
+    folder = only_session(tmp_path, "finger_flexion")
+    first, second = json.loads((folder / "session.json").read_text())["takes"]
+    reason = ("the thumb bent fully only 1 time of 5 (a bend counts when the "
+              "curl rises above 60 percent of the take's range after being "
+              "below 30 percent)")
+    assert first["accepted"] is False and first["reason"] == reason
+    assert first["decided_by"] == "auto" and first["attempt"] == 1
+    assert first["check"]["span_fraction"] >= rp.SPAN_GATE   # span: a pass
+    assert first["check"]["cycles_from_events"] == 5
+    assert first["check"]["cycles_from_peaks"] == 1
+    name = first["name"]
+    assert first["files"]["glove"] == f"rejected/glove/{name}.jsonl"
+    note = (folder / "rejected" / f"{name}.reason.txt").read_text()
+    assert note.splitlines()[0] == reason
+    assert "decided by: auto" in note
+    events = rp.read_events(folder / first["files"]["events"])
+    assert events[-1]["kind"] == "decision"
+    assert events[-1]["accepted"] is False and events[-1]["reason"] == reason
+    assert (f"      REJECTED: {reason}\n"
+            "      what to do: fold the thumb fully across the palm on every "
+            "bend, then open it fully\n") in out
+    assert "retrying (1/1)" in out
+    assert second["accepted"] is True and second["attempt"] == 2
+    assert second["take"] == 1 and second["check"]["cycles_from_peaks"] == 5
+    assert (folder / second["files"]["glove"]).is_file()
 
 
 # --- pieces ------------------------------------------------------------------

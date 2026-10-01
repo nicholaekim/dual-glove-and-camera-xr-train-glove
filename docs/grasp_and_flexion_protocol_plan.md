@@ -204,7 +204,11 @@ Set B (glove, camera reference):
   their own ranges (the ring drags the middle and pinky along, and the glove
   senses flexion only, so a hard cutoff would reject real coupled motion);
 - cycles counted two ways, from the cued events and from the glove curl
-  peaks; a mismatch is flagged;
+  peaks (a rise above 60 % of the take's own range after being below 30 %
+  of it); the two must match, and the recorder rejects a take where they
+  do not, with the checker's own count, so it is redone on the spot
+  (2026-10-01: a thumb take that folded fully on one cycle of five passed
+  the span gate and failed only in the checker, after the session);
 - where the camera followed the finger (camera span at least 0.50, the
   `finger_sweep` rule), the transfer curve, hysteresis and lag are reported
   per finger and per speed, with the number of cycles and frames that met

@@ -87,7 +87,12 @@ What happens, in order:
    straighten and rest with a beep. Move one finger only and keep the others
    straight. Follow the beeps, not the screen.
 5. After each take the console says ACCEPTED or REJECTED with the reason. A
-   rejected take is recorded again straight away, up to two more times.
+   take is rejected when the cued finger did not move far enough, or did
+   not bend fully on every bend beep (for example `REJECTED: the thumb bent
+   fully only 1 time of 5 ...`); the line under it then says what to do,
+   for example `what to do: fold the thumb fully across the palm on every
+   bend, then open it fully`. A rejected take is recorded again straight
+   away, up to two more times.
 6. At the end the console prints a table of every take and the folder, and
    the folder opens in File Explorer.
 
@@ -210,9 +215,13 @@ the take in progress is moved to `rejected\` as interrupted.
 ## What makes a take accepted
 
 - Set B: the cued finger has to move at least 0.60 of its own open-to-fist
-  range from the warm-up. The other four fingers are measured and reported,
-  never failed on. The cycles are counted from the beeps and from the
-  finger's peaks; a mismatch is a note, not a rejection.
+  range from the warm-up, and it has to bend fully once for every bend
+  beep. A bend counts when the curl rises above 60 percent of the take's
+  own range after being below 30 percent, the same count the checker
+  (`scripts\check_protocol.py`) fails a take on, so a finger that folds
+  fully on only some cycles is rejected on the spot instead of after the
+  session. The other four fingers are measured and reported, never failed
+  on.
 - Set C: in the last 1.5 seconds of every step, a finger the step says is
   flexed has to read above 0.60 of its range, and a finger the step says is
   straight must not read above 0.60. A straight finger between 0.30 and 0.60

@@ -439,12 +439,18 @@ def test_warmup_refusal_rule():
 
 # --- peaks and the Set B check --------------------------------------------------
 def flexion_trace(finger="index", cycles=5, amplitude=1.0, dt=1 / 60.0,
-                  bend=1.0, hold=0.5, straighten=1.0, rest=0.5, t0=100.0):
-    """A glove trace of one finger doing `cycles` cycles, events to match."""
+                  bend=1.0, hold=0.5, straighten=1.0, rest=0.5, t0=100.0,
+                  amplitudes=None):
+    """A glove trace of one finger doing `cycles` cycles, events to match.
+
+    `amplitudes` gives each cycle its own bend (a finger that folds fully
+    on some cycles only); without it every cycle bends `amplitude`.
+    """
     i = ALL5.index(finger)
     events = [{"t": t0, "kind": "take_start", "item": finger, "take": 1}]
     curls, t, step = [], t0, 0
     for cycle in range(1, cycles + 1):
+        amp = amplitudes[cycle - 1] if amplitudes else amplitude
         for phase, dur in (("bend", bend), ("hold", hold),
                            ("straighten", straighten), ("rest", rest)):
             events.append({"t": t, "kind": "cue", "step": step, "label": phase,
@@ -455,7 +461,7 @@ def flexion_trace(finger="index", cycles=5, amplitude=1.0, dt=1 / 60.0,
             for k in range(n):
                 e = k / n
                 f = {"bend": e, "hold": 1.0, "straighten": 1.0 - e,
-                     "rest": 0.0}[phase] * amplitude
+                     "rest": 0.0}[phase] * amp
                 fr = [0.0] * 5
                 fr[i] = f
                 curls.append((t + k * dt, curls_at(fr)))
@@ -471,12 +477,32 @@ def test_count_peaks():
     assert rp.count_peaks([0.01, 0.02, 0.0, 0.03] * 20) == 0     # no range
     assert rp.count_peaks([1.0, 1.0, 0.0, 0.0, 1.0, 0.0]) == 1   # starts bent
     assert rp.count_peaks([]) == 0
+    assert rp.count_peaks([None, 0.0, 1.0, float("nan"), 0.0, 1.0]) == 2
+
+
+def test_the_peak_count_is_the_checkers(monkeypatch):
+    """One function and one set of thresholds for the recorder and the
+    checker, and the quick check really calls it: a copy could drift, and a
+    take the recorder accepted would then fail the checker on its bend
+    count after the session again."""
+    from cam_hand import protocol_check as pc
+
+    assert pc.count_peaks is rp.count_peaks
+    assert (pc.PEAK_LOW_SHARE, pc.PEAK_HIGH_SHARE, pc.MIN_PEAK_RANGE) == (
+        rp.PEAK_LOW, rp.PEAK_HIGH, rp.PEAK_MIN_RANGE)
+    curls, events = flexion_trace(cycles=5)
+    seen = []
+    monkeypatch.setattr(rp, "count_peaks",
+                        lambda values: seen.append(len(values)) or 5)
+    assert rp.check_flexion_take(curls, events, glove_ends(), "index",
+                                 5).accepted
+    assert seen == [len(curls)]
 
 
 def test_flexion_check_accepts_a_full_take():
     curls, events = flexion_trace(cycles=5)
     res = rp.check_flexion_take(curls, events, glove_ends(), "index", 5)
-    assert res.accepted and res.reason == ""
+    assert res.accepted and res.reason == "" and res.hint == ""
     assert res.details["span_fraction"] == pytest.approx(1.0, abs=0.02)
     assert res.details["cycles_from_events"] == 5
     assert res.details["cycles_from_peaks"] == 5
@@ -484,6 +510,7 @@ def test_flexion_check_accepts_a_full_take():
     assert res.details["other_spans"]["middle"] == pytest.approx(0.0)
     assert res.notes == []
     assert res.as_dict()["accepted"] is True
+    assert "hint" not in res.as_dict()
 
 
 def test_flexion_check_rejects_naming_finger_and_fraction():
@@ -492,9 +519,64 @@ def test_flexion_check_rejects_naming_finger_and_fraction():
     assert not res.accepted
     assert res.reason == ("the ring moved only 0.40 of its warm-up range "
                           "(needs 0.60)")
+    assert res.hint == ("fold the ring fully into the palm on every bend, "
+                        "then open it fully")
     pinky, events = flexion_trace(finger="pinky", cycles=5, amplitude=0.1)
     res = rp.check_flexion_take(pinky, events, glove_ends(), "pinky", 5)
     assert "the little finger moved only 0.10" in res.reason
+    assert res.hint == ("fold the little finger fully into the palm on every "
+                        "bend, then open it fully")
+
+
+FOLD_RULE = ("(a bend counts when the curl rises above 60 percent of the "
+             "take's range after being below 30 percent)")
+
+
+def test_flexion_check_rejects_a_take_bent_fully_once():
+    """The thumb take of 2026-10-01: its curl covered 0.78 of its range, so
+    the span gate passed it, but the thumb folded fully on one cycle of
+    five and the checker failed it after the session. The quick check now
+    rejects it while the gloves are still on."""
+    curls, events = flexion_trace(finger="thumb", cycles=5,
+                                  amplitudes=[0.4, 0.4, 0.4, 0.4, 1.0])
+    res = rp.check_flexion_take(curls, events, glove_ends(), "thumb", 5)
+    assert res.details["span_fraction"] >= rp.SPAN_GATE   # span alone: pass
+    assert res.details["cycles_from_events"] == 5
+    assert res.details["cycles_from_peaks"] == 1
+    assert not res.accepted
+    assert res.reason == "the thumb bent fully only 1 time of 5 " + FOLD_RULE
+    assert res.hint == ("fold the thumb fully across the palm on every bend, "
+                        "then open it fully")
+    # the bend count is the reason, so no note says it a second time
+    assert not any(n.startswith("cycles:") for n in res.notes)
+
+    curls, events = flexion_trace(finger="thumb", cycles=5,
+                                  amplitudes=[0.4, 1.0, 0.4, 0.4, 1.0])
+    res = rp.check_flexion_take(curls, events, glove_ends(), "thumb", 5)
+    assert res.reason == "the thumb bent fully only 2 times of 5 " + FOLD_RULE
+
+
+def test_flexion_check_rejects_more_bends_than_cues():
+    curls, events = flexion_trace(cycles=6)
+    events = [e for e in events if e.get("cycle") != 6]   # 5 bend cues
+    res = rp.check_flexion_take(curls, events, glove_ends(), "index", 5)
+    assert not res.accepted
+    assert res.details["cycles_from_peaks"] == 6
+    assert res.reason == "the index bent fully 6 times for 5 bend cues " + \
+        FOLD_RULE
+
+
+def test_a_short_span_stays_the_reason_with_the_bend_count_as_a_note():
+    """A finger that fell short of the span gate is rejected for that, as
+    before. A bend count that does not match its cues as well is kept as a
+    note, because that reason does not say it."""
+    curls, events = flexion_trace(cycles=6, amplitude=0.5)
+    events = [e for e in events if e.get("cycle") != 6]   # 5 bend cues
+    res = rp.check_flexion_take(curls, events, glove_ends(), "index", 5)
+    assert res.reason == ("the index moved only 0.50 of its warm-up range "
+                          "(needs 0.60)")
+    assert ("cycles: 5 cued in the protocol, 5 in the events, 6 peaks in "
+            "the index curl") in res.notes
 
 
 def test_flexion_check_flags_a_cycle_mismatch_without_rejecting():
@@ -510,10 +592,12 @@ def test_flexion_check_with_no_frames_or_no_range():
     _curls, events = flexion_trace(cycles=2)
     res = rp.check_flexion_take([], events, glove_ends(), "index", 2)
     assert not res.accepted and "no glove frames" in res.reason
+    assert res.hint == ""          # nothing the hand can do about no frames
     flat = glove_ends(fist=[1.40] + FIST[1:])
     curls, events = flexion_trace(finger="thumb", cycles=2)
     res = rp.check_flexion_take(curls, events, flat, "thumb", 2)
     assert not res.accepted and "no warm-up range" in res.reason
+    assert res.hint == ""
 
 
 # --- the Set C check ------------------------------------------------------------

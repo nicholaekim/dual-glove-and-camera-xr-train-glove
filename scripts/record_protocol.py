@@ -1080,6 +1080,11 @@ class ProtocolSession:
 
         verdict = "ACCEPTED" if accepted else f"REJECTED: {reason}"
         self.say(f"      {verdict}")
+        if not accepted and not interrupted and check.hint:
+            # What to change before the retry that starts in a few seconds,
+            # in one line: the reason says what the glove measured, this
+            # says what the hand should do about it.
+            self.say(f"      what to do: {check.hint}")
         for note in check.notes:
             self.say(f"      note: {note}")
         gap = health.get("max_gap_ms") or 0
