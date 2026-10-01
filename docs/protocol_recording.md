@@ -76,7 +76,10 @@ What happens, in order:
    press Enter. The time you press Enter is saved as the calibration time.
 2. The recorder waits for the left glove, then for the camera: hold the
    left hand open, palm toward the lens, 18 to 28 cm above the module. The
-   right hand rests on the table for the whole run.
+   right hand rests on the table for the whole run. A camera window shows
+   the IR image, the skeleton and the height against the band, so you can
+   see where your hand is and how far each finger bends (`--hide-camera`
+   runs without it; it was the default until 2026-10-01).
 3. Warm-up: a beep and "OPEN PALM" for 3 seconds, a higher beep and "FULL
    FIST" for 3 seconds. This measures each finger's own range for today.
 4. The takes: thumb, index, middle, ring, little finger, index slow, index

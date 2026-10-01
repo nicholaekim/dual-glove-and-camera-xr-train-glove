@@ -440,3 +440,38 @@ def test_keys_writer_adds_the_contract_keys(tmp_path):
         w.write("\n")
     assert lines(path) == [{"take": 1, "wall_time": 1.0, "session": "s1",
                             "item": "index"}]
+
+
+def test_the_camera_window_is_shown_unless_hidden(monkeypatch):
+    """Set B and C show the camera window by default: on 2026-10-01 the
+    operator could not place the hand or see how far the thumb bent without
+    the picture, and two sessions ended on the first take. `--hide-camera`
+    keeps the plan's cue-only screen, the viewer run with `--no-window`."""
+    import subprocess as sp
+
+    module = load_script()
+    launched = []
+
+    class Proc:
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            pass
+
+    monkeypatch.setattr(sp, "Popen", lambda cmd, **kw: (launched.append(cmd), Proc())[1])
+    shown = module.ViewerStills("left", (18.0, 28.0))
+    hidden = module.ViewerStills("left", (18.0, 28.0), window=False)
+    try:
+        assert len(launched) == 2
+        assert "--no-window" not in launched[0]
+        assert "--no-window" in launched[1]
+        for cmd in launched:
+            assert cmd[cmd.index("--hand") + 1] == "left"
+            assert cmd[cmd.index("--band") + 1] == "18,28"
+    finally:
+        shown.close()
+        hidden.close()
+    base = ["--set", "finger_flexion", "--hand", "left"]
+    assert module.parse_args(base).hide_camera is False
+    assert module.parse_args(base + ["--hide-camera"]).hide_camera is True

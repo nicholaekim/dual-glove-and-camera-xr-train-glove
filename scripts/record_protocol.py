@@ -37,8 +37,9 @@ Pieces reused rather than rewritten: the glove recorder with the packet
 arrival time (`StampedFrameRecorder`) and the beep from
 `scripts/record_simultaneous.py`; the acquire gate, HUD, async beeper, crop
 box and still bookkeeping from `leap_hand.protocol`; `LeapRecorder`; the
-camera viewer (`scripts/leap/camera_view.py`) run with no window, only to
-cut the one hand-cropped IR still per take.
+camera viewer (`scripts/leap/camera_view.py`), which shows the IR image
+and the skeleton so the operator can see the hand (`--hide-camera` runs it
+with no window, only to cut the one hand-cropped IR still per take).
 
 Rehearse with no hardware at all (a mock glove that follows the cues, a mock
 camera, a quarter of the real durations):
@@ -443,10 +444,12 @@ class HiddenCameraView(CameraView):
 
     The viewer already knows how to cut a still to the tracked hand (and to
     leave a note when there is no hand), which is the still the contract
-    asks for. What it must not do here is show the IR image and the skeleton
-    while the operator performs, so it runs with no window at all.
-    `CameraView.start` builds its command inline, which is why this one is
-    repeated with the one flag added.
+    asks for. This one shows nothing while the operator performs (the
+    plan's cue-only screen, `--hide-camera`). It is no longer the default:
+    on 2026-10-01 the operator could not place the hand or see how far the
+    thumb bent without the picture, and two Set B sessions ended on the
+    first take. `CameraView.start` builds its command inline, which is why
+    this one is repeated with the one flag added.
     """
 
     def start(self):
@@ -485,10 +488,13 @@ class NoStills:
 
 
 class ViewerStills(NoStills):
-    """Stills from the real camera, through the hidden viewer."""
+    """Stills from the real camera, through the viewer: its window (the IR
+    image, the skeleton, height against the band, the tracking line) by
+    default, or hidden with `window=False` (`--hide-camera`)."""
 
-    def __init__(self, hand: str, band):
-        self.view = HiddenCameraView(hand=hand, band=band).start()
+    def __init__(self, hand: str, band, window: bool = True):
+        cls = CameraView if window else HiddenCameraView
+        self.view = cls(hand=hand, band=band).start()
 
     def request(self, path, caption: str, hand) -> None:
         self.view.caption(caption)
@@ -1271,6 +1277,10 @@ def parse_args(argv=None):
                    help="synthetic Ultraleap stream")
     p.add_argument("--no-view", action="store_true",
                    help="no cue window (the console still shows every cue)")
+    p.add_argument("--hide-camera", action="store_true",
+                   help="run the camera with no window (stills only); the "
+                        "default shows the IR image and the skeleton so you "
+                        "can see the hand")
     p.add_argument("--no-open", action="store_true",
                    help="do not open the folder in Explorer at the end")
     p.add_argument("--no-beep", action="store_true",
@@ -1405,7 +1415,7 @@ def run(args) -> int:
             print(f"\nNo live tracking: {e}\n")
             return EXIT_REFUSED
         stills = MockStills() if args.mock_leap else \
-            ViewerStills(args.hand, args.band)
+            ViewerStills(args.hand, args.band, window=not args.hide_camera)
 
     beep = (lambda f, ms: None) if args.no_beep else coached().beep
     session = ProtocolSession(args, protocol, items, plan, seed, glove, leap,
