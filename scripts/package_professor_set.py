@@ -8,7 +8,8 @@ from the session folders every time instead of being assembled by hand:
     <out>\\grasps\\<item>_<hand>_take<N>.jsonl, ..._keypoints.txt,
                   <item>_<hand>_all_frames.txt, grasps_summary.csv
     <out>\\finger_flexion\\<hand>\\<take>.jsonl, camera_<take>.jsonl,
-                  <take>.events.jsonl, <take>.txt, flexion_report.txt
+                  <take>.events.jsonl, <take>.txt, flexion_report.txt,
+                  <session>_warmup*.json
     <out>\\sequences\\<hand>\\ the same layout, plus sequence_check.csv
 
   python scripts/package_professor_set.py --out "..\\xr trainer\\grasp and flexion set for professor 2026-09-28" ^
@@ -33,6 +34,13 @@ WHAT GOES IN, AND WHAT DOES NOT
                   recorder followed (`operator_hand_ids` in the meta), else,
                   for a take recorded before it followed one, the tracker
                   label `protocol_check.choose_camera_label` picks
+
+  Warm-ups (Sets B and C): every `warmup*.json` of a session, renamed
+  `<session>_<file>`, beside its takes: a session resumed after a break has
+  one warm-up per run, and each take was judged against its own (session
+  section of the README, and `takes[i].warmup` in its session.json). They
+  hold the open, fist and single-finger ends every fraction is taken
+  between, and say what the glove numbers are.
 
   Joint frames, when `scripts/joint_frames_view.py --session` has been run
   on a session: its `joint_frames/<take>.csv` (and `camera_<take>.csv`) for
@@ -450,6 +458,13 @@ def check_for(session: pc.Session) -> Tuple[List[Dict[str, str]], str, str]:
             "checked while packaging (fixed bands)")
 
 
+def warmup_files(session: pc.Session) -> List[Path]:
+    """Every warm-up file of a session folder: warmup.json, then a resumed
+    session's warmup_<HHMMSS>.json files in the order they were written."""
+    found = [p for p in session.path.glob("warmup*.json") if p.is_file()]
+    return sorted(found, key=lambda p: (p.name != pc.WARMUP_FILE, p.name))
+
+
 def plan_glove_takes(session: pc.Session, kind: str, exporter,
                      pdf_name: str = JOINT_FRAMES_PDF
                      ) -> Tuple[List[Output], List[str]]:
@@ -476,6 +491,10 @@ def plan_glove_takes(session: pc.Session, kind: str, exporter,
                                source=t.path("events")))
         else:
             missing.append(f"{t.name}: no events file")
+    # Every warm-up the takes were judged against, named by session (two
+    # sessions of one hand share this folder).
+    for p in warmup_files(session):
+        plan.append(Output(folder / f"{session.name}_{p.name}", source=p))
     frames, notes = plan_joint_frames(session, folder, names, pdf_name)
     return plan + frames, missing + notes
 
@@ -630,14 +649,36 @@ def plan_glove_set(sessions: List[pc.Session], kind: str, exporter
 # --- README ----------------------------------------------------------------------------
 
 def _endpoints_lines(session: pc.Session) -> List[str]:
-    ends = pc.endpoints(session.warmup, pc.GLOVE)
-    if not ends:
-        return ["    warm-up: none recorded"]
-    return ["    warm-up glove curl, thumb index middle ring pinky: open "
-            + " ".join(pc.fmt(ends[f][0]) if f in ends else "-"
-                       for f in pc.FINGERS)
-            + ", fist " + " ".join(pc.fmt(ends[f][1]) if f in ends else "-"
-                                   for f in pc.FINGERS)]
+    """README lines: each warm-up file's glove open, fist and (when it has
+    them) single-finger values, in the units its takes were measured in.
+
+    The open palm and the fist are read as measured (`cued=False`): the
+    checker's default puts a cued finger's single bend at the end of its
+    range, which printed under "fist" would misname it.
+    """
+    names = session.warmup_names or [pc.WARMUP_FILE]
+    out = []
+    for n in names:
+        w = session.warmup_named(n)
+        where = "" if len(names) == 1 else f" {n}"
+        ends = pc.endpoints(w, pc.GLOVE, cued=False)
+        if not ends:
+            out.append(f"    warm-up{where}: none recorded")
+            continue
+        units = ("glove (thumb in degrees, the rest curl)"
+                 if pc.thumb_in_degrees(w) else "glove curl")
+        text = (f"    warm-up{where} {units}, thumb index middle ring "
+                "pinky: open "
+                + " ".join(pc.fmt(ends[f][0]) if f in ends else "-"
+                           for f in pc.FINGERS)
+                + ", fist " + " ".join(pc.fmt(ends[f][1]) if f in ends
+                                       else "-" for f in pc.FINGERS))
+        single = (w.get(pc.GLOVE) or {}).get("single")
+        if isinstance(single, dict):
+            text += ", single " + " ".join(pc.fmt(single.get(f))
+                                           for f in pc.FINGERS)
+        out.append(text)
+    return out
 
 
 def _item_counts(session: pc.Session) -> str:
@@ -899,7 +940,9 @@ def readme_text(packaged: Dict[str, List[pc.Session]], infos: Dict[str, dict],
                   f"      <hand>\\<take>.events.jsonl      every cue and "
                   "decision, same clock as the frames",
                   f"      <hand>\\<take>.txt               glove, every "
-                  "frame, 21 landmarks, wrist at the origin, mm"]
+                  "frame, 21 landmarks, wrist at the origin, mm",
+                  f"      <hand>\\<session>_warmup*.json   each session's "
+                  "warm-up(s): the open, fist and single-finger ends"]
             L.append("      <hand>\\flexion_report.txt       cycles, range, "
                      "hysteresis, lag, per finger and speed"
                      if kind == pc.FLEXION else
@@ -967,10 +1010,12 @@ def readme_text(packaged: Dict[str, List[pc.Session]], infos: Dict[str, dict],
           "separate count was judged on",
           "    its reacquisitions figure, and that figure is repeated in "
           "both columns.",
-          "  Set B: the cued finger's glove curl spans at least 60 % of its "
-          "own open-to-fist range from",
-          "    the session warm-up; the other four fingers' spans are "
-          "reported, not failed (the ring drags",
+          "  Set B: the cued finger's glove reading spans at least 60 % of "
+          "its own range from the",
+          "    session warm-up (open palm to the finger bent on its own, for "
+          "sessions recorded since",
+          "    2026-10-01; open palm to fist before); the other four fingers' "
+          "spans are reported, not failed (the ring drags",
           "    the middle and little finger along). Cycles are counted from "
           "the cues and from the glove",
           "    curl peaks and must agree with each other and with the "
@@ -998,6 +1043,18 @@ def readme_text(packaged: Dict[str, List[pc.Session]], infos: Dict[str, dict],
           "    the session warm-up (3 s open palm, 3 s fist); 0 = open palm, "
           "1 = fist. curl = fingertip-",
           "    to-wrist distance over palm length.",
+          "  Since 2026-10-01 the warm-up also has each finger bent on its "
+          "own for 3 s (single), and a",
+          "    finger the cue names is measured against that (0 = open "
+          "palm, 1 = its own bend) when it",
+          "    bent far enough (index to little finger at least half of the "
+          "fist span, thumb at least 35",
+          "    degrees). The glove thumb is then its bend in degrees "
+          "(TMC_fe + MCP_fe + IP, larger = more",
+          "    bent) instead of the curl, which barely moves when the thumb "
+          "bends; the warm-up file's",
+          "    units say which. A session resumed after a break has one "
+          "warm-up per run.",
           ""]
 
     if any(infos.get(k, {}).get("joint_frames") or

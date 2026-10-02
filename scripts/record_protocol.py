@@ -13,20 +13,35 @@ checked by `cam_hand.recording_protocol`.
 
 Why it is built this way (plan: `docs/grasp_and_flexion_protocol_plan.md`):
 
-  * the cue window shows ONLY the take name, the cue words and a countdown.
-    No skeleton and no camera image, with or without the camera. One person
-    cues, performs and judges, and a live skeleton invites shaping the
-    movement until glove and camera agree; the operator follows the beep.
+  * the cue window shows the take name, the cue words, a countdown and,
+    along its bottom third, five bars: each finger's GLOVE reading as a
+    fraction of its range from today's warm-up, the cued finger drawn wide,
+    green when it is where the cue wants it and amber when not. On
+    2026-10-01 three Set B sessions ended on the thumb because nobody could
+    tell whether the glove had registered a bend at all. The bars show the
+    glove against its own warm-up, never against the camera, so the two
+    sensors under comparison are still not put side by side for the
+    operator to make them agree; the operator follows the beep.
+    `--no-bars` keeps the plan's cue-only screen.
   * every take is checked before the next one starts (the quick check in
     `recording_protocol`), because a bad take is cheap to redo while the
     gloves are on and expensive to discover afterwards. A rejected attempt
     is MOVED to `rejected/` with its reason, never deleted: the two sensors
     under evaluation are the ones judging, so every exclusion has to stay
     countable.
-  * each finger is measured against its own open and fist for THIS session
-    (the warm-up), not a number from another day. A glove that barely moves
-    between the two refuses the session instead of producing fractions of
-    nothing.
+  * each finger is measured against its own range for THIS session (the
+    warm-up: open palm, full fist, then each finger bent on its own), not a
+    number from another day. A glove that barely moves between open and
+    fist, or a finger that barely bends on its own, refuses the warm-up
+    instead of producing fractions of nothing; it is repeated up to
+    WARMUP_TRIES times before the session is refused. The glove's thumb is
+    measured by its joint angles in degrees (`recording_protocol.
+    glove_bends`), because its curl barely moves when it bends.
+  * a session cut short (Ctrl+C, `q`, a refused warm-up) carries on in the
+    same folder with `--resume <folder>` or `--resume latest`: the saved
+    round order is reused, items that already have their accepted takes are
+    skipped, and a new warm-up (`warmup_<HHMMSS>.json`) is recorded, because
+    the gloves came off and their readings with them.
   * Set C runs all seven sequences once per round in a shuffled order, with
     the seed saved, so the three takes of a sequence are independent
     repetitions rather than practice.
@@ -60,11 +75,18 @@ Real session (XR Trainer streaming to 127.0.0.1:9002, camera plugged in):
   python scripts/record_protocol.py --set sequences --hand left
 
 During the few seconds after each take, `r` redoes it (the operator's own
-verdict, which does not use up a retry) and `q` stops the session, on the
-cue window or in the console. Exit code 0 when every planned take has an
-accepted attempt, 1 when some take has none or the session was stopped, 2
-when the session was refused before any take (protocol file, glove, camera,
-acquire gate or warm-up).
+verdict, which does not use up a retry), `s` skips the rest of that item in
+this run and `q` stops the session, on the cue window or in the console.
+During a take, `s` ends it at once: the attempt is rejected ("skipped by
+the operator (s) during the take") and the item is skipped. Carry on later:
+
+  python scripts/record_protocol.py --set finger_flexion --hand left \\
+      --resume latest
+
+Exit code 0 when every planned take has an accepted attempt, 1 when some
+take has none, an item was skipped with no accepted take or the session was
+stopped, 2 when the session was refused before any take (protocol file,
+glove, camera, acquire gate, warm-up, or a folder that cannot be resumed).
 """
 import argparse
 import bisect
@@ -78,7 +100,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -112,7 +134,7 @@ from leap_hand.protocol import (  # noqa: E402
 from leap_hand.recorder import LeapRecorder  # noqa: E402
 from leap_hand.stream import LeapUnavailable, open_stream  # noqa: E402
 from xr_hand.joints import HEADER_LEN, JOINT_NAMES, VALUES_PER_JOINT  # noqa: E402
-from xr_hand.keypoints21 import MP21_TO_OPENXR_IDX, frame_to_keypoints21  # noqa: E402
+from xr_hand.keypoints21 import MP21_TO_OPENXR_IDX  # noqa: E402
 from xr_hand.parser import parse_hand_message  # noqa: E402
 from xr_hand.receiver import OSCHandReceiver, QueueItem  # noqa: E402
 from xr_hand.validator import StreamMonitor, validate_raw_message  # noqa: E402
@@ -127,6 +149,19 @@ WARMUP_FIST_S = 3.0       # ... then a full fist 3 s
 # the glove's lag, up to 0.47 s on the right hand), so the medians are taken
 # over the rest of the window. The windows in warmup.json are those.
 WARMUP_SETTLE_S = 1.0
+# Then each finger on its own, thumb to little finger: bent alone and held
+# for WARMUP_SINGLE_S (its median over the last WARMUP_SETTLE_S of that is
+# its `single`), then straightened for WARMUP_SINGLE_REST_S. The fist ends
+# with one straighten too, so no finger starts its bend from the fist.
+WARMUP_SINGLE_S = 3.0
+WARMUP_SINGLE_REST_S = 1.5
+# A refused warm-up is done again, whole, this many times in all before the
+# session is refused: the usual cause is a bend that stopped short, which the
+# refusal names, and the gloves are on and calibrated by then.
+WARMUP_TRIES = 3
+# The live bars only draw a glove frame this recent; older means the glove
+# stopped, and an old bar would say the finger is somewhere it is not.
+BARS_FRESH_S = 0.5
 STILL_WAIT_S = 2.0        # how long to wait for the viewer's still after a take
 GLOVE_WAIT_PACKETS = 10
 # Below this share of a take with the operator's hand tracked, the console
@@ -139,8 +174,14 @@ PREP_BEEP = (500, 80)
 END_BEEP = (500, 250)
 WARMUP_OPEN_BEEP = (1000, 200)
 WARMUP_FIST_BEEP = (1200, 200)
+WARMUP_BEND_BEEP = (1200, 200)        # high: bend this finger on its own
+WARMUP_STRAIGHTEN_BEEP = (800, 200)   # low: straighten it
 
 REJECTED = "rejected"
+WARMUP_FILE = "warmup.json"
+SKIP_KEY = "s"
+SKIPPED_DURING_TAKE = "skipped by the operator (s) during the take"
+SKIPPED_TEXT = "skipped by the operator"
 # Where sessions go when --out-dir is not given. A rehearsal with a mock
 # sensor goes to its own tree (contract, section 7), so it can never sit
 # beside a real session and be packaged as data by mistake.
@@ -330,16 +371,41 @@ class CueFollowingGlove:
 
 # --- the cue window ----------------------------------------------------------
 class CueWindow:
-    """What the operator looks at: the take name, the cue words, a countdown.
+    """What the operator looks at: the take name, the cue words, a countdown,
+    and the glove's five bars (module docstring).
 
-    Nothing else, in either camera mode, on purpose: see the module
-    docstring. A plain OpenCV canvas, kept on top, redrawn at most 30 times
-    a second. `enabled=False` (`--no-view`) makes every call a no-op.
+    A plain OpenCV canvas, kept on top, redrawn at most 30 times a second.
+    `render` draws one frame and touches no window, so it can be tested and
+    looked at without a screen; `show` puts it on the window.
+    `enabled=False` (`--no-view`) makes `show` a no-op.
+
+    The bars sit in the bottom third, thumb to little finger, each filled
+    from the bottom (0 = the warm-up open palm) to the top (1 = the end of
+    the finger's range), the fill clipped to [0, 1] and the number printed
+    as it is. Ticks on both sides of every bar mark STRAIGHT_BELOW and
+    FLEXED_ABOVE. The cued finger(s) are wide and bright: green when the
+    reading is where the phase wants it (at or above FLEXED_ABOVE to bend,
+    flex or hold; at or below STRAIGHT_BELOW to straighten, extend or rest),
+    amber when it is not, white when there is no phase to judge by (the
+    pause). The others are narrow and grey.
     """
 
     NAME = "Protocol cues"
     W, H = 1000, 560
     EVERY = 1.0 / 30.0
+    # Colours (BGR) and sizes of the bars.
+    GREEN = (0, 200, 0)
+    AMBER = (0, 170, 255)
+    NEUTRAL = (235, 235, 235)
+    GREY = (120, 120, 120)
+    TRACK = (70, 70, 70)
+    TICK = (200, 200, 200)
+    CUED_W, OTHER_W = 70, 26
+    LABEL_H = 28                       # finger names under the bars
+    BENT_PHASES = ("bend", "flex", "hold")
+    OPEN_PHASES = ("straighten", "extend", "rest")
+    BAR_LABELS = {"thumb": "thumb", "index": "index", "middle": "middle",
+                  "ring": "ring", "pinky": "little"}
 
     def __init__(self, enabled: bool = True):
         self.enabled = bool(enabled)
@@ -362,8 +428,112 @@ class CueWindow:
             lines.append(line)
         return lines or [""]
 
+    @classmethod
+    def bar_colour(cls, fraction: Optional[float],
+                   phase: Optional[str]) -> Tuple[int, int, int]:
+        """A cued bar's colour: green when the reading is where `phase`
+        wants it, amber when not, neutral with no phase to judge by."""
+        if phase in cls.BENT_PHASES:
+            ok = fraction is not None and fraction >= rp.FLEXED_ABOVE
+        elif phase in cls.OPEN_PHASES:
+            ok = fraction is not None and fraction <= rp.STRAIGHT_BELOW
+        else:
+            return cls.NEUTRAL
+        return cls.GREEN if ok else cls.AMBER
+
+    @classmethod
+    def _draw_bars(cls, img: np.ndarray, bars: dict) -> None:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        fractions = bars.get("fractions") or {}
+        cued = set(bars.get("cued") or ())
+        phase = bars.get("phase")
+        top = cls.H - cls.H // 3                  # the bottom third
+        y_top = top + 8
+        y_bot = cls.H - cls.LABEL_H
+        height = y_bot - y_top
+        slot = cls.W // len(rp.FINGERS)
+        for k, f in enumerate(rp.FINGERS):
+            cx = k * slot + slot // 2
+            is_cued = f in cued
+            half = (cls.CUED_W if is_cued else cls.OTHER_W) // 2
+            x0, x1 = cx - half, cx + half
+            v = fractions.get(f)
+            colour = cls.bar_colour(v, phase) if is_cued else cls.GREY
+            cv2.rectangle(img, (x0, y_top), (x1, y_bot), cls.TRACK, 1)
+            if v is not None:
+                fill = min(1.0, max(0.0, float(v)))
+                y_fill = y_bot - int(round(fill * height))
+                if y_fill < y_bot:
+                    cv2.rectangle(img, (x0, y_fill), (x1, y_bot), colour, -1)
+            for mark in (rp.STRAIGHT_BELOW, rp.FLEXED_ABOVE):
+                y = y_bot - int(round(mark * height))
+                cv2.line(img, (x0 - 9, y), (x0 - 2, y), cls.TICK, 1)
+                cv2.line(img, (x1 + 2, y), (x1 + 9, y), cls.TICK, 1)
+            text = "-" if v is None else f"{float(v):.2f}"
+            shade = (255, 255, 255) if is_cued else (150, 150, 150)
+            cv2.putText(img, text, (x1 + 12, y_top + 18), font, 0.55, shade,
+                        1, cv2.LINE_AA)
+            label = cls.BAR_LABELS.get(f, f)
+            size = cv2.getTextSize(label, font, 0.6, 1)[0][0]
+            cv2.putText(img, label, (cx - size // 2, cls.H - 8), font, 0.6,
+                        shade, 1, cv2.LINE_AA)
+
+    @classmethod
+    def render(cls, title: str, words: str, seconds_left: Optional[float],
+               sub: str = "", bars: Optional[dict] = None) -> np.ndarray:
+        """One frame of the window as a BGR image; no window is touched.
+
+        `bars` is {"fractions": {finger: float or None}, "cued": [finger,
+        ...], "phase": "bend" | "hold" | "straighten" | "rest" | "flex" |
+        "extend" | None} (`ProtocolSession.bars_now`), or None for the
+        cue-only screen. With bars the words move up and the countdown goes
+        to the top right, so the bottom third holds the bars alone.
+        """
+        img = np.zeros((cls.H, cls.W, 3), np.uint8)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        cv2.putText(img, title or "", (24, 44), font, 0.8, (170, 170, 170), 2,
+                    cv2.LINE_AA)
+        lines = cls._wrap(words or "", 1.8, 4, cls.W - 80)
+        if len(lines) > 2:
+            lines = cls._wrap(words or "", 1.0, 2, cls.W - 60)[:5]
+            scale, thick, step = 1.0, 2, 44
+        else:
+            scale, thick, step = 1.8, 4, 74
+        middle = 0.30 if bars is not None else 0.42
+        y = int(cls.H * middle) - (len(lines) - 1) * step // 2
+        if bars is not None:
+            y = max(y, 100)
+        for line in lines:
+            size = cv2.getTextSize(line, font, scale, thick)[0][0]
+            cv2.putText(img, line, ((cls.W - size) // 2, y), font, scale,
+                        (255, 255, 255), thick, cv2.LINE_AA)
+            y += step
+        floor = cls.H - cls.H // 3 - 8 if bars is not None else cls.H
+        for line in cls._wrap(sub or "", 0.7, 2, cls.W - 60)[:2]:
+            if bars is not None and y + 10 > floor:
+                break
+            size = cv2.getTextSize(line, font, 0.7, 2)[0][0]
+            cv2.putText(img, line, ((cls.W - size) // 2, y + 10), font, 0.7,
+                        (170, 170, 170), 2, cv2.LINE_AA)
+            y += 34
+        if seconds_left is not None:
+            left = max(0.0, float(seconds_left))
+            text = f"{left:.1f}" if left < 1.0 else f"{math.ceil(left):d}"
+            if bars is None:
+                size = cv2.getTextSize(text, font, 2.2, 5)[0][0]
+                cv2.putText(img, text, ((cls.W - size) // 2, cls.H - 40),
+                            font, 2.2, (0, 220, 255), 5, cv2.LINE_AA)
+            else:
+                size = cv2.getTextSize(text, font, 1.6, 4)[0][0]
+                cv2.putText(img, text, (cls.W - size - 24, 60), font, 1.6,
+                            (0, 220, 255), 4, cv2.LINE_AA)
+        if bars is not None:
+            cls._draw_bars(img, bars)
+        return img
+
     def show(self, title: str, words: str, seconds_left: Optional[float],
-             sub: str = "", force: bool = False) -> str:
+             sub: str = "", force: bool = False,
+             bars: Optional[dict] = None) -> str:
         """Redraw; returns the key pressed on the window ('' for none)."""
         if not self.enabled:
             return ""
@@ -379,33 +549,7 @@ class CueWindow:
             except Exception:
                 pass
             self._open = True
-        img = np.zeros((self.H, self.W, 3), np.uint8)
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        cv2.putText(img, title or "", (24, 44), font, 0.8, (170, 170, 170), 2,
-                    cv2.LINE_AA)
-        lines = self._wrap(words or "", 1.8, 4, self.W - 80)
-        if len(lines) > 2:
-            lines = self._wrap(words or "", 1.0, 2, self.W - 60)[:5]
-            scale, thick, step = 1.0, 2, 44
-        else:
-            scale, thick, step = 1.8, 4, 74
-        y = int(self.H * 0.42) - (len(lines) - 1) * step // 2
-        for line in lines:
-            size = cv2.getTextSize(line, font, scale, thick)[0][0]
-            cv2.putText(img, line, ((self.W - size) // 2, y), font, scale,
-                        (255, 255, 255), thick, cv2.LINE_AA)
-            y += step
-        for line in self._wrap(sub or "", 0.7, 2, self.W - 60)[:2]:
-            size = cv2.getTextSize(line, font, 0.7, 2)[0][0]
-            cv2.putText(img, line, ((self.W - size) // 2, y + 10), font, 0.7,
-                        (170, 170, 170), 2, cv2.LINE_AA)
-            y += 34
-        if seconds_left is not None:
-            left = max(0.0, float(seconds_left))
-            text = f"{left:.1f}" if left < 1.0 else f"{math.ceil(left):d}"
-            size = cv2.getTextSize(text, font, 2.2, 5)[0][0]
-            cv2.putText(img, text, ((self.W - size) // 2, self.H - 40), font,
-                        2.2, (0, 220, 255), 5, cv2.LINE_AA)
+        img = self.render(title, words, seconds_left, sub, bars)
         cv2.imshow(self.NAME, img)
         k = cv2.waitKey(1) & 0xFF
         return chr(k).lower() if 32 <= k < 127 else ""
@@ -436,6 +580,21 @@ def flush_console_keys() -> None:
     for _ in range(64):
         if not console_key():
             return
+
+
+def console_has_key() -> bool:
+    """Is a key waiting in the console? Only when a person is at it.
+
+    Asked before reading a key DURING a take, so a key is read there only
+    when one was pressed; the pause after the take reads `console_key` as
+    it always has (and flushes what was typed during the take first)."""
+    try:
+        if not sys.stdin.isatty():
+            return False
+        import msvcrt
+        return bool(msvcrt.kbhit())
+    except Exception:
+        return False
 
 
 # --- the one still per take --------------------------------------------------
@@ -602,6 +761,14 @@ class StopSession(Exception):
     """The operator stopped the session."""
 
 
+class SkipTake(Exception):
+    """`s` during a take: end it now, reject it, skip the item."""
+
+
+class ResumeRefused(Exception):
+    """`--resume` names a folder this run cannot carry on. Exit code 2."""
+
+
 # --- the session -------------------------------------------------------------
 class ProtocolSession:
     """One hand, one protocol file, one folder. See the module docstring."""
@@ -642,12 +809,25 @@ class ProtocolSession:
         self._snap = None
         self._warned: set = set()
         self.warmup: Optional[dict] = None
+        self.warmup_name = WARMUP_FILE
         self.dir: Optional[Path] = None
         self.takes: List[dict] = []
         self.accepted: Dict[str, int] = {i: 0 for i in items}
+        # Every round records each item once, so a plan's length is its
+        # takes per item; `run` sets it from the protocol or the session.
+        self.takes_per_item = len(plan)
         self.failed: List[str] = []
+        self.skipped_items: set = set()       # `s`: this run only
+        self.skips: List[dict] = []
         self.stopped: Optional[str] = None
         self.meta: dict = {}
+        # The live bars: the newest glove frame of the operator's hand as
+        # (time, five readings), the warm-up block the fractions are taken
+        # against, and (cued fingers, phase) while bars are wanted.
+        self.show_bars = not getattr(args, "no_bars", False)
+        self.last_bends: Optional[Tuple[float, List[float]]] = None
+        self.bar_ends: Optional[dict] = None
+        self.bar_cue: Optional[Tuple[List[str], Optional[str]]] = None
 
     # --- plumbing ---------------------------------------------------------
     @staticmethod
@@ -685,11 +865,39 @@ class ProtocolSession:
              sub: str = "") -> None:
         self.display = (title, words, deadline, sub)
 
+    def bars_now(self, now: Optional[float] = None) -> Optional[dict]:
+        """The cue window's bars from the newest glove frame, or None.
+
+        None outside the stretches that show bars (a take, the warm-up's
+        single-finger part, the pause after a take), before the warm-up has
+        endpoints, and when the newest frame is older than BARS_FRESH_S. A
+        cued finger is put on its own range (`recording_protocol.
+        range_ends`), the others on the fist, as the quick check reads them.
+        """
+        if self.bar_cue is None or not self.bar_ends or \
+                self.last_bends is None:
+            return None
+        now = time.time() if now is None else float(now)
+        t, bends = self.last_bends
+        if now - t > BARS_FRESH_S:
+            return None
+        cued, phase = self.bar_cue
+        fractions: Dict[str, Optional[float]] = {}
+        for i, f in enumerate(rp.FINGERS):
+            try:
+                o, e = rp.range_ends(self.bar_ends, f, cued=f in cued)
+            except (KeyError, TypeError, ValueError):
+                fractions[f] = None
+                continue
+            fractions[f] = rp.fraction(o, e, bends[i])
+        return {"fractions": fractions, "cued": list(cued), "phase": phase}
+
     # --- one pass over both sensors ----------------------------------------
     def tick(self, record: bool = True) -> str:
         """Drain both sensors once, record what belongs in the take, redraw.
         Returns the key pressed on the cue window, if any."""
         now = time.time()
+        newest = None
         for item in self.glove.drain(256):
             hand, raw = item
             result = validate_raw_message(raw)
@@ -709,8 +917,16 @@ class ProtocolSession:
             if record and self.glove_rec is not None:
                 self.glove_rec.record(frame, capture_time=t)
             if self.collect is not None:
-                self.collect["glove"].append(
-                    (t, flexion_features(frame_to_keypoints21(frame))))
+                bends = rp.glove_bends(frame)
+                self.collect["glove"].append((t, bends))
+                self.last_bends, newest = (t, bends), None
+            else:
+                newest = (t, frame)
+        if newest is not None:
+            # Outside the warm-up only the newest frame of a drain is
+            # measured: the bars draw one frame, and a thumb's joint table
+            # per frame is the costly part of a tick.
+            self.last_bends = (newest[0], rp.glove_bends(newest[1]))
         if self.leap is not None:
             for _side, lh in self.leap.drain(256):
                 if lh.hand_side != self.hand:
@@ -737,14 +953,22 @@ class ProtocolSession:
                               / (now - self._rate_at))
             self._rate_at, self._rate_mark = now, self.glove_total
         title, words, deadline, sub = self.display
+        bars = (self.bars_now(now) if self.show_bars and self.window.enabled
+                else None)
         key = self.window.show(title, words,
                                None if deadline is None else deadline - now,
-                               sub)
+                               sub, bars=bars)
         time.sleep(0.004)
         return key
 
-    def hold_until(self, deadline: float, record: bool = True) -> None:
-        """Keep draining until `deadline`, asking for the still on time."""
+    def hold_until(self, deadline: float, record: bool = True,
+                   keys: bool = False) -> None:
+        """Keep draining until `deadline`, asking for the still on time.
+
+        `keys` (during a take): `s` on the cue window or in the console ends
+        the take at once (SkipTake). The console is read only when a key is
+        waiting, so the pause after the take still gets the keys meant for
+        it."""
         while True:
             now = time.time()
             if self._snap is not None and now >= self._snap[0]:
@@ -753,7 +977,12 @@ class ProtocolSession:
                 self.stills.request(path, caption, self.last_hand)
             if now >= deadline:
                 return
-            self.tick(record)
+            key = self.tick(record)
+            if keys:
+                if not key and console_has_key():
+                    key = console_key()
+                if key == SKIP_KEY:
+                    raise SkipTake()
 
     def reset_monitors(self) -> None:
         """Forget the last packet counter of each glove, after a stretch in
@@ -837,11 +1066,29 @@ class ProtocolSession:
         while folder.exists():                 # two sessions in one second
             n += 1
             folder = base / f"{stamp}_{self.hand}_{n}"
+        return self.use_folder(folder)
+
+    def use_folder(self, folder: Path) -> Path:
+        """Record into `folder` (a new one, or a resumed session's own),
+        with the subfolders this run writes."""
+        folder = Path(folder)
         for sub in ("glove", "events") + (("leap", "stills")
                                           if self.leap is not None else ()):
             (folder / sub).mkdir(parents=True, exist_ok=True)
         self.dir = folder
         return folder
+
+    def resumed_warmup_name(self) -> str:
+        """`warmup_<HHMMSS>.json` for a resumed run's warm-up: the first
+        run's warmup.json is never rewritten, because the takes recorded
+        before were judged against it."""
+        stamp = time.strftime("%H%M%S")
+        name, n = f"warmup_{stamp}.json", 1
+        while (self.dir / name).exists() or \
+                name in (self.meta.get("warmups") or []):
+            n += 1
+            name = f"warmup_{stamp}_{n}.json"
+        return name
 
     def write_session(self, ended: Optional[str] = None) -> None:
         if self.dir is None:
@@ -853,10 +1100,55 @@ class ProtocolSession:
         write_json(self.dir / "session.json", data)
 
     # --- the warm-up --------------------------------------------------------
-    def run_warmup(self) -> dict:
-        """Open palm then full fist, cued; each finger's endpoints for today."""
+    def warm_up(self, name: str = WARMUP_FILE) -> dict:
+        """The warm-up, done again whole while it is refused, up to
+        WARMUP_TRIES times; the last record is returned (refused or not)."""
+        refusals: List[str] = []
+        record: dict = {}
+        for k in range(1, WARMUP_TRIES + 1):
+            if k > 1:
+                self.say("", f"warm-up again ({k} of {WARMUP_TRIES})")
+            record = self.run_warmup(name, try_no=k, earlier=refusals)
+            warmups = self.meta.setdefault("warmups", [])
+            if name not in warmups:
+                warmups.append(name)
+            if not record["refused"]:
+                return record
+            refusals.append(record["refused"])
+            self.say(f"      warm-up refused: {record['refused']}")
+        return record
+
+    def _warmup_straighten(self, finger: Optional[str], seconds: float,
+                           words: str) -> None:
+        t = time.time()
+        self.beep(*WARMUP_STRAIGHTEN_BEEP)
+        self.mock_follow((), seconds, t=t, warmup=True)
+        self.bar_cue = ([finger] if finger else [], rp.STRAIGHTEN)
+        self.show("WARM-UP", words, t + seconds)
+        self.hold_until(t + seconds, record=False)
+
+    def _num(self, sensor: str, finger: str, value) -> str:
+        if value is None:
+            return "-"
+        if sensor == "glove" and finger == rp.THUMB:
+            return f"{float(value):.1f}"            # degrees
+        return f"{float(value):.3f}"
+
+    def run_warmup(self, name: str = WARMUP_FILE, try_no: int = 1,
+                   earlier=()) -> dict:
+        """Open palm, full fist, then each finger on its own, cued; each
+        finger's range for today, written to `name` in the session folder.
+
+        The refusal rule and the camera's endpoints stay on the open palm
+        and the fist; each finger's single bend is the median over the last
+        WARMUP_SETTLE_S of its bend window (`recording_protocol.
+        warmup_record`). The bars run through the single-finger part,
+        against the open palm and fist just measured.
+        """
         all5 = rp.FINGERS
-        self.say("", "WARM-UP: an open palm, then a full fist, on the beeps.")
+        self.say("", "WARM-UP: an open palm, a full fist, then each finger "
+                     "on its own, on the beeps.")
+        self.bar_cue = None
         start = time.time()
         countdown = self.seconds(WARMUP_COUNTDOWN_S)
         self.mock_follow((), countdown, warmup=True)
@@ -880,29 +1172,63 @@ class ProtocolSession:
         self.show("WARM-UP", "FULL FIST", t_fist + fist_s)
         self.say(f"      full fist ({fist_s:g} s)")
         self.hold_until(t_fist + fist_s, record=False)
+        t_fist_end = time.time()
+        settle = self.seconds(WARMUP_SETTLE_S)
+        w_open = (t_open + settle, t_fist)
+        w_fist = (t_fist + settle, t_fist_end)
+        self.bar_ends = rp.window_endpoints(self.collect["glove"], w_open,
+                                            w_fist)
+
+        bend_s = self.seconds(WARMUP_SINGLE_S)
+        rest_s = self.seconds(WARMUP_SINGLE_REST_S)
+        self._warmup_straighten(None, rest_s, "OPEN the hand, fingers "
+                                              "straight")
+        t_single: Dict[str, Tuple[float, float]] = {}
+        for f in all5:
+            words = rp.FINGER_WORDS[f]
+            t_bend = time.time()
+            self.beep(*WARMUP_BEND_BEEP)
+            self.mock_follow((f,), bend_s, t=t_bend, warmup=True)
+            self.bar_cue = ([f], rp.BEND)
+            self.show("WARM-UP", f"bend the {words.upper()} only",
+                      t_bend + bend_s, "the other fingers stay straight; "
+                      "hold it bent until the low beep")
+            self.say(f"      {words} on its own ({bend_s:g} s)")
+            self.hold_until(t_bend + bend_s, record=False)
+            t_up = time.time()
+            t_single[f] = (t_up - settle, t_up)
+            self._warmup_straighten(f, rest_s, "straighten")
+        self.bar_cue = None
         t_end = time.time()
         self.beep(*END_BEEP)
         self.mock_follow((), self.seconds(PREP_S), t=t_end, warmup=True)
         collected, self.collect = self.collect, None
 
-        settle = self.seconds(WARMUP_SETTLE_S)
         record = rp.warmup_record(
-            self.hand, (t_open + settle, t_fist), (t_fist + settle, t_end),
-            collected["glove"],
+            self.hand, w_open, w_fist, collected["glove"],
             collected["camera"] if self.leap is not None else None,
-            settle_s=settle)
-        write_json(self.dir / "warmup.json", record)
+            settle_s=settle, t_single=t_single, units=rp.GLOVE_UNITS)
+        # Which try of WARMUP_TRIES this is, and why the ones before it
+        # were refused: a repeated warm-up is not a hidden one.
+        record["try"] = int(try_no)
+        record["earlier_refusals"] = list(earlier)
+        write_json(self.dir / name, record)
+        self.say(f"      {name}:")
         for sensor in ("glove", "camera"):
             ends = record[sensor]
             if ends is None:
                 continue
-            self.say(f"      {sensor:<6} open  " + "  ".join(
-                f"{f} {ends['open'][f]:.3f}" for f in rp.FINGERS))
-            self.say(f"      {sensor:<6} fist  " + "  ".join(
-                f"{f} {ends['fist'][f]:.3f}" for f in rp.FINGERS))
-            self.say(f"      {sensor:<6} span  " + "  ".join(
-                f"{f} {ends['span'][f]:.3f}" for f in rp.FINGERS))
+            for key in ("open", "fist", "span", "single", "single_span"):
+                values = ends.get(key)
+                if not isinstance(values, dict):
+                    continue
+                self.say(f"      {sensor:<6} {key:<11} " + "  ".join(
+                    f"{f} {self._num(sensor, f, values.get(f))}"
+                    for f in rp.FINGERS))
+        self.say("      (glove thumb in degrees, larger = more bent; every "
+                 "other number is a curl, smaller = more bent)")
         self.warmup = record
+        self.bar_ends = record["glove"]
         return record
 
     # --- one attempt at one take ----------------------------------------------
@@ -939,6 +1265,26 @@ class ProtocolSession:
     def _rel(self, path: Path) -> str:
         return Path(path).relative_to(self.dir).as_posix()
 
+    def _item_cued(self, item: dict) -> List[str]:
+        """The fingers the bars draw wide outside a cue: Set B's finger."""
+        return [item["finger"]] if self.protocol.name == rp.FLEXION else []
+
+    def _cue_bars(self, cue: rp.Cue, previous: Optional[rp.Cue],
+                  item: dict) -> Tuple[List[str], Optional[str]]:
+        """(cued fingers, phase) for the bars during one cue.
+
+        Set B: the item's finger, in the cue's phase. Set C: the step's
+        flexed fingers; the phase by `cue_pitch`'s rule (a step that flexes
+        a finger is "flex", one that only straightens is "extend", one that
+        changes nothing is "hold", and its flexed fingers stay bent).
+        """
+        if cue.phase is not None:
+            return [item["finger"]], cue.phase
+        pitch = rp.cue_pitch(cue, previous)
+        phase = {rp.PITCH_FLEX: "flex",
+                 rp.PITCH_EXTEND: "extend"}.get(pitch, rp.HOLD)
+        return list(cue.flexed), phase
+
     def run_take(self, item_id: str, take: int, attempt: int, round_no: int
                  ) -> dict:
         item = self.protocol.item(item_id)
@@ -946,6 +1292,7 @@ class ProtocolSession:
         label = item["label"]
         hint = self._item_hint(item)
         self._warned = set()
+        self.bar_cue = (self._item_cued(item), None)
 
         # --- preparation: the item's words, hand open -----------------
         self.say("", f"--- round {round_no}/{len(self.plan)}: {label}, take "
@@ -980,16 +1327,17 @@ class ProtocolSession:
         if "still" in paths:
             self._snap = (t0 + offsets[k_still] + cues[k_still].hold_s / 2.0,
                           paths["still"], f"{name}  {cues[k_still].label}")
-        interrupted = False
+        interrupted = skipped = False
         previous = None
         try:
             for k, cue in enumerate(cues):
-                self.hold_until(t0 + offsets[k])
+                self.hold_until(t0 + offsets[k], keys=True)
                 t = time.time()
                 self.beep(rp.cue_pitch(cue, previous),
                           max(40, min(BEEP_MS, int(cue.hold_s * 600))))
                 events.write("cue", t=t, **cue.event_fields())
                 self.mock_follow(cue.flexed, cue.hold_s, cue.phase, t=t)
+                self.bar_cue = self._cue_bars(cue, previous, item)
                 # `step` as the events file and the reject reasons count it
                 # (from 0), so "step 3" means the same cue everywhere.
                 where = (f"cycle {cue.cycle}/{item['cycles']}"
@@ -999,9 +1347,11 @@ class ProtocolSession:
                 self.say(f"      [{k + 1:>2}/{len(cues)}] {where:<11} "
                          f"{cue.label}  ({cue.hold_s:g} s)")
                 previous = cue
-            self.hold_until(t0 + total)
+            self.hold_until(t0 + total, keys=True)
         except KeyboardInterrupt:
             interrupted = True
+        except SkipTake:
+            skipped = True
         finally:
             t1 = time.time()
             events.write("take_end", t=t1, item=item_id, take=take)
@@ -1024,13 +1374,13 @@ class ProtocolSession:
         check = rp.CheckResult(False, "interrupted before the check")
         try:
             if "still" in paths:
-                wait_end = time.time() + (0.0 if interrupted
+                wait_end = time.time() + (0.0 if interrupted or skipped
                                           else STILL_WAIT_S)
                 while not self.stills.ready(paths["still"]) and \
                         time.time() < wait_end:
                     self.tick(record=False)
                 still_name, still_missing = still_status(paths["still"])
-            curls = rp.read_curls(paths["glove"], self.hand)
+            curls = rp.read_bends(paths["glove"], self.hand)
             check = rp.check_take(self.protocol, item_id, curls,
                                   rp.read_events(paths["events"]),
                                   self.warmup["glove"], self.scale)
@@ -1046,6 +1396,8 @@ class ProtocolSession:
         if interrupted:
             accepted, reason, by = (False, "interrupted by the operator "
                                     "(Ctrl+C) during the take", "operator")
+        elif skipped:
+            accepted, reason, by = False, SKIPPED_DURING_TAKE, "operator"
         else:
             accepted, reason, by = check.accepted, check.reason, "auto"
         decided_at = time.time()
@@ -1071,6 +1423,9 @@ class ProtocolSession:
                                 if self.leap is not None else None),
             "still_missing": (still_missing if "still" in paths
                               and not still_name else None),
+            # The warm-up file this take was judged against (contract
+            # section 3); a resumed run has its own.
+            "warmup": self.warmup_name,
             "check": check.as_dict(),
         }
         if not accepted:
@@ -1080,7 +1435,7 @@ class ProtocolSession:
 
         verdict = "ACCEPTED" if accepted else f"REJECTED: {reason}"
         self.say(f"      {verdict}")
-        if not accepted and not interrupted and check.hint:
+        if not accepted and not interrupted and not skipped and check.hint:
             # What to change before the retry that starts in a few seconds,
             # in one line: the reason says what the glove measured, this
             # says what the hand should do about it.
@@ -1147,28 +1502,59 @@ class ProtocolSession:
         self.say(f"      REDO: {entry['name']} moved to {REJECTED}/")
 
     def pause(self, entry: dict) -> str:
-        """The few seconds after a take: 'r' redo, 'q' stop, or nothing."""
+        """The few seconds after a take: 'r' redo, 's' skip the rest of the
+        item, 'q' stop, or nothing. The bars stay up, so the operator can
+        see the glove answer before the next take."""
         flush_console_keys()
         end = time.time() + self.seconds(PAUSE_S)
         words = ("ACCEPTED" if entry["accepted"]
                  else f"REJECTED: {entry['reason']}")
+        self.bar_cue = (self._item_cued(self.protocol.item(entry["item"])),
+                        None)
         self.show(entry["name"], words, end,
-                  "press r to redo this take, q to stop the session")
-        while time.time() < end:
-            key = self.tick(record=False) or console_key()
-            if key in ("r", "q"):
-                return key
-        return ""
+                  "press r to redo this take, s to skip the rest of this "
+                  "item, q to stop the session")
+        try:
+            while time.time() < end:
+                key = self.tick(record=False) or console_key()
+                if key in ("r", "q", SKIP_KEY):
+                    return key
+            return ""
+        finally:
+            self.bar_cue = None
+
+    def skip_item(self, item_id: str, take: int) -> None:
+        """`s`: no more attempts at `item_id` in this run. Written to
+        session.json under "skipped"; the skip belongs to this run, not to
+        the data, so a --resume records the item again."""
+        self.skipped_items.add(item_id)
+        rec = {"item": item_id, "at": iso_now(), "take": int(take)}
+        self.meta.setdefault("skipped", []).append(rec)
+        self.skips.append(rec)
+        self.write_session()
+        self.say(f"      SKIPPED: no more {item_id} in this run "
+                 f"({SKIPPED_TEXT})")
+
+    def skipped_without_take(self) -> List[str]:
+        """Items skipped in this run that have no accepted take: they make
+        the run incomplete, as a failed take does."""
+        return sorted(i for i in self.skipped_items
+                      if self.accepted.get(i, 0) == 0)
 
     def record_take(self, item_id: str, round_no: int) -> None:
         """One planned take: attempts until one is accepted, or the retries
-        run out. The operator's own redo does not use up a retry."""
+        run out. The operator's own redo does not use up a retry; `s` ends
+        the item for this run, during the take or in the pause after it."""
         take = self.accepted[item_id] + 1
         auto_rejects = 0
         attempt = 0
         while True:
             attempt += 1
             entry = self.run_take(item_id, take, attempt, round_no)
+            if entry["decided_by"] == "operator" and \
+                    entry["reason"] == SKIPPED_DURING_TAKE:
+                self.skip_item(item_id, take)
+                return
             key = self.pause(entry)
             if key == "r" and entry["accepted"]:
                 self.operator_redo(entry)
@@ -1179,6 +1565,10 @@ class ProtocolSession:
                 raise StopSession("stopped by the operator (q)")
             if entry["accepted"]:
                 self.accepted[item_id] += 1
+            if key == SKIP_KEY:
+                self.skip_item(item_id, take)
+                return
+            if entry["accepted"]:
                 return
             auto_rejects += 1
             if auto_rejects > self.args.retries:
@@ -1189,8 +1579,15 @@ class ProtocolSession:
             self.say(f"      retrying ({auto_rejects}/{self.args.retries})")
 
     def run_rounds(self) -> None:
+        """Every planned take, round by round. An item skipped in this run
+        is passed over, and so is one that already has its takes (a resumed
+        session): take numbers go on from the accepted count."""
         for r, order in enumerate(self.plan, 1):
             for item_id in order:
+                if item_id in self.skipped_items:
+                    continue
+                if self.accepted[item_id] >= self.takes_per_item:
+                    continue
                 self.record_take(item_id, r)
 
     # --- the end --------------------------------------------------------------
@@ -1205,6 +1602,9 @@ class ProtocolSession:
                 self.say(f"  {t['item']:<22} {t['take']:>4}  "
                          f"{'yes' if t['accepted'] else 'no':<8}  "
                          f"{t['reason']}")
+            for s in self.skips:
+                self.say(f"  {s['item']:<22} {s['take']:>4}  {'-':<8}  "
+                         f"{SKIPPED_TEXT} (no more attempts in this run)")
         if self.failed:
             self.say("", "  takes with no accepted attempt: "
                      + ", ".join(self.failed))
@@ -1258,9 +1658,18 @@ def parse_args(argv=None):
     p.add_argument("--retries", type=int, default=2,
                    help="automatic retries after a rejected attempt "
                         "(default 2)")
-    p.add_argument("--time-scale", type=float, default=1.0,
+    p.add_argument("--time-scale", type=float, default=None,
                    help="multiply every cue duration (rehearsals and tests; "
-                        "a real session uses 1.0)")
+                        "a real session uses 1.0, the default; --resume "
+                        "keeps the session's own)")
+    p.add_argument("--resume", default=None, metavar="FOLDER|latest",
+                   help="carry on a session that was cut short, in its own "
+                        "folder: its items, takes and round order are "
+                        "reused and items that have their takes are "
+                        "skipped; the calibration prompt, the acquire gate "
+                        "and a new warm-up (warmup_<HHMMSS>.json) are done "
+                        "again. latest = the newest folder of this set and "
+                        "hand under --out-dir")
     p.add_argument("--calibrated-at", default=None, metavar="ISO",
                    help="when both gloves were calibrated in XR Trainer, e.g. "
                         "2026-09-28T14:00:00 (skips the Enter prompt)")
@@ -1282,6 +1691,11 @@ def parse_args(argv=None):
                    help="synthetic Ultraleap stream")
     p.add_argument("--no-view", action="store_true",
                    help="no cue window (the console still shows every cue)")
+    p.add_argument("--no-bars", action="store_true",
+                   help="no finger bars on the cue window, only the words "
+                        "and the countdown; the bars (the default) show "
+                        "each finger's glove reading against today's "
+                        "warm-up")
     p.add_argument("--hide-camera", action="store_true",
                    help="run the camera with no window (stills only); the "
                         "default shows the IR image and the skeleton so you "
@@ -1306,6 +1720,18 @@ def parse_args(argv=None):
         p.error("--retries cannot be negative")
     if args.takes is not None and args.takes < 1:
         p.error("--takes must be at least 1")
+    if args.resume is not None:
+        clash = [flag for flag, value in (("--items", args.items),
+                                          ("--takes", args.takes),
+                                          ("--seed", args.seed))
+                 if value is not None]
+        if clash:
+            p.error("--resume carries on a session that already fixes its "
+                    "items, takes and round order; drop "
+                    + " and ".join(clash))
+    args.time_scale_given = args.time_scale is not None
+    if args.time_scale is None:
+        args.time_scale = 1.0
     if not args.time_scale > 0:
         p.error("--time-scale must be above 0")
     try:
@@ -1338,27 +1764,149 @@ def ask_calibration(args) -> Optional[str]:
     return iso_now()
 
 
+def latest_session(out_dir: Path, set_name: str, hand: str) -> Optional[Path]:
+    """The newest folder under `<out_dir>/<set>/` named `..._<hand>` with a
+    session.json, or None. Folder names start with the session's stamp, so
+    the newest is the last by name."""
+    base = Path(out_dir) / set_name
+    if not base.is_dir():
+        return None
+    found = [p for p in base.iterdir()
+             if p.is_dir() and p.name.endswith(f"_{hand}")
+             and (p / "session.json").is_file()]
+    return max(found, key=lambda p: p.name) if found else None
+
+
+def _any_mock(value) -> bool:
+    """session.json's "mock": a boolean, or (Sets B and C before their fix)
+    a dict of flags, any of which counts."""
+    if isinstance(value, dict):
+        return any(bool(v) for v in value.values())
+    return bool(value)
+
+
+def resume_folder(args, protocol: rp.Protocol) -> Tuple[Path, dict]:
+    """The folder `--resume` names and its session.json.
+
+    Raises ResumeRefused, naming every reason, when this run cannot carry
+    the session on: another set, hand or protocol file (its sha256), a
+    mock session resumed for real or the other way round (`mock` only, not
+    which mock: a rehearsal can change its mock glove), another camera or
+    time scale, no saved round order, or a session whose warm-up predates
+    the thumb in degrees (its takes and new ones would measure the thumb two
+    ways; the checker could not put them on one scale).
+    """
+    if str(args.resume).strip().lower() == "latest":
+        folder = latest_session(args.out_dir, protocol.name, args.hand)
+        if folder is None:
+            raise ResumeRefused(
+                f"no {args.hand}-hand {protocol.name} session (a folder "
+                f"ending in _{args.hand} with a session.json) under "
+                f"{Path(args.out_dir) / protocol.name}")
+    else:
+        folder = Path(args.resume)
+    try:
+        meta = json.loads((folder / "session.json").read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError):
+        meta = None
+    if not isinstance(meta, dict):
+        raise ResumeRefused(f"no readable session.json in {folder}")
+    why = []
+    if meta.get("set") != protocol.name:
+        why.append(f"it is a {meta.get('set')} session and this run records "
+                   f"{protocol.name}")
+    if meta.get("hand") != args.hand:
+        why.append(f"it is the {meta.get('hand')} hand's session and this "
+                   f"run is --hand {args.hand}")
+    if meta.get("protocol_sha256") != protocol.sha256:
+        why.append(f"{display_path(protocol.path)} is not the protocol file "
+                   "the session was recorded under (sha256 differs)")
+    if _any_mock(meta.get("mock")) != bool(args.mock):
+        why.append(f"it is a {'mock' if _any_mock(meta.get('mock')) else 'real'}"
+                   f" session and this run is "
+                   f"{'mock' if args.mock else 'real'}")
+    if meta.get("camera", "leap") != args.camera:
+        why.append(f"it ran with --camera {meta.get('camera')}")
+    scale = float(meta.get("time_scale") or 1.0)
+    if args.time_scale_given and scale != float(args.time_scale):
+        why.append(f"it ran at --time-scale {scale:g}")
+    if not isinstance(meta.get("rounds"), list) or not meta["rounds"]:
+        why.append("its session.json has no round order to carry on")
+    first = folder / WARMUP_FILE
+    if first.is_file():
+        try:
+            warm = json.loads(first.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            warm = None
+        if isinstance(warm, dict) and not warm.get("units"):
+            why.append("its warm-up was recorded before the glove thumb was "
+                       "measured in degrees (warmup.json has no units), so "
+                       "its takes and new ones would measure the thumb two "
+                       "ways; record a new session instead")
+    if why:
+        raise ResumeRefused(f"{folder}: " + "; ".join(why))
+    return folder, meta
+
+
+def planned_left(plan: List[List[str]], done: Dict[str, int],
+                 takes: int) -> List[str]:
+    """The planned takes still to record, in order, when every one of them
+    is accepted: an item is passed over once it has `takes` accepted."""
+    counts = dict(done)
+    out = []
+    for order in plan:
+        for item_id in order:
+            if counts.get(item_id, 0) < takes:
+                counts[item_id] = counts.get(item_id, 0) + 1
+                out.append(item_id)
+    return out
+
+
 def run(args) -> int:
     path = args.protocol if args.protocol is not None else \
         ROOT / "protocols" / f"{args.set}.json"
+    resumed = None
     try:
         protocol = rp.load_protocol(path)
         if protocol.name not in SET_CHOICES:
             raise rp.ProtocolError(
                 f"{path}: Set A ({protocol.name}) is recorded by "
                 "scripts/leap/record_poses.py --protocol, not by this recorder")
-        items = rp.select_items(protocol, (args.items or "").split(",")
-                                if args.items else None)
+        if args.resume is not None:
+            try:
+                resumed = resume_folder(args, protocol)
+            except ResumeRefused as e:
+                print(f"\nCannot resume: {e}\n")
+                return EXIT_REFUSED
+            items = rp.select_items(protocol, resumed[1].get("items") or [])
+        else:
+            items = rp.select_items(protocol, (args.items or "").split(",")
+                                    if args.items else None)
     except rp.ProtocolError as e:
         print(f"\nProtocol file problem: {e}\n")
         return EXIT_REFUSED
     coached()        # a few seconds of imports, before the Enter, not after
-    takes = args.takes if args.takes is not None else protocol.takes_per_item
     shuffle = protocol.shuffle_rounds
-    seed = args.seed
-    if shuffle and seed is None:
-        seed = random.SystemRandom().randrange(1, 2 ** 31)
-    plan = rp.rounds(items, takes, seed=seed, shuffle=shuffle)
+    done: Dict[str, int] = {i: 0 for i in items}
+    if resumed is not None:
+        folder, old = resumed
+        if not args.time_scale_given:
+            args.time_scale = float(old.get("time_scale") or 1.0)
+        takes = int(old.get("takes_per_item") or protocol.takes_per_item)
+        seed = old.get("seed")
+        plan = [list(r) for r in old["rounds"]]
+        for t in old.get("takes") or []:
+            if t.get("accepted") and t.get("item") in done:
+                done[t["item"]] += 1
+    else:
+        takes = args.takes if args.takes is not None else \
+            protocol.takes_per_item
+        seed = args.seed
+        if shuffle and seed is None:
+            seed = random.SystemRandom().randrange(1, 2 ** 31)
+        plan = rp.rounds(items, takes, seed=seed, shuffle=shuffle)
+    left = planned_left(plan, done, takes)
 
     camera = args.camera
     setup = ("gloves on + camera, one hand" if camera == "leap"
@@ -1368,10 +1916,16 @@ def run(args) -> int:
                                                          args.time_scale))
                 for i in items}
     eta = sum(per_take[i] + (PREP_S + PAUSE_S) * args.time_scale
-              for r in plan for i in r)
+              for i in left)
     print("=" * 72)
-    print(f"PROTOCOL {protocol.name} v{protocol.version}: {n_takes} takes in "
-          f"{len(plan)} round(s), about {eta / 60:.1f} min of recording")
+    if resumed is not None:
+        print(f"RESUMING {resumed[0]}: {n_takes - len(left)} of {n_takes} "
+              f"planned takes accepted, {len(left)} to record, about "
+              f"{eta / 60:.1f} min")
+    else:
+        print(f"PROTOCOL {protocol.name} v{protocol.version}: {n_takes} takes "
+              f"in {len(plan)} round(s), about {eta / 60:.1f} min of "
+              "recording")
     print(f"  Setup: {setup}. The {args.hand.upper()} hand works; the other "
           "hand rests on the table.")
     print(f"  items: {', '.join(items)}")
@@ -1390,8 +1944,17 @@ def run(args) -> int:
         print(f"  time scale {args.time_scale:g}: every duration is scaled "
               "(rehearsal, not a real session)")
     print("  Follow the beeps: high = bend or flex, low = straighten or "
-          "extend. The window shows only the words.")
+          "extend. The window shows the words" + (
+              "." if args.no_bars else
+              " and each finger's glove reading (green = where the cue "
+              "wants it)."))
+    print("  After a take: r = redo, s = skip the rest of this item, q = "
+          "stop. During a take: s = skip it now.")
     print("=" * 72)
+    if resumed is not None and not left:
+        print(f"Nothing left to record in {resumed[0]}: every item has its "
+              f"{takes} accepted take(s).")
+        return EXIT_OK
 
     calibrated_at = ask_calibration(args)
     started = iso_now()
@@ -1426,53 +1989,84 @@ def run(args) -> int:
     session = ProtocolSession(args, protocol, items, plan, seed, glove, leap,
                               stills, CueWindow(enabled=not args.no_view),
                               beep)
-    session.meta = {
-        "set": protocol.name,
-        "protocol_file": display_path(protocol.path),
-        "protocol_name": protocol.name,
-        "protocol_version": protocol.version,
-        "protocol_sha256": protocol.sha256,
-        "hand": args.hand,
-        "operator": args.operator,
-        "camera": camera,
-        "glove": True,
-        "started": started,
-        "ended": None,
-        "xr_trainer_calibrated_at": calibrated_at,
-        "seed": seed if shuffle else None,
-        "rounds": plan,
-        "tool_commit": tool_commit(),
-        "takes": [],
-        "session": None,
-        "items": items,
-        "takes_per_item": takes,
-        "retries": args.retries,
-        "time_scale": args.time_scale,
-        # The packager refuses a session with "mock": true (contract 7);
-        # which sensor was synthetic, and how, is in "mock_flags".
-        "mock": args.mock,
-        "mock_flags": {"glove": bool(args.mock_glove),
-                       "glove_follows_cues": bool(
-                           args.mock_glove and not args.mock_glove_ignore_cues),
-                       "leap": bool(args.mock_leap)},
-        "warmup": "warmup.json",
-        "stopped": None,
-    }
+    session.takes_per_item = takes
+    if resumed is not None:
+        folder, old = resumed
+        session.meta = dict(old)
+        session.takes = list(old.get("takes") or [])
+        session.accepted = dict(done)
+        # The first run's calibration stays under its old key; every run's
+        # is listed under "calibrated", in order.
+        cal = old.get("calibrated")
+        session.meta["calibrated"] = (
+            list(cal) if isinstance(cal, list)
+            else [old.get("xr_trainer_calibrated_at")]) + [calibrated_at]
+        session.meta["resumed"] = list(old.get("resumed") or []) + [started]
+        session.meta["warmups"] = list(
+            old.get("warmups")
+            or ([WARMUP_FILE] if (folder / WARMUP_FILE).is_file() else []))
+        session.meta["skipped"] = list(old.get("skipped") or [])
+        session.meta.update(ended=None, stopped=None)
+    else:
+        session.meta = {
+            "set": protocol.name,
+            "protocol_file": display_path(protocol.path),
+            "protocol_name": protocol.name,
+            "protocol_version": protocol.version,
+            "protocol_sha256": protocol.sha256,
+            "hand": args.hand,
+            "operator": args.operator,
+            "camera": camera,
+            "glove": True,
+            "started": started,
+            "ended": None,
+            "xr_trainer_calibrated_at": calibrated_at,
+            "calibrated": [calibrated_at],
+            "seed": seed if shuffle else None,
+            "rounds": plan,
+            "tool_commit": tool_commit(),
+            "takes": [],
+            "session": None,
+            "items": items,
+            "takes_per_item": takes,
+            "retries": args.retries,
+            "time_scale": args.time_scale,
+            # The packager refuses a session with "mock": true (contract 7);
+            # which sensor was synthetic, and how, is in "mock_flags".
+            "mock": args.mock,
+            "mock_flags": {"glove": bool(args.mock_glove),
+                           "glove_follows_cues": bool(
+                               args.mock_glove
+                               and not args.mock_glove_ignore_cues),
+                           "leap": bool(args.mock_leap)},
+            "warmup": WARMUP_FILE,
+            # Every warm-up file of the session, in order; a take entry's
+            # "warmup" names the one it was judged against.
+            "warmups": [],
+            "resumed": [],
+            "skipped": [],
+            "stopped": None,
+        }
     code = EXIT_OK
     try:
         session.wait_for_glove(args.glove_timeout)
         if leap is not None:
             session.acquire(args.acquire_timeout)
-        folder = session.make_folder(args.out_dir)
-        session.meta["session"] = folder.name
+        if resumed is not None:
+            session.use_folder(resumed[0])
+            session.warmup_name = session.resumed_warmup_name()
+        else:
+            folder = session.make_folder(args.out_dir)
+            session.meta["session"] = folder.name
+            session.warmup_name = WARMUP_FILE
         session.write_session()
-        warm = session.run_warmup()
+        warm = session.warm_up(session.warmup_name)
         if warm["refused"]:
             session.stopped = f"warm-up refused: {warm['refused']}"
             raise NotReady(f"warm-up: {warm['refused']}")
         session.write_session()
         session.run_rounds()
-        if session.failed:
+        if session.failed or session.skipped_without_take():
             code = EXIT_INCOMPLETE
     except NotReady as e:
         session.say("", f"REFUSED: {e}")
@@ -1489,6 +2083,9 @@ def run(args) -> int:
         session.close()
         session.write_session(ended=iso_now())
         session.summary()
+    if session.dir is not None and code != EXIT_OK:
+        session.say(f"  carry on later in the same folder: --resume "
+                    f"\"{session.dir.resolve()}\" (or --resume latest)")
     if session.dir is not None and not args.no_open and \
             hasattr(os, "startfile"):
         try:

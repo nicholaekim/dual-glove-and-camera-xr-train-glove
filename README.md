@@ -122,6 +122,13 @@ that names the hardware setup of every step:
   finger_flexion|sequences --hand left|right` (runbook
   `docs/protocol_recording.md`). The sequences are data in
   `protocols/sequences.json`, so a new order is a new entry, not code.
+  The cue window shows five live bars, each finger's glove reading against
+  today's warm-up, green when the cued finger is where the cue wants it
+  (`--no-bars` hides them). The warm-up bends each finger on its own after
+  the fist, a cued finger is measured against that bend, and the glove
+  thumb is read as its joint angles in degrees. A session that stopped
+  carries on in its own folder with `--resume latest` (a new warm-up, the
+  same round order), and `s` skips the rest of an item.
 - `scripts/check_protocol.py <session folder>` grades a session against the
   plan's rules and writes `check.csv` / `check.txt`;
   `scripts/package_professor_set.py` builds the hand-in folder (JSONL, the

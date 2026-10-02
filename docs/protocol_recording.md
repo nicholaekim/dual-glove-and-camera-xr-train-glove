@@ -18,7 +18,7 @@ A rehearsal uses a mock glove and a mock camera, so its folders go under
 rehearsals never sit beside real sessions, and the packager refuses them.
 
 Step 1. **No hardware.** Rehearse Set B with the mock glove and mock camera
-(about 15 seconds):
+(about 25 seconds):
 
 ```powershell
 .venv\Scripts\python.exe scripts\record_protocol.py --set finger_flexion --hand left --items index_fast --mock-glove --mock-leap --no-view --no-open --calibrated-at 2026-09-28T14:00:00 --time-scale 0.25
@@ -27,7 +27,7 @@ Step 1. **No hardware.** Rehearse Set B with the mock glove and mock camera
 The console ends with `1 accepted, 0 rejected` and the folder it wrote,
 under `recordings\protocol_mock\finger_flexion\`.
 
-Step 2. **No hardware.** Rehearse Set C the same way (about 15 seconds):
+Step 2. **No hardware.** Rehearse Set C the same way (about 25 seconds):
 
 ```powershell
 .venv\Scripts\python.exe scripts\record_protocol.py --set sequences --hand left --items seq3_alternating --takes 1 --mock-glove --mock-leap --no-view --no-open --calibrated-at 2026-09-28T14:00:00 --time-scale 0.25
@@ -80,21 +80,36 @@ What happens, in order:
    the IR image, the skeleton and the height against the band, so you can
    see where your hand is and how far each finger bends (`--hide-camera`
    runs without it; it was the default until 2026-10-01).
-3. Warm-up: a beep and "OPEN PALM" for 3 seconds, a higher beep and "FULL
-   FIST" for 3 seconds. This measures each finger's own range for today.
+3. Warm-up (about 30 seconds): a beep and "OPEN PALM" for 3 seconds, a
+   higher beep and "FULL FIST" for 3 seconds, a low beep to open the hand,
+   then each finger on its own, thumb first: a high beep and "bend the
+   THUMB only" for 3 seconds (fold it fully and hold it there), a low beep
+   and "straighten" for 1.5 seconds, then the index, the middle, the ring
+   and the little finger the same way. This measures each finger's own
+   range for today: a cued finger is measured against how far it bent on
+   its own. The warm-up is refused, and done again (the console says
+   `warm-up again (2 of 3)`), when a finger barely bent on its own; the
+   reason says which finger and what to do, for example `in the
+   single-finger warm-up the thumb bent only 12 degrees (needs 35): fold it
+   fully across the palm, tip to the base of the little finger`. After
+   three refused warm-ups the session is refused.
 4. The takes: thumb, index, middle, ring, little finger, index slow, index
    fast. Each one shows its name for 3 seconds, then calls every bend, hold,
    straighten and rest with a beep. Move one finger only and keep the others
-   straight. Follow the beeps, not the screen.
+   straight. Follow the beeps; the bars on the cue window show what the
+   glove measured (see "What you see and hear").
 5. After each take the console says ACCEPTED or REJECTED with the reason. A
    take is rejected when the cued finger did not move far enough, or did
    not bend fully on every bend beep (for example `REJECTED: the thumb bent
    fully only 1 time of 5 ...`); the line under it then says what to do,
    for example `what to do: fold the thumb fully across the palm on every
    bend, then open it fully`. A rejected take is recorded again straight
-   away, up to two more times.
+   away, up to two more times. Press `s` to give up on an item for this run
+   (in the pause after a take, or during the take to end it at once).
 6. At the end the console prints a table of every take and the folder, and
-   the folder opens in File Explorer.
+   the folder opens in File Explorer. When the run stopped before the end
+   (Ctrl+C, `q`, `s`, a refused warm-up), the console also prints how to
+   carry on in the same folder; see "Carrying on a session that stopped".
 
 Step 7. **Gloves on + camera.** Check Set B for the left hand. Use the
 folder path printed at the end of step 6:
@@ -188,10 +203,25 @@ options take several folders each).
 
 ## What you see and hear
 
-The window shows only the take name, the words of the current cue and a
-countdown. It never shows the camera image or a skeleton, on purpose: the
-operator follows the beep, and a live skeleton invites shaping the movement
-until the two sensors agree.
+Two windows. The camera window (the IR image, the skeleton, the height
+against the band and the tracking line) shows where the hand is;
+`--hide-camera` runs without it. The cue window shows the take name, the
+words of the current cue, a countdown and, along its bottom third, five
+bars, thumb to little finger: each finger's glove reading as a fraction of
+its range from today's warm-up, 0 at the bottom (open) and 1 at the top
+(bent as far as in the warm-up). The two thin ticks beside every bar mark
+0.3 and 0.6. The cued finger is drawn wide:
+
+| Bar | Meaning |
+|-----|---------|
+| green | the glove reads the cued finger where the cue wants it: at or above 0.6 to bend, hold or flex, at or below 0.3 to straighten, rest or extend |
+| amber | it does not (yet): bend further, or open further |
+| white | no cue to judge by (the pause after a take) |
+| grey, narrow | a finger the cue does not name |
+
+The bars show only the glove against its own warm-up, never the camera,
+so glove and camera are still not put side by side for the operator to make
+them agree. `--no-bars` keeps the cue window to the words and the countdown.
 
 | Beep | Meaning |
 |------|---------|
@@ -207,28 +237,40 @@ For 3 seconds after each take:
 | Key | What it does |
 |-----|--------------|
 | `r` | redo this take: it moves to `rejected\` with "redo asked by the operator" |
+| `s` | skip the rest of this item in this run: no more attempts at it (the take just recorded is kept if it was accepted) |
 | `q` | stop the session after this take; everything recorded so far is kept |
 
-The keys work on the cue window and in the console. Ctrl+C stops at once;
-the take in progress is moved to `rejected\` as interrupted.
+During a take, `s` ends the take at once: it is moved to `rejected\` with
+"skipped by the operator (s) during the take" and the item is skipped. A
+skipped item is listed in the table at the end and in `session.json` under
+`skipped`; a run that skipped an item with no accepted take ends with exit
+code 1, like a failed take. The keys work on the cue window and in the
+console. Ctrl+C stops at once; the take in progress is moved to
+`rejected\` as interrupted.
 
 ## What makes a take accepted
 
-- Set B: the cued finger has to move at least 0.60 of its own open-to-fist
-  range from the warm-up, and it has to bend fully once for every bend
-  beep. A bend counts when the curl rises above 60 percent of the take's
-  own range after being below 30 percent, the same count the checker
-  (`scripts\check_protocol.py`) fails a take on, so a finger that folds
-  fully on only some cycles is rejected on the spot instead of after the
-  session. The other four fingers are measured and reported, never failed
-  on.
+- Set B: the cued finger has to move at least 0.60 of its own range from
+  the warm-up (open palm to the finger bent on its own), and it has to bend
+  fully once for every bend beep. A bend counts when the reading rises
+  above 60 percent of the take's own range after being below 30 percent,
+  the same count the checker (`scripts\check_protocol.py`) fails a take
+  on, so a finger that folds fully on only some cycles is rejected on the
+  spot instead of after the session. The other four fingers are measured
+  (against the fist) and reported, never failed on.
 - Set C: in the last 1.5 seconds of every step, a finger the step says is
   flexed has to read above 0.60 of its range, and a finger the step says is
   straight must not read above 0.60. A straight finger between 0.30 and 0.60
   is reported as coupling (the ring pulls its neighbours along) and does not
   reject the take.
-- The session is refused at the warm-up when the glove's index, middle, ring
-  or little finger moves less than 0.30 between the open palm and the fist.
+- The glove's thumb is measured by its joint angles in degrees (its three
+  flexion angles summed), not by the fingertip distance, which barely moves
+  when the thumb bends. The other four fingers keep the fingertip distance.
+- The warm-up is refused when the glove's index, middle, ring or little
+  finger moves less than 0.30 between the open palm and the fist, or when a
+  finger bent on its own moves less than half of its fist range (the thumb:
+  less than 35 degrees). It is done again up to three times before the
+  session is refused.
 
 ## When something stops the run
 
@@ -239,6 +281,31 @@ the take in progress is moved to `rejected\` as interrupted.
 | `No live tracking: ...` | Plug the camera in and start the Ultraleap Tracking service, then run it again. |
 | `REFUSED: no acquirable left hand in 60 s` | Hold the hand open, palm toward the lens, 18 to 28 cm above the module, then run it again. |
 | `REFUSED: warm-up: the glove barely moved ...` | Calibrate both gloves in XR Trainer again, then run it again and make a full fist. |
+| `REFUSED: warm-up: in the single-finger warm-up the thumb bent only ...` | Run the same command with `--resume latest` and, at "bend the THUMB only", fold the thumb fully across the palm and hold it until the low beep. |
+
+## Carrying on a session that stopped
+
+**Gloves on + camera.** A session that stopped before the end (Ctrl+C, `q`,
+`s`, a refused warm-up, a crash) carries on in its own folder. Run the same
+command as before with `--resume latest` added, for example after step 6:
+
+```powershell
+.venv\Scripts\python.exe scripts\record_protocol.py --set finger_flexion --hand left --resume latest
+```
+
+`latest` is the newest folder of this set and hand. To name one, give its
+path instead of `latest`. What happens: the calibration prompt again
+(Enter), the wait for the glove, the camera's acquire, and a new warm-up,
+saved as `warmup_<HHMMSS>.json` beside the first one (the gloves came off
+since, so the ranges are measured again; the first `warmup.json` is never
+rewritten). Then the session's own round order goes on: items that already
+have their accepted takes are passed over, and the rest are recorded,
+numbered on from the accepted takes. Do not add `--items`, `--takes` or
+`--seed`: the session already fixes them, and the recorder refuses them.
+It also refuses a folder of another set or hand, a mock session in a real
+run, and a session recorded before the glove thumb was measured in degrees
+(before 2026-10-01); start a new session for those. An item skipped with
+`s` is recorded again on resume.
 
 ## Where the files go
 
@@ -247,8 +314,9 @@ One folder per run:
 
 | File | What it is |
 |------|------------|
-| `session.json` | the run: protocol file and version, hand, calibration time, round order and seed, every take with its verdict (rewritten after every take) |
-| `warmup.json` | each finger's open, fist and span for this run, glove and camera |
+| `session.json` | the run: protocol file and version, hand, calibration time, round order and seed, every take with its verdict and the warm-up it was judged against, skipped items, resumed runs (rewritten after every take) |
+| `warmup.json` | each finger's open, fist, span and single-finger bend for this run, glove and camera, and the units (glove thumb in degrees) |
+| `warmup_<HHMMSS>.json` | the warm-up of each later run of a resumed session |
 | `glove\<take>.jsonl` | the glove at its full rate, every line tagged with session, item and take |
 | `leap\<take>.jsonl` | the camera beside it, both hands if it saw two |
 | `events\<take>.events.jsonl` | every cue at the moment of its beep, and every decision |

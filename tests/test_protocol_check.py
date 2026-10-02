@@ -1030,3 +1030,133 @@ def test_mock_flags_in_all_three_shapes(tmp_path):
     (session / "session.json").write_text(json.dumps(meta), encoding="utf-8")
     text = pc.render_text(pc.check_session(session))
     assert "MOCK      synthetic data" in text and "mock.glove" in text
+
+
+# --- per-take warm-ups, single-finger ends, the thumb in degrees (2026-10-01) ---
+
+def test_each_take_is_checked_against_its_own_warm_up(tmp_path):
+    """A resumed session: the second take was judged against the second
+    run's warm-up, whose index range ends half way (as a single bend that
+    far would), so the same full bend spans 1.5 of it. Both files are in
+    the header and each take's file is in check.csv."""
+    session = make_flexion_session(tmp_path, [FlexTake("index"),
+                                              FlexTake("index")])
+    warm = json.loads((session / "warmup.json").read_text(encoding="utf-8"))
+    half = curls_at("left", 0.5)["index"]
+    warm["glove"]["fist"]["index"] = half
+    warm["glove"]["span"]["index"] = warm["glove"]["open"]["index"] - half
+    (session / "warmup_171012.json").write_text(json.dumps(warm),
+                                                encoding="utf-8")
+    meta = json.loads((session / "session.json").read_text(encoding="utf-8"))
+    meta["warmups"] = ["warmup.json", "warmup_171012.json"]
+    meta["takes"][1]["warmup"] = "warmup_171012.json"
+    (session / "session.json").write_text(json.dumps(meta), encoding="utf-8")
+    check = pc.check_session(session)
+    first, second = check.rows
+    assert (first["warmup"], second["warmup"]) == ("warmup.json",
+                                                   "warmup_171012.json")
+    assert first["cued_span_fraction"] == pytest.approx(1.0, abs=0.05)
+    assert second["cued_span_fraction"] == pytest.approx(1.5, abs=0.05)
+    assert any(h.startswith("warm-up   warmup.json: glove open")
+               for h in check.header)
+    assert any(h.startswith("warm-up   warmup_171012.json: glove open")
+               for h in check.header)
+    csv_path, _txt, _text = pc.write_check(check, tmp_path / "out")
+    rows = pc.read_check_csv(csv_path)
+    assert [r["warmup"] for r in rows] == ["warmup.json",
+                                           "warmup_171012.json"]
+    # a session written before resume: one warm-up, every take on it
+    plain = pc.load_session(make_flexion_session(tmp_path / "p",
+                                                 [FlexTake("index")]))
+    assert list(plain.warmups) == ["warmup.json"]
+    assert [t.warmup for t in plain.takes] == ["warmup.json"]
+
+
+def test_units_in_the_warm_up_put_the_glove_thumb_in_degrees(tmp_path):
+    from cam_hand import recording_protocol as rp
+
+    session = make_flexion_session(tmp_path, [FlexTake("index")],
+                                   camera=False, stills=False)
+    loaded = pc.load_session(session)
+    ref = loaded.takes[0]
+    old = pc.load_take(loaded, ref)
+    assert old.thumb_degrees is False
+    warm = json.loads((session / "warmup.json").read_text(encoding="utf-8"))
+    warm["units"] = rp.GLOVE_UNITS
+    (session / "warmup.json").write_text(json.dumps(warm), encoding="utf-8")
+    loaded = pc.load_session(session)
+    new = pc.load_take(loaded, loaded.takes[0])
+    assert new.thumb_degrees is True
+    # index to pinky are the same curls; the thumb is now degrees
+    assert np.allclose(new.glove_c[:, 1:], old.glove_c[:, 1:])
+    frames = [fr for _d, fr in pc.read_frames(ref.path("glove"))[0]][:3]
+    assert np.allclose(new.glove_c[:3, 0],
+                       [rp.glove_bends(fr)[0] for fr in frames])
+    assert pc.thumb_in_degrees(warm) and not pc.thumb_in_degrees({})
+
+
+def test_a_straight_finger_keeps_the_fist_range():
+    """Set C: a flexed finger is judged against its own single bend, a
+    straight one against the fist, so coupling reads as it always did."""
+    flexed_ref = {f: (1.0, 0.5) for f in FINGERS}      # single bend half way
+    straight_ref = {f: (1.0, 0.0) for f in FINGERS}     # the fist
+    curl = {f: 1.0 for f in FINGERS}
+    curl.update(index=0.5, middle=0.6)
+    ok, fr, wrong, cpl = pc.judge_step(curl, ["index"], flexed_ref,
+                                       straight_ref)
+    assert ok and wrong == []
+    assert fr["index"] == pytest.approx(1.0)
+    assert cpl == {"middle": pytest.approx(0.4)}
+    # on the single range the middle would have read flexed
+    ok, _fr, wrong, _c = pc.judge_step(curl, ["index"], flexed_ref)
+    assert not ok and wrong == ["middle 0.80 reads flexed, should be "
+                                "straight"]
+
+
+# --- the three real Set B sessions of 2026-10-01, read only ------------------------
+REAL_SET_B = REPO / "recordings" / "protocol" / "finger_flexion"
+# What the checker said about them before the thumb was measured in degrees
+# (commit 83bb2b6): per take, the cued span and the failures. Their
+# warm-ups have no `units`, so the thumb stays a curl and nothing changes.
+TODAY_SET_B = {
+    "20261001_164245_left": [
+        ("thumb_left_take1_20261001_164257", 0.4343, [
+            "thumb spans 0.43 of its warm-up range, need 0.60",
+            "5 bend cue(s) but 4 glove curl peak(s)"]),
+        ("thumb_left_take1_20261001_164355", 0.0, [
+            "1 bend cue(s), the protocol asks for 5",
+            "thumb spans 0.00 of its warm-up range, need 0.60",
+            "1 bend cue(s) but 0 glove curl peak(s)"]),
+    ],
+    "20261001_164741_left": [
+        ("thumb_left_take1_20261001_164753", 0.129, [
+            "thumb spans 0.13 of its warm-up range, need 0.60",
+            "5 bend cue(s) but 0 glove curl peak(s)"]),
+        ("thumb_left_take1_20261001_164850", 0.6024, [
+            "1 bend cue(s), the protocol asks for 5",
+            "1 bend cue(s) but 0 glove curl peak(s)"]),
+    ],
+    "20261001_165512_left": [
+        ("thumb_left_take1_20261001_165525", 0.7798, [
+            "5 bend cue(s) but 1 glove curl peak(s)"]),
+        ("index_left_take1_20261001_165622", 0.1488, [
+            "1 bend cue(s), the protocol asks for 5",
+            "index spans 0.15 of its warm-up range, need 0.60",
+            "1 bend cue(s) but 0 glove curl peak(s)"]),
+    ],
+}
+
+
+@pytest.mark.skipif(not all((REAL_SET_B / s / "session.json").is_file()
+                            for s in TODAY_SET_B),
+                    reason="the 2026-10-01 Set B sessions are not here")
+def test_todays_real_set_b_sessions_check_as_before():
+    for name, want in TODAY_SET_B.items():
+        check = pc.check_session(REAL_SET_B / name)
+        got = [(r["name"], r["cued_span_fraction"], r["failures"])
+               for r in check.rows]
+        assert got == want, name
+        assert {r["warmup"] for r in check.rows} == {"warmup.json"}
+        assert not any(pc.thumb_in_degrees(w)
+                       for w in check.session.warmups.values())
+        assert not (REAL_SET_B / name / "warmup_").exists()

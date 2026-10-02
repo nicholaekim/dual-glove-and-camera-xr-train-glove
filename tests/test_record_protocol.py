@@ -12,6 +12,7 @@ folds fully on one bend of five.
 import hashlib
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import time
@@ -129,13 +130,18 @@ def test_finger_flexion_rehearsal(tmp_path):
     assert warm["t_open"][1] <= warm["t_fist"][0]
     for sensor in ("glove", "camera"):
         block = warm[sensor]
-        assert set(block) == {"open", "fist", "span", "frames"}
+        # since 2026-10-01 each finger is also bent on its own
+        assert set(block) == {"open", "fist", "span", "frames", "single",
+                              "single_span", "t_single"}
         assert set(block["open"]) == set(rp.FINGERS)
         for f in rp.FINGERS:
             assert block["span"][f] == pytest.approx(
                 block["open"][f] - block["fist"][f], abs=2e-4)
+            assert block["single_span"][f] == pytest.approx(
+                block["open"][f] - block["single"][f], abs=2e-4)
         assert block["frames"] > 10
     assert min(warm["glove"]["span"][f] for f in rp.REFUSE_FINGERS) >= 0.3
+    assert warm["units"] == rp.GLOVE_UNITS
 
     check_frames(folder, name, "index_fast", 1)
 
@@ -336,14 +342,18 @@ def test_rounds_follow_the_saved_seed_and_number_the_takes(tmp_path,
     assert all(t["files"]["leap"] is None for t in session["takes"])
 
 
-def test_warmup_refusal_stops_before_any_take(tmp_path, monkeypatch):
+def test_warmup_refusal_stops_before_any_take(tmp_path, monkeypatch, capsys):
     module = load_script()
     monkeypatch.setattr(module.CueFollowingGlove, "MAX_ANGLE", 0.3)
     code = _in_process(module, monkeypatch, tmp_path, [])
     assert code == 2
+    out = capsys.readouterr().out
+    # done again, whole, before the session is refused
+    assert "warm-up again (2 of 3)" in out and "warm-up again (3 of 3)" in out
     folder = only_session(tmp_path, "finger_flexion")
     warm = json.loads((folder / "warmup.json").read_text())
     assert warm["refused"].startswith("the glove barely moved")
+    assert warm["try"] == 3 and len(warm["earlier_refusals"]) == 2
     session = json.loads((folder / "session.json").read_text())
     assert session["stopped"].startswith("warm-up refused: the glove barely")
     assert session["takes"] == []
@@ -581,3 +591,335 @@ def test_the_camera_window_is_shown_unless_hidden(monkeypatch):
     base = ["--set", "finger_flexion", "--hand", "left"]
     assert module.parse_args(base).hide_camera is False
     assert module.parse_args(base + ["--hide-camera"]).hide_camera is True
+
+
+# --- 2026-10-01: live bars, the single-finger warm-up, resume, skip ----------
+def _bar_pixels(img, module, finger, colour):
+    """Rows of the bottom third, in the middle column of `finger`'s bar,
+    that are exactly `colour` (BGR)."""
+    import numpy as np
+    win = module.CueWindow
+    slot = win.W // len(rp.FINGERS)
+    x = rp.FINGERS.index(finger) * slot + slot // 2
+    col = img[win.H - win.H // 3:, x, :]
+    return int(np.all(col == np.array(colour, dtype=col.dtype), axis=1).sum())
+
+
+def test_cue_window_renders_the_bars():
+    """The bars are drawn by `render` alone (no window): the cued finger's
+    fill is its fraction of the bar, green when a bend phase has it at 0.7,
+    amber at 0.4; the others grey; nothing in the bottom third without
+    bars."""
+    module = load_script()
+    win = module.CueWindow
+    height = (win.H - win.LABEL_H) - (win.H - win.H // 3 + 8)
+
+    def bars(index, phase="bend"):
+        return {"fractions": {"thumb": 0.1, "index": index, "middle": 0.2,
+                              "ring": None, "pinky": 0.05},
+                "cued": ["index"], "phase": phase}
+
+    plain = win.render("index_left_take1", "BEND THE INDEX", None, "")
+    assert plain.shape == (win.H, win.W, 3)
+    assert plain[win.H - win.H // 3:].max() == 0           # no bars at all
+    green = win.render("t", "BEND THE INDEX", 2.0, "cycle 1/5", bars(0.7))
+    assert _bar_pixels(green, module, "index", win.GREEN) == pytest.approx(
+        0.7 * height, abs=1.5)
+    assert _bar_pixels(green, module, "index", win.AMBER) == 0
+    amber = win.render("t", "BEND THE INDEX", 2.0, "cycle 1/5", bars(0.4))
+    assert _bar_pixels(amber, module, "index", win.AMBER) == pytest.approx(
+        0.4 * height, abs=1.5)
+    assert _bar_pixels(amber, module, "index", win.GREEN) == 0
+    # the others are grey; the fill is clipped to the bar
+    assert _bar_pixels(green, module, "middle", win.GREY) == pytest.approx(
+        0.2 * height, abs=1.5)
+    full = win.render("t", "HOLD", 1.0, "", bars(1.4, "hold"))
+    assert _bar_pixels(full, module, "index", win.GREEN) == pytest.approx(
+        height, abs=1.5)
+    # straightening wants the finger low
+    assert win.bar_colour(0.2, "straighten") == win.GREEN
+    assert win.bar_colour(0.5, "rest") == win.AMBER
+    assert win.bar_colour(0.9, "flex") == win.GREEN
+    assert win.bar_colour(0.1, "extend") == win.GREEN
+    assert win.bar_colour(0.9, None) == win.NEUTRAL
+    # the instance method is the same drawing
+    same = module.CueWindow(enabled=False).render(
+        "t", "BEND THE INDEX", 2.0, "cycle 1/5", bars(0.7))
+    assert (same == green).all()
+    args = module.parse_args(["--set", "finger_flexion", "--hand", "left"])
+    assert args.no_bars is False
+    assert module.parse_args(["--set", "finger_flexion", "--hand", "left",
+                              "--no-bars"]).no_bars is True
+
+
+def test_glove_bends_measure_the_thumb_in_degrees():
+    """On the cue-following mock, asking for the thumb on its own moves the
+    glove thumb by far more than 40 degrees (TMC_fe + MCP_fe + IP); the
+    other four readings are exactly the old curls."""
+    from cam_hand.features import flexion_features
+    from xr_hand.keypoints21 import frame_to_keypoints21
+    from xr_hand.parser import parse_hand_message
+
+    module = load_script()
+    glove = module.CueFollowingGlove("left", time_scale=1.0)
+    glove.NOISE = 0.0
+    glove.follow(("thumb",), 3.0, t=100.0, warmup=True)
+
+    def frame_at(t):
+        raw = glove.gens["left"].next_frame()
+        glove._shape(raw, glove.bend_at(t))
+        return parse_hand_message(raw, "left")
+
+    opened, bent = frame_at(50.0), frame_at(102.5 + glove.lag)
+    a, b = rp.glove_bends(opened), rp.glove_bends(bent)
+    assert b[0] - a[0] >= 40.0
+    assert b[0] - a[0] == pytest.approx(2 * 1.1 * 180.0 / 3.141592653589793,
+                                        abs=0.5)        # MCP and IP, 1.1 rad
+    for frame, values in ((opened, a), (bent, b)):
+        old = [float(v) for v in flexion_features(frame_to_keypoints21(frame))]
+        assert values[1:] == old[1:]
+    assert rp.thumb_bend_deg(bent) == b[0]
+
+
+def test_set_b_mock_run_measures_each_finger_on_its_own(tmp_path):
+    """A mock Set B run (thumb and the fast index, cue-following glove, mock
+    camera, a quarter of the durations) records the single-finger warm-up
+    with its units, accepts every take against it, and the checker passes
+    every accepted take with the warm-up named in check.csv."""
+    proc, _took = run_cli(
+        "--set", "finger_flexion", "--hand", "left", "--items",
+        "thumb,index_fast", "--mock-glove", "--mock-leap", "--no-view",
+        "--no-open", "--calibrated-at", "2026-10-01T17:00:00",
+        "--time-scale", "0.25", "--retries", "0", out_dir=tmp_path)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    folder = only_session(tmp_path, "finger_flexion")
+    warm = json.loads((folder / "warmup.json").read_text())
+    glove = warm["glove"]
+    assert warm["refused"] is None and warm["units"] == rp.GLOVE_UNITS
+    assert warm["try"] == 1 and warm["earlier_refusals"] == []
+    assert set(glove["single"]) == set(rp.FINGERS)
+    assert all(glove["single"][f] is not None for f in rp.FINGERS)
+    assert set(glove["t_single"]) == set(rp.FINGERS)
+    assert glove["single"]["thumb"] > 35.0
+    assert glove["single"]["thumb"] - glove["open"]["thumb"] > 35.0
+    assert rp.single_refusal(glove) is None
+    session = json.loads((folder / "session.json").read_text())
+    assert session["warmups"] == ["warmup.json"]
+    assert session["resumed"] == [] and session["skipped"] == []
+    assert [t["item"] for t in session["takes"]] == ["thumb", "index_fast"]
+    for t in session["takes"]:
+        assert t["accepted"] is True, t
+        assert t["warmup"] == "warmup.json"
+        assert t["check"]["range_end"] == "single"
+    out = tmp_path / "check"
+    check = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "check_protocol.py"),
+         str(folder), "--out", str(out)], cwd=ROOT, capture_output=True,
+        text=True, timeout=300)
+    assert check.returncode == 0, check.stdout + check.stderr
+    assert "Every accepted take passes." in check.stdout
+    assert "glove thumb in degrees" in check.stdout
+    import csv
+    with open(out / "check.csv", encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert [r["warmup"] for r in rows] == ["warmup.json"] * 2
+    assert {r["verdict"] for r in rows} == {"pass"}
+
+
+def _thumb_lazy_on_first_warmup(module):
+    """A mock hand that does not bend the thumb on its own in the first
+    warm-up (it stays open), and does in every warm-up after it."""
+
+    class Glove(module.CueFollowingGlove):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.thumb_singles = 0
+
+        def follow(self, flexed, duration, phase=None, t=None,
+                   warmup=False):
+            if warmup and tuple(flexed) == ("thumb",):
+                self.thumb_singles += 1
+                if self.thumb_singles == 1:
+                    flexed = ()
+            super().follow(flexed, duration, phase, t=t, warmup=warmup)
+
+    return Glove
+
+
+def test_a_short_single_bend_repeats_the_warm_up(tmp_path, monkeypatch,
+                                                 capsys):
+    """The thumb that stays open in the single-finger part refuses the
+    warm-up, naming the thumb and what to do; the warm-up is done again
+    and the second one is used, with the first refusal kept in it."""
+    module = load_script()
+    monkeypatch.setattr(module, "CueFollowingGlove",
+                        _thumb_lazy_on_first_warmup(module))
+    code = _in_process(module, monkeypatch, tmp_path, [], "--items", "thumb")
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert "warm-up again (2 of 3)" in out
+    assert "in the single-finger warm-up the thumb bent only" in out
+    folder = only_session(tmp_path, "finger_flexion")
+    warm = json.loads((folder / "warmup.json").read_text())
+    assert warm["refused"] is None and warm["try"] == 2
+    [why] = warm["earlier_refusals"]
+    assert why.startswith("in the single-finger warm-up the thumb bent only ")
+    assert "(needs 35): fold it fully across the palm, tip to the base of " \
+           "the little finger" in why
+    [take] = json.loads((folder / "session.json").read_text())["takes"]
+    assert take["accepted"] is True
+
+
+def test_resume_carries_a_session_on_in_its_own_folder(tmp_path,
+                                                       monkeypatch, capsys):
+    """Every take of the first run rejected (the mock hand ignores the
+    cues, no retries); `--resume latest` with a hand that follows them
+    records both items into the same folder, against a warm-up of its own,
+    without touching the first run's warmup.json or round order."""
+    module = load_script()
+    monkeypatch.setattr(module, "console_key", lambda: "")
+    monkeypatch.setattr(module, "flush_console_keys", lambda: None)
+    base = ["--set", "finger_flexion", "--hand", "left", "--camera", "none",
+            "--no-view", "--no-open", "--no-beep", "--time-scale", "0.1",
+            "--calibrated-at", "2026-10-01T17:00:00",
+            "--out-dir", str(tmp_path)]
+    first = module.parse_args(base + ["--mock-glove-ignore-cues",
+                                      "--retries", "0", "--items",
+                                      "thumb,index", "--takes", "1"])
+    assert module.run(first) == 1
+    folder = only_session(tmp_path, "finger_flexion")
+    before = json.loads((folder / "session.json").read_text())
+    assert [t["accepted"] for t in before["takes"]] == [False, False]
+    warm_before = (folder / "warmup.json").read_bytes()
+    assert module.latest_session(tmp_path, "finger_flexion", "left") == folder
+
+    second = module.parse_args(base + ["--mock-glove", "--resume", "latest",
+                                       "--calibrated-at",
+                                       "2026-10-01T17:30:00"])
+    assert second.time_scale_given is True
+    assert module.run(second) == 0, capsys.readouterr().out
+    assert only_session(tmp_path, "finger_flexion") == folder
+    after = json.loads((folder / "session.json").read_text())
+    assert after["rounds"] == before["rounds"] == [["thumb", "index"]]
+    assert after["items"] == ["thumb", "index"]
+    assert len(after["resumed"]) == 1
+    assert after["warmups"][0] == "warmup.json"
+    [new_warm] = after["warmups"][1:]
+    assert re.fullmatch(r"warmup_\d{6}\.json", new_warm)
+    assert (folder / new_warm).is_file()
+    assert (folder / "warmup.json").read_bytes() == warm_before
+    assert after["xr_trainer_calibrated_at"] == "2026-10-01T17:00:00"
+    assert after["calibrated"] == ["2026-10-01T17:00:00",
+                                   "2026-10-01T17:30:00"]
+    takes = after["takes"]
+    assert [t["accepted"] for t in takes] == [False, False, True, True]
+    assert [t["warmup"] for t in takes] == ["warmup.json"] * 2 + [new_warm] * 2
+    assert [(t["item"], t["take"]) for t in takes[2:]] == [("thumb", 1),
+                                                           ("index", 1)]
+    for t in takes[2:]:
+        assert (folder / t["files"]["glove"]).is_file()
+
+    # everything recorded: a third --resume has nothing left to do
+    assert module.run(module.parse_args(base + ["--mock-glove", "--resume",
+                                                str(folder)])) == 0
+    assert len(json.loads((folder / "session.json").read_text())[
+        "resumed"]) == 1
+
+
+def test_resume_refusals(tmp_path, monkeypatch, capsys):
+    module = load_script()
+    left = tmp_path / "finger_flexion" / "20261001_170000_left"
+    right = tmp_path / "finger_flexion" / "20261001_170500_right"
+    protocol = rp.load_protocol(ROOT / "protocols" / "finger_flexion.json")
+    meta = {"set": "finger_flexion", "hand": "left", "mock": True,
+            "protocol_sha256": protocol.sha256, "camera": "none",
+            "time_scale": 0.1, "rounds": [["thumb"]], "items": ["thumb"],
+            "takes_per_item": 1, "takes": []}
+    for folder, hand in ((left, "left"), (right, "right")):
+        folder.mkdir(parents=True)
+        (folder / "session.json").write_text(json.dumps(dict(meta,
+                                                             hand=hand)))
+    base = ["--set", "finger_flexion", "--camera", "none", "--mock-glove",
+            "--no-view", "--no-open", "--no-beep", "--out-dir", str(tmp_path)]
+    # the right hand's folder with --hand left
+    args = module.parse_args(base + ["--hand", "left", "--resume", str(right)])
+    assert module.run(args) == 2
+    assert "it is the right hand's session and this run is --hand left" in \
+        capsys.readouterr().out
+    # latest finds the hand's own folder only
+    assert module.latest_session(tmp_path, "finger_flexion", "left") == left
+    assert module.latest_session(tmp_path, "finger_flexion", "right") == right
+    assert module.latest_session(tmp_path, "sequences", "left") is None
+    # a real run cannot resume a mock session, nor another time scale
+    args = module.parse_args(["--set", "finger_flexion", "--hand", "left",
+                              "--camera", "none", "--resume", str(left),
+                              "--time-scale", "0.5", "--out-dir",
+                              str(tmp_path)])
+    assert module.run(args) == 2
+    out = capsys.readouterr().out
+    assert "it is a mock session and this run is real" in out
+    assert "it ran at --time-scale 0.1" in out
+    # a session recorded before the thumb was measured in degrees
+    (left / "warmup.json").write_text(json.dumps({"glove": {}, "refused":
+                                                  None}))
+    assert module.run(module.parse_args(base + ["--hand", "left", "--resume",
+                                                "latest"])) == 2
+    assert "before the glove thumb was measured in degrees" in \
+        capsys.readouterr().out
+    # the session already fixes its items, takes and seed
+    for extra in (["--items", "thumb"], ["--takes", "2"], ["--seed", "3"]):
+        with pytest.raises(SystemExit):
+            module.parse_args(base + ["--hand", "left", "--resume", "latest"]
+                              + extra)
+    assert not (tmp_path / "finger_flexion" / "20261001_170000_left"
+                / "glove").exists()
+
+
+def test_s_in_the_pause_skips_the_rest_of_the_item(tmp_path, monkeypatch,
+                                                   capsys):
+    module = load_script()
+    code = _in_process(module, monkeypatch, tmp_path, ["s"], "--items",
+                       "index_fast,index", "--takes", "2")
+    out = capsys.readouterr().out
+    assert code == 0, out           # the skipped item has an accepted take
+    folder = only_session(tmp_path, "finger_flexion")
+    session = json.loads((folder / "session.json").read_text())
+    assert [(t["item"], t["take"], t["accepted"]) for t in session["takes"]] \
+        == [("index", 1, True), ("index_fast", 1, True),
+            ("index_fast", 2, True)]
+    [skip] = session["skipped"]
+    assert skip["item"] == "index" and skip["take"] == 1 and skip["at"]
+    assert "skipped by the operator" in out
+
+
+def test_s_during_a_take_rejects_it_and_skips_the_item(tmp_path,
+                                                       monkeypatch, capsys):
+    module = load_script()
+
+    def show(self, title, words, seconds_left, sub="", force=False,
+             bars=None):
+        return "s" if title.startswith("index_left_take1") and \
+            words == "HOLD" else ""
+
+    monkeypatch.setattr(module.CueWindow, "show", show)
+    code = _in_process(module, monkeypatch, tmp_path, [], "--items",
+                       "index_fast,index")
+    out = capsys.readouterr().out
+    assert code == 1, out           # skipped with no accepted take
+    folder = only_session(tmp_path, "finger_flexion")
+    session = json.loads((folder / "session.json").read_text())
+    first, second = session["takes"]
+    assert first["item"] == "index" and first["accepted"] is False
+    assert first["reason"] == "skipped by the operator (s) during the take"
+    assert first["decided_by"] == "operator"
+    name = first["name"]
+    assert first["files"]["glove"] == f"rejected/glove/{name}.jsonl"
+    assert (folder / first["files"]["glove"]).is_file()
+    note = (folder / "rejected" / f"{name}.reason.txt").read_text()
+    assert note.splitlines()[0] == first["reason"]
+    events = rp.read_events(folder / first["files"]["events"])
+    assert events[-1]["kind"] == "decision" and events[-1]["by"] == "operator"
+    assert len(rp.cue_events(events)) < 20          # it ended at once
+    assert second["item"] == "index_fast" and second["accepted"] is True
+    assert session["skipped"] == [{"item": "index", "at": session["skipped"][
+        0]["at"], "take": 1}]

@@ -31,6 +31,18 @@ THE MEASUREMENT IS THE ONE THE REST OF THE REPO USES
   `leap_hand.diagnostics`, unchanged: the finger-sweep tool and this checker
   must say the same thing about the same bend.
 
+  Since 2026-10-01 a warm-up also holds each finger bent on its own
+  (`single`) and says what its glove numbers are (`units`). For the finger
+  a cue names, the end of the range is that single bend when it is usable
+  (`recording_protocol.single_usable`), else the fist; a finger the cue
+  leaves straight keeps the fist (`endpoints`). The glove's thumb is then
+  in degrees (TMC_fe + MCP_fe + IP, `recording_protocol.glove_bends`, the
+  recorder's own function), decided per take by the warm-up the take was
+  judged against: a warm-up without `units` (every session before that
+  day) keeps the thumb's curl, so those sessions check exactly as before.
+  A resumed session has one warm-up file per run, and each take names its
+  own (`takes[i].warmup`, else `warmup.json`).
+
 SET B (finger_flexion)
   * cued span: 5th to 95th percentile of the cued finger's glove fraction over
     the take (the same percentiles `diagnostics.camera_range` uses, so one
@@ -149,7 +161,11 @@ from cam_hand.recording_protocol import (
     PEAK_HIGH as PEAK_HIGH_SHARE,
     PEAK_LOW as PEAK_LOW_SHARE,
     PEAK_MIN_RANGE as MIN_PEAK_RANGE,
+    SINGLE_MIN_SHARE,
+    THUMB_MIN_DEG,
     count_peaks,
+    glove_bends,
+    single_usable,
 )
 from leap_hand.diagnostics import (
     MIN_CAMERA_RANGE,
@@ -199,6 +215,8 @@ DEFAULT_HOLD_S = 2.5
 MIN_WINDOW_COVERAGE = 0.5
 GRASP_MIN_TRACKED = 0.90        # plan section 4, Set A acquisition gate
 WARMUP_MIN_SPAN = 0.30          # contract section 4, index..pinky glove span
+WARMUP_FILE = "warmup.json"     # the first (or only) warm-up of a session
+THUMB = "thumb"
 # Second-look flag for grasp outliers: a take whose value is further from its
 # grasp's median than this many times the session's typical take-to-median
 # distance for that value, and at least OUTLIER_FLOOR away.
@@ -221,6 +239,7 @@ LAYOUT = {
 
 CSV_COLUMNS = [
     "set", "session", "item", "take", "name", "hand", "accepted", "reason",
+    "warmup",
     "frames_glove", "glove_hz", "glove_gap_max_ms", "glove_lost_packets",
     "frames_camera", "camera_trusted_fraction", "camera_label",
     "paired_fraction", "clock",
@@ -262,6 +281,9 @@ class TakeRef:
     accepted: bool
     reason: str
     files: Dict[str, Path] = field(default_factory=dict)
+    # The warm-up file the recorder judged this take against (contract
+    # section 3); an entry written before resume existed means warmup.json.
+    warmup: str = WARMUP_FILE
 
     def path(self, kind: str) -> Optional[Path]:
         """The file of this kind if it exists on disk, else None."""
@@ -279,10 +301,33 @@ class Session:
     protocol: Optional[dict]
     protocol_note: str
     takes: List[TakeRef]
+    # Every warm-up file of the session by name (session.json "warmups",
+    # else warmup.json), None for one that cannot be read.
+    warmups: Dict[str, Optional[dict]] = field(default_factory=dict)
 
     @property
     def name(self) -> str:
         return self.path.name
+
+    @property
+    def warmup_names(self) -> List[str]:
+        """The warm-up files in the session's order, then any a take names
+        that session.json does not list."""
+        names = list(self.warmups)
+        for t in self.takes:
+            if t.warmup not in names:
+                names.append(t.warmup)
+        return names
+
+    def warmup_named(self, name: str) -> Optional[dict]:
+        """One warm-up file of the session by name, None if unreadable."""
+        if name == WARMUP_FILE:
+            return self.warmup
+        return self.warmups.get(name)
+
+    def warmup_for(self, ref: "TakeRef") -> Optional[dict]:
+        """The warm-up a take was judged against."""
+        return self.warmup_named(ref.warmup)
 
     def item(self, item_id: str) -> Optional[dict]:
         """The protocol file's entry for this item, if the file was readable."""
@@ -412,7 +457,21 @@ def session_takes(session_dir: Path, meta: dict) -> List[TakeRef]:
         out.append(TakeRef(
             name=name, item=str(t.get("item") or item),
             take=t.get("take", take), accepted=accepted, reason=reason,
-            files=_resolve(session_dir, name, accepted, t.get("files"))))
+            files=_resolve(session_dir, name, accepted, t.get("files")),
+            warmup=str(t.get("warmup") or WARMUP_FILE)))
+    return out
+
+
+def read_warmups(session_dir: Path, meta: dict) -> Dict[str, Optional[dict]]:
+    """{file name: warm-up} for every warm-up session.json lists ("warmups",
+    written since resume existed), else for warmup.json alone."""
+    listed = meta.get("warmups")
+    names = [str(n) for n in listed] if isinstance(listed, list) and listed \
+        else [WARMUP_FILE]
+    out: Dict[str, Optional[dict]] = {}
+    for n in names:
+        w = read_json(session_dir / n)
+        out[n] = w if isinstance(w, dict) else None
     return out
 
 
@@ -445,12 +504,13 @@ def load_session(session_dir) -> Session:
     hand = str(meta.get("hand") or "")
     if hand not in ("left", "right"):
         hand = "right" if session_dir.name.endswith("_right") else "left"
-    warmup = read_json(session_dir / "warmup.json")
+    warmup = read_json(session_dir / WARMUP_FILE)
     protocol, note = load_protocol(session_dir, meta)
     return Session(path=session_dir, meta=meta, set=kind, hand=hand,
                    warmup=warmup if isinstance(warmup, dict) else None,
                    protocol=protocol, protocol_note=note,
-                   takes=session_takes(session_dir, meta))
+                   takes=session_takes(session_dir, meta),
+                   warmups=read_warmups(session_dir, meta))
 
 
 def read_events(path: Optional[Path]) -> List[dict]:
@@ -471,20 +531,41 @@ def read_events(path: Optional[Path]) -> List[dict]:
     return out
 
 
-def endpoints(warmup: Optional[dict], sensor: str
+def endpoints(warmup: Optional[dict], sensor: str, cued: bool = True
               ) -> Optional[Dict[str, Tuple[float, float]]]:
-    """{finger: (open, fist)} from warmup.json for one sensor, or None."""
+    """{finger: (open, end)} from a warm-up for one sensor, or None.
+
+    `cued` (the default): the end is the finger's own single bend where the
+    warm-up has one and it is usable (`recording_protocol.single_usable`),
+    else the fist; the range a finger is held to when the cue names it.
+    `cued=False`: the fist for every finger, the range of a finger the cue
+    leaves straight. A warm-up without `single` gives (open, fist) either
+    way.
+    """
     if not warmup or warmup.get("refused"):
         return None
     block = warmup.get(sensor)
     if not isinstance(block, dict):
         return None
     opn, fst = block.get("open") or {}, block.get("fist") or {}
+    single = block.get("single") or {}
     out = {}
     for f in FINGERS:
-        if opn.get(f) is not None and fst.get(f) is not None:
+        if opn.get(f) is None:
+            continue
+        if cued and single.get(f) is not None and single_usable(block, f):
+            out[f] = (float(opn[f]), float(single[f]))
+        elif fst.get(f) is not None:
             out[f] = (float(opn[f]), float(fst[f]))
     return out or None
+
+
+def thumb_in_degrees(warmup: Optional[dict]) -> bool:
+    """Does a take judged against this warm-up carry the glove thumb in
+    degrees? Yes when the warm-up says what its units are (written since
+    2026-10-01); a warm-up without `units` was measured with the curl for
+    all five, and so must its takes be."""
+    return bool(isinstance(warmup, dict) and warmup.get("units"))
 
 
 def fractions(curls, ends: Dict[str, Tuple[float, float]]) -> np.ndarray:
@@ -582,7 +663,8 @@ def read_frames(path: Path) -> Tuple[List[Tuple[dict, object]], int]:
     return out, bad
 
 
-def load_stream(path: Optional[Path], hand: str, camera: bool) -> Stream:
+def load_stream(path: Optional[Path], hand: str, camera: bool,
+                thumb_degrees: bool = False) -> Stream:
     """A glove or camera JSONL take -> `Stream` of the operator's hand.
 
     The glove's label is its own device's and is trusted; the camera's is the
@@ -591,7 +673,9 @@ def load_stream(path: Optional[Path], hand: str, camera: bool) -> Stream:
     the glove, while the palm normal is still computed with the tracker's own
     label, because that is the chirality its skeleton was fitted as.
     A line that does not parse (a take cut off mid-write) is counted and
-    skipped, not fatal.
+    skipped, not fatal. `thumb_degrees` (a glove take whose warm-up has
+    `units`): the glove is measured by the recorder's own `glove_bends`, the
+    thumb in degrees; otherwise, and for the camera, the curl for all five.
     """
     if path is None:
         return Stream()
@@ -623,7 +707,10 @@ def load_stream(path: Optional[Path], hand: str, camera: bool) -> Stream:
                                     if abs26 else None),
             })
         rows.append(row)
-        curls.append(flexion_features(frame_to_keypoints21(frame)))
+        if thumb_degrees and not camera:
+            curls.append(glove_bends(frame))
+        else:
+            curls.append(flexion_features(frame_to_keypoints21(frame)))
         counters.append(d.get("packet_counter"))
     return Stream(rows=rows,
                   curls=np.asarray(curls, dtype=float).reshape(-1, 5),
@@ -653,6 +740,8 @@ class TakeData:
     cam_ok: np.ndarray
     fields: dict
     notes: List[str]
+    warmup: Optional[dict] = None         # the warm-up this take is judged on
+    thumb_degrees: bool = False           # glove thumb in degrees
 
     def glove_in(self, a: float, b: float) -> np.ndarray:
         return (self.glove_t >= a) & (self.glove_t <= b)
@@ -671,9 +760,13 @@ def _rnd(v, nd: int = 4):
 
 
 def load_take(session: Session, ref: TakeRef) -> TakeData:
-    """Read one take's glove, camera and events and put them on one clock."""
+    """Read one take's glove, camera and events and put them on one clock.
+    The glove is measured in the units of the take's own warm-up."""
     notes: List[str] = []
-    glove = load_stream(ref.path("glove"), session.hand, camera=False)
+    warm = session.warmup_for(ref)
+    degrees = thumb_in_degrees(warm)
+    glove = load_stream(ref.path("glove"), session.hand, camera=False,
+                        thumb_degrees=degrees)
     cam = load_stream(ref.path("leap"), session.hand, camera=True)
     if ref.path("glove") is None:
         notes.append("no glove file")
@@ -716,7 +809,8 @@ def load_take(session: Session, ref: TakeRef) -> TakeData:
     has_cam = ref.path("leap") is not None
     fields = {"frames_glove": glove.n,
               "frames_camera": cam.n if has_cam else None,
-              "camera_label": cam.label, "clock": clock}
+              "camera_label": cam.label, "clock": clock,
+              "warmup": ref.warmup}
     if gt.size:
         log = StreamLog(gap_s=0.1)
         for t, c in zip(gt, gcount):
@@ -739,7 +833,8 @@ def load_take(session: Session, ref: TakeRef) -> TakeData:
                      else "the events file holds no events")
     return TakeData(ref=ref, events=events, t0=t0, t1=t1, clock=clock,
                     glove_t=gt, glove_c=gc, cam_t=ct, cam_c=cc, cam_ok=cam_ok,
-                    fields=fields, notes=notes)
+                    fields=fields, notes=notes, warmup=warm,
+                    thumb_degrees=degrees)
 
 
 # --- Set B ---------------------------------------------------------------------
@@ -784,7 +879,10 @@ def check_flexion_take(session: Session, data: TakeData
     t1 = data.t1 if data.t1 is not None else math.inf
     gm = data.glove_in(t0, t1)
     gt, gc = data.glove_t[gm], data.glove_c[gm]
-    ends = endpoints(session.warmup, GLOVE)
+    # The cued finger against its own range, the other four against the
+    # fist (reported only, on the scale they always were).
+    ends = endpoints(data.warmup, GLOVE)
+    straight = endpoints(data.warmup, GLOVE, cued=False)
 
     if finger is None:
         failures.append("no cued finger in the events or the protocol")
@@ -803,7 +901,9 @@ def check_flexion_take(session: Session, data: TakeData
     frac = None
     if ends is not None and gt.size and idx is not None:
         frac = fractions(gc, ends)
-        spans = {f: span_of(frac[:, i]) for i, f in enumerate(FINGERS)}
+        frac_other = fractions(gc, straight) if straight else frac
+        spans = {f: span_of((frac if f == finger else frac_other)[:, i])
+                 for i, f in enumerate(FINGERS)}
         cued = spans[finger]
         fields["cued_span_fraction"] = _rnd(cued)
         fields["other_spans"] = {f: _rnd(spans[f]) for f in FINGERS
@@ -838,9 +938,16 @@ def check_flexion_take(session: Session, data: TakeData
     # --- the camera as the reference -------------------------------------
     cm = data.cam_in(t0, t1)
     ct, cv = data.cam_t[cm], data.cam_c[cm, idx]
-    rail = ends[finger][0] if ends and finger in ends else \
-        open_reference(gc)[idx]
-    sweep = analyse_finger(gt, gc[:, idx], ct, cv, rail, finger=finger)
+    # A glove thumb in degrees rises as it bends while the camera's curl
+    # falls; the lag is a correlation and the curve is read against the
+    # camera, so the degrees are negated here (and the report says so).
+    sign = -1.0 if data.thumb_degrees and finger == THUMB else 1.0
+    gsig = gc[:, idx] * sign
+    signed = gc.copy()
+    signed[:, idx] = gsig
+    rail = ends[finger][0] * sign if ends and finger in ends else \
+        open_reference(signed)[idx]
+    sweep = analyse_finger(gt, gsig, ct, cv, rail, finger=finger)
     fields["camera_span"] = _rnd(sweep.span.span) if sweep.span.n else None
     cycles: List[dict] = []
     for k, (a, b) in enumerate(bounds):
@@ -851,14 +958,14 @@ def check_flexion_take(session: Session, data: TakeData
         row["camera_span"] = _rnd(rng.span, 3) if rng.n else None
         row["followed"] = rng.followed
         if rng.followed:
-            lag = estimate_lag(gt[g_in], gc[g_in, idx], ct[c_in], cv[c_in])
+            lag = estimate_lag(gt[g_in], gsig[g_in], ct[c_in], cv[c_in])
             shift = 0.0
             if lag is not None:
                 row["lag_ms"] = _rnd(lag.ms, 1)
                 shift = lag.seconds
             cam_at = np.interp(gt[g_in] - shift, ct[c_in], cv[c_in])
             row["hysteresis"] = _rnd(_median_or_none(
-                b_.hysteresis for b_ in transfer_curve(cam_at, gc[g_in, idx])),
+                b_.hysteresis for b_ in transfer_curve(cam_at, gsig[g_in])),
                 3)
         cycles.append(row)
     followed = [c for c in cycles if c["followed"]]
@@ -873,6 +980,11 @@ def check_flexion_take(session: Session, data: TakeData
         fields["hysteresis_median"] = _rnd(_median_or_none(
             b_.hysteresis for b_ in sweep.bins), 3)
     detail.extend(_flexion_detail(ref, finger, sweep, cycles))
+    if sign < 0:
+        detail.insert(1, "  glove thumb in degrees (TMC_fe + MCP_fe + IP); "
+                         "the transfer curve and the rail show minus the "
+                         "degrees, so the glove falls as the thumb bends, as "
+                         "the camera's curl does")
     return fields, failures, detail
 
 
@@ -1011,24 +1123,42 @@ def measure_steps(data: TakeData, steps: List[dict]) -> List[dict]:
     return out
 
 
+FLEXED_REF, STRAIGHT_REF = "flexed", "straight"
+
+
 def band_refs(session: Session, measured: Dict[str, List[dict]],
               accepted: Dict[str, bool], bands: str
-              ) -> Tuple[Dict[str, Dict[str, Optional[Tuple[float, float]]]],
-                         List[str]]:
-    """The (open, fist) curl each finger's fraction is taken against, per sensor.
+              ) -> Tuple[Dict[str, Dict[str, Dict[str, Dict[
+                  str, Optional[Tuple[float, float]]]]]], List[str]]:
+    """The (open, end) each finger's fraction is taken against.
 
-    `fixed`: the warm-up. `auto`: the session's own open-hand and full-fist
-    steps (accepted takes), falling back to the warm-up per end. Returns the
-    references and one line per sensor saying where they came from.
+    Returns ({warm-up file: {sensor: {"flexed": {finger: ends},
+    "straight": {finger: ends}}}}, one line per sensor saying where they
+    came from). "flexed" is for a finger the step flexes, "straight" for
+    one it leaves straight. `fixed`: the take's own warm-up, a flexed finger
+    against its single bend where usable (`endpoints`), a straight one
+    against the fist. `auto`: the session's own open-hand and full-fist
+    steps (accepted takes) for both, falling back to the warm-up's fist per
+    end. A session with one warm-up has one entry, as before resume.
     """
-    refs: Dict[str, Dict[str, Optional[Tuple[float, float]]]] = {}
+    names = session.warmup_names or [WARMUP_FILE]
+    refs: Dict[str, Dict[str, Dict[str, Dict[
+        str, Optional[Tuple[float, float]]]]]] = {n: {} for n in names}
     lines: List[str] = []
+    several = " (each take's own)" if len(names) > 1 else ""
     for sensor in (GLOVE, CAMERA):
-        warm = endpoints(session.warmup, sensor) or {}
+        warms = {n: session.warmup_named(n) for n in names}
         if bands == FIXED:
-            refs[sensor] = {f: warm.get(f) for f in FINGERS}
-            lines.append(f"{sensor} against the warm-up" if warm else
-                         f"{sensor} has no warm-up endpoints")
+            found = False
+            for n in names:
+                cued = endpoints(warms[n], sensor) or {}
+                fist = endpoints(warms[n], sensor, cued=False) or {}
+                found = found or bool(cued)
+                refs[n][sensor] = {
+                    FLEXED_REF: {f: cued.get(f) for f in FINGERS},
+                    STRAIGHT_REF: {f: fist.get(f) for f in FINGERS}}
+            lines.append(f"{sensor} against the warm-up{several}" if found
+                         else f"{sensor} has no warm-up endpoints")
             continue
         opens: Dict[str, list] = {f: [] for f in FINGERS}
         fists: Dict[str, list] = {f: [] for f in FINGERS}
@@ -1048,14 +1178,16 @@ def band_refs(session: Session, measured: Dict[str, List[dict]],
                     n_fist += 1
                     for f in FINGERS:
                         fists[f].append(curl[f])
-        ref = {}
-        for f in FINGERS:
-            o = float(np.median(opens[f])) if opens[f] else (
-                warm[f][0] if f in warm else None)
-            c = float(np.median(fists[f])) if fists[f] else (
-                warm[f][1] if f in warm else None)
-            ref[f] = (o, c) if o is not None and c is not None else None
-        refs[sensor] = ref
+        for n in names:
+            warm = endpoints(warms[n], sensor, cued=False) or {}
+            ref = {}
+            for f in FINGERS:
+                o = float(np.median(opens[f])) if opens[f] else (
+                    warm[f][0] if f in warm else None)
+                c = float(np.median(fists[f])) if fists[f] else (
+                    warm[f][1] if f in warm else None)
+                ref[f] = (o, c) if o is not None and c is not None else None
+            refs[n][sensor] = {FLEXED_REF: ref, STRAIGHT_REF: ref}
         lines.append(
             f"{sensor} open from {n_open} open-hand step(s)"
             + ("" if n_open else " (none, warm-up used)")
@@ -1065,7 +1197,9 @@ def band_refs(session: Session, measured: Dict[str, List[dict]],
 
 
 def judge_step(curl: Optional[Dict[str, float]], flexed: Sequence[str],
-               ref: Dict[str, Optional[Tuple[float, float]]]
+               ref: Dict[str, Optional[Tuple[float, float]]],
+               ref_straight: Optional[Dict[str, Optional[
+                   Tuple[float, float]]]] = None
                ) -> Tuple[Optional[bool], Dict[str, Optional[float]],
                           List[str], Dict[str, float]]:
     """(pass, fractions, wrong fingers, coupling) for one step on one sensor.
@@ -1074,11 +1208,15 @@ def judge_step(curl: Optional[Dict[str, float]], flexed: Sequence[str],
     only at FLEXED_ABOVE or more, and between STRAIGHT_BELOW and that it is
     coupling: {finger: fraction}, reported, not failed. None for pass when
     there is no data in the window. A finger that cannot be put on a
-    fraction is wrong: the step cannot be shown to have passed.
+    fraction is wrong: the step cannot be shown to have passed. A flexed
+    finger is put on `ref`, a straight one on `ref_straight` (default
+    `ref`; see `band_refs`).
     """
     if curl is None:
         return None, {f: None for f in FINGERS}, [], {}
-    fr = {f: fraction_of(curl[f], ref.get(f)) for f in FINGERS}
+    rs = ref if ref_straight is None else ref_straight
+    fr = {f: fraction_of(curl[f], (ref if f in flexed else rs).get(f))
+          for f in FINGERS}
     wrong: List[str] = []
     coupling: Dict[str, float] = {}
     for f in FINGERS:
@@ -1096,7 +1234,9 @@ def judge_step(curl: Optional[Dict[str, float]], flexed: Sequence[str],
 
 def check_sequence_take(session: Session, data: TakeData, steps: List[dict],
                         refs, bands: str) -> Tuple[dict, List[str], List[str]]:
-    """Set C verdict for one take from its measured steps."""
+    """Set C verdict for one take from its measured steps. `refs` is the
+    take's own warm-up's entry of `band_refs`: {sensor: {"flexed": ...,
+    "straight": ...}}."""
     fields: dict = {"bands": bands}
     failures: List[str] = []
     item_cfg = session.item(data.ref.item)
@@ -1108,8 +1248,9 @@ def check_sequence_take(session: Session, data: TakeData, steps: List[dict],
             len(steps) != len(item_cfg["steps"]):
         failures.append(f"{len(steps)} step(s) cued, the protocol has "
                         f"{len(item_cfg['steps'])}")
-    glove_refs = any(v is not None for v in refs[GLOVE].values())
-    camera_refs = any(v is not None for v in refs[CAMERA].values())
+    glove_refs = any(v is not None for v in refs[GLOVE][FLEXED_REF].values())
+    camera_refs = any(v is not None
+                      for v in refs[CAMERA][FLEXED_REF].values())
     if steps and not glove_refs:
         failures.append("no glove endpoints to put the steps on a fraction"
                         + (" (no warm-up; try --bands auto)" if bands == FIXED
@@ -1117,10 +1258,11 @@ def check_sequence_take(session: Session, data: TakeData, steps: List[dict],
     judged = []
     for s in steps:
         g_ok, g_fr, g_wrong, g_cpl = judge_step(
-            s["glove_curl"] if glove_refs else None, s["flexed"], refs[GLOVE])
+            s["glove_curl"] if glove_refs else None, s["flexed"],
+            refs[GLOVE][FLEXED_REF], refs[GLOVE][STRAIGHT_REF])
         c_ok, c_fr, c_wrong, c_cpl = judge_step(
             s["camera_curl"] if camera_refs else None, s["flexed"],
-            refs[CAMERA])
+            refs[CAMERA][FLEXED_REF], refs[CAMERA][STRAIGHT_REF])
         if not glove_refs:
             g_wrong = ["no glove endpoints"]
         elif g_ok is None:
@@ -1311,7 +1453,9 @@ def _base_row(session: Session, ref: TakeRef) -> dict:
     row = {c: None for c in CSV_COLUMNS}
     row.update({"set": session.set, "session": session.name, "item": ref.item,
                 "take": ref.take, "name": ref.name, "hand": session.hand,
-                "accepted": ref.accepted, "reason": ref.reason})
+                "accepted": ref.accepted, "reason": ref.reason,
+                "warmup": (ref.warmup if session.set in (FLEXION, SEQUENCES)
+                           else None)})
     return row
 
 
@@ -1350,7 +1494,7 @@ def check_session(session_dir, bands: str = FIXED) -> SessionCheck:
                     r["notes"] = r["notes"] + ["second look: " + f
                                                for f in flags]
     elif session.set in (FLEXION, SEQUENCES):
-        header.append("warm-up   " + _warmup_text(session))
+        header.extend(_warmup_lines(session))
         loaded = [(ref, load_take(session, ref)) for ref in session.takes]
         clocks: Dict[str, int] = {}
         for _ref, data in loaded:
@@ -1384,7 +1528,8 @@ def check_session(session_dir, bands: str = FIXED) -> SessionCheck:
                 row = _base_row(session, ref)
                 row.update(data.fields)
                 fields, failures, detail = check_sequence_take(
-                    session, data, measured[ref.name], refs, bands)
+                    session, data, measured[ref.name], refs[ref.warmup],
+                    bands)
                 row.update(fields)
                 row["failures"] = failures
                 row["notes"] = list(data.notes)
@@ -1398,30 +1543,56 @@ def check_session(session_dir, bands: str = FIXED) -> SessionCheck:
                         details=details, header=header)
 
 
-def _warmup_text(session: Session) -> str:
-    w = session.warmup
+def _warmup_lines(session: Session) -> List[str]:
+    """The header's warm-up lines: one for a session with one warm-up (as
+    before resume), else one per file, named, in the session's order."""
+    names = session.warmup_names
+    if len(names) <= 1:
+        name = names[0] if names else WARMUP_FILE
+        return ["warm-up   " + _warmup_text(session.warmup_named(name), name)]
+    return [f"warm-up   {n}: " + _warmup_text(session.warmup_named(n), n)
+            for n in names]
+
+
+def _warmup_text(w: Optional[dict], name: str = WARMUP_FILE) -> str:
+    """One warm-up's open, fist and (when it has them) single values."""
     if not w:
-        return "none (no warmup.json)"
+        return f"none (no {name})"
     if w.get("refused"):
         return f"REFUSED: {w['refused']}"
     parts = []
     for sensor in (GLOVE, CAMERA):
-        e = endpoints(w, sensor)
+        e = endpoints(w, sensor, cued=False)
+        block = w.get(sensor) if isinstance(w.get(sensor), dict) else {}
         if e:
-            parts.append(
-                f"{sensor} open " + " ".join(fmt(e[f][0]) if f in e else "-"
-                                             for f in FINGERS)
+            text = (f"{sensor} open " + " ".join(
+                fmt(e[f][0]) if f in e else "-" for f in FINGERS)
                 + " fist " + " ".join(fmt(e[f][1]) if f in e else "-"
                                       for f in FINGERS))
+            single = block.get("single")
+            if isinstance(single, dict):
+                text += " single " + " ".join(fmt(single.get(f))
+                                              for f in FINGERS)
+            parts.append(text)
         else:
             parts.append(f"{sensor} none")
-    text = " | ".join(parts) + " (thumb..pinky, curl units)"
-    ends = endpoints(w, GLOVE) or {}
+    units = ("thumb..pinky; glove thumb in degrees, the rest curl units"
+             if thumb_in_degrees(w) else "thumb..pinky, curl units")
+    text = " | ".join(parts) + f" ({units})"
+    glove = w.get(GLOVE) if isinstance(w.get(GLOVE), dict) else None
+    if glove is not None and isinstance(glove.get("single"), dict):
+        used = [f for f in FINGERS if single_usable(glove, f)]
+        text += ("; cued fingers end at their single bend: "
+                 + (", ".join(used) or "none") + " (others at the fist)")
+    ends = endpoints(w, GLOVE, cued=False) or {}
     small = [f"{f} {ends[f][0] - ends[f][1]:.2f}" for f in FINGERS[1:]
              if f in ends and ends[f][0] - ends[f][1] < WARMUP_MIN_SPAN]
     if small:
         text += (f"; glove span under {WARMUP_MIN_SPAN:.2f} (contract "
                  "section 4 refuses such a session): " + ", ".join(small))
+    if int(w.get("try") or 1) > 1:
+        text += (f"; try {w['try']}, after "
+                 f"{len(w.get('earlier_refusals') or [])} refused")
     return text
 
 
@@ -1557,6 +1728,19 @@ def rules_text(check: SessionCheck) -> List[str]:
             "  paired          nearest camera frame within "
             f"{PAIR_MAX_DT * 1000:.0f} ms on the take's pairing clock",
         ]
+    if s.set in (FLEXION, SEQUENCES) and any(
+            isinstance(w, dict) and isinstance(w.get(GLOVE), dict)
+            and "single" in w[GLOVE] for w in s.warmups.values()):
+        out.append(
+            "  range end       a finger the cue names: its own bend in the "
+            "warm-up's single-finger part when usable (index to pinky at "
+            f"least {SINGLE_MIN_SHARE:.2f} of the fist span, thumb at least "
+            f"{THUMB_MIN_DEG:g} degrees), else the fist; a finger the cue "
+            "leaves straight: the fist")
+    if any(thumb_in_degrees(w) for w in s.warmups.values()):
+        out.append("  glove thumb     degrees, TMC_fe + MCP_fe + IP "
+                   "(cam_hand.recording_protocol.glove_bends), for takes "
+                   "whose warm-up has units")
     if s.set == FLEXION:
         out += [
             "  cued span       5th to 95th percentile of the cued finger's "

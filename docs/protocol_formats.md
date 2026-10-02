@@ -15,6 +15,8 @@ operator's hand (`left` or `right`), never the tracker's label.
 
     session.json                 one per session (section 3)
     warmup.json                  glove sets only (section 4)
+    warmup_<HHMMSS>.json         the warm-up of each later run of a resumed
+                                 session (sections 3 and 4)
     glove/<take>.jsonl           glove frames, full rate (section 5)
     leap/<take>.jsonl            camera frames when the camera ran (section 5)
     events/<take>.events.jsonl   cues and decisions (section 6)
@@ -132,24 +134,92 @@ it under `protocol_changes`).
 Rejected attempts appear in `takes` with `accepted: false`, a non-empty
 `reason`, and paths under `rejected/`.
 
+Sets B and C (`scripts/record_protocol.py`) also write, since 2026-10-01:
+
+    "warmups": ["warmup.json", "warmup_171012.json"],
+                            every warm-up file of the session, in order
+    "resumed": ["2026-10-01T17:10:05"],
+                            when each later run started (--resume); [] for
+                            a session recorded in one run
+    "calibrated": ["2026-10-01T16:55:00", "2026-10-01T17:09:40"],
+                            each run's XR Trainer calibration time, in order;
+                            xr_trainer_calibrated_at keeps the first
+    "skipped": [{"item": "thumb", "at": "2026-10-01T17:12:30", "take": 1}],
+                            items the operator skipped with `s`, and the take
+                            number being recorded when it was pressed
+    takes[i].warmup         the warm-up file the take was judged against;
+                            an entry without it means warmup.json
+
+`--resume <folder>|latest` carries a session on in its own folder (`latest`
+= the newest folder under `<out-dir>/<set>/` whose name ends with `_<hand>`
+and holds a session.json). It is refused when the folder's `set`, `hand`,
+`protocol_sha256`, `mock` (true or false, not which mock), `camera` or
+`time_scale` differ from the run, when the session.json has no `rounds`,
+and when its warmup.json has no `units` (a session recorded before the
+glove thumb was measured in degrees). `--items`, `--takes` and `--seed` are
+refused with `--resume`: the session already fixes them. The saved `rounds`
+are reused in order; a planned take is passed over when its item already
+has `takes_per_item` accepted takes, and take numbers go on from the
+accepted count. Each later run asks for the calibration again, waits for
+the glove, acquires, and records a new warm-up as `warmup_<HHMMSS>.json`;
+the first run's warmup.json is never rewritten. A skip belongs to the run:
+a later run records a skipped item again.
+
 ## 4. `warmup.json` (glove sets)
 
 Open palm 3 s then full fist 3 s, cued by beeps, before the first take.
+Since 2026-10-01 (Sets B and C) the fist is followed by a straighten
+(1.5 s, low beep) and then each finger on its own, thumb to little finger:
+"bend the THUMB only" for 3 s (high beep), then "straighten" for 1.5 s (low
+beep).
 
     {"hand": "left",
      "t_open": [t0, t1], "t_fist": [t0, t1],
-     "glove": {"open": {"thumb": 1.43, ...}, "fist": {...}, "span": {...}, "frames": 178},
-     "camera": {"open": {...}, "fist": {...}, "span": {...}, "frames": 270} | null,
-     "refused": null | "reason"}
+     "glove": {"open": {"thumb": 1.43, ...}, "fist": {...}, "span": {...}, "frames": 178,
+               "single": {"thumb": 118.2, "index": 0.95, ...},
+               "single_span": {"thumb": -96.4, "index": 1.02, ...},
+               "t_single": {"thumb": [t0, t1], ...}},
+     "camera": {"open": {...}, "fist": {...}, "span": {...}, "frames": 270,
+                "single": {...}, "single_span": {...}, "t_single": {...}} | null,
+     "units": {"thumb": "degrees, TMC_fe + MCP_fe + IP, larger = more bent",
+               "fingers": "curl, wrist to tip over palm length, smaller = more bent"},
+     "refused": null | "reason",
+     "settle_s": 1.0, "try": 1, "earlier_refusals": []}
 
-Values are medians of the per-finger curl over each window, in the curl
-units the rest of the repo uses (`leap_hand.pose_check` and
-`cam_hand.fusion`). `span = open - fist` per finger. A glove span under
-0.30 on any of index/middle/ring/pinky refuses the session with the reason.
+Values are medians over each window. `t_open` and `t_fist` are the median
+windows (the first `settle_s` of each cued window is left out), and so is
+each `t_single` entry: the last `settle_s` of that finger's bend window.
+`span = open - fist` and `single_span = open - single`, per finger.
+
+Units. The camera block is the curl for all five fingers, in the units the
+rest of the repo uses (`leap_hand.pose_check` and `cam_hand.fusion`). So is
+the glove block of a warm-up without `units` (every session before
+2026-10-01). With `units`, the glove's index to pinky are still the curl,
+and the glove's thumb is its bend in degrees, `T_TMC_fe + T_MCP_fe + T_IP`
+from `xr_hand.joint_frames` (`cam_hand.recording_protocol.glove_bends`), so
+its `span` and `single_span` are negative. Every glove frame file of a
+take is read in the units of the warm-up the take was judged against.
+
+Refusal. A glove span under 0.30 on any of index/middle/ring/pinky refuses
+the warm-up with the reason (the first rule). Then a finger whose own bend
+is not usable refuses it, named, with what to do: index to pinky need
+`single_span` of at least 0.50 of their fist `span`, the thumb at least 35
+degrees of bend (`single - open`), e.g. "in the single-finger warm-up the
+thumb bent only 12 degrees (needs 35): fold it fully across the palm, tip
+to the base of the little finger" (`recording_protocol.single_refusal`).
+The recorder does a refused warm-up again, whole, up to 3 times before it
+refuses the session; `try` is which try the file holds and
+`earlier_refusals` the reasons of the ones before it.
 
 Fraction of a finger's range, used everywhere below:
-`fraction = (open - curl) / (open - fist)`, so 0 = the warm-up open palm and
-1 = the warm-up fist, clipped to [-0.5, 1.5].
+`fraction = (open - value) / (open - end)`, clipped to [-0.5, 1.5], so 0 =
+the warm-up open palm and 1 = the end of the range. For a finger the cue
+names (Set B's finger; in Set C the step's flexed fingers) the end is its
+own `single` when the warm-up has one and it is usable by the rule above,
+else the `fist`; for a finger the cue leaves straight it is the `fist`.
+A warm-up without `single` gives (open, fist) for every finger, as before.
+The formula works in either direction: the curl falls as a finger bends,
+the thumb's degrees rise.
 
 ## 5. Frame files
 
@@ -183,8 +253,10 @@ One JSON object per line, `t` is `time.time()` on the recording machine
 `step` counts cues from 0 within the take. For sequences there is no
 `cycle`/`phase`; `flexed` is the step's set and `hold_s` is the protocol's
 `hold_s`. The operator's own redo (`r` during the pause after a take) is a
-decision with `by: "operator"`. Every cue is written at the moment the beep
-sounds.
+decision with `by: "operator"`, and so is `s` during a take, which ends it
+at once with the reason "skipped by the operator (s) during the take" (the
+attempt moves to `rejected/` like any rejection). Every cue is written at
+the moment the beep sounds.
 
 ## 7. Set A per-take files
 
@@ -287,15 +359,22 @@ told otherwise.
 ## 8. Checker outputs
 
 `check.csv` one row per take (accepted and rejected), columns at least:
-`set, item, take, accepted, reason, frames_glove, glove_hz, glove_gap_max_ms,
-frames_camera, paired_fraction, cued_span_fraction, other_spans (json),
-cycles_from_events, cycles_from_peaks, steps_total, steps_pass_glove,
-steps_pass_camera, lag_ms_median, verdict`.
+`set, item, take, accepted, reason, warmup, frames_glove, glove_hz,
+glove_gap_max_ms, frames_camera, paired_fraction, cued_span_fraction,
+other_spans (json), cycles_from_events, cycles_from_peaks, steps_total,
+steps_pass_glove, steps_pass_camera, lag_ms_median, verdict`. `warmup` is
+the warm-up file the take is checked against (Sets B and C; section 3):
+each take's fractions use its own warm-up's endpoints (section 4), and its
+glove file is read in that warm-up's units. `cued_span_fraction` is on the
+cued finger's range; `other_spans` stay on the fist range.
 
-`check.txt`: the same as a readable table, then per item the transfer curve,
+`check.txt`: the header lists every warm-up file of the session with its
+glove and camera open, fist and (when it has them) single values, then the
+same as `check.csv` as a readable table, then per item the transfer curve,
 hysteresis and lag lines (`leap_hand.diagnostics`) where the camera
 followed (span >= 0.50), with the counts of frames and cycles that met that
-rule.
+rule. A glove thumb in degrees is negated for the curve and the lag, so it
+falls as the thumb bends, as the camera's curl does, and the report says so.
 
 Verdict rules are in the plan, section 4. Exit code 1 when an accepted take
 fails a rule, 0 otherwise.
@@ -308,7 +387,8 @@ fails a rule, 0 otherwise.
              <item>_left_all_frames.txt, grasps_summary.csv
       finger_flexion\<hand>\<take>.jsonl, camera_<take>.jsonl,
              <take>.events.jsonl, <take>.txt (professor format, all frames),
-             flexion_report.txt
+             flexion_report.txt, <session>_warmup.json and
+             <session>_warmup_<HHMMSS>.json (every warm-up of the session)
       sequences\<hand>\ same layout, sequence_check.csv
       <set>\joint_frames\<take>.csv and joint_frames.pdf   when the session
              was exported with scripts/joint_frames_view.py --session:

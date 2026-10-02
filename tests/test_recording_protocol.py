@@ -730,3 +730,162 @@ def test_read_curls_uses_capture_time(tmp_path):
     assert all(len(c) == 5 for _t, c in left)
     assert len(rp.read_curls(path)) == 10
     assert rp.read_curls(tmp_path / "none.jsonl") == []
+
+
+# --- the single-finger warm-up (2026-10-01) -------------------------------------
+THUMB_OPEN_DEG, THUMB_FIST_DEG = 20.0, 140.0
+OPEN5 = [THUMB_OPEN_DEG] + OPEN[1:]          # the glove thumb in degrees
+FIST5 = [THUMB_FIST_DEG] + FIST[1:]
+
+
+def single_warmup(single):
+    """Synthetic warm-up samples in the recorder's order: open palm 0 to
+    3 s, fist 3 to 6 s, then each finger alone for 1 s from 6 s on, held at
+    `single[finger]` (the thumb in degrees, the others curls) while the
+    others stay open. Returns (samples, t_single windows)."""
+    samples = [(i * 0.05, list(OPEN5)) for i in range(60)]
+    samples += [(3.0 + i * 0.05, list(FIST5)) for i in range(60)]
+    for k, f in enumerate(ALL5):
+        for i in range(20):
+            v = list(OPEN5)
+            v[k] = single[f]
+            samples.append((6.0 + k + i * 0.05, v))
+    t_single = {f: (6.5 + k, 6.95 + k) for k, f in enumerate(ALL5)}
+    return samples, t_single
+
+
+GOOD_SINGLE = dict(zip(ALL5, [120.0] + FIST[1:]))
+
+
+def record_with(single):
+    samples, t_single = single_warmup(single)
+    return rp.warmup_record("left", (1.0, 2.99), (4.0, 6.0), samples,
+                            settle_s=1.0, t_single=t_single,
+                            units=rp.GLOVE_UNITS)
+
+
+def test_single_finger_warmup_record():
+    rec = record_with(GOOD_SINGLE)
+    glove = rec["glove"]
+    assert rec["refused"] is None and rec["units"] == rp.GLOVE_UNITS
+    assert set(glove) == {"open", "fist", "span", "frames", "single",
+                          "single_span", "t_single"}
+    assert glove["single"]["thumb"] == pytest.approx(120.0)
+    assert glove["single_span"]["thumb"] == pytest.approx(20.0 - 120.0)
+    assert glove["single"]["ring"] == pytest.approx(FIST[3])
+    assert glove["t_single"]["index"] == [7.5, 7.95]
+    assert rp.single_refusal(glove) is None
+    assert rp.warmup_refusal(glove) is None
+    # the old shape is untouched without the single part
+    samples, _ = single_warmup(GOOD_SINGLE)
+    old = rp.warmup_record("left", (1.0, 2.99), (4.0, 6.0), samples)
+    assert "single" not in old["glove"] and "units" not in old
+    assert rp.single_refusal(old["glove"]) is None
+
+
+def test_a_thumb_bent_12_degrees_refuses_naming_the_thumb():
+    rec = record_with(dict(GOOD_SINGLE, thumb=THUMB_OPEN_DEG + 12.0))
+    assert rec["refused"] == (
+        "in the single-finger warm-up the thumb bent only 12 degrees (needs "
+        "35): fold it fully across the palm, tip to the base of the little "
+        "finger")
+    assert rp.warmup_refusal(rec["glove"]) == rec["refused"]
+    assert not rp.single_usable(rec["glove"], "thumb")
+    # 34.6 degrees does not print as the 35 it missed
+    rec = record_with(dict(GOOD_SINGLE, thumb=THUMB_OPEN_DEG + 34.6))
+    assert "bent only 34.6 degrees (needs 35)" in rec["refused"]
+    assert rp.single_usable(record_with(dict(
+        GOOD_SINGLE, thumb=THUMB_OPEN_DEG + 35.0))["glove"], "thumb")
+
+
+def test_a_ring_under_half_its_fist_span_refuses_naming_the_ring():
+    ring = OPEN[3] - 0.4 * (OPEN[3] - FIST[3])
+    rec = record_with(dict(GOOD_SINGLE, ring=ring))
+    why = rec["refused"]
+    assert why.startswith("in the single-finger warm-up the ring bent only "
+                          "0.40 of its fist span (needs 0.50)")
+    assert "thumb" not in why
+    # a fist that barely moved is still the first reason
+    weak = record_with(dict(GOOD_SINGLE, thumb=THUMB_OPEN_DEG + 1.0))
+    weak["glove"]["span"]["ring"] = 0.2
+    assert rp.warmup_refusal(weak["glove"]).startswith(
+        "the glove barely moved")
+
+
+def test_endpoints_use_the_single_bend_when_usable():
+    from cam_hand import protocol_check as pc
+
+    rec = record_with(dict(GOOD_SINGLE, ring=OPEN[3] - 0.4 * (OPEN[3]
+                                                               - FIST[3])))
+    glove = rec["glove"]
+    # thumb usable: open to its own bend; ring not usable: open to the fist
+    assert rp._endpoints(glove, "thumb") == (pytest.approx(20.0),
+                                             pytest.approx(120.0))
+    assert rp._endpoints(glove, "ring") == (pytest.approx(OPEN[3]),
+                                            pytest.approx(FIST[3]))
+    # a finger the cue leaves straight keeps the fist
+    assert rp._endpoints(glove, "thumb", cued=False) == (
+        pytest.approx(20.0), pytest.approx(140.0))
+    assert rp.fraction(*rp._endpoints(glove, "thumb"), 70.0) == \
+        pytest.approx(0.5)
+    # the checker reads the same rule off warmup.json (not refused here)
+    warm = dict(rec, refused=None)
+    ends = pc.endpoints(warm, "glove")
+    assert ends["thumb"] == (pytest.approx(20.0), pytest.approx(120.0))
+    assert ends["ring"] == (pytest.approx(OPEN[3]), pytest.approx(FIST[3]))
+    assert pc.endpoints(warm, "glove", cued=False)["thumb"] == (
+        pytest.approx(20.0), pytest.approx(140.0))
+    # a warm-up without the single part: the fist, every finger
+    assert rp._endpoints(glove_ends(), "index") == (OPEN[1], FIST[1])
+
+
+def test_the_quick_check_measures_the_cued_finger_on_its_own_bend():
+    """A thumb take in degrees that bends 20 to 120 (its single bend) spans
+    its whole range; the same take against the fist (140) would not."""
+    glove = record_with(GOOD_SINGLE)["glove"]
+    events = [{"t": 100.0, "kind": "take_start"}]
+    curls, t = [], 100.0
+    for cycle in range(1, 6):
+        for phase, dur in (("bend", 1.0), ("hold", 0.5), ("straighten", 1.0),
+                           ("rest", 0.5)):
+            events.append({"t": t, "kind": "cue", "cycle": cycle,
+                           "phase": phase, "flexed": ["thumb"]})
+            for k in range(30):
+                e = k / 30.0
+                f = {"bend": e, "hold": 1.0, "straighten": 1.0 - e,
+                     "rest": 0.0}[phase]
+                curls.append((t + k * dur / 30.0,
+                              [20.0 + 100.0 * f] + OPEN[1:]))
+            t += dur
+    events.append({"t": t, "kind": "take_end"})
+    res = rp.check_flexion_take(curls, events, glove, "thumb", 5)
+    assert res.accepted, res.reason
+    assert res.details["range_end"] == "single"
+    assert res.details["span_fraction"] == pytest.approx(1.0, abs=0.02)
+    old = dict(glove)
+    del old["single"]
+    res = rp.check_flexion_take(curls, events, old, "thumb", 5)
+    assert res.details["range_end"] == "fist"
+    assert res.details["span_fraction"] == pytest.approx(100 / 120, abs=0.02)
+
+
+def test_read_bends_measures_the_glove_thumb_in_degrees(tmp_path):
+    from cam_hand.features import flexion_features
+    from xr_hand.keypoints21 import frame_to_keypoints21
+    from xr_hand.mock import MockHandGenerator
+    from xr_hand.parser import parse_hand_message
+    from xr_hand.recorder import FrameRecorder
+
+    path = tmp_path / "g.jsonl"
+    rec = FrameRecorder(take=1)
+    rec.start(path)
+    frames = [parse_hand_message(MockHandGenerator("left").next_frame(),
+                                 "left") for _ in range(3)]
+    for fr in frames:
+        rec.record(fr)
+    rec.stop()
+    got = rp.read_bends(path, "left")
+    assert [v for _t, v in got] == [rp.glove_bends(fr) for fr in frames]
+    assert got[0][1][1:] == [float(v) for v in flexion_features(
+        frame_to_keypoints21(frames[0]))][1:]
+    assert rp.read_curls is rp.read_bends

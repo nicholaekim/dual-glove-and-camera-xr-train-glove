@@ -557,3 +557,38 @@ def test_an_image_renamed_into_joint_frames_is_still_refused(sessions,
     assert pkg.main(["--out", str(out), "--flexion", str(flexion)]) == 1
     assert "REFUSED" in capsys.readouterr().out
     assert not out.exists()
+
+
+def test_every_warm_up_of_a_session_is_handed_in(sessions, tmp_path):
+    """A resumed session has a warm-up per run and each take names its own:
+    every warmup*.json goes in beside the takes, named by session, and the
+    README lists each file's open and fist."""
+    import shutil
+    src = sessions["flexion"]
+    dst = tmp_path / "b" / src.name
+    shutil.copytree(src, dst)
+    warm = (dst / "warmup.json").read_text(encoding="utf-8")
+    (dst / "warmup_171012.json").write_text(warm, encoding="utf-8")
+    meta = json.loads((dst / "session.json").read_text(encoding="utf-8"))
+    meta["warmups"] = ["warmup.json", "warmup_171012.json"]
+    meta["takes"][-1]["warmup"] = "warmup_171012.json"
+    (dst / "session.json").write_text(json.dumps(meta), encoding="utf-8")
+    out = tmp_path / "out"
+    assert pkg.main(["--out", str(out), "--flexion", str(dst)]) == 0
+    left = out / "finger_flexion" / "left"
+    assert (left / f"{dst.name}_warmup.json").read_text(
+        encoding="utf-8") == warm
+    assert (left / f"{dst.name}_warmup_171012.json").is_file()
+    readme = (out / "README.txt").read_text(encoding="utf-8")
+    assert "    warm-up warmup.json glove curl, thumb index" in readme
+    assert "    warm-up warmup_171012.json glove curl, thumb index" in readme
+    assert "<session>_warmup*.json" in readme
+    assert "\u2014" not in readme
+
+
+def test_one_warm_up_reads_as_before(package):
+    _rc, out = package
+    readme = (out / "README.txt").read_text(encoding="utf-8")
+    assert "    warm-up glove curl, thumb index middle ring pinky: open " \
+        in readme
+    assert list((out / "finger_flexion" / "left").glob("*_warmup.json"))
