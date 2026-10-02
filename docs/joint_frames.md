@@ -110,14 +110,15 @@ cd "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer"
 
 The window shows the IR picture with every tracked hand (both, when both
 are in view) and a 1 cm triad at every joint (x red, y green, z blue) and,
-on the right, one hand's 26 rows (x y z in mm, flexion, abduction) and its
-24 angles. The hand the table shows is drawn bright, the other a little
-dimmer; `--hand left` or `--hand right` shows one hand only. Keys:
+on the right, one table per hand, left then right: the 26 rows (x y z in
+mm, flexion, abduction) and the 24 angles, each from that hand's own
+frames. One hand is drawn bright, the other a little dimmer; `--hand left`
+or `--hand right` shows one hand only, with a single wider table. Keys:
 
 | Key | What it does |
 |---|---|
-| h | moves the table (and the bright drawing) to the other hand |
-| g | with `--glove`: switches the table between the camera hand and the glove hand |
+| h | makes the other hand the bright one in the picture |
+| g | with `--glove`: switches the tables between the camera hands and the glove hands |
 | n | highlights the next finger (rows and axes) |
 | s | saves a PNG of the window into `recordings\joint_frames\` |
 | q or Esc | closes the window |

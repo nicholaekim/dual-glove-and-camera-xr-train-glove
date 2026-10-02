@@ -10,14 +10,14 @@ LIVE (camera only, bare hand; or gloves on + camera with --glove)
 
   The IR image with every tracked hand (both when both are in view), a 1 cm
   axis triad at each of the 26 joints (x red, y green, z blue) and, beside
-  it, one hand's 26 rows (joint, x y z in mm in the wrist frame, flexion,
-  abduction) and the paper's 24 angles. The table's hand is drawn bright, the
-  other a little dimmer. Keys: h switches the table to the other hand,
-  g switches it between the camera hand and the glove hand, n highlights
-  the next finger, s saves a PNG of the window into recordings\\joint_frames\\,
-  q or Esc quits. `--hand left` or `--hand right` shows that hand only. The
-  glove has no position of its own, so each glove hand is drawn at its
-  camera hand's wrist (or above the module when no hand is tracked).
+  it, a table per hand, left then right: the 26 rows (joint, x y z in mm in
+  the wrist frame, flexion, abduction) and the paper's 24 angles. Keys:
+  h picks which hand is drawn bright, g switches the tables between the
+  camera hands and the glove hands, n highlights the next finger, s saves a
+  PNG of the window into recordings\\joint_frames\\, q or Esc quits.
+  `--hand left` or `--hand right` shows that hand only, with one wider
+  table. The glove has no position of its own, so each glove hand is drawn
+  at its camera hand's wrist (or above the module when no hand is tracked).
 
   It is a read-only client of the tracking service, like
   scripts\\leap\\camera_view.py, so it runs next to any recorder. `--glove`
@@ -581,7 +581,8 @@ IMAGE_SIZE = 384 * SCALE
 BASELINE_HALF_MM = 32.0           # camera_view.py: the left lens sits at x = +32 mm
 LEFT_CAMERA = 1                   # eLeapPerspectiveType_stereo_left
 DEFAULT_WRIST_M = (0.0, 0.25, 0.05)   # the glove hand with no camera hand: above the module
-PANEL_W = 600
+PANEL_W = 600                     # one hand's table (--hand left/right)
+PANEL_W_PAIR = 520                # each of the two tables when both hands are shown
 
 
 class Projector:
@@ -802,24 +803,49 @@ class LiveView:
                            else (255, 255, 255), -1, cv2.LINE_AA)
         frame = cv2.flip(frame, 1)          # mirror, as camera_view.py
         n_hands = len(self.camera_hands())
-        put(frame, f"table: {show} hand, {table_side or 'none'}"
-                   f"   ({n_hands} tracked)" + (
+        put(frame, (f"tables: {show}, both hands   bright: {table_side or 'none'}"
+                    if self.prefer == "both" else
+                    f"table: {show} hand, {table_side or 'none'}")
+                   + f"   ({n_hands} tracked)" + (
             "" if show == self.source else " (no glove frame yet)"),
             (12, 24), 0.6, (0, 255, 255), 2)
         put(frame, f"tracking {self.fps:4.1f} Hz   h other hand   g glove/camera"
                    "   n finger   s save PNG   q quit", (12, size - 14), 0.45)
-        rows = cam_rows if show == "camera" else glove_rows
-        panel = self.panel(rows, show, lh, highlight)
         self.drawn += 1
-        return np.hstack([frame, panel])
+        if self.prefer == "both":
+            # one table per hand, left then right, each with its own data
+            hands = self.camera_hands()
+            gloves = self.fresh(self.glove, 1.0) if self.glove_on else {}
+            panels = []
+            for side in ("left", "right"):
+                hand = hands.get(side)
+                if show == "camera":
+                    rows_s = (jf.joint_table(jf.line_from_leap_hand(hand),
+                                             "camera", self.reference)
+                              if hand is not None else None)
+                else:
+                    frame_g = gloves.get(side)
+                    rows_s = (jf.joint_table(jf.line_from_hand_frame(frame_g),
+                                             "glove", self.reference)
+                              if frame_g is not None else None)
+                panels.append(self.panel(rows_s, show, hand, highlight,
+                                         PANEL_W_PAIR, side))
+            return np.hstack([frame] + panels)
+        rows = cam_rows if show == "camera" else glove_rows
+        return np.hstack([frame, self.panel(rows, show, lh, highlight)])
 
-    def panel(self, rows, show, lh, highlight) -> np.ndarray:
-        panel = np.full((IMAGE_SIZE, PANEL_W, 3), 24, np.uint8)
+    def panel(self, rows, show, lh, highlight, width: int = PANEL_W,
+              side: Optional[str] = None) -> np.ndarray:
+        """One hand's table. `width` scales the columns (the pair of panels
+        for both hands is narrower than the single one); `side` names the
+        hand when there is no tracked hand to name it."""
+        panel = np.full((IMAGE_SIZE, width, 3), 24, np.uint8)
         grey, white = (175, 175, 175), (235, 235, 235)
+        f = width / PANEL_W
         y = 22
-        side = lh.hand_side.upper() if lh is not None else ""
-        panel_text(panel, f"{show.upper()} {side} hand, {self.reference} frame "
-                          "(mm, degrees)", (10, y), 0.55, (255, 255, 255))
+        name = (lh.hand_side if lh is not None else side or "").upper()
+        panel_text(panel, f"{show.upper()} {name} hand, {self.reference} frame "
+                          "(mm, degrees)", (10, y), 0.5, (255, 255, 255))
         y += 26
         if rows is None:
             panel_text(panel, "no hand tracked" if show == "camera" else
@@ -827,19 +853,20 @@ class LiveView:
             return panel
         panel_text(panel, "joint", (10, y), 0.4, grey)
         for head, _key, right in PANEL_COLUMNS:
-            panel_text(panel, head, (right, y), 0.4, grey, right=True)
+            panel_text(panel, head, (right * f, y), 0.4, grey, right=True)
         for r in rows:
             y += 15
             lit = bool(highlight) and r["joint"].startswith(highlight + "_")
             colour = HIGHLIGHT_BGR if lit else white
             panel_text(panel, r["joint"], (10, y), 0.4, colour)
             for _head, key, right in PANEL_COLUMNS:
-                panel_text(panel, jf.fmt_num(r[key], 1), (right, y), 0.4,
+                panel_text(panel, jf.fmt_num(r[key], 1), (right * f, y), 0.4,
                            colour, right=True)
         y += 28
         panel_text(panel, "the paper's 24 angles (degrees)", (10, y), 0.5,
                    (255, 255, 255))
         dof = jf.dof24(rows)
+        step = (width - 100) / 5
         for letter, finger in jf.FINGERS:
             y += 18
             lit = highlight == finger
@@ -849,7 +876,7 @@ class LiveView:
             names = [n for n in jf.DOF24_NAMES if n.startswith(letter + "_")]
             for m, n in enumerate(names):
                 panel_text(panel, f"{n[2:]} {jf.fmt_num(dof[n], 1)}",
-                           (92 + 100 * m, y), 0.4, colour)
+                           (92 + step * m, y), 0.4, colour)
         y += 26
         if show == "camera" and lh is not None:
             bend = jf.wrist_palm_deg(jf.line_from_leap_hand(lh), "camera")
@@ -899,7 +926,8 @@ def run_live(args) -> int:
     if not args.no_window:
         import cv2
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(win, IMAGE_SIZE + PANEL_W, IMAGE_SIZE)
+        cv2.resizeWindow(win, IMAGE_SIZE + (2 * PANEL_W_PAIR if args.hand == "both"
+                                            else PANEL_W), IMAGE_SIZE)
     t0 = time.time()
     try:
         while True:

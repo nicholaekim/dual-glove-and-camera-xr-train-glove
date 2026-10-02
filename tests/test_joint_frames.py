@@ -627,7 +627,13 @@ def test_live_view_keys_and_glove_table():
                                     hand_side_hint="left"))
     project = view.Projector(None)
     img = lv.compose(project)
-    assert img.shape == (view.IMAGE_SIZE, view.IMAGE_SIZE + view.PANEL_W, 3)
+    assert img.shape == (view.IMAGE_SIZE,
+                         view.IMAGE_SIZE + 2 * view.PANEL_W_PAIR, 3)
+    one = view.LiveView(prefer="left", glove_on=True)
+    for side, lh in stream.generate(1):
+        one.add_camera(lh)
+    assert one.compose(project).shape == (view.IMAGE_SIZE,
+                                          view.IMAGE_SIZE + view.PANEL_W, 3)
     assert lv.keys(ord("g")) and lv.source == "glove"
     assert lv.keys(ord("n")) and view.FINGER_CYCLE[lv.finger] == "THUMB"
     lv.compose(project)
@@ -660,6 +666,13 @@ def test_live_view_draws_both_hands_and_h_switches_the_table():
     picture = img_two[:, :view.IMAGE_SIZE]
     dim = dim_left if second == "right" else dim_right
     assert (picture == dim).all(axis=2).any()
+    # both tables carry data: each panel's heading names its hand and the
+    # right panel is not the "no hand tracked" placeholder (it has many
+    # text pixels)
+    left_panel = img_two[:, view.IMAGE_SIZE:view.IMAGE_SIZE + view.PANEL_W_PAIR]
+    right_panel = img_two[:, view.IMAGE_SIZE + view.PANEL_W_PAIR:]
+    assert (left_panel > 200).any(axis=2).sum() > 3000
+    assert (right_panel > 200).any(axis=2).sum() > 3000
     only = view.LiveView(prefer="left")
     for side, lh in stream.generate(2):
         only.add_camera(lh)
