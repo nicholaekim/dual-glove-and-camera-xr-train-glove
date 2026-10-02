@@ -108,12 +108,16 @@ cd "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer"
 .venv\Scripts\python.exe scripts\joint_frames_view.py --live
 ```
 
-The window shows the IR picture with a 1 cm triad at every joint (x red,
-y green, z blue) and, on the right, the 26 rows (x y z in mm, flexion,
-abduction) and the 24 angles. Keys:
+The window shows the IR picture with every tracked hand (both, when both
+are in view) and a 1 cm triad at every joint (x red, y green, z blue) and,
+on the right, one hand's 26 rows (x y z in mm, flexion, abduction) and its
+24 angles. The hand the table shows is drawn bright, the other a little
+dimmer; `--hand left` or `--hand right` shows one hand only. Keys:
 
 | Key | What it does |
 |---|---|
+| h | moves the table (and the bright drawing) to the other hand |
+| g | with `--glove`: switches the table between the camera hand and the glove hand |
 | n | highlights the next finger (rows and axes) |
 | s | saves a PNG of the window into `recordings\joint_frames\` |
 | q or Esc | closes the window |
