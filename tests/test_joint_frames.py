@@ -633,3 +633,36 @@ def test_live_view_keys_and_glove_table():
     lv.compose(project)
     assert lv.drawn == 2
     assert not lv.keys(ord("q"))
+
+
+def test_live_view_draws_both_hands_and_h_switches_the_table():
+    """Both tracked hands are drawn; the h key moves the table to the other
+    hand; --hand left limits the view to that hand."""
+    lv = view.LiveView()
+    stream = MockLeapStream(pose="open", seed=2, dropout_every=0,
+                            reacquire_every=0)
+    for side, lh in stream.generate(2):
+        lv.add_camera(lh)
+    assert set(lv.camera_hands()) == {"left", "right"}
+    project = view.Projector(None)
+    first = lv.camera_hand().hand_side
+    img_one = lv.compose(project)
+    assert lv.keys(ord("h"))
+    second = lv.camera_hand().hand_side
+    assert {first, second} == {"left", "right"}
+    img_two = lv.compose(project)
+    # the bright (table) hand changed, so the picture differs
+    assert (img_one != img_two).any()
+    # with the table on one hand, both skeletons are still in the picture:
+    # a hand drawn dimmer still carries its own colour somewhere
+    dim_left = tuple(int(v * 0.6) for v in view.LIVE_HAND_BGR["left"])
+    dim_right = tuple(int(v * 0.6) for v in view.LIVE_HAND_BGR["right"])
+    picture = img_two[:, :view.IMAGE_SIZE]
+    dim = dim_left if second == "right" else dim_right
+    assert (picture == dim).all(axis=2).any()
+    only = view.LiveView(prefer="left")
+    for side, lh in stream.generate(2):
+        only.add_camera(lh)
+    assert set(only.camera_hands()) == {"left"}
+    assert only.camera_hand().hand_side == "left"
+    assert only.keys(ord("h")) and only.camera_hand().hand_side == "left"

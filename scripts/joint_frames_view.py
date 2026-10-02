@@ -8,14 +8,16 @@ LIVE (camera only, bare hand; or gloves on + camera with --glove)
   .venv\\Scripts\\python.exe scripts\\joint_frames_view.py --live
   .venv\\Scripts\\python.exe scripts\\joint_frames_view.py --live --glove
 
-  The IR image with the tracked hand, a 1 cm axis triad at each of the 26
-  joints (x red, y green, z blue) and, beside it, the 26 rows (joint, x y z
-  in mm in the wrist frame, flexion, abduction) and the paper's 24 angles.
-  Keys: g switches the table between the camera hand and the glove hand,
-  n highlights the next finger, s saves a PNG of the window into
-  recordings\\joint_frames\\, q or Esc quits. The glove has no position of
-  its own, so its hand is drawn at the camera hand's wrist (or above the
-  module when no hand is tracked).
+  The IR image with every tracked hand (both when both are in view), a 1 cm
+  axis triad at each of the 26 joints (x red, y green, z blue) and, beside
+  it, one hand's 26 rows (joint, x y z in mm in the wrist frame, flexion,
+  abduction) and the paper's 24 angles. The table's hand is drawn bright, the
+  other a little dimmer. Keys: h switches the table to the other hand,
+  g switches it between the camera hand and the glove hand, n highlights
+  the next finger, s saves a PNG of the window into recordings\\joint_frames\\,
+  q or Esc quits. `--hand left` or `--hand right` shows that hand only. The
+  glove has no position of its own, so each glove hand is drawn at its
+  camera hand's wrist (or above the module when no hand is tracked).
 
   It is a read-only client of the tracking service, like
   scripts\\leap\\camera_view.py, so it runs next to any recorder. `--glove`
@@ -650,6 +652,7 @@ class LiveView:
         self.prefer = prefer
         self.glove_on = glove_on
         self.source = "camera"
+        self.table_side = None              # h key: which hand the table shows
         self.finger = 0                     # index into FINGER_CYCLE
         self.cam: Dict[str, Tuple[float, object]] = {}     # side -> (t, LeapHand)
         self.glove: Dict[str, Tuple[float, object]] = {}   # side -> (t, HandFrame)
@@ -670,12 +673,22 @@ class LiveView:
         now = time.time()
         return {s: v for s, (t, v) in store.items() if now - t < max_age}
 
-    def camera_hand(self):
+    def camera_hands(self) -> dict:
+        """side -> LeapHand of every hand seen in the last quarter second,
+        limited to one side when the viewer was started with --hand."""
         hands = self.fresh(self.cam, 0.25)
+        if self.prefer in ("left", "right"):
+            hands = {s: h for s, h in hands.items() if s == self.prefer}
+        return hands
+
+    def camera_hand(self):
+        """The hand the table shows: the one picked with the h key when it is
+        in view, else the hand seen longest."""
+        hands = self.camera_hands()
         if not hands:
             return None
-        if self.prefer in hands:
-            return hands[self.prefer]
+        if self.table_side in hands:
+            return hands[self.table_side]
         return max(hands.values(), key=lambda lh: lh.visible_time_us)
 
     def glove_frame(self, side: Optional[str]):
@@ -692,6 +705,10 @@ class LiveView:
             return False
         if key == ord("g"):
             self.source = "glove" if self.source == "camera" else "camera"
+        elif key == ord("h"):
+            lh = self.camera_hand()
+            current = lh.hand_side if lh is not None else self.table_side
+            self.table_side = "right" if current == "left" else "left"
         elif key == ord("n"):
             self.finger = (self.finger + 1) % len(FINGER_CYCLE)
         return True
@@ -737,28 +754,39 @@ class LiveView:
         show = self.source
         if show == "glove" and glove_rows is None:
             show = "camera"
-        # both skeletons; axes on the one the table shows
-        drawn = []
-        if lh is not None:
-            pos = np.asarray(lh.abs26, dtype=float)
-            _p, rots, _h = jf.world_pose(jf.line_from_leap_hand(lh), "camera")
-            axes = np.array(rots)
-            drawn.append(("camera", lh.hand_side, pos, axes))
+        # every tracked hand gets its skeleton and axes; the hand whose table
+        # is shown (`lh`, or its glove) is drawn bright with the finger
+        # highlight, the others a little dimmer
+        drawn = []       # (source, side, pos, axes, is_table_hand)
+        table_side = lh.hand_side if lh is not None else None
+        for side, hand in sorted(self.camera_hands().items()):
+            pos = np.asarray(hand.abs26, dtype=float)
+            _p, rots, _h = jf.world_pose(jf.line_from_leap_hand(hand), "camera")
+            drawn.append(("camera", side, pos, np.array(rots),
+                          show == "camera" and side == table_side))
+            if self.glove_on and side != table_side:
+                frame_g = self.fresh(self.glove, 1.0).get(side)
+                if frame_g is not None:      # the other hand's glove, at its wrist
+                    rows_g = jf.joint_table(jf.line_from_hand_frame(frame_g),
+                                            "glove", self.reference)
+                    ref = jf.PALM if self.reference == "palm" else jf.WRIST
+                    world = jf.to_world(rows_g, _p[jf.WRIST], rots[ref])
+                    drawn.append(("glove", side, world[0], world[1], False))
         if glove_world is not None:
-            side = lh.hand_side if lh is not None else next(iter(
-                self.fresh(self.glove, 1.0)), "left")
-            drawn.append(("glove", side, glove_world[0], glove_world[1]))
-        for src, side, pos, axes in drawn:
+            side = table_side or next(iter(self.fresh(self.glove, 1.0)), "left")
+            drawn.append(("glove", side, glove_world[0], glove_world[1],
+                          show == "glove"))
+        for src, side, pos, axes, is_table in drawn:
             col = LIVE_HAND_BGR.get(side, (200, 200, 200))
-            if src != show:
-                col = tuple(int(v * 0.45) for v in col)
+            if not is_table:
+                col = tuple(int(v * 0.6) for v in col)
             px = [project(p * 1000.0) for p in pos]
             for a, b in BONES:
                 if px[a] and px[b]:
-                    cv2.line(frame, px[a], px[b], col, 2 if src == show else 1,
+                    cv2.line(frame, px[a], px[b], col, 2 if is_table else 1,
                              cv2.LINE_AA)
-            if src != show:
-                continue
+            if src == "glove" and not is_table and show == "camera":
+                continue                     # a dim glove skeleton only
             for i, p in enumerate(pos):
                 if px[i] is None:
                     continue
@@ -767,16 +795,19 @@ class LiveView:
                     if tip:
                         bgr = AXIS_RGB[k][::-1]
                         cv2.line(frame, px[i], tip, bgr,
-                                 3 if i in lit else 1, cv2.LINE_AA)
-                cv2.circle(frame, px[i], 4 if i in lit else 2,
-                           HIGHLIGHT_BGR if i in lit else (255, 255, 255), -1,
-                           cv2.LINE_AA)
+                                 3 if (is_table and i in lit) else 1,
+                                 cv2.LINE_AA)
+                cv2.circle(frame, px[i], 4 if (is_table and i in lit) else 2,
+                           HIGHLIGHT_BGR if (is_table and i in lit)
+                           else (255, 255, 255), -1, cv2.LINE_AA)
         frame = cv2.flip(frame, 1)          # mirror, as camera_view.py
-        put(frame, f"table: {show} hand" + (
+        n_hands = len(self.camera_hands())
+        put(frame, f"table: {show} hand, {table_side or 'none'}"
+                   f"   ({n_hands} tracked)" + (
             "" if show == self.source else " (no glove frame yet)"),
             (12, 24), 0.6, (0, 255, 255), 2)
-        put(frame, f"tracking {self.fps:4.1f} Hz   g glove/camera   n finger"
-                   "   s save PNG   q quit", (12, size - 14), 0.45)
+        put(frame, f"tracking {self.fps:4.1f} Hz   h other hand   g glove/camera"
+                   "   n finger   s save PNG   q quit", (12, size - 14), 0.45)
         rows = cam_rows if show == "camera" else glove_rows
         panel = self.panel(rows, show, lh, highlight)
         self.drawn += 1
@@ -786,7 +817,8 @@ class LiveView:
         panel = np.full((IMAGE_SIZE, PANEL_W, 3), 24, np.uint8)
         grey, white = (175, 175, 175), (235, 235, 235)
         y = 22
-        panel_text(panel, f"{show.upper()} hand, {self.reference} frame "
+        side = lh.hand_side.upper() if lh is not None else ""
+        panel_text(panel, f"{show.upper()} {side} hand, {self.reference} frame "
                           "(mm, degrees)", (10, y), 0.55, (255, 255, 255))
         y += 26
         if rows is None:
