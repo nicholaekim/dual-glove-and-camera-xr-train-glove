@@ -24,8 +24,6 @@ Sanity check whenever this changes: MediaPipe should still COLLAPSE on the
 output (the real glove scores ~1%). If MediaPipe sees the synthetic glove
 fine, it is not simulating the problem.
 """
-from typing import Sequence
-
 import numpy as np
 
 # (chain of landmark indices per finger, knuckle -> tip)

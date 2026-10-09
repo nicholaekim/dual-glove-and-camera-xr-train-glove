@@ -180,15 +180,6 @@ class Schedule:
                 return w
         return None
 
-    def pose_at(self, t: float) -> str:
-        """The pose being held at second `t`, or "" past the end."""
-        w = self.at(t)
-        return w.pose if w else ""
-
-    def boundaries(self) -> List[float]:
-        """The instants a new pose starts, the first one excluded."""
-        return [w.start for w in self.windows[1:]]
-
 
 def parse_schedule(text: str) -> Schedule:
     """`"open_palm:5,fist:5"` -> a `Schedule`. Raises ValueError with the fix.

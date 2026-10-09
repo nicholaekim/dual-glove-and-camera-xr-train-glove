@@ -456,6 +456,45 @@ def acquired_line(hand, seconds) -> str:
     return f"{hand.upper()} hand: acquired after {seconds:.1f} s."
 
 
+def make_warmup_cue(*, camera, glove, hud, beeper, log, warmup,
+                    caption, next_hud):
+    """Build the stage callback shared by live fusion and the demo."""
+    words = band_words(warmup.band)
+    hands = warmup.hands
+    asked = {}
+
+    def cue(stage, hand, seconds):
+        name = hand.upper()
+        camera.coach(MOCK_POSE.get(stage))
+        glove.coach(hand, stage)
+        hud.close()
+        if stage == STAGE_ACQUIRE:
+            asked[hand] = time.time()
+            caption(f"{name} hand: ACQUIRE, open palm {words} up")
+            log.say(f"{name} hand: ACQUIRE. Hold the {name} hand open over "
+                    f"the module, palm to the lens, {words} up (waiting up "
+                    f"to {seconds:g} s).")
+        elif stage == STAGE_COUNTDOWN:
+            beeper.beep(ACQUIRED_FREQ, CUE_MS)
+            now = time.time()
+            log.say(acquired_line(hand, now - asked.get(hand, now)))
+            caption(countdown_text(hand, seconds))
+            hud.show(countdown_text(hand, seconds), now, force=True)
+            next_hud[0] = now + HUD_EVERY
+        elif stage == STAGE_NOT_ACQUIRED:
+            caption(f"{name} hand: NOT ACQUIRED")
+            later = hands[hands.index(hand) + 1:]
+            log.say(f"{name} hand refused: {warmup.not_acquired[hand]}"
+                    + (f". Going on to the {later[0].upper()} hand."
+                       if later else ""))
+        else:
+            beeper.beep(CUE_FREQ, CUE_MS)
+            caption(f"{name} hand: {stage} ({seconds:g} s)")
+            log.say(f"{name} hand: {stage} for {seconds:g} s")
+
+    return cue
+
+
 def conclude_warmup(learned, hands, fit, out, log):
     """Say what the warm-up learned and decided, save each fitted hand's
     bone measurement beside `out`, and write PATH.warmup.txt.
@@ -829,14 +868,12 @@ def main(argv=None) -> int:
     warmup = Warmup(hands, open_s=args.warmup_open, fist_s=args.warmup_fist,
                     acquire_s=args.acquire_timeout, countdown_s=COUNTDOWN_S,
                     band=DEFAULT_BAND)
-    words = band_words(DEFAULT_BAND)
     log.say("Warm-up, one hand at a time ("
             + ", then ".join(h.upper() for h in hands)
             + f"): acquire, open palm {args.warmup_open:g} s, fist "
             f"{args.warmup_fist:g} s.")
     shown = [None]
     next_hud = [0.0]
-    asked = {}
 
     def caption(text):
         # The window's caption is a status file; write it only on a change.
@@ -844,34 +881,9 @@ def main(argv=None) -> int:
             shown[0] = text
             view.caption(text, band=DEFAULT_BAND)
 
-    def cue(stage, hand, seconds):
-        name = hand.upper()
-        camera.coach(MOCK_POSE.get(stage))
-        glove.coach(hand, stage)
-        hud.close()
-        if stage == STAGE_ACQUIRE:
-            asked[hand] = time.time()
-            caption(f"{name} hand: ACQUIRE, open palm {words} up")
-            log.say(f"{name} hand: ACQUIRE. Hold the {name} hand open over "
-                    f"the module, palm to the lens, {words} up (waiting up "
-                    f"to {seconds:g} s).")
-        elif stage == STAGE_COUNTDOWN:
-            beeper.beep(ACQUIRED_FREQ, CUE_MS)
-            now = time.time()
-            log.say(acquired_line(hand, now - asked.get(hand, now)))
-            caption(countdown_text(hand, seconds))
-            hud.show(countdown_text(hand, seconds), now, force=True)
-            next_hud[0] = now + HUD_EVERY
-        elif stage == STAGE_NOT_ACQUIRED:
-            caption(f"{name} hand: NOT ACQUIRED")
-            later = hands[hands.index(hand) + 1:]
-            log.say(f"{name} hand refused: {warmup.not_acquired[hand]}"
-                    + (f". Going on to the {later[0].upper()} hand."
-                       if later else ""))
-        else:
-            beeper.beep(CUE_FREQ, CUE_MS)
-            caption(f"{name} hand: {stage} ({seconds:g} s)")
-            log.say(f"{name} hand: {stage} for {seconds:g} s")
+    cue = make_warmup_cue(
+        camera=camera, glove=glove, hud=hud, beeper=beeper, log=log,
+        warmup=warmup, caption=caption, next_hud=next_hud)
 
     def poll(w):
         for row in camera.drain():

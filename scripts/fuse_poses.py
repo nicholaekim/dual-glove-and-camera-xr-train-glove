@@ -140,12 +140,10 @@ from cam_hand.features import (
 )
 from cam_hand.fusion import (
     AUTO,
-    CAMERA_DOFS,
     DEFAULT_ANCHOR,
     DEFAULT_GATES,
     DEFAULT_RAIL,
     GATED_DOFS,
-    MODE_DISAGREE,
     MODE_RAIL,
     NOT_MEASURABLE,
     OVERRIDE_MODES,

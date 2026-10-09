@@ -794,10 +794,6 @@ class TakeResult:
     tries: List[Attempt] = field(default_factory=list)
 
 
-class Quit(Exception):
-    """The operator asked to stop (Ctrl+C), mid-acquire."""
-
-
 from leap_hand.protocol import CameraView  # noqa: E402  (the live camera window)
 
 

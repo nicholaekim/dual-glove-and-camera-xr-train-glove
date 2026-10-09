@@ -317,10 +317,6 @@ def validate_protocol(data, where: str = "protocol") -> None:
                                     "false")
 
 
-def file_sha256(path) -> str:
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
 def load_protocol(path) -> Protocol:
     """Read, parse and validate one protocol file. Raises ProtocolError."""
     path = Path(path)

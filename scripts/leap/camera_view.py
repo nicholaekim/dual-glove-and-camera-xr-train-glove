@@ -27,7 +27,7 @@ hand, which reduces what it shows to the hand and a margin around it (a hand
 held near the face can still include part of it). With no hand tracked it
 writes a `<stem>.skipped.txt` note instead of the JPEG.
 """
-import argparse, math, os, sys, threading, time
+import argparse, math, os, threading, time
 
 import cv2
 import numpy as np
