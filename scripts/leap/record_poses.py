@@ -197,6 +197,14 @@ What changes from the plain session, and why:
   five kept takes, recording only takes 4 and 5 of a grasp that has three,
   and the session then counts five as its target.
 
+  One tracking condition per session. `--hint hand_on_object` asks the
+  Ultraleap service for its tracking for hands occluded by a held object,
+  which needs the service's Hyperion license; without it the recorder
+  refuses to start. session.json, every take entry in it and every take's
+  meta say `tracking_hints`, `hints_confirmed` and `license_hyperion`, and
+  `--resume` refuses a session recorded with other hints, so one folder
+  never mixes the two conditions.
+
   python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left
   python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left --items hook,lateral_key --takes 1
   python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left --resume recordings/protocol/grasps/<session>
@@ -244,7 +252,8 @@ from leap_hand.recorder import LeapRecorder
 from leap_hand.static_interval import (DEFAULT_STATIC_S, FOLLOW_RADIUS_M,
                                        MIN_TRACKED_FRACTION, row_frame,
                                        summarise_take)
-from leap_hand.stream import LeapUnavailable, open_stream
+from leap_hand.stream import (KNOWN_HINTS, LeapUnavailable, hint_metadata,
+                              open_stream)
 from leap_hand.tracking_quality import (LOSS_GAP_S, cause_label, causes_for,
                                         fix_for, state_from_leaphand,
                                         take_losses, take_reason)
@@ -2033,7 +2042,8 @@ class Attempt:
 
 
 def load_session(folder: Path, hand: str, sha256: str, mock: bool,
-                 raw: Optional[bytes] = None) -> dict:
+                 raw: Optional[bytes] = None,
+                 hints: Tuple[str, ...] = ()) -> dict:
     """An earlier session's session.json, checked before `--resume` adds to it.
 
     Refused when it is not a grasp session, is another hand's, was a mock
@@ -2043,6 +2053,11 @@ def load_session(folder: Path, hand: str, sha256: str, mock: bool,
     orientation hints added on lines of their own (`sha256_without_hints`
     of today's bytes, `raw`, is the session's sha256): the grasps, takes and
     timings are then byte for byte the ones the session was recorded with.
+
+    Also refused when it was recorded with other tracking hints (`--hint`)
+    than `hints`: one session folder, one tracking condition. A session
+    written before the hints existed has no `tracking_hints` and was
+    recorded with none.
     """
     path = Path(folder) / "session.json"
     try:
@@ -2058,6 +2073,13 @@ def load_session(folder: Path, hand: str, sha256: str, mock: bool,
     if bool(old.get("mock")) != mock:
         raise SystemExit(f"cannot resume {folder}: it was "
                          f"{'a mock' if old.get('mock') else 'a camera'} session")
+    recorded = sorted(set(old.get("tracking_hints") or []))
+    if recorded != sorted(set(hints)):
+        raise SystemExit(
+            f"cannot resume {folder}: it was recorded with "
+            f"{hint_text(recorded)} and this run asks for {hint_text(hints)}; "
+            "a session folder holds one tracking condition, so resume it with "
+            f"{hint_flags(recorded) or 'no --hint'}, or start a new session")
     if old.get("protocol_sha256") != sha256:
         if raw is None or sha256_without_hints(raw) != old.get("protocol_sha256"):
             raise SystemExit(f"cannot resume {folder}: the protocol file has "
@@ -2066,6 +2088,19 @@ def load_session(folder: Path, hand: str, sha256: str, mock: bool,
         print(f"note: the protocol file differs from the one {Path(folder).name} "
               "was recorded with only by per-grasp orientation hints; resuming it")
     return old
+
+
+def hint_text(hints) -> str:
+    """'tracking hint hand_on_object', or 'no tracking hint'."""
+    hints = list(hints)
+    if not hints:
+        return "no tracking hint"
+    return f"tracking hint{'s' if len(hints) > 1 else ''} {', '.join(hints)}"
+
+
+def hint_flags(hints) -> str:
+    """The `--hint` options that ask for `hints`, '' for none."""
+    return " ".join(f"--hint {h}" for h in hints)
 
 
 def make_session_dir(root: Path, hand: str) -> Path:
@@ -2230,6 +2265,10 @@ class ProtocolSession(Session):
             "operator": self.operator,
             "camera": "leap",
             "mock": self.mock,
+            # the tracking hints asked for (--hint; one condition per
+            # session folder, `load_session`), whether the service confirmed
+            # them, and its Hyperion flag as read (null: not read, no hint)
+            **hint_metadata(self.source),
             "glove": False,
             "started": self.started,
             "ended": self.ended,
@@ -2990,7 +3029,12 @@ class ProtocolSession(Session):
             "accepted": accepted, "reason": reason, "decided_at": decided_at,
             "decided_by": by, "tracked_fraction": meta["tracked_fraction"],
             "grab_strength": meta["grab_strength"],
-            "pinch_strength": meta["pinch_strength"], "files": files})
+            "pinch_strength": meta["pinch_strength"],
+            # the stream's hint state as the take was decided, as in its meta
+            "tracking_hints": meta["tracking_hints"],
+            "hints_confirmed": meta["hints_confirmed"],
+            "license_hyperion": meta["license_hyperion"],
+            "files": files})
         self.write_session()
         got = Attempt(item=iid, take=n, attempt=attempt, name=name,
                       accepted=accepted, reason=reason,
@@ -3087,6 +3131,10 @@ class ProtocolSession(Session):
             "protocol_name": self.protocol.get("name"),
             "protocol_version": self.protocol.get("version"),
             "mock": self.mock,
+            # the tracking hints the stream was asked for (--hint), whether
+            # the service confirmed them, and its Hyperion flag as read,
+            # all as they stood when this take was decided
+            **hint_metadata(self.source),
             "take_start": round(span[0], 6),
             "take_end": round(span[1], 6),
             "duration_s": round(span[1] - span[0], 3),
@@ -3187,10 +3235,14 @@ class ProtocolSession(Session):
     def resume_command(self) -> str:
         """The command that records what this session is still missing."""
         protocol = repo_relative(self.protocol_path).replace("/", os.sep)
+        # the session's own hints, or `load_session` refuses the command
+        hints = hint_flags(hint_metadata(getattr(self, "source", None))
+                           ["tracking_hints"])
         return (rf".venv\Scripts\python.exe scripts\leap\record_poses.py "
                 f"{'--mock ' if self.mock else ''}--protocol {protocol} "
                 f"--hand {self.hand} --resume \"{self.session_dir}\""
-                f"{'' if self.coach else ' --no-coach'}")
+                f"{'' if self.coach else ' --no-coach'}"
+                f"{' ' + hints if hints else ''}")
 
 
 def make_mock_source(dropout: float = 0.0, coach: bool = True,
@@ -3198,8 +3250,12 @@ def make_mock_source(dropout: float = 0.0, coach: bool = True,
                      other_hand: str = "same",
                      close_s: Optional[float] = None,
                      close_early: int = 0,
-                     back_after: Optional[float] = None):
+                     back_after: Optional[float] = None,
+                     hints: Tuple[str, ...] = ()):
     """The synthetic camera behind `--mock`, started.
+
+    `hints` (`--hint`) changes no hand: the mock records them and reports
+    them confirmed, so a rehearsal writes the metadata a hinted run would.
 
     Coached, the `hand` acts the take out (`leap_hand.mock.CoachedActor`):
     an open palm at OPEN HAND, held open through READY, closing at the
@@ -3228,12 +3284,14 @@ def make_mock_source(dropout: float = 0.0, coach: bool = True,
                                                     hold_dropout=dropout,
                                                     operator=hand,
                                                     other_hand=other_hand,
-                                                    **acting))
+                                                    **acting),
+                                hints=hints)
     elif dropout > 0:
         source = MockLeapStream(dropout_every=90, reacquire_every=0,
-                                dropout_frames=max(1, min(89, round(90 * dropout))))
+                                dropout_frames=max(1, min(89, round(90 * dropout))),
+                                hints=hints)
     else:
-        source = MockLeapStream(dropout_every=0, reacquire_every=0)
+        source = MockLeapStream(dropout_every=0, reacquire_every=0, hints=hints)
     # Skip the mock hand past its first 0.3 s of visibility, which the
     # recorder drops as settling: a live hand has been in view that long
     # by the time the stream wait is over, and with --prep 0 the first
@@ -3306,6 +3364,7 @@ def run_protocol(args, parser) -> None:
             parser.error(f"{flag} must be above 0 seconds")
 
     protocol, sha = load_protocol(args.protocol)
+    hints = tuple(dict.fromkeys(args.hint or ()))   # each --hint once, in order
     resume = None
     # Each setting comes from the command line, else from the session being
     # resumed (a session keeps one timing throughout), else from the file.
@@ -3323,7 +3382,7 @@ def run_protocol(args, parser) -> None:
     waits = {"lost_wait_s": LOST_WAIT_S, "form_window_s": FORM_WINDOW_S}
     if args.resume is not None:
         old = load_session(args.resume, args.hand, sha, bool(args.mock),
-                           raw=Path(args.protocol).read_bytes())
+                           raw=Path(args.protocol).read_bytes(), hints=hints)
         resume = (Path(args.resume), old)
         for key in base:
             # A plain countdown's seconds are not a forming time, nor the
@@ -3367,10 +3426,11 @@ def run_protocol(args, parser) -> None:
                                   close_s=min(MOCK_CLOSE_MAX_S,
                                               MOCK_CLOSE_SHARE * prep),
                                   close_early=args.mock_close_early or 0,
-                                  back_after=args.mock_back_after)
+                                  back_after=args.mock_back_after,
+                                  hints=hints)
     else:
         try:
-            source = open_stream(mode=args.mode)
+            source = open_stream(mode=args.mode, hints=hints)
         except LeapUnavailable as e:
             raise SystemExit(f"\nNo live tracking: {e}\n")
 
@@ -3431,6 +3491,13 @@ def run_protocol(args, parser) -> None:
                                "(--auto-accept)" if args.auto_accept else REVIEW_KEYS))
         print("  picture: " + ("off (--no-panel)" if panel is None
                                else panel.describe()))
+        if hints:
+            # a live stream that got this far has confirmed them (start()
+            # refuses otherwise)
+            said = ("mock: written to the metadata, the hands are unchanged"
+                    if args.mock else
+                    "confirmed by the service, Hyperion license present")
+            print(f"  hint:    {', '.join(hints)} ({said})")
         print(f"  folder:  {session.session_dir}")
         if resume is not None:
             kept = sum(session.accepted.values())
@@ -3532,6 +3599,15 @@ def main() -> None:
                         "'palm turned 30 degrees toward the lens'")
     g.add_argument("--operator", default=None,
                    help="who recorded the session, for session.json")
+    g.add_argument("--hint", action="append", choices=KNOWN_HINTS, default=None,
+                   metavar="NAME",
+                   help="ask the Ultraleap service for a tracking hint on every "
+                        "device; hand_on_object is its tracking for hands "
+                        "occluded by a held object and needs the service's "
+                        "Hyperion license (the recorder refuses to start "
+                        "without it). Written to session.json and every take; "
+                        "a resumed session keeps the hints it was recorded "
+                        "with")
     g.add_argument("--no-coach", action="store_true",
                    help="the plain GET READY countdown instead of the coached "
                         "take (OPEN HAND, then MAKE THE GRASP, then HOLD STILL)")
@@ -3580,6 +3656,9 @@ def main() -> None:
         ("--auto-accept", args.auto_accept), ("--no-open", args.no_open),
         ("--no-panel", args.no_panel),
         ("--note", args.note), ("--operator", args.operator),
+        # the plain session writes no session.json and no meta, so nothing
+        # would record which condition its takes were made under
+        ("--hint", args.hint),
         ("--no-coach", args.no_coach),
         ("--lost-wait", args.lost_wait), ("--form-window", args.form_window),
         ("--mock-dropout", args.mock_dropout),

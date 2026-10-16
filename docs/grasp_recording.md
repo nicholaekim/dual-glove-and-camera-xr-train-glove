@@ -322,6 +322,60 @@ table then lists that grasp as short of its takes, and step 8 below records
 what is missing. The packager's README lists the grasps still short of 3
 kept takes, with the most common reason they were rejected.
 
+## Hand-on-object hint (--hint hand_on_object)
+
+`--hint hand_on_object` asks the Ultraleap tracking service for the
+tracking it tunes for hands occluded by an object they hold. LeapC calls
+this a hint: the service is told how the hands will be used and decides
+what to do with it, and LeapC has no call that reads the hints back. It
+needs the service's Hyperion license. The license flag (`Hyperion`, read
+with `LeapCheckLicenseFlag`) was present on this machine's service, 6.2.0,
+on 2026-10-16.
+
+Both recorders take it: `record_poses.py --protocol ... --hint
+hand_on_object` and `record_simultaneous.py --camera leap --hand left
+--hint hand_on_object`. After the camera is found and before the first
+frame is counted, the recorder reads the license flag and sets the hint on
+every device. If the flag is absent it refuses to start, with "the
+Ultraleap service here has no Hyperion license, so the hand_on_object hint
+would be ignored and the recording would be labelled with a condition it
+was not made under". The service ignores a hint it is not licensed for
+without an error, which is why the flag is read first. The recorder also
+refuses when the license check or the hint call returns an error code, and
+names the code. With a hint, the connection to the service is opened
+multi-device aware, which LeapC requires for hints. Without one it is the
+same connection as before.
+
+Every take records what was asked and what was confirmed, in three fields:
+
+    tracking_hints     ["hand_on_object"], or [] with no --hint
+    hints_confirmed    true when the service accepted the hint on every device
+    license_hyperion   the Hyperion flag as read: true or false, or null
+                       when it was not read (no --hint)
+
+`record_poses.py` writes them at the top of `session.json`, in every take
+entry of `session.json` and in every `meta\<take>.json`, kept or rejected.
+`record_simultaneous.py` writes them, with `note` (`--note` exactly as
+typed, null without it), into every `<take>.meta.json`, kept or under
+`rejected\`. A `--mock` run records the hint and reports it confirmed with
+the license true. The synthetic hands are the same with or without it.
+
+A session folder holds one hint condition. `record_poses.py --resume`
+refuses a session recorded with other hints than the ones on its command
+line, and `record_simultaneous.py` refuses an `--out-dir` that already
+holds a `<take>.meta.json` recorded with other hints. The printed resume
+and redo commands carry the session's own `--hint`. A session or meta
+written before 2026-10-16 has no `tracking_hints` and counts as recorded
+without a hint. `--hint` is refused where nothing would record
+it: `record_poses.py` without `--protocol`, and `record_simultaneous.py`
+with the webcam or with `--hand both`, neither of which writes a meta file.
+The same goes for `--note` in `record_simultaneous.py`.
+
+Not checked yet: that the service accepts the hint from these recorders
+with the Stereo IR 170 attached. The tests run the whole sequence against
+fake LeapC objects. The first camera run with `--hint` is the check:
+`hints_confirmed` true in its meta.
+
 ## Steps
 
 ### Step 1. No hardware: open PowerShell in the repo folder

@@ -51,6 +51,15 @@ never deleted: the two sensors being evaluated are the ones vetoing the take,
 so the exclusions have to stay countable. `--no-pose-check` turns it off, and
 it is off for mock sensors, whose hand shape does not follow the pose called.
 
+`--hint hand_on_object` (coached leap sessions only) asks the Ultraleap
+service for its tracking for hands occluded by a held object. It needs the
+service's Hyperion license, and the recorder refuses to start without it.
+Every `<take>.meta.json`, kept or rejected, says `tracking_hints`,
+`hints_confirmed` and `license_hyperion`, and `note` holds `--note` exactly
+as typed (null without it), e.g. which object was in the hand. An
+`--out-dir` that already holds takes recorded with other hints is refused:
+one folder, one tracking condition.
+
 Needs XR Trainer streaming to 127.0.0.1:9002 plus the camera. Rehearse the
 whole thing with no hardware at all:
 
@@ -118,7 +127,8 @@ from leap_hand.pose_check import (
     short_summary,
 )
 from leap_hand.recorder import LeapRecorder
-from leap_hand.stream import LeapUnavailable, open_stream
+from leap_hand.stream import (KNOWN_HINTS, LeapUnavailable, hint_metadata,
+                              open_stream)
 
 # The glove side comes from the xr_hand package in this repo.
 from xr_hand.parser import parse_hand_message
@@ -163,6 +173,30 @@ POSE_HINTS = {
     "pinch": "thumb and index fingertips touching, others relaxed",
     "three": "index + middle + ring extended, little and thumb curled",
 }
+
+
+def recorded_hints(out_dir: Path) -> dict:
+    """{sorted tracking hints: one meta file} over the `<take>.meta.json`
+    already in `out_dir`, kept or rejected. A meta written before the hints
+    existed has no `tracking_hints` and was recorded with none."""
+    found: dict = {}
+    for folder in (out_dir / LEAP, out_dir / REJECTED / LEAP):
+        for path in sorted(folder.glob("*.meta.json")):
+            try:
+                meta = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            hints = tuple(sorted(set(meta.get("tracking_hints") or [])))
+            found.setdefault(hints, path)
+    return found
+
+
+def hint_text(hints) -> str:
+    """'tracking hint hand_on_object', or 'no tracking hint'."""
+    hints = list(hints)
+    if not hints:
+        return "no tracking hint"
+    return f"tracking hint{'s' if len(hints) > 1 else ''} {', '.join(hints)}"
 
 
 def beep(freq: int = 880, ms: int = 180) -> None:
@@ -837,10 +871,12 @@ class CoachedLeapSession(LeapSyncSession):
                  leap_hz=None, hand: str = "left", band=DEFAULT_BAND,
                  settle: float = DEFAULT_SETTLE, retries: int = DEFAULT_RETRIES,
                  acquire_timeout: float = 60.0, pose_check: bool = True,
-                 pose_check_params=DEFAULT_PARAMS):
+                 pose_check_params=DEFAULT_PARAMS, note: Optional[str] = None):
         super().__init__(leap_source, glove_source, hz=hz, out_dir=out_dir,
                          leap_hz=leap_hz)
         self.hand = hand
+        # `--note`, free text, into every meta.json exactly as given
+        self.note = note
         self.band = band
         self.settle = float(settle)
         self.retries = int(retries)
@@ -1446,6 +1482,13 @@ class CoachedLeapSession(LeapSyncSession):
             "still_missing_reason": (None if still
                                      else got.still_missing or STILL_UNKNOWN),
             "file": file,
+            # The tracking hints the camera was asked for (--hint), whether
+            # the service confirmed them and its Hyperion flag as read, as
+            # they stood when the attempt was judged; then --note as typed.
+            # Read with getattr: a session object without a camera reads as
+            # no hint and no note.
+            **hint_metadata(getattr(self, "leap", None)),
+            "note": getattr(self, "note", None),
         }
 
     def _write_meta(self, result: TakeResult) -> None:
@@ -1471,9 +1514,15 @@ class CoachedLeapSession(LeapSyncSession):
         self.beeper.stop()
 
     def redo_command(self, failed: List[str], takes: int) -> str:
+        # the redo is recorded under the same tracking hint and note
+        state = hint_metadata(getattr(self, "leap", None))
+        extra = "".join(f" --hint {h}" for h in state["tracking_hints"])
+        note = getattr(self, "note", None)
+        if note is not None:
+            extra += f' --note "{note}"'
         return ("python scripts/record_simultaneous.py --camera leap "
                 f"--hand {self.hand} --poses {','.join(failed)} "
-                f"--takes {takes}")
+                f"--takes {takes}{extra}")
 
     def print_summary(self) -> None:
         self.hud.close()
@@ -1608,6 +1657,18 @@ def main() -> None:
                    help="record the take even when the hand is not in the "
                         "pose that was asked for (the check is off for mock "
                         "sensors either way — see below)")
+    p.add_argument("--hint", action="append", choices=KNOWN_HINTS, default=None,
+                   metavar="NAME",
+                   help="ask the Ultraleap service for a tracking hint on every "
+                        "device (--camera leap --hand left|right); "
+                        "hand_on_object is its tracking for hands occluded by "
+                        "a held object and needs the service's Hyperion "
+                        "license (the recorder refuses to start without it). "
+                        "Written to every take's meta.json")
+    p.add_argument("--note", default=None,
+                   help="free text stored as 'note' in every take's meta.json "
+                        "exactly as given, e.g. which object was in the hand "
+                        "(--camera leap --hand left|right)")
     args = p.parse_args()
 
     poses = [slugify(x) for x in args.poses.split(",") if slugify(x)]
@@ -1642,6 +1703,28 @@ def main() -> None:
     except ValueError as e:
         raise SystemExit(str(e))
     coached = backend == LEAP and args.hand in ("left", "right")
+    hints = tuple(dict.fromkeys(args.hint or ()))   # each --hint once, in order
+    # Both go into each take's meta.json, which only the coached session
+    # writes: anywhere else they would be dropped without a trace, and a take
+    # whose condition is not on disk is a take nobody can sort.
+    for flag, given in (("--hint", hints), ("--note", args.note is not None)):
+        if given and not coached:
+            raise SystemExit(
+                f"{flag} needs --camera leap --hand left|right: it is written "
+                "into each take's meta.json, and only that session writes one")
+    # One output folder, one tracking condition: takes made with and without
+    # a hint side by side could only be told apart by opening every meta.
+    if backend == LEAP:
+        mixed = {h: path for h, path in recorded_hints(args.out_dir).items()
+                 if h != tuple(sorted(hints))}
+        if mixed:
+            other, path = next(iter(mixed.items()))
+            raise SystemExit(
+                f"{args.out_dir} already holds takes recorded with "
+                f"{hint_text(other)} ({path.name}) and this run asks for "
+                f"{hint_text(hints)}. A session folder holds one tracking "
+                "condition: give this run its own --out-dir, or the same "
+                "--hint as those takes")
 
     # The glove is kept at FULL RATE on the leap backend. It used to be
     # throttled to 5 Hz like the webcam session, which is 24 frames in a
@@ -1707,16 +1790,24 @@ def main() -> None:
     try:
         if backend == LEAP:
             try:
-                leap = open_stream(mock=args.mock_leap, mode=args.mode)
+                leap = open_stream(mock=args.mock_leap, mode=args.mode,
+                                   hints=hints)
             except LeapUnavailable as e:
                 raise SystemExit(f"\nNo live tracking: {e}\n")
+            if hints:
+                state = hint_metadata(leap)
+                print(f"  hint: {', '.join(state['tracking_hints'])} "
+                      + ("(mock: written to the metadata, the hands are "
+                         "unchanged)" if args.mock_leap else
+                         "(confirmed by the service, Hyperion license present)")
+                      + "\n")
             if coached:
                 session = CoachedLeapSession(
                     leap, glove, hz=glove_hz, out_dir=args.out_dir,
                     leap_hz=args.leap_hz or None, hand=args.hand, band=band,
                     settle=args.settle, retries=args.retries,
                     acquire_timeout=args.acquire_timeout,
-                    pose_check=pose_check_on)
+                    pose_check=pose_check_on, note=args.note)
                 session.view = CameraView(
                     hand=args.hand, band=band,
                     enabled=not (args.no_view or args.mock_leap)).start()

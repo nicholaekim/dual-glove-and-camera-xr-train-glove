@@ -2309,3 +2309,140 @@ def test_without_protocol_the_plain_session_is_unchanged(rp, monkeypatch, tmp_pa
     # the 5 frames/s default per hand, not every frame
     assert len(lines) <= 2 * 8
     assert not (out / "session.json").exists()
+
+
+# --- the tracking hint (--hint hand_on_object) -----------------------------------------
+# The mock reports a requested hint as confirmed by a licensed service, so a
+# rehearsal writes what a hinted camera run writes (leap_hand.mock).
+HINT_KEYS = ("tracking_hints", "hints_confirmed", "license_hyperion")
+HINTED = {"tracking_hints": ["hand_on_object"], "hints_confirmed": True,
+          "license_hyperion": True}
+UNHINTED = {"tracking_hints": [], "hints_confirmed": False,
+            "license_hyperion": None}
+
+
+def hint_keys(d: dict) -> dict:
+    return {k: d[k] for k in HINT_KEYS}
+
+
+def test_a_hint_session_writes_the_hint_in_session_json_and_every_take(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """H3: session.json, every take entry in it (redone or kept) and every
+    take's meta carry the three keys, and nothing that was there is gone."""
+    real = rp.Reviewer
+    monkeypatch.setattr(rp, "Reviewer",
+                        lambda auto=False: real(keys=iter(["r", "\r", "\r"])))
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--takes", "1",
+                                    "--items", "tip_pinch,hook",
+                                    "--hint", "hand_on_object"))
+    folder = session_dir(out)
+    session = read_json(folder / "session.json")
+    assert SESSION_FIELDS <= set(session)
+    assert hint_keys(session) == HINTED
+    takes = session["takes"]
+    assert [(t["item"], t["accepted"]) for t in takes] == [
+        ("tip_pinch", False), ("tip_pinch", True), ("hook", True)]
+    for entry in takes:
+        assert hint_keys(entry) == HINTED, entry["name"]
+        meta = read_json(folder / entry["files"]["meta"])
+        assert META_FIELDS <= set(meta)
+        assert hint_keys(meta) == HINTED, entry["name"]
+    assert "hint:    hand_on_object" in capsys.readouterr().out
+
+
+def test_a_session_with_no_hint_says_none_in_session_json_and_every_take(
+        rp, monkeypatch, tmp_path, protocol_file):
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook"))
+    folder = session_dir(out)
+    session = read_json(folder / "session.json")
+    assert hint_keys(session) == UNHINTED
+    (entry,) = session["takes"]
+    assert hint_keys(entry) == UNHINTED
+    assert hint_keys(read_json(folder / entry["files"]["meta"])) == UNHINTED
+
+
+def test_resume_with_a_different_hint_is_refused_and_the_same_hint_carries_on(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """One session folder, one tracking condition."""
+    real = rp.Reviewer
+    monkeypatch.setattr(rp, "Reviewer",
+                        lambda auto=False: real(auto=auto, keys=iter(["\r", "q"])))
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--items", "hook",
+                                    "--takes", "2", "--hint", "hand_on_object"))
+    folder = session_dir(out)
+    # the end table's resume command asks for the session's own hint
+    printed = capsys.readouterr().out
+    (command,) = [line for line in printed.splitlines() if "--resume" in line]
+    assert command.strip().endswith("--hint hand_on_object")
+    before = (folder / "session.json").read_bytes()
+
+    with pytest.raises(SystemExit) as e:
+        run(rp, monkeypatch, "--mock", "--protocol", protocol_file, "--hand",
+            "left", "--resume", folder, "--auto-accept", "--no-open")
+    message = str(e.value)
+    assert "tracking hint hand_on_object" in message
+    assert "no tracking hint" in message
+    assert "one tracking condition" in message
+    assert "--hint hand_on_object" in message
+    assert (folder / "session.json").read_bytes() == before, "nothing written"
+    assert session_dir(out) == folder
+
+    # the same hint resumes the same session, and its new take says so too
+    run(rp, monkeypatch, "--mock", "--protocol", protocol_file, "--hand", "left",
+        "--resume", folder, "--auto-accept", "--no-open",
+        "--hint", "hand_on_object")
+    session = read_json(folder / "session.json")
+    assert [(t["take"], t["accepted"]) for t in session["takes"]] == [
+        (1, True), (2, False), (2, True)]
+    assert hint_keys(session) == HINTED
+    assert all(hint_keys(t) == HINTED for t in session["takes"])
+
+
+def test_resume_of_a_session_without_a_hint_refuses_a_hint(
+        rp, monkeypatch, tmp_path, protocol_file):
+    """...and a session written before the hints existed counts as none."""
+    real = rp.Reviewer
+    monkeypatch.setattr(rp, "Reviewer",
+                        lambda auto=False: real(auto=auto, keys=iter(["\r", "q"])))
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--items", "hook",
+                                    "--takes", "2"))
+    folder = session_dir(out)
+    path = folder / "session.json"
+    old = read_json(path)
+    for key in HINT_KEYS:                     # as written before 2026-10-16
+        old.pop(key)
+        for entry in old["takes"]:
+            entry.pop(key)
+    path.write_text(json.dumps(old, indent=2), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="one tracking condition"):
+        run(rp, monkeypatch, "--mock", "--protocol", protocol_file, "--hand",
+            "left", "--resume", folder, "--auto-accept", "--no-open",
+            "--hint", "hand_on_object")
+    assert read_json(path) == old
+
+    run(rp, monkeypatch, "--mock", "--protocol", protocol_file, "--hand", "left",
+        "--resume", folder, "--auto-accept", "--no-open")
+    session = read_json(path)
+    assert session["takes"][:2] == old["takes"], "earlier entries untouched"
+    assert hint_keys(session) == UNHINTED
+    assert hint_keys(session["takes"][2]) == UNHINTED
+
+
+def test_hint_is_refused_without_a_protocol_and_by_unknown_name(rp, monkeypatch,
+                                                                tmp_path,
+                                                                protocol_file):
+    # the plain session writes no session.json or meta to record it in
+    with pytest.raises(SystemExit):
+        run(rp, monkeypatch, "--mock", "--poses", "fist", "--takes", "1",
+            "--hint", "hand_on_object", "--out-dir", tmp_path / "poses")
+    assert not (tmp_path / "poses").exists()
+    with pytest.raises(SystemExit):
+        run(rp, monkeypatch, *mock_args(protocol_file, tmp_path / "grasps",
+                                        "--hint", "hand_on_objects"))
+    assert not (tmp_path / "grasps").exists()
