@@ -643,8 +643,10 @@ paced bends read 1.19, 1.74 and 3.32 s, 0.24 of the cue or more; a fourth
 rise, 0.11 s while the finger was opening, is a stray that the bend count
 already fails a take for. That sweep's straightens read 0.09, 1.05 and
 0.96 s of 5 s, and the straightens of 20261013_180909_left 0.05 to 1.91 s:
-the glove's reading falls quickly once a finger starts to open, so a bar on
-the straighten would not tell a slow opening from a fast one. The bend's
+the glove's reading fell no slower in that sweep's slow openings than in
+snapped ones, so a bar on the straighten would not tell a slow opening from
+a fast one (until 2026-10-16 this said the reading always falls quickly once
+a finger starts to open, which the sessions of 2026-10-15 do not show). The bend's
 bar rests on that one sweep of one finger of one glove, which is why
 `--no-speed-check` exists.
 

@@ -47,8 +47,9 @@ Why it is built this way (plan: `docs/grasp_and_flexion_protocol_plan.md`):
     a session is judged by the rule it was started under and `--resume`
     carries it on; `--no-speed-check` records a session without it (the
     times are then reported, not judged). The straighten is timed and never
-    judged: the glove's reading falls quickly once a finger starts to open,
-    however slowly the finger moves. While a slow bend or straighten is
+    judged: in the one paced sweep of a finger opened slowly on purpose
+    (2026-09-20) the glove's reading fell no slower than in snapped
+    straightens. While a slow bend or straighten is
     cued, the cue window says to use the whole time and draws the finger's
     bar white, not green or amber: there is no position to be at yet.
   * each finger is measured against its own range for THIS session (the

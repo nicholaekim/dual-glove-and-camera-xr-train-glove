@@ -350,8 +350,10 @@ console. Ctrl+C stops at once; the take in progress is moved to
   least 15 percent of the cue's time: 0.60 s of the 4 s bends, 0.90 s of
   the slow index's 6 s. One bend under that rejects the take. The fast
   index (1 s) is not judged. The straighten is timed the same way down and
-  printed, never judged: the glove's reading falls quickly once a finger
-  starts to open, however slowly the finger moves. The bar is set between
+  printed, never judged: in the one paced sweep of a finger opened slowly
+  on purpose (2026-09-20) the glove's reading fell no slower than in
+  snapped straightens, so its time does not tell a slow opening from a
+  fast one. The bar is set between
   what the recordings show (on 2026-10-13 a whole session's bends took
   0.05 to 0.55 s, at most 0.11 of their cue; the bends of a slow sweep
   paced at 5 s read 1.2 to 3.3 s on the glove, 0.24 of the cue or more),

@@ -36,8 +36,9 @@ glove-only session met every rule of section 4 with bends of 0.05 to
 0.55 s under cues that give 4 and 6 s. The quick check now also rejects a
 take in which a bend the cue gives 2 s or more for took under 15 % of the
 cue's time across the middle of its rise; the straighten is timed and
-reported, not judged, because the glove's reading falls quickly once a
-finger starts to open. Like the other numbers of section 4 this is an
+reported, not judged, because in the one paced sweep of a finger opened
+slowly on purpose (2026-09-20) the glove's reading fell no slower than in
+snapped straightens. Like the other numbers of section 4 this is an
 acquisition gate, not the definition of a slow bend; the measured times
 are in every report. `docs/protocol_formats.md`, section 8, has the rule
 and the recordings its bar was set between.

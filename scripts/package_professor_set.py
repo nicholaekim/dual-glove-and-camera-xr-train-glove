@@ -715,6 +715,19 @@ def _j(row: Dict[str, str], key: str):
         return None
 
 
+# The report's key to its span and cycles columns. A fraction runs from the
+# finger's open-palm reading to its own end of the warm-up: the cued finger's
+# bend on its own when that was usable, else the fist (the report's "range
+# end" rule); the other fingers' end is the fist.
+SPAN_HEADER = ("span = 5th to 95th percentile of the glove fraction over the "
+               "take, 0 = warm-up open palm, 1 = the finger's own end of the "
+               "warm-up: for the cued finger its bend on its own when that "
+               "was usable, else the fist, for the other fingers the fist "
+               "(range end, under Rules in force at the end). cycles "
+               "ev/pk/exp = bend cues / glove curl peaks / the protocol's "
+               "count.")
+
+
 def flexion_report(hand: str, parts: List[Tuple[pc.Session, list, str, str]]
                    ) -> str:
     cam, glove_only = camera_split([part[0] for part in parts])
@@ -725,10 +738,7 @@ def flexion_report(hand: str, parts: List[Tuple[pc.Session, list, str, str]]
             "per handed-in take; the",
             "checker's full output for each session follows, rejected "
             "attempts included and marked.",
-            "span = 5th to 95th percentile of the glove fraction over the "
-            "take, 0 = warm-up open palm,",
-            "1 = warm-up fist. cycles ev/pk/exp = bend cues / glove curl "
-            "peaks / the protocol's count.",
+            ] + wrapped(SPAN_HEADER, "", "") + [
             "Lag is per cycle (median shown) and per take, positive = the "
             "glove trails the camera, only",
             "where the camera followed the finger (camera span >= 0.50)."]
@@ -743,11 +753,7 @@ def flexion_report(hand: str, parts: List[Tuple[pc.Session, list, str, str]]
             "these recordings. One row",
             "per handed-in take; the checker's full output for each session "
             "follows, rejected attempts",
-            "included and marked.",
-            "span = 5th to 95th percentile of the glove fraction over the "
-            "take, 0 = warm-up open palm,",
-            "1 = warm-up fist. cycles ev/pk/exp = bend cues / glove curl "
-            "peaks / the protocol's count.",
+            "included and marked."] + wrapped(SPAN_HEADER, "", "") + [
             "cam span, followed, lag and hyst need a camera beside the glove "
             "and are empty here (no cam)."]
     marks = pc.rule_marks(None)
@@ -1275,9 +1281,12 @@ def speed_rule_lines(packaged: Dict[str, List[pc.Session]]) -> List[str]:
                  "bend-speed rule (it was added on " + pc.SPEED_RULE_SINCE
                  + "): the times are reported as they are, and a cue that "
                  "gave 4 s for a bend does not mean the bend took 4 s. ")
-    text += ("The straighten is never judged: the glove's reading falls "
-             "quickly once a finger starts to open, however slowly the "
-             "finger moves, so its time says little about the movement.")
+    text += ("The straighten is timed and reported, never judged: in the "
+             "one earlier recording of a finger opened slowly on purpose "
+             "(a paced sweep of one finger, 2026-09-20), the glove's "
+             "reading fell no slower than in snapped straightens, so the "
+             "straighten's time is not taken as a measure of the "
+             "movement.")
     return wrapped(text, "  ", "    ")
 
 
@@ -1542,8 +1551,8 @@ def glove_readme_text(packaged: Dict[str, List[pc.Session]],
                    "60 % of its own range from the session warm-up (open "
                    "palm to the finger bent on its own, for sessions recorded "
                    "since 2026-10-01; open palm to fist before); the other "
-                   "four fingers' spans are reported, not failed (the ring "
-                   "drags the middle and little finger along). Cycles are "
+                   "four fingers' spans are reported, not failed (a "
+                   "finger's neighbours can bend with it). Cycles are "
                    "counted from the cues and from the glove curl peaks and "
                    "must agree with each other and with the protocol.",
                    "  ", "    ")] + ([
@@ -1559,8 +1568,8 @@ def glove_readme_text(packaged: Dict[str, List[pc.Session]],
           "    0.6 for the fingers the step flexes; a finger the step leaves "
           "straight fails only when it",
           "    reads flexed (0.6 or more), and between 0.3 and 0.6 it is "
-          "reported as coupling (the ring",
-          "    pulls its neighbours along), not failed. A take passes when "
+          "reported as coupling (a finger's",
+          "    neighbours can bend with it), not failed. A take passes when "
           "every step does."] + ([
               "    The same check on the camera where it is trusted is "
               "reported beside it, so a glove fault",

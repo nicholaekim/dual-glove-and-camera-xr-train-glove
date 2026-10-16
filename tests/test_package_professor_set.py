@@ -2319,7 +2319,8 @@ def test_the_flexion_report_and_readme_carry_the_bend_times_and_the_rule(
             "must take at least 15 % of the cue's time, or the take was "
             "recorded again; the fast index item is not judged.",
             "Every Set B session of this folder was recorded under it.",
-            "The straighten is never judged:",
+            "The straighten is timed and reported, never judged: in the one "
+            "earlier recording of a finger opened slowly on purpose",
             "sensors: glove only, no camera bend-speed rule in force:"):
         assert needle in readme, needle
     # a folder of Set B alone, recorded with the glove alone, says nothing
