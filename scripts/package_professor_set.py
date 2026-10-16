@@ -74,6 +74,13 @@ WHAT GOES IN, AND WHAT DOES NOT
   hold the open, fist and single-finger ends every fraction is taken
   between, and say what the glove numbers are.
 
+  Items not recorded (Sets B and C): a protocol item a hand has no accepted
+  take of is named in SETUP ("Not recorded with ..."), and under each
+  session with what became of its attempts at it (rejected, stopped or
+  skipped by the operator, or not tried) and how the session ended; the
+  Set B item table says "not recorded" beside it. `--not-recorded-reason`
+  adds why, in the README's words after the facts.
+
   Joint angles (Sets B and C, `cam_hand.angle_series`): the movement sets
   are handed in as angles over time, because one summary frame says nothing
   about a movement. `joint_angles\\<take>.csv` has every glove frame of the
@@ -996,22 +1003,146 @@ def wrapped(text: str, first: str = "  ", rest: str = "    ") -> List[str]:
 GLOVE_SETS = (pc.FLEXION, pc.SEQUENCES)
 
 
+def protocol_of(sessions: Sequence[pc.Session]) -> dict:
+    """The protocol the set's sessions were recorded under (the first one
+    that could be read), or {}."""
+    return next((s.protocol for s in sessions if s.protocol), None) or {}
+
+
+def _and(words: Sequence[str]) -> str:
+    """'a', 'a and b', 'a, b and c'."""
+    words = list(words)
+    return (", ".join(words[:-1]) + " and " + words[-1] if len(words) > 1
+            else "".join(words))
+
+
+def not_recorded(sessions: Sequence[pc.Session], proto: dict
+                 ) -> List[Tuple[str, List[str]]]:
+    """The protocol's items, in its order, that some hand of the set has no
+    accepted take of, each with those hands: what the folder lacks."""
+    hands = sorted({s.hand for s in sessions})
+    got = {(t.item, s.hand) for s in sessions for t in accepted(s)}
+    out = []
+    for it in proto.get("items", []):
+        lacking = [h for h in hands if (it["id"], h) not in got]
+        if lacking:
+            out.append((it["id"], lacking))
+    return out
+
+
+def not_recorded_lines(sessions: Sequence[pc.Session], proto: dict,
+                       reason: Optional[str] = None) -> List[str]:
+    """SETUP: the items of the set no take of which is in the folder, by
+    hand, and why, when the build was told (`--not-recorded-reason`)."""
+    missing = not_recorded(sessions, proto)
+    if not missing:
+        return []
+    hands = sorted({s.hand for s in sessions})
+    groups: Dict[Tuple[str, ...], List[str]] = {}
+    for item, lacking in missing:
+        groups.setdefault(tuple(lacking), []).append(item)
+    parts = [("Not recorded with either hand: " if len(hands) > 1
+              and list(lacking) == hands else
+              f"Not recorded with the {_and(lacking)} hand: ") + _and(items)
+             + "." for lacking, items in groups.items()]
+    text = (" ".join(parts) + " How each session's attempts at "
+            + ("it" if len(missing) == 1 else "them")
+            + " ended is under SESSIONS.")
+    if reason:
+        text += " Why: " + reason.strip().rstrip(".") + "."
+    return wrapped(text, "  ", "    ")
+
+
+def _how_ended(take: pc.TakeRef) -> str:
+    """How a rejected attempt ended, in a few words."""
+    reason = take.reason or ""
+    if reason.startswith("interrupted by the operator"):
+        return "stopped by the operator during the take"
+    if reason.startswith("skipped by the operator"):
+        return "skipped by the operator during the take"
+    return "rejected"
+
+
+def session_not_recorded_lines(session: pc.Session) -> List[str]:
+    """SESSIONS: the protocol's items this session has no accepted take of,
+    with what became of its attempts at each, and how the session ended."""
+    proto = session.protocol or {}
+    have = {t.item for t in accepted(session)}
+    lacking = [it["id"] for it in proto.get("items", [])
+               if it["id"] not in have]
+    if not lacking:
+        return []
+    skipped = {x.get("item") for x in (session.meta.get("skipped") or [])
+               if isinstance(x, dict)}
+    parts = []
+    for item in lacking:
+        tries = [t for t in session.takes if t.item == item]
+        if not tries:
+            parts.append(f"{item} (" + ("skipped by the operator"
+                                        if item in skipped else "not tried")
+                         + ")")
+            continue
+        ends: Dict[str, int] = {}
+        for t in tries:
+            ends[_how_ended(t)] = ends.get(_how_ended(t), 0) + 1
+        told = f"{len(tries)} attempt" + ("s" if len(tries) > 1 else "")
+        if len(ends) == 1:
+            told += ", " + ("" if len(tries) == 1 else "both "
+                            if len(tries) == 2 else "all ") + next(iter(ends))
+        else:
+            told += ": " + ", ".join(f"{n} {what}" for what, n in ends.items())
+        parts.append(f"{item} ({told})")
+    text = "not recorded: " + ", ".join(parts)
+    if session.meta.get("stopped"):
+        text += f"; the session ended: {session.meta['stopped']}"
+    return wrapped(text, "    ", "      ")
+
+
+def flexion_item_lines(sessions: Sequence[pc.Session], proto: dict
+                       ) -> List[str]:
+    """Set B's items as the protocol has them, one line each, with the takes
+    handed in per hand, or "not recorded"."""
+    hands = sorted({s.hand for s in sessions})
+    count: Dict[Tuple[str, str], int] = {}
+    for s in sessions:
+        for t in accepted(s):
+            count[(t.item, s.hand)] = count.get((t.item, s.hand), 0) + 1
+    items = [it for it in proto.get("items", [])
+             if it.get("bend_s") is not None]
+    if not items:
+        return []
+    each = proto.get("takes_per_item")
+    lines = wrapped(
+        "Items, as the protocol has them (seconds of each phase of a cycle, "
+        "every phase cued by a beep), and the takes handed in"
+        + (f" (the protocol asks for {each} of each per hand)" if each else "")
+        + ":", "  ", "  ")
+    width = max(len("item"), *(len(it["id"]) for it in items)) + 2
+    lines.append(f"    {'item':<{width}}{'cycles':>6}{'bend':>7}{'hold':>7}"
+                 f"{'straighten':>12}{'rest':>7}   handed in")
+    for it in items:
+        got = [f"{h} {count.get((it['id'], h), 0)}" for h in hands]
+        done = any(count.get((it["id"], h)) for h in hands)
+        lines.append(
+            f"    {it['id']:<{width}}{it.get('cycles', '-'):>6}"
+            f"{it['bend_s']:>7g}{it.get('hold_s', 0):>7g}"
+            f"{it.get('straighten_s', 0):>12g}{it.get('rest_s', 0):>7g}   "
+            + (", ".join(got) if done else "not recorded"))
+    return lines
+
+
 def setup_lines(kind: str, sessions: List[pc.Session],
-                info: Optional[dict] = None) -> List[str]:
+                info: Optional[dict] = None,
+                not_recorded_reason: Optional[str] = None) -> List[str]:
     """SETUP lines of one glove set (Set A's are the grasp README's)."""
     hands = ", ".join(sorted({s.hand for s in sessions})) or "-"
-    proto = next((s.protocol for s in sessions if s.protocol), None) or {}
+    proto = protocol_of(sessions)
     cam, glove_only = camera_split(sessions)
     only_note = (wrapped("Glove only, no camera: session "
                          + ", ".join(s.name for s in glove_only) + ".",
                          "  ", "    ") if cam and glove_only else [])
+    missing = not_recorded_lines(sessions, proto, not_recorded_reason)
     if kind == pc.FLEXION:
-        items = [f"{it['id']} ({it.get('cycles')} cycles, bend "
-                 f"{it.get('bend_s'):g} s, hold {it.get('hold_s'):g} s, "
-                 f"straighten {it.get('straighten_s'):g} s, rest "
-                 f"{it.get('rest_s'):g} s)"
-                 for it in proto.get("items", [])
-                 if it.get("bend_s") is not None]
         out = [
             f"  Hardware: gloves on + camera ({hands} hand, one hand at a "
             "time, the other resting on the",
@@ -1031,9 +1162,8 @@ def setup_lines(kind: str, sessions: List[pc.Session],
             "every cycle was cued by a beep and is timestamped in the "
             ".events.jsonl file.", "  ", "  ")
         out += only_note
-        if items:
-            out += wrapped("Items: " + "; ".join(items) + ".", "  ", "    ")
-        return out
+        out += flexion_item_lines(sessions, proto)
+        return out + missing
     hold = proto.get("hold_s", 2.5)
     window = proto.get("check_window_s", 1.5)
     return [
@@ -1046,7 +1176,7 @@ def setup_lines(kind: str, sessions: List[pc.Session],
         "per sequence, recorded as three",
         "  rounds in a shuffled order (the seed is in the session's own "
         "metadata).",
-    ]
+    ] + missing
 
 
 def joint_frame_contents(kind: str, info: dict) -> List[str]:
@@ -1275,12 +1405,15 @@ def angle_section(packaged: Dict[str, List[pc.Session]],
 
 def glove_readme_text(packaged: Dict[str, List[pc.Session]],
                       infos: Dict[str, dict], operator: str, built: str,
-                      standalone: bool = True) -> str:
+                      standalone: bool = True,
+                      not_recorded_reason: Optional[str] = None) -> str:
     """The README of Sets B and C, the glove recordings.
 
     `standalone` is the whole README of a folder without Set A; otherwise
     the text is the second part of the folder's README, after the grasp
     set's own twenty sections (`leap_hand.grasp_handin.readme_text`).
+    `not_recorded_reason`: why the items the folder has no take of were not
+    recorded (`--not-recorded-reason`), printed after them in SETUP.
     """
     L: List[str] = []
     sessions = [s for k in GLOVE_SETS for s in packaged.get(k, [])]
@@ -1362,8 +1495,11 @@ def glove_readme_text(packaged: Dict[str, List[pc.Session]],
     for kind in GLOVE_SETS:
         if packaged.get(kind):
             L.append(f"{SET_TITLES[kind]}:")
-            L += setup_lines(kind, packaged[kind], infos.get(kind))
+            L += setup_lines(kind, packaged[kind], infos.get(kind),
+                             not_recorded_reason)
             L.append("")
+    missing_any = any(not_recorded(packaged[k], protocol_of(packaged[k]))
+                      for k in GLOVE_SETS if packaged.get(k))
 
     L += ["SESSIONS", "-" * 78]
     for kind in GLOVE_SETS:
@@ -1390,6 +1526,7 @@ def glove_readme_text(packaged: Dict[str, List[pc.Session]],
             L.append(f"    handed in: {len(accepted(s))} take(s) "
                      f"({_item_counts(s)}); {n_rej} rejected attempt(s) kept "
                      "back with their reasons")
+            L += session_not_recorded_lines(s)
     for kind in GLOVE_SETS:
         for m in infos.get(kind, {}).get("missing", []):
             L.append(f"  not handed in: {m}")
@@ -1401,16 +1538,15 @@ def glove_readme_text(packaged: Dict[str, List[pc.Session]],
           "continuous values are always kept in the reports, and no fixed "
           "number is the definition of",
           "a correct movement.",
-          "  Set B: the cued finger's glove reading spans at least 60 % of "
-          "its own range from the",
-          "    session warm-up (open palm to the finger bent on its own, for "
-          "sessions recorded since",
-          "    2026-10-01; open palm to fist before); the other four fingers' "
-          "spans are reported, not failed (the ring drags",
-          "    the middle and little finger along). Cycles are counted from "
-          "the cues and from the glove",
-          "    curl peaks and must agree with each other and with the "
-          "protocol."] + ([
+          *wrapped("Set B: the cued finger's glove reading spans at least "
+                   "60 % of its own range from the session warm-up (open "
+                   "palm to the finger bent on its own, for sessions recorded "
+                   "since 2026-10-01; open palm to fist before); the other "
+                   "four fingers' spans are reported, not failed (the ring "
+                   "drags the middle and little finger along). Cycles are "
+                   "counted from the cues and from the glove curl peaks and "
+                   "must agree with each other and with the protocol.",
+                   "  ", "    ")] + ([
               "    Where the camera followed the finger (camera span at "
               "least 0.50), the transfer curve,",
               "    hysteresis and lag are reported per cycle and per take."]
@@ -1437,8 +1573,11 @@ def glove_readme_text(packaged: Dict[str, List[pc.Session]],
               "operator's movement by a second",
               "    sensor. sequence_check.csv has every fraction, the "
               "pass/fail and the coupling per step."]) + [
-          "  Failed takes were redone in the same session; the failed "
-          "attempts are not in this folder.",
+          *wrapped("Failed takes were redone in the same session"
+                   + (", except for the items SETUP lists as not recorded"
+                      if missing_any else "")
+                   + "; the recordings of the failed attempts are not in "
+                   "this folder.", "  ", "    "),
           "  fraction = (open - curl) / (open - fist), with open and fist "
           "the finger's own medians from",
           "    the session warm-up (3 s open palm, 3 s fist); 0 = open palm, "
@@ -1544,13 +1683,15 @@ def tool_version() -> str:
 
 def readme_text(packaged: Dict[str, List[pc.Session]], infos: Dict[str, dict],
                 operator: str, built: str, command: str = "",
-                thresholds: Optional[dict] = None) -> str:
+                thresholds: Optional[dict] = None,
+                not_recorded_reason: Optional[str] = None) -> str:
     """The folder's README: the grasp set's twenty sections when Set A is in
     the folder, then the glove sets' part when Sets B or C are."""
     grasp_info = infos.get(pc.GRASPS)
     gloves = any(packaged.get(k) for k in GLOVE_SETS)
     if grasp_info is None or grasp_info.get("set") is None:
-        return glove_readme_text(packaged, infos, operator, built)
+        return glove_readme_text(packaged, infos, operator, built,
+                                 not_recorded_reason=not_recorded_reason)
     gs = grasp_info["set"]
     # MOCK DATA at the top when the grasp session OR any transition session
     # of the build is mock (`grasp_handin.add_transition_session` names
@@ -1564,8 +1705,9 @@ def readme_text(packaged: Dict[str, List[pc.Session]], infos: Dict[str, dict],
         command or "python scripts/rebuild_grasp_set.py",
         tool=tool_version(), mock=mock, thresholds=thresholds)
     if gloves:
-        text += "\n" + glove_readme_text(packaged, infos, operator, built,
-                                         standalone=False)
+        text += "\n" + glove_readme_text(
+            packaged, infos, operator, built, standalone=False,
+            not_recorded_reason=not_recorded_reason)
     return text
 
 
@@ -1767,6 +1909,11 @@ def main(argv=None) -> int:
     p.add_argument("--operator", default=None,
                    help="operator name for the README (default: from "
                         "session.json)")
+    p.add_argument("--not-recorded-reason", default=None,
+                   help="why the protocol items of Sets B and C that have no "
+                        "take in the folder were not recorded; the README "
+                        "prints it after naming them (they are named either "
+                        "way)")
     p.add_argument("--participant", default="P01",
                    help="participant id written in the transition table "
                         "(default: P01)")
@@ -1823,7 +1970,7 @@ def main(argv=None) -> int:
         + [f'"{a}"' if " " in a else a for a in rebuild_arguments(
             argv if argv is not None else sys.argv[1:])])
     fresh = readme_text(packaged, infos, operator, built, command,
-                        thresholds)
+                        thresholds, args.not_recorded_reason)
     readme = keep_unchanged_readme(args.out, fresh)
     plan.append(Output(Path("README.txt"),
                        write=lambda dest: dest.write_text(readme,

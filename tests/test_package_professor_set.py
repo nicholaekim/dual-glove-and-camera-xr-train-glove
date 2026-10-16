@@ -2389,3 +2389,94 @@ def test_a_check_csv_from_before_the_bend_times_is_not_reused(tmp_path,
                if x.startswith("  index_left_take1"))
     assert re.fullmatch(r"1\.[67]\d/4", row.split()[4]), row
     assert "checked while packaging (fixed bands)" in report
+
+
+# --- items with no take: named, with what became of the attempts -------------
+
+FOUR_ITEMS = dict(fx.FLEXION_PROTOCOL, items=fx.FLEXION_ITEMS + [dict(
+    fx.FLEXION_ITEMS[0], id="pinky", label="pinky", finger="pinky")])
+REASON = "the operator chose to record the first items only"
+
+
+def _missing_items_folder(tmp_path, reason=REASON):
+    """Left: index kept, middle stopped by the operator during its one
+    attempt, ring and pinky never tried, the session stopped (Ctrl+C).
+    Right: index and middle kept, ring rejected once and then skipped during
+    its second attempt, pinky skipped before it began."""
+    left = fx.make_flexion_session(tmp_path / "l", [
+        fx.FlexTake("index"),
+        fx.FlexTake("middle", accepted=False, reason="interrupted by the "
+                    "operator (Ctrl+C) during the take")],
+        camera=False, stills=False, protocol=FOUR_ITEMS,
+        meta={"stopped": "interrupted by the operator (Ctrl+C)"})
+    right = fx.make_flexion_session(tmp_path / "r", [
+        fx.FlexTake("index"), fx.FlexTake("middle"),
+        fx.FlexTake("ring", peaks=[0.3] * 5, accepted=False,
+                    reason="span too small"),
+        fx.FlexTake("ring", accepted=False,
+                    reason="skipped by the operator (s) during the take")],
+        hand="right", camera=False, stills=False, protocol=FOUR_ITEMS,
+        meta={"skipped": [{"item": "ring", "at": "2026-09-28T14:20:00",
+                           "take": 1},
+                          {"item": "pinky", "at": "2026-09-28T14:21:00",
+                           "take": 1}]})
+    out = tmp_path / "out"
+    args = ["--out", str(out), "--flexion", str(left), str(right),
+            "--operator", "N Kim"]
+    assert pkg.main(args + (["--not-recorded-reason", reason]
+                            if reason else [])) == 0
+    return (out / "README.txt").read_text(encoding="utf-8")
+
+
+def test_items_with_no_take_are_named_with_their_attempts(tmp_path):
+    text = _missing_items_folder(tmp_path)
+    flat = " ".join(text.split())
+    assert ("Not recorded with the left hand: middle. Not recorded with "
+            "either hand: ring and pinky. How each session's attempts at "
+            "them ended is under SESSIONS. Why: the operator chose to record "
+            "the first items only.") in flat
+    setup = text[text.index("\nSETUP\n"):text.index("\nSESSIONS\n")]
+    rows = {line.split()[0]: line for line in setup.splitlines()
+            if line.startswith("    ") and line.split()[0] in
+            ("index", "middle", "ring", "pinky")}
+    assert rows["index"].endswith("   left 1, right 1")
+    assert rows["middle"].endswith("   left 0, right 1")
+    assert rows["ring"].endswith("   not recorded")
+    assert rows["pinky"].endswith("   not recorded")
+    assert re.search(r"^    index +5 +1 +0\.5 +1 +0\.5   ", rows["index"]), \
+        rows["index"]
+    assert ("not recorded: middle (1 attempt, stopped by the operator during "
+            "the take), ring (not tried), pinky (not tried); the session "
+            "ended: interrupted by the operator (Ctrl+C)") in flat
+    assert ("not recorded: ring (2 attempts: 1 rejected, 1 skipped by the "
+            "operator during the take), pinky (skipped by the operator)"
+            ) in flat
+    assert ("Failed takes were redone in the same session, except for the "
+            "items SETUP lists as not recorded; the recordings of the failed "
+            "attempts are not in this folder.") in flat
+    assert all(len(line) <= 96 for line in setup.splitlines()), setup
+
+
+def test_without_a_reason_the_items_are_still_named(tmp_path):
+    flat = " ".join(_missing_items_folder(tmp_path, reason=None).split())
+    assert "Not recorded with either hand: ring and pinky." in flat
+    assert "Why:" not in flat
+
+
+def test_a_set_with_every_item_recorded_says_nothing_of_the_kind(tmp_path):
+    one = dict(fx.FLEXION_PROTOCOL, items=fx.FLEXION_ITEMS[:1])
+    session = fx.make_flexion_session(
+        tmp_path / "s", [fx.FlexTake("index", peaks=[0.3] * 5, accepted=False,
+                                     reason="span too small"),
+                         fx.FlexTake("index")],
+        camera=False, stills=False, protocol=one)
+    out = tmp_path / "out"
+    assert pkg.main(["--out", str(out), "--flexion", str(session),
+                     "--not-recorded-reason", "unused"]) == 0
+    text = (out / "README.txt").read_text(encoding="utf-8")
+    flat = " ".join(text.split())
+    assert "ot recorded" not in flat and "Why:" not in flat
+    assert ("Failed takes were redone in the same session; the recordings of "
+            "the failed attempts are not in this folder.") in flat
+    setup = text[text.index("\nSETUP\n"):text.index("\nSESSIONS\n")]
+    assert re.search(r"^    index +5 .*   left 1$", setup, re.M), setup

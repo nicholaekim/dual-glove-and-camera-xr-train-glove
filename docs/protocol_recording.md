@@ -251,6 +251,19 @@ of a digit are one measurement spread over its joints by XR Trainer's hand
 model, so the files show how far one finger goes along with another, not how
 the joints of one finger depend on each other.
 
+An item of the protocol that a hand has no accepted take of is named in the
+README whether or not anything is said about it: the Set B item table says
+"not recorded" beside it, SETUP names it, and each session's lines say what
+became of its attempts at it (rejected, stopped or skipped by the operator,
+or not tried) and how the session ended. When an item was left out on
+purpose, say why with `--not-recorded-reason`; the README prints it after
+those facts. On 2026-10-15 the slow and fast index were left out of Set B
+on both hands:
+
+```powershell
+.venv\Scripts\python.exe scripts\package_professor_set.py --out "..\xr trainer\glove flexion and sequences 2026-10-15" --flexion recordings\protocol\finger_flexion\20261015_204941_left recordings\protocol\finger_flexion\20261015_210752_right --sequences recordings\protocol\sequences\20261015_212038_left recordings\protocol\sequences\20261015_214026_right --operator "N Kim" --not-recorded-reason "the operator chose to record the five items at the 4 s pace only, not the slow (6 s) or the fast (1 s) index"
+```
+
 ## A video of each take
 
 **No hardware.** Nothing films the hand in a glove-only session. To see a

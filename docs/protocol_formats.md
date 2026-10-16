@@ -973,6 +973,20 @@ camera reference, a transfer curve, hysteresis or lag; a folder that mixes
 the two kinds names the glove-only sessions; every session's lines carry
 `sensors: glove only, no camera` or `sensors: glove and Ultraleap camera`.
 
+Items with no take (added 2026-10-16). Set B's SETUP lists the protocol's
+items in a table, one line each (cycles; seconds of bend, hold, straighten
+and rest; the takes handed in per hand, or "not recorded"). For either set,
+a protocol item that a hand has no accepted take of is named in SETUP
+("Not recorded with either hand: ..." or "with the <hand> hand"), and under
+the session in SESSIONS with what became of each attempt at it: "rejected",
+"stopped by the operator during the take" (reason "interrupted by the
+operator (Ctrl+C) during the take"), "skipped by the operator during the
+take", or, with no attempt, "skipped by the operator" (session.json
+`skipped`) or "not tried"; then how the session ended (`stopped`), when it
+was stopped. `--not-recorded-reason` adds "Why: ..." after the SETUP line.
+QUALITY RULES then says failed takes were redone "except for the items SETUP
+lists as not recorded".
+
 `<set>\<hand>\joint_angles\<take>.csv` (`cam_hand.angle_series`), one row
 per glove line of the recorded hand in the take's glove file, in time order:
 
