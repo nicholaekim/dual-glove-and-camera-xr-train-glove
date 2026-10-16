@@ -203,6 +203,9 @@ class FlexTake:
     camera_follows: bool = True
     cycles: Optional[int] = None              # cues written (default: item's)
     camera_label: Optional[str] = None        # tracker's label if not the hand
+    # seconds into its phase at which a bend (or a straighten) is over, the
+    # finger then waiting; None: it eases through the whole phase
+    bend_in: Optional[float] = None
 
 
 @dataclass
@@ -245,10 +248,12 @@ def write_warmup(session: Path, hand: str, camera: bool, t0: float) -> None:
 
 
 def write_session_json(session: Path, kind: str, hand: str, proto_path: Path,
-                       camera: bool, takes: List[dict], operator="N Kim"
-                       ) -> None:
+                       camera: bool, takes: List[dict], operator="N Kim",
+                       meta: Optional[dict] = None) -> None:
+    """`meta`: more keys of session.json (speed_check, time_scale)."""
     data = proto_path.read_bytes()
     (session / "session.json").write_text(json.dumps({
+        **(meta or {}),
         "set": kind, "protocol_file": str(proto_path),
         "protocol_name": kind, "protocol_version": 1,
         "protocol_sha256": hashlib.sha256(data).hexdigest(),
@@ -283,8 +288,10 @@ def _files(name: str, camera: bool, stills: bool) -> dict:
 
 
 def make_flexion_session(root: Path, takes: List[FlexTake], hand="left",
-                         camera=True, stills=True, protocol=None) -> Path:
-    """A finger_flexion session: 5 paced cycles per take, glove trailing."""
+                         camera=True, stills=True, protocol=None,
+                         meta=None) -> Path:
+    """A finger_flexion session: 5 paced cycles per take, glove trailing.
+    `meta`: more keys for its session.json."""
     session = _session_dir(root, "finger_flexion", hand)
     proto_path = write_protocol(root, protocol or FLEXION_PROTOCOL)
     items = {it["id"]: it for it in (protocol or FLEXION_PROTOCOL)["items"]}
@@ -324,20 +331,20 @@ def make_flexion_session(root: Path, takes: List[FlexTake], hand="left",
         t_end = start + cycles * period + 0.3
 
         def state(tt, peaks=peaks, it=it, start=start, period=period,
-                  cycles=cycles):
+                  cycles=cycles, quick=spec.bend_in):
             x = tt - start
             if x < 0 or x >= cycles * period:
                 return 0.0
             c, u = int(x // period), x % period
             p = peaks[c] if c < len(peaks) else 1.0
             if u < it["bend_s"]:
-                return p * smooth(u / it["bend_s"])
+                return p * smooth(u / (quick or it["bend_s"]))
             u -= it["bend_s"]
             if u < it["hold_s"]:
                 return p
             u -= it["hold_s"]
             if u < it["straighten_s"]:
-                return p * (1.0 - smooth(u / it["straighten_s"]))
+                return p * (1.0 - smooth(u / (quick or it["straighten_s"])))
             return 0.0
 
         def fracs(tt, spec=spec, finger=finger, state=state, cam=False):
@@ -378,7 +385,7 @@ def make_flexion_session(root: Path, takes: List[FlexTake], hand="left",
                                    _files(name, camera, stills)))
         t = t_end + 5.0
     write_session_json(session, "finger_flexion", hand, proto_path, camera,
-                       entries)
+                       entries, meta=meta)
     return session
 
 
@@ -1001,6 +1008,183 @@ def test_a_summary_frame_fitted_as_the_other_hand_fails_the_grasp(tmp_path):
     assert rows[3]["verdict"] == pc.PASS, rows[3]["failures"]
 
 
+def add_forming(session: Path, prefix: str, coaching: Optional[dict],
+                frames: int = 12) -> str:
+    """Give one take of a `make_grasp_session` a forming file, the way the
+    recorder writes it since 2026-10-02: forming/<take>.jsonl, listed in
+    session.json and the meta's `files`, numbers in the meta's `coaching`
+    (`coaching` None: the key left out). Returns the take's name."""
+    data = json.loads((session / "session.json").read_text(encoding="utf-8"))
+    entry = next(t for t in data["takes"] if t["name"].startswith(prefix))
+    name = entry["name"]
+    leap = [json.loads(x) for x in (session / entry["files"]["leap"]).read_text(
+        encoding="utf-8").splitlines()]
+    write_jsonl(session / "forming" / f"{name}.jsonl", leap[:frames])
+    entry["files"]["forming"] = f"forming/{name}.jsonl"
+    (session / "session.json").write_text(json.dumps(data, indent=1),
+                                          encoding="utf-8")
+    meta_path = session / entry["files"]["meta"]
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["files"] = {"glove": None, "events": None, **entry["files"]}
+    if coaching is not None:
+        meta["coaching"] = coaching
+    meta_path.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+    return name
+
+
+def check_cli():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "check_protocol_cli_forming", REPO / "scripts" / "check_protocol.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    return cli
+
+
+def test_forming_takes_need_their_transition_and_old_takes_pass_as_before(
+        tmp_path, capsys):
+    """A take with a forming file must say what was measured from it
+    (coaching.transition_s present, null allowed, and forming_frames >= 1);
+    every take without one, as recorded before 2026-10-02, is unchanged."""
+    session = make_grasp_session(tmp_path, rejected=False)
+    cli = check_cli()
+    before = pc.check_session(session)
+    assert cli.check_forming(before) == 0
+    assert all(r["verdict"] == pc.PASS for r in before.rows)
+
+    timed = add_forming(session, "cylindrical_left_take1",
+                        {"transition_s": 0.84, "forming_frames": 12})
+    unsettled = add_forming(session, "cylindrical_left_take2",
+                            {"transition_s": None, "forming_frames": 12})
+    untimed = add_forming(session, "tip_pinch_left_take1",
+                          {"forming_frames": 12})
+    empty = add_forming(session, "tip_pinch_left_take2",
+                        {"transition_s": None, "forming_frames": 0})
+    no_coaching = add_forming(session, "tip_pinch_left_take3", None)
+    check = pc.check_session(session)
+    assert cli.check_forming(check) == 5
+    rows = {r["name"]: r for r in check.rows}
+    assert rows[timed]["verdict"] == pc.PASS
+    assert ("transition 0.84 s, close cue to settled (12 forming frames)"
+            in rows[timed]["notes"])
+    assert rows[unsettled]["verdict"] == pc.PASS
+    assert any(n.startswith("transition none") for n in rows[unsettled]["notes"])
+    assert rows[untimed]["verdict"] == pc.FAIL
+    assert ("forming file, but no coaching.transition_s in the meta"
+            in rows[untimed]["failures"])
+    assert rows[empty]["verdict"] == pc.FAIL
+    assert any("forming_frames is 0" in f for f in rows[empty]["failures"])
+    assert rows[no_coaching]["verdict"] == pc.FAIL
+    # the old takes, untouched
+    for name, r in rows.items():
+        if name.startswith(("cylindrical_left_take3",)):
+            assert r["verdict"] == pc.PASS and not any(
+                "transition" in n for n in r["notes"])
+    assert check.exit_code == 1
+
+    # the command line: the rule, the notes in check.csv, the exit code
+    assert cli.main([str(session)]) == 1
+    text = capsys.readouterr().out
+    assert "3 accepted take(s) fail a rule" in text
+    assert "forming   5 take(s) with a forming file" in text
+    with open(session / "check.csv", encoding="utf-8", newline="") as f:
+        notes = {r["name"]: r["notes"] for r in csv.DictReader(f)}
+    assert "transition 0.84 s" in notes[timed]
+
+
+def test_forming_check_passes_a_null_transition_with_its_note_and_asks_for_a_recompute(
+        tmp_path, capsys):
+    """The peak-anchored rule's metas: a null transition with its note is an
+    answer, not a failure, and the note is in the take's notes; a number
+    with a note keeps both. A meta from the first rule (transition_s, but
+    no peak, last move or note) passes too, with "recompute needed" and
+    the command."""
+    session = make_grasp_session(tmp_path, rejected=False)
+    cli = check_cli()
+    rule = {"speed_mm_s": 20.0, "window_s": 0.3, "step_s": 0.1,
+            "move_speed_mm_s": 50.0}
+    closed = add_forming(session, "cylindrical_left_take1", {
+        "transition_s": None, "peak_speed_mm_s": 43.4, "peak_at_s": 0.146,
+        "last_move_s": None, "transition_rule": rule, "forming_frames": 12,
+        "transition_note": "no close after the cue (peak 43 mm/s): the hand "
+                           "was already in the grasp"})
+    adjusted = add_forming(session, "cylindrical_left_take2", {
+        "transition_s": 2.147, "peak_speed_mm_s": 268.1, "peak_at_s": 1.68,
+        "last_move_s": 4.295, "transition_rule": rule, "forming_frames": 12,
+        "transition_note": "settled, then moved again at 3.10 s"})
+    unsettled = add_forming(session, "cylindrical_left_take3", {
+        "transition_s": None, "peak_speed_mm_s": 150.0, "peak_at_s": 0.3,
+        "last_move_s": 3.9, "transition_rule": rule, "forming_frames": 12,
+        "transition_note": "never settled before the hold"})
+    first_rule = add_forming(session, "tip_pinch_left_take1",
+                             {"transition_s": 0.18, "forming_frames": 12})
+    check = pc.check_session(session)
+    assert cli.check_forming(check) == 4
+    rows = {r["name"]: r for r in check.rows}
+    for name in (closed, adjusted, unsettled, first_rule):
+        assert rows[name]["verdict"] == pc.PASS, rows[name]["failures"]
+    assert ("transition none: no close after the cue (peak 43 mm/s): the hand "
+            "was already in the grasp (12 forming frames)") in rows[closed]["notes"]
+    assert ("transition 2.15 s, close cue to settled (12 forming frames); "
+            "settled, then moved again at 3.10 s") in rows[adjusted]["notes"]
+    assert ("transition none: never settled before the hold (12 forming "
+            "frames)") in rows[unsettled]["notes"]
+    assert not any("recompute" in n for name in (closed, adjusted, unsettled)
+                   for n in rows[name]["notes"])
+    (stale,) = [n for n in rows[first_rule]["notes"] if "recompute" in n]
+    assert stale.startswith("recompute needed: no coaching.peak_speed_mm_s, "
+                            "last_move_s, transition_note")
+    assert "scripts/leap/recompute_transition.py" in stale
+    assert "transition 0.18 s, close cue to settled (12 forming frames)" in (
+        rows[first_rule]["notes"])
+    assert check.exit_code == 0
+    assert cli.main([str(session)]) == 0
+    text = capsys.readouterr().out
+    assert "0 accepted take(s) fail a rule" in text
+    assert "1 take(s) timed by the first rule: recompute needed, not a failure" in text
+
+
+def test_forming_check_passes_a_take_kept_after_a_loss_while_forming(
+        tmp_path, capsys):
+    """The recorder's rules of 2026-10-07 keep a take whose hand was lost
+    while forming and found again: its forming file is marked and its meta
+    has no transition_s, with the note saying why. That is an answer, not a
+    failure, and not a take to recompute; the note is in the take's notes."""
+    from leap_hand import transition as tr
+
+    session = make_grasp_session(tmp_path, rejected=False)
+    cli = check_cli()
+    rule = {"speed_mm_s": 20.0, "window_s": 0.3, "step_s": 0.1,
+            "move_speed_mm_s": 50.0}
+    name = add_forming(session, "cylindrical_left_take1", {
+        "transition_s": None, "peak_speed_mm_s": None, "peak_at_s": None,
+        "last_move_s": None, "transition_rule": rule, "forming_frames": 12,
+        "transition_note": tr.lost_note(1), "forming_lost_count": 1})
+    path = session / "forming" / f"{name}.jsonl"
+    rows = [json.loads(x) for x in path.read_text(encoding="utf-8").splitlines()]
+    write_jsonl(path, [dict(r, forming_lost_count=1) for r in rows])
+    check = pc.check_session(session)
+    assert cli.check_forming(check) == 1
+    row = next(r for r in check.rows if r["name"] == name)
+    assert row["verdict"] == pc.PASS, row["failures"]
+    assert (f"transition none: {tr.lost_note(1)} (12 forming frames)"
+            in row["notes"])
+    assert not any("recompute" in n for n in row["notes"])
+    assert check.exit_code == 0
+    assert cli.main([str(session)]) == 0
+    assert "0 accepted take(s) fail a rule" in capsys.readouterr().out
+
+
+def test_forming_check_leaves_a_session_without_forming_files_alone(tmp_path,
+                                                                     capsys):
+    session = make_grasp_session(tmp_path)
+    cli = check_cli()
+    assert cli.main([str(session)]) == 0
+    text = capsys.readouterr().out
+    assert "0 accepted take(s) fail a rule" in text
+    assert "forming file" not in text and "transition" not in text
+
+
 def test_step_window_keeps_its_share_of_a_scaled_hold():
     from types import SimpleNamespace
     t = 1000.0
@@ -1160,3 +1344,199 @@ def test_todays_real_set_b_sessions_check_as_before():
         assert not any(pc.thumb_in_degrees(w)
                        for w in check.session.warmups.values())
         assert not (REAL_SET_B / name / "warmup_").exists()
+
+
+# --- bend speed (the rule of 2026-10-13) --------------------------------------------
+from cam_hand import recording_protocol as rp  # noqa: E402
+
+SLOW_PROTOCOL = {
+    "name": "finger_flexion", "version": 1, "description": "test",
+    "takes_per_item": 1,
+    "items": [{"id": f, "label": f, "finger": f, "cycles": 2, "bend_s": 4.0,
+               "hold_s": 1.0, "straighten_s": 4.0, "rest_s": 1.0}
+              for f in ("index", "ring")]}
+SNAPPED = ("2 of 2 bend(s) took 0.13 s, a 4 s bend cue needs 0.60 s")
+RULE_TEXT = ("bend-speed rule in force: a bend the cue gives 2 s or more for "
+             "must take at least 15 % of the cue's time to go from 20 % to "
+             "80 % of its own rise; the straighten is timed, never judged")
+
+
+def _slow_session(root, rule, camera=False):
+    """Two takes under 4 s bend cues: the index moves for the whole cue, the
+    ring is fully bent 0.3 s into it. `rule`: the session's speed_check, or
+    "absent" for a session.json from before the key existed."""
+    meta = {} if rule == "absent" else {"speed_check": rule}
+    return make_flexion_session(
+        root, [FlexTake("index"), FlexTake("ring", bend_in=0.3)],
+        camera=camera, stills=False, protocol=SLOW_PROTOCOL, meta=meta)
+
+
+def test_under_the_speed_rule_a_snapped_bend_fails_the_take(tmp_path):
+    check = pc.check_session(_slow_session(tmp_path, rp.speed_rule()))
+    index, ring = check.rows
+    assert index["verdict"] == pc.PASS and index["failures"] == []
+    assert ring["verdict"] == pc.FAIL
+    assert ring["failures"] == ["ring bent too fast: " + SNAPPED]
+    for row in (index, ring):
+        assert row["speed_rule"] == "in force"
+        assert row["bend_cue_s"] == 4.0 and row["straighten_cue_s"] == 4.0
+        assert len(row["bend_times_s"]) == 2 == row["cycles_from_peaks"]
+        assert len(row["straighten_times_s"]) == 2
+        assert row["notes"] == []
+    # the fixture hand eases in and out of a 4 s bend: 0.43 of it between
+    # the marks; the snapped one the same share of its 0.3 s
+    assert index["bend_time_median_s"] == pytest.approx(1.70, abs=0.05)
+    assert index["straighten_time_median_s"] == pytest.approx(1.70, abs=0.05)
+    assert ring["bend_time_median_s"] == pytest.approx(0.128, abs=0.02)
+    assert ring["bend_times_s"] == pytest.approx([0.128] * 2, abs=0.02)
+    text = pc.render_text(check)
+    assert f"  speed     {RULE_TEXT}\n" in text
+    assert ("  bend times (s), 20 to 80 % of each bend's rise: 0.13 0.13; the "
+            "4 s cue needs 0.60 (rule in force)") in text
+    assert "  straighten times (s), back down across 20 to 80 %: " in text
+    assert "; reported, never judged" in text
+    assert "      fails: ring bent too fast: " + SNAPPED in text
+    table = [x for x in text.splitlines() if x.lstrip().startswith("take ")]
+    assert table[0].rstrip().endswith("lag ms  bend s  open s")
+    assert "  bend s, open s  the median over the take's counted bends" in text
+    # check.csv carries the times, and reads back as current
+    csv_path, _txt, _text = pc.write_check(check, tmp_path / "out")
+    rows = pc.read_check_csv(csv_path)
+    assert {"speed_rule", "bend_cue_s", "bend_times_s", "bend_time_median_s",
+            "straighten_cue_s", "straighten_times_s",
+            "straighten_time_median_s"} <= set(rows[0])
+    assert json.loads(rows[1]["bend_times_s"]) == ring["bend_times_s"]
+    assert rows[1]["speed_rule"] == "in force" and rows[1]["bend_cue_s"] == "4"
+    assert pc.check_is_current(check.session, rows)
+    # one written before the columns existed is not current
+    older = [{k: v for k, v in r.items() if "bend" not in k
+              and "straighten" not in k and k != "speed_rule"} for r in rows]
+    assert not pc.check_is_current(check.session, older)
+
+
+@pytest.mark.parametrize("rule", [None, "absent"])
+def test_without_the_rule_the_same_take_passes_and_a_note_says_so(tmp_path,
+                                                                  rule):
+    """A session recorded with --no-speed-check, and one from before the
+    rule existed: the verdicts are what they were, the times are there, and
+    a note says which bends today's rule would have refused."""
+    check = pc.check_session(_slow_session(tmp_path, rule))
+    index, ring = check.rows
+    assert index["verdict"] == ring["verdict"] == pc.PASS
+    assert ring["failures"] == [] and index["notes"] == []
+    assert ring["notes"] == [
+        "bend speed not judged (this session has no speed rule): " + SNAPPED
+        + " under the rule of 2026-10-13"]
+    assert index["speed_rule"] == ring["speed_rule"] == "not in force"
+    assert ring["bend_time_median_s"] == pytest.approx(0.128, abs=0.02)
+    text = pc.render_text(check)
+    assert ("  speed     no bend-speed rule in this session (it was recorded "
+            "before the rule was added on 2026-10-13, or with "
+            "--no-speed-check)") in text
+    assert "0.13 0.13; not judged (no speed rule in this session; the rule " \
+           "of 2026-10-13 asks 0.60 of a 4 s cue)" in text
+    assert "; not judged (no speed rule in this session)\n" in text  # index
+    assert "Every accepted take passes." in text
+
+
+def test_a_fast_cue_is_not_judged_and_a_scaled_run_is_judged_as_the_real_one(
+        tmp_path):
+    # the stock fixture items give 1 s for a bend: not slow cues
+    session = make_flexion_session(
+        tmp_path / "fast", [FlexTake("index", bend_in=0.05)], camera=False,
+        stills=False, meta={"speed_check": rp.speed_rule()})
+    (row,) = pc.check_session(session).rows
+    assert row["verdict"] == pc.PASS and row["speed_rule"] == "not a slow cue"
+    assert row["notes"] == [] and max(row["bend_times_s"]) < 0.1
+    # the same 1 s cues in a run at a quarter of the time are 4 s cues
+    session = make_flexion_session(
+        tmp_path / "quarter", [FlexTake("index", bend_in=0.05)],
+        camera=False, stills=False,
+        meta={"speed_check": rp.speed_rule(), "time_scale": 0.25})
+    (row,) = pc.check_session(session).rows
+    assert row["verdict"] == pc.FAIL and row["speed_rule"] == "in force"
+    assert row["failures"][0].startswith("index bent too fast: 5 of 5 bend(s)")
+    assert row["failures"][0].endswith("a 1 s bend cue needs 0.15 s")
+
+
+def test_the_rule_is_the_sessions_own_numbers(tmp_path):
+    """A session judged under a looser rule than today's stays judged under
+    it: the checker reads the numbers from session.json, not the code."""
+    looser = dict(rp.speed_rule(), min_bend_share=0.02)
+    check = pc.check_session(_slow_session(tmp_path, looser))
+    assert [r["verdict"] for r in check.rows] == [pc.PASS, pc.PASS]
+    assert "must take at least 2 % of the cue's time" in pc.render_text(check)
+    assert pc.speed_rule_of({"speed_check": looser}) == looser
+    assert pc.speed_rule_of({"speed_check": None}) is None
+    assert pc.speed_rule_of({}) is None and pc.speed_rule_of(None) is None
+
+
+def test_the_speed_measure_is_the_recorders(tmp_path):
+    assert pc.bend_moves is rp.bend_moves and pc.bend_speed is rp.bend_speed
+    session = pc.load_session(_slow_session(tmp_path, rp.speed_rule(),
+                                            camera=True))
+    check = pc.check_session(session)
+    # with the camera beside the glove the times are reported the same way
+    assert [r["verdict"] for r in check.rows] == [pc.PASS, pc.FAIL]
+    assert "bend times (s), 20 to 80 % of each bend's rise: " in \
+        pc.render_text(check)
+
+
+REAL_13 = REAL_SET_B / "20261013_180909_left"
+PACED_SWEEP = (REPO / "results" / "diagnostics"
+               / "dead_zone_right_ring_20260920_212254.csv")
+
+
+@pytest.mark.skipif(not (REAL_13 / "session.json").is_file(),
+                    reason="the 2026-10-13 Set B session is not here")
+def test_the_real_session_of_2026_10_13_keeps_its_verdicts_and_shows_its_speed():
+    """Recorded an hour before the rule: seven accepted takes that pass as
+    they did, one rejected attempt that fails as it did, and for the six
+    slow-cued accepted takes every bend under the bar the rule now sets."""
+    check = pc.check_session(REAL_13)
+    assert pc.speed_rule_of(check.session.meta) is None
+    accepted = [r for r in check.rows if r["accepted"]]
+    assert [r["item"] for r in accepted] == [
+        "thumb", "index", "middle", "ring", "pinky", "index_slow",
+        "index_fast"]
+    assert {r["verdict"] for r in accepted} == {pc.PASS}
+    (rejected,) = [r for r in check.rows if not r["accepted"]]
+    assert rejected["failures"] == ["5 bend cue(s) but 6 glove curl peak(s)"]
+    rule = rp.speed_rule()
+    for r in accepted:
+        assert r["speed_rule"] == "not in force"
+        moves = [{"rise_s": x} for x in r["bend_times_s"]]
+        judged = rp.bend_speed(moves, r["bend_cue_s"], rule)
+        if r["item"] == "index_fast":
+            assert judged["state"] == rp.SPEED_FAST_CUE and r["notes"] == []
+            continue
+        assert judged["fast"] == list(range(len(moves))), r["item"]
+        assert max(r["bend_times_s"]) < 0.75 * judged["need_s"], r["item"]
+        assert len(r["notes"]) == 1 and r["notes"][0].startswith(
+            "bend speed not judged (this session has no speed rule): "
+            f"{len(moves)} of {len(moves)} bend(s) took ")
+
+
+@pytest.mark.skipif(not PACED_SWEEP.is_file(),
+                    reason="the paced slow sweep of 2026-09-20 is not here")
+def test_the_paced_slow_sweep_is_over_the_bar():
+    """The one recording on disk of a finger bent slowly on purpose (5 s to
+    bend, 5 s to straighten, right ring): its three paced bends read 1.2 to
+    3.3 s on the glove, over the 0.75 s the rule asks of a 5 s cue. The
+    fourth, a 0.1 s rise while the finger was opening, is a stray a take
+    would already fail its bend count for."""
+    import csv
+    with open(PACED_SWEEP, newline="") as f:
+        rows = list(csv.DictReader(f))
+    times = [float(r["t"]) for r in rows]
+    bent = [-float(r["glove_curl"]) for r in rows]      # curl falls as it bends
+    moves = rp.bend_moves(times, bent)
+    assert len(moves) == rp.count_peaks(bent) == 4
+    need = rp.MIN_BEND_SHARE * 5.0
+    paced = [m["rise_s"] for m in moves if m["rise_s"] >= need]
+    assert paced == pytest.approx([1.19, 1.74, 3.32], abs=0.05)
+    (stray,) = [m for m in moves if m["rise_s"] < need]
+    assert stray["rise_s"] < 0.2 and 6.0 < stray["at"] < 9.0
+    # and its straightens are why the straighten is not judged
+    falls = [m["fall_s"] for m in moves if m["rise_s"] >= need]
+    assert max(falls) < 1.2

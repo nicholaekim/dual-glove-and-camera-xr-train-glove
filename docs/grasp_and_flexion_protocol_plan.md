@@ -16,8 +16,31 @@ The professor asked for three sets:
 | Set | What | Sensor | Hardware setup for the session |
 |-----|------|--------|--------------------------------|
 | A | Static grasp-type poses from the reference papers (spherical, cylindrical, lateral, pinch, tripod, and the rest shown in the papers). Final configuration only. | Camera ("Leap Motion" = the Ultraleap IR 170) | camera only, bare hand |
-| B | Single-finger flexion, each finger separately: straight, slow bend to full flexion, hold about 1 s, slow straighten, 5 repetitions. Index also at a slow and a faster speed, several repetitions each. | Glove | gloves on + camera (camera as reference, see below) |
-| C | Seven sequential movements (one finger at a time, reverse order, alternating, pairs, progressive closing, other configurations, flex and release in sequence). | Glove | gloves on + camera |
+| B | Single-finger flexion, each finger separately: straight, slow bend to full flexion, hold about 1 s, slow straighten, 5 repetitions. Index also at a slow and a faster speed, several repetitions each. | Glove | gloves on, no camera (since 2026-10-12; until then gloves on + camera, the camera as reference) |
+| C | Seven sequential movements (one finger at a time, reverse order, alternating, pairs, progressive closing, other configurations, flex and release in sequence). | Glove | gloves on, no camera (since 2026-10-12) |
+
+Amendment, 2026-10-12: Sets B and C are recorded with the glove alone. The
+professor's instruction for both is the data glove, the Leap Motion camera
+being the sensor of Set A only, and the research these recordings feed is
+moving from the camera's keypoints to the glove's (joint angles checked
+against anatomical limits, then dependencies between joints). Wherever this
+plan has the camera beside the gloves in Sets B and C (the reference, the
+transfer curve, the lag), that is now an optional comparison run and not
+part of the hand-in; `docs/protocol_recording.md` is the runbook, and the
+hand-in gives each take's joint angles frame by frame and at every held cue
+(`docs/protocol_formats.md`, section 9).
+
+Amendment, 2026-10-13: Set B's bends are checked for speed. The professor's
+text is "slowly bend the finger until it is fully flexed"; the first
+glove-only session met every rule of section 4 with bends of 0.05 to
+0.55 s under cues that give 4 and 6 s. The quick check now also rejects a
+take in which a bend the cue gives 2 s or more for took under 15 % of the
+cue's time across the middle of its rise; the straighten is timed and
+reported, not judged, because the glove's reading falls quickly once a
+finger starts to open. Like the other numbers of section 4 this is an
+acquisition gate, not the definition of a slow bend; the measured times
+are in every report. `docs/protocol_formats.md`, section 8, has the rule
+and the recordings its bar was set between.
 
 ## 1. What is already in the repo and what is missing
 

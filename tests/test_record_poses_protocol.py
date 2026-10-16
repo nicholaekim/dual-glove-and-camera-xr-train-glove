@@ -159,6 +159,8 @@ def test_mock_session_writes_the_contract_folder(rp, monkeypatch, tmp_path,
     assert session["protocol_name"] == "grasps" and session["protocol_version"] == 1
     assert len(session["protocol_sha256"]) == 64
     assert session["ended"] is not None
+    assert session["recorder_rules"] == rp.RECORDER_RULES
+    assert session["recorder_rules_changes"] == []
     assert [t["item"] for t in session["takes"]] == ITEMS
     assert all(t["accepted"] and t["reason"] == "" for t in session["takes"])
 
@@ -201,6 +203,10 @@ def test_mock_session_writes_the_contract_folder(rp, monkeypatch, tmp_path,
         assert 0.0 <= meta["grab_strength"] <= 1.0
         assert 0.0 <= meta["pinch_strength"] <= 1.0
         assert meta["orientation_note"] == "palm down, no turn"
+        # the rules it was recorded under, so a reader can tell these takes
+        # from those recorded before 2026-10-07
+        assert meta["recorder_rules"] == rp.RECORDER_RULES == "2026-10-07"
+        assert meta["coaching"]["forming_lost_count"] == 0
         assert meta["decided_at"] == entry["decided_at"]
         assert meta["decided_by"] == "auto"
         assert meta["still_missing_reason"] is None
@@ -795,8 +801,12 @@ FINGERTIPS_DOWN = {
     "p3_circular_precision_thumb_1_finger",
     "p3_circular_precision_thumb_2_fingers", "p3_prismatic_precision",
     "p1_palmar", "p3_circular_precision_thumb_4_fingers"}
-FORMING_REASON_RE = re.compile(
-    r"lost the hand (?P<n>\d+) times? while forming the grasp, the last at "
+# the reason under the rules of 2026-10-07: a hand lost while forming is
+# waited for, and rejects the attempt only when it is not found again in time
+NOT_FOUND_REASON_RE = re.compile(
+    r"lost the hand while forming the grasp and it was not found again "
+    r"(?P<why>within the (?P<wait>[\d.]+) s wait for it|before the forming "
+    r"window ended, (?P<window>[\d.]+) s after the GO beep): at "
     r"(?P<cm>\d+) cm with the palm (?P<deg>\d+) degrees from the lens "
     r"\((?P<cause>[a-z ]+): (?P<fix>.+)\)")
 
@@ -898,9 +908,10 @@ def test_the_open_hand_frame_says_open_hand_and_hides_the_picture(rp):
         assert info["lost"] == [] and "no hand seen" in info["lines"]
         assert " ".join(info["label"]) == it["label"]
         assert info["label_bottom"] < info["status_top"], it["id"]
+        # the OPEN HAND after a loss during READY
         _img, info = rp.compose_open(it, 2, 3, "", lost=True, status="LOST YOU")
-        assert " ".join(info["lost"]) == ("LOST YOU: open the hand, then close "
-                                          "it slower")
+        assert " ".join(info["lost"]) == ("LOST YOU: show the open hand to the "
+                                          "camera again")
         assert info["status"] == "LOST YOU"
         _img, info = rp.compose_copy(it, None, 3, 3, "MAKE THE GRASP", 4.0)
         assert info["label_bottom"] < info["status_top"], it["id"]
@@ -927,16 +938,19 @@ def test_coached_open_hand_waits_for_the_hand(rp, monkeypatch, tmp_path,
     coaching = meta["coaching"]
     # 1 s with no hand, then 0.5 s of open palm in the band
     assert 1.4 <= coaching["acquire_s"] <= 3.0, coaching
-    assert coaching["lost_while_forming"] == 0
+    assert coaching["forming_lost_count"] == 0
+    # the earlier rules' count of send-backs is not written any more
+    assert "lost_while_forming" not in coaching
     assert coaching["acquire_rounds_s"] == [coaching["acquire_s"]]
     (acq,) = coaching["acquired"]
     assert 18.0 <= acq["height_cm"] <= 40.0 and acq["view_angle_deg"] <= 50.0
     assert meta["orientation_hint"] == "palm toward the camera"
     # the mock was walked through the take, phase by phase
     (actor,) = actors
-    assert actor.phases == ["open", "form", "hold", "idle"]
-    # COPY THIS: OPEN HAND (no picture yet), then the grasp, then the take
-    assert phases(timeline)[:3] == ["OPEN HAND", "MAKE THE GRASP", "HOLD STILL"]
+    assert actor.phases == ["open", "ready", "form", "hold", "idle"]
+    # COPY THIS: OPEN HAND (no picture yet), READY, then the grasp, then the take
+    assert phases(timeline)[:4] == ["OPEN HAND", "READY", "MAKE THE GRASP",
+                                    "HOLD STILL"]
     opens = [x for x in timeline if x[0] == "open"]
     assert opens and all(x[4]["panel_box"] is None for x in opens)
     assert any(line.startswith("no hand seen") for x in opens
@@ -944,6 +958,29 @@ def test_coached_open_hand_waits_for_the_hand(rp, monkeypatch, tmp_path,
     printed = capsys.readouterr().out
     assert printed.count("OPEN HAND, palm to the camera") == 1
     assert "MAKE THE GRASP, keep the palm toward the camera" in printed
+
+
+def test_coached_open_hand_waits_even_when_the_recorder_is_slow_to_start(
+        rp, monkeypatch, tmp_path, protocol_file):
+    """The recorder stalls 1 s before its first OPEN HAND (a slow `git
+    rev-parse` on a loaded machine; the full suite hit this): the mock's
+    frames for that second are made at the first drain, all at once, and
+    they must not be an open hand already, or OPEN HAND is acquired at once
+    (acquire_s 0.06 before the fix, with or without the forming changes)."""
+    import time
+
+    real = rp.tool_commit
+    monkeypatch.setattr(rp, "tool_commit", lambda: (time.sleep(1.0), real())[1])
+    actor_with(monkeypatch, absent_open_s=1.0)
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--prep", "0.5"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    coaching = read_json(folder / entry["files"]["meta"])["coaching"]
+    # 1 s with no hand, then 0.5 s of open palm, counted from OPEN HAND
+    assert 1.4 <= coaching["acquire_s"] <= 3.0, coaching
 
 
 def test_coached_open_hand_times_out_with_the_reason(rp, monkeypatch, tmp_path,
@@ -973,79 +1010,548 @@ def test_coached_open_hand_times_out_with_the_reason(rp, monkeypatch, tmp_path,
         assert meta["still_missing_reason"] == "not_recorded"
         coaching = meta["coaching"]
         assert coaching["acquire_s"] == pytest.approx(1.0, abs=0.3)
-        assert coaching["lost_while_forming"] == 0
+        assert coaching["forming_lost_count"] == 0
         assert coaching["acquire_missing"].startswith("no hand seen")
         reason = (folder / entry["files"]["reason"]).read_text(encoding="utf-8")
         assert reason.splitlines()[0] == entry["reason"]
     assert not list(folder.glob("leap/*")) and not list(folder.glob("rejected/leap/*"))
 
 
-def test_coached_loss_while_forming_goes_back_to_open_hand_and_is_counted(
+def test_a_hand_lost_while_forming_and_found_again_keeps_the_take(
         rp, monkeypatch, tmp_path, protocol_file, capsys):
-    """The mock loses the hand as it closes on the first try (palm turned
-    edge-on, then gone) and keeps it on the second: LOST YOU, back to OPEN
-    HAND, and the kept take's meta counts the loss and says where it was."""
+    """The rules of 2026-10-07. The mock loses the hand as it closes (palm
+    turned edge-on, then gone, 0.6 s after the GO beep) and it is back 0.5 s
+    later under a new id: LOST YOU, the recorder waits, finds it, holds it
+    1 s, and records the static take under the unchanged gate. The take is
+    kept at its first attempt with forming_lost_count 1; the forming file
+    is the one MAKE THE GRASP, the gap in it, every line marked, and the
+    transition code calls it invalid with no duration."""
+    from leap_hand import transition as tr
+
     actors = actor_with(monkeypatch)
     timeline = spy_timeline(rp, monkeypatch)
     out = tmp_path / "grasps"
     run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
                                     "--takes", "1", "--items", "tip_pinch",
-                                    "--prep", "1.5", "--mock-lose-forming", "1"))
+                                    "--prep", "1.5", "--mock-lose-forming", "1",
+                                    "--mock-back-after", "0.5"))
     folder = session_dir(out)
     (entry,) = read_json(folder / "session.json")["takes"]
-    assert entry["accepted"] is True and entry["attempt"] == 1
+    assert entry["accepted"] is True and entry["attempt"] == 1, entry["reason"]
     meta = read_json(folder / entry["files"]["meta"])
-    assert meta["tracked_fraction"] >= 0.9
+    assert meta["recorder_rules"] == rp.RECORDER_RULES == "2026-10-07"
+    # the static take itself: the same gate as ever, passed
+    assert meta["tracked_fraction"] >= 0.9 and meta["gate"]["passed"] is True
+    assert meta["gate"]["reacquisitions_in_static_interval"] == 0
     coaching = meta["coaching"]
-    assert coaching["lost_while_forming"] == 1
-    assert len(coaching["acquire_rounds_s"]) == 2 and len(coaching["acquired"]) == 2
-    assert coaching["acquire_s"] == pytest.approx(sum(coaching["acquire_rounds_s"]),
-                                                  abs=0.02)
+    assert coaching["forming_lost_count"] == 1
+    assert "lost_while_forming" not in coaching   # no "close it slower" any more
     (loss,) = coaching["forming_losses"]
     assert loss["view_angle_deg"] > 60.0 and loss["cause"] == "palm turned away"
     assert loss["height_cm"] == pytest.approx(25.0, abs=1.5)
-    assert 0.0 < loss["after_s"] < 1.5 and loss["fix"]
+    assert 0.5 <= loss["after_s"] < 1.0 and loss["fix"]
+    assert loss["gone_s"] == pytest.approx(0.5, abs=0.1)
+    assert loss["found_after_s"] == pytest.approx(1.1, abs=0.15)
+    # one OPEN HAND, no reset: the loss was waited out
+    assert len(coaching["acquire_rounds_s"]) == 1 and coaching["resets"] == 0
+    assert coaching["lost_wait_s"] == rp.LOST_WAIT_S == 4.0
+    assert coaching["form_window_s"] == rp.FORM_WINDOW_S == 8.0
+    assert coaching["relock_s"] == rp.RELOCK_S == 1.0
+    # the hold began once the hand found again had been held 1 s
+    started = meta["take_start"] - coaching["form_start"]
+    assert loss["found_after_s"] + rp.RELOCK_S - 0.05 <= started
+    assert started <= loss["found_after_s"] + rp.RELOCK_S + 0.4
     (actor,) = actors
     assert actor.lost == 1
-    assert actor.phases == ["open", "form", "open", "form", "hold", "idle"]
-    # what the operator saw: the loss, then OPEN HAND again with LOST YOU on it
-    assert phases(timeline) == ["OPEN HAND", "MAKE THE GRASP", "LOST YOU",
-                                "OPEN HAND (lost)", "MAKE THE GRASP",
-                                "HOLD STILL", "CHECKING THE TAKE"]
+    assert actor.phases == ["open", "ready", "form", "hold", "idle"]
+    assert phases(timeline) == ["OPEN HAND", "READY", "MAKE THE GRASP",
+                                "LOST YOU", "MAKE THE GRASP", "HOLD STILL",
+                                "CHECKING THE TAKE"]
+    lost = [x for x in timeline if x[0] == "copy" and x[2] == "LOST YOU"]
+    assert lost and all(" ".join(x[4]["hint"]) == rp.FORM_LOST_HINT for x in lost)
     printed = capsys.readouterr().out
-    assert printed.count("LOST YOU: open the hand, then close it slower") == 1
-    assert printed.count("OPEN HAND, palm to the camera:") == 2
-    # the take is the hold only: the open palm and the loss are not in it
+    assert printed.count(rp.FORM_LOST_TEXT) == 1
+    assert "found again after 0.5 s: hold the grasp there 1 s before the take" \
+        in printed
+    assert printed.count("OPEN HAND, palm to the camera:") == 1
+    # the take follows the hand found again, and is the hold only
+    first, = coaching["acquired"]
+    assert meta["operator_hand_ids"] == [first["hand_id"] + 1]
     lines = read_lines(folder / entry["files"]["leap"])
     assert min(x["grab_strength"] for x in lines) == pytest.approx(0.6, abs=0.01)
+    # the forming file: both ids, the gap, every line marked
+    forming = read_lines(folder / entry["files"]["forming"])
+    assert coaching["forming_frames"] == len(forming)
+    assert {x["hand_id"] for x in forming if x["hand_side"] == "left"} == {
+        first["hand_id"], first["hand_id"] + 1}
+    assert all(x[tr.FORMING_LOST_KEY] == 1 for x in forming)
+    t = sorted(x["capture_time"] for x in forming if x["hand_side"] == "left")
+    assert max(b - a for a, b in zip(t, t[1:])) == pytest.approx(0.5, abs=0.1)
+    # and no rule times it: the meta's transition, the hand-in's timing
+    assert coaching["transition_s"] is None
+    assert coaching["transition_note"] == tr.lost_note(1)
+    g = tr.forming_timing(forming, meta)
+    assert g.validity == tr.INVALID and g.notes == tr.lost_note(1)
+    assert g.transition_duration_s is None and g.movement_start_time_s is None
 
 
-def test_coached_three_losses_reject_with_the_reason(rp, monkeypatch, tmp_path,
-                                                     protocol_file, capsys):
+def test_a_hand_lost_while_forming_and_not_found_again_is_rejected(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """Lost, and gone for good: the recorder waits `--lost-wait` (here 0.6 s)
+    from its last frame and rejects the attempt with the reason, nothing
+    recorded; the forming file goes to rejected/ marked. With a forming
+    window that ends first, the reason names the window instead."""
     out = tmp_path / "grasps"
     run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
                                     "--takes", "1", "--items", "tip_pinch",
                                     "--prep", "1.5", "--retries", "0",
-                                    "--mock-lose-forming", "3"))
+                                    "--mock-lose-forming", "1",
+                                    "--lost-wait", "0.6"))
     folder = session_dir(out)
     (entry,) = read_json(folder / "session.json")["takes"]
     assert entry["accepted"] is False and entry["decided_by"] == "coach"
-    m = FORMING_REASON_RE.fullmatch(entry["reason"])
+    m = NOT_FOUND_REASON_RE.fullmatch(entry["reason"])
     assert m, entry["reason"]
-    assert m["n"] == "3" and m["cause"] == "palm turned away"
+    assert m["wait"] == "0.6" and m["cause"] == "palm turned away"
     assert m["cm"] == "25" and int(m["deg"]) > 60
     meta = read_json(folder / entry["files"]["meta"])
     assert meta["reason"] == entry["reason"] and meta["accepted"] is False
     coaching = meta["coaching"]
-    assert coaching["lost_while_forming"] == 3
-    assert len(coaching["forming_losses"]) == 3
-    assert len(coaching["acquire_rounds_s"]) == 3
+    assert coaching["forming_lost_count"] == 1
+    (loss,) = coaching["forming_losses"]
+    assert loss["found_after_s"] is None
+    assert loss["gone_s"] == pytest.approx(0.6, abs=0.15)
+    assert len(coaching["acquire_rounds_s"]) == 1 and coaching["resets"] == 0
+    assert entry["files"]["leap"] is None, "nothing was recorded"
+    assert entry["files"]["forming"] == f"rejected/forming/{entry['name']}.jsonl"
+    reason = (folder / entry["files"]["reason"]).read_text(encoding="utf-8")
+    assert reason.splitlines()[0] == entry["reason"]
+    printed = capsys.readouterr().out
+    assert printed.count(rp.FORM_LOST_TEXT) == 1
+    assert "REJECTED: lost the hand while forming the grasp and it was not " \
+           "found again within the 0.6 s wait for it" in printed
+
+    # the forming window, 1.7 s after the GO beep, ends before the 4 s wait
+    out = tmp_path / "window"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "tip_pinch",
+                                    "--prep", "1.5", "--retries", "0",
+                                    "--mock-lose-forming", "1",
+                                    "--form-window", "1.7"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    m = NOT_FOUND_REASON_RE.fullmatch(entry["reason"])
+    assert m and m["window"] == "1.7", entry["reason"]
+    coaching = read_json(folder / entry["files"]["meta"])["coaching"]
+    assert coaching["form_window_s"] == 1.7
+    assert coaching["forming_losses"][0]["after_s"] + \
+        coaching["forming_losses"][0]["gone_s"] == pytest.approx(1.7, abs=0.2)
+    assert read_json(folder / "session.json")["coaching"]["form_window_s"] == 1.7
+
+
+def test_the_form_window_and_the_wait_are_options_of_the_coached_take(
+        rp, monkeypatch, tmp_path, protocol_file):
+    for extra in (["--lost-wait", "0"], ["--form-window", "-1"],
+                  ["--form-window", "0.5", "--prep", "1.0"],
+                  ["--no-coach", "--lost-wait", "2"],
+                  ["--mock-back-after", "0.5"],                # nothing to bring back
+                  ["--mock-lose-forming", "1", "--mock-back-after", "-1"]):
+        with pytest.raises(SystemExit):
+            run(rp, monkeypatch, *mock_args(protocol_file, tmp_path / "x",
+                                            *extra))
+    with pytest.raises(SystemExit):                    # protocol options
+        run(rp, monkeypatch, "--mock", "--lost-wait", "2")
+    assert not (tmp_path / "x").exists()
+
+
+# --- READY, and the hand closed before the cue ---------------------------------------
+# the reason under the rules of 2026-10-07: a close before the GO beep resets
+# the attempt, and only past the limit rejects it
+RESET_REASON_RE = re.compile(
+    r"closed before the GO beep (?P<n>\d+) times?; reset to OPEN HAND "
+    r"(?P<limit>\d+) times, the limit that ends a stuck loop; the last "
+    r"(?P<where>.+)")
+
+
+def spy_beeps(rp, monkeypatch):
+    """Every beep, (wall clock, frequency, ms, volume), in order."""
+    import time
+
+    heard = []
+    monkeypatch.setattr(rp, "beep", lambda freq=880, ms=180, volume=None:
+                        heard.append((time.time(), freq, ms, volume)))
+    return heard
+
+
+def test_the_ready_pause_frame_says_keep_hand_open_until_the_go_beep(rp):
+    item = {"id": "hook", "label": "Hook (paper 1, Schlesinger)"}
+    _img, info = rp.compose_open(item, 1, 3, "hand acquired", 0.6,
+                                 status=rp.READY_STATUS)
+    assert info["big"] == ["KEEP HAND OPEN", "close on the GO beep"]
+    assert info["status"] == "READY" and info["panel_box"] is None
+    assert info["lost"] == []
+    assert rp.READY_TEXT == "KEEP HAND OPEN - close on the GO beep"
+    assert any("until the GO beep" in line for line in info["lines"])
+    # the OPEN HAND after an early close says why, in red: the hint
+    _img, info = rp.compose_open(item, 1, 3, "", lost=rp.CLOSED_TEXT,
+                                 status=rp.CLOSED_STATUS)
+    assert " ".join(info["lost"]) == ("CLOSED TOO SOON - keep the hand open "
+                                      "until the GO beep")
+    assert info["status"] == "CLOSED EARLY"
+    assert info["big"] == ["OPEN HAND,", "palm to the camera"]
+    # every word drawable by OpenCV's font
+    assert all(ord(c) < 128 for c in rp.READY_TEXT + rp.CLOSED_TEXT
+               + rp.LOST_TEXT + rp.FORM_LOST_TEXT)
+
+
+def test_the_ready_and_go_cues_are_two_different_sounds(rp, monkeypatch):
+    """READY: two short, quiet, low beeps; GO: one long, loud, high beep.
+    Written as tones of those loudnesses (`tone_wav`), so the difference is
+    in the samples, not only in the numbers asked for."""
+    import io
+    import wave
+
+    import numpy as np
+
+    heard = spy_beeps(rp, monkeypatch)
+    rp.cue_ready()
+    rp.cue_go()
+    (_t1, f1, ms1, v1), (_t2, f2, ms2, v2), (_t3, fg, msg, vg) = heard
+    assert (f1, ms1, v1) == (f2, ms2, v2) == rp.BEEP_READY
+    assert (fg, msg, vg) == rp.BEEP_GO
+    assert fg >= 3 * f1 and msg >= 5 * ms1 and vg >= 3 * v1
+    assert rp.BEEP_LOST[0] < fg      # the low beep of a loss is not the GO
+
+    def samples(freq, ms, volume):
+        with wave.open(io.BytesIO(rp.tone_wav(freq, ms, volume))) as w:
+            assert (w.getnchannels(), w.getsampwidth(),
+                    w.getframerate()) == (1, 2, rp.TONE_RATE)
+            return np.frombuffer(w.readframes(w.getnframes()), "<i2")
+
+    ready, go = samples(*rp.BEEP_READY), samples(*rp.BEEP_GO)
+    assert len(ready) == round(rp.TONE_RATE * 0.070)
+    assert len(go) == round(rp.TONE_RATE * 0.450)
+    assert np.abs(go).max() > 32000 and np.abs(ready).max() < 0.35 * 32767
+    assert np.abs(go).max() >= 3 * np.abs(ready).max()
+    # zero crossings: the pitch of each
+    def hz(s):
+        return np.count_nonzero(np.diff(np.signbit(s))) / 2 / (len(s) / rp.TONE_RATE)
+    assert hz(ready) == pytest.approx(rp.BEEP_READY[0], rel=0.1)
+    assert hz(go) == pytest.approx(rp.BEEP_GO[0], rel=0.05)
+    # session.json says what the cues were
+    cues = rp.cue_sounds()
+    assert cues["ready"]["beeps"] == 2 and cues["go"]["beeps"] == 1
+    assert cues["go"]["volume"] > cues["ready"]["volume"]
+
+
+def test_ready_pause_watch_sees_a_close_but_not_a_still_open_hand(rp):
+    """READY's watch, on the mock acting READY: an open palm held still is
+    never closing; the same palm closing on the acquisition beep is, at
+    50 mm/s or more, and a frame of the other hand never counts."""
+    from leap_hand.mock import CoachedActor, MockLeapStream
+
+    def ready_hands(early):
+        actor = CoachedActor(operator="left", close_before_cue=int(early),
+                             close_s=0.5)
+        s = MockLeapStream(dropout_every=0, reacquire_every=0, script=actor)
+        s.start()
+        actor.phase("open", 0)
+        actor.phase("ready", 0)
+        return s.generate(90)                         # READY_PAUSE_S of frames
+
+    for early in (False, True):
+        hands = ready_hands(early)
+        left = [lh for side, lh in hands if side == "left"]
+        right = {lh.hand_id for side, lh in hands if side == "right"}
+        w = rp.ReadyWatch(rp.hand_seen(left[0], 50.0), others=right,
+                          label="left")
+        got = None
+        for k, (_side, lh) in enumerate(hands[2:]):
+            w.add(lh, 50.0 + k / 180)
+            got = got or w.closing()
+        assert w.lost(50.0 + 89 / 90) is None
+        if early:
+            assert got is not None and got[0] >= rp.MOVE_SPEED_MM_S
+            assert left[0].capture_time <= got[1] <= left[0].capture_time + 0.5
+        else:
+            assert got is None
+            assert w.fastest is not None and w.fastest[0] < 25.0
+
+
+def test_ready_pause_comes_between_the_ready_cue_and_the_go_cue(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """The two beeps on 2026-10-02 sounded back to back and alike. Now the
+    acquired hand gets the READY cue (two short low beeps), is held open
+    READY_PAUSE_S (1 s) from the end of it, KEEP HAND OPEN on the window
+    and the console, and only then the GO cue (one long high beep): never
+    sooner than before. The mock's close waits for the GO cue, and the
+    forming file starts at it."""
+    heard = spy_beeps(rp, monkeypatch)
+    actors = actor_with(monkeypatch)
+    timeline = spy_timeline(rp, monkeypatch)
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--prep", "1.0"))
+    folder = session_dir(out)
+    session = read_json(folder / "session.json")
+    (entry,) = session["takes"]
+    assert entry["accepted"] is True
+    assert session["coaching"]["ready_pause_s"] == rp.READY_PAUSE_S == 1.0
+    assert session["coaching"]["move_speed_mm_s"] == 50.0
+    assert session["coaching"]["cues"] == rp.cue_sounds()
+    ready_beeps = [t for t, f, ms, v in heard if (f, ms, v) == rp.BEEP_READY]
+    go = [t for t, f, ms, v in heard if (f, ms, v) == rp.BEEP_GO]
+    assert len(ready_beeps) == 2 and len(go) == 1
+    assert ready_beeps[1] - ready_beeps[0] >= rp.BEEP_READY_GAP_S - 0.01
+    # the GO cue no sooner than a full READY_PAUSE_S after the READY cue
+    assert go[0] - ready_beeps[1] >= rp.READY_PAUSE_S
+    assert go[0] - ready_beeps[1] < rp.READY_PAUSE_S + 0.5
+    # the cues in order: READY, READY, GO, then the take's own two beeps
+    assert [(f, ms) for _t, f, ms, _v in heard[:3]] == [
+        rp.BEEP_READY[:2], rp.BEEP_READY[:2], rp.BEEP_GO[:2]]
+    (actor,) = actors
+    assert actor.phases == ["open", "ready", "form", "hold", "idle"]
+    assert phases(timeline)[:4] == ["OPEN HAND", "READY", "MAKE THE GRASP",
+                                    "HOLD STILL"]
+    ready = [x for x in timeline if x[2] == "READY"]
+    assert all(x[0] == "open" and x[4]["big"] == ["KEEP HAND OPEN",
+                                                  "close on the GO beep"]
+               and x[4]["panel_box"] is None for x in ready)
+    printed = capsys.readouterr().out
+    assert printed.count("KEEP HAND OPEN - close on the GO beep: 1 s") == 1
+    assert "close only on the GO beep" in printed         # the session header
+    assert "READY = two short low beeps, KEEP HAND OPEN; GO = one long high " \
+           "beep" in printed
+    meta = read_json(folder / entry["files"]["meta"])
+    coaching = meta["coaching"]
+    assert coaching["ready_pause_s"] == 1.0
+    assert coaching["closed_before_cue"] == 0 and coaching["early_closes"] == []
+    # the cue is the GO beep: the forming file starts there, after READY,
+    # and the open palm held through READY is not in it
+    assert coaching["form_start"] >= ready_beeps[1] + rp.READY_PAUSE_S
+    assert coaching["form_start"] == pytest.approx(go[0], abs=0.05)
+    lines = read_lines(folder / entry["files"]["forming"])
+    assert min(x["capture_time"] for x in lines) >= coaching["form_start"]
+    assert coaching["transition_s"] == pytest.approx(0.25, abs=0.1)
+    assert coaching["peak_speed_mm_s"] >= rp.MOVE_SPEED_MM_S
+
+
+def test_a_mock_closing_before_the_cue_in_ready_is_reset_and_counted(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """--mock-close-early 1: the hand closes on the READY cue, during
+    READY; the attempt is reset to OPEN HAND with CLOSED TOO SOON, counted,
+    and the next round closes on the GO beep and is kept."""
+    actors = actor_with(monkeypatch)
+    timeline = spy_timeline(rp, monkeypatch)
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "tip_pinch",
+                                    "--prep", "1.0", "--mock-close-early", "1"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    assert entry["accepted"] is True and entry["attempt"] == 1
+    meta = read_json(folder / entry["files"]["meta"])
+    coaching = meta["coaching"]
+    assert coaching["closed_before_cue"] == 1
+    assert coaching["forming_lost_count"] == 0
+    (early,) = coaching["early_closes"]
+    assert early["during"] == "ready" and early["speed_mm_s"] >= 50.0
+    assert 0.0 <= early["after_s"] < rp.READY_PAUSE_S
+    assert len(coaching["acquire_rounds_s"]) == 2 and len(coaching["acquired"]) == 2
+    (actor,) = actors
+    assert actor.closed_early == 1
+    assert actor.phases == ["open", "ready", "open", "ready", "form", "hold",
+                            "idle"]
+    assert phases(timeline) == ["OPEN HAND", "READY", "CLOSED EARLY",
+                                "OPEN HAND (lost)", "READY", "MAKE THE GRASP",
+                                "HOLD STILL", "CHECKING THE TAKE"]
+    assert coaching["resets"] == 1 and coaching["ready_losses"] == []
+    printed = capsys.readouterr().out
+    assert printed.count(rp.CLOSED_TEXT) == 1
+    assert "reset 1 of 10: closed before the GO beep, during READY" in printed
+    # the kept take's forming file is the round that closed on the cue
+    assert coaching["transition_s"] is not None
+    assert coaching["transition_note"] == ""
+
+
+def test_a_hand_closed_before_the_cue_has_no_close_after_the_go_beep(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """The hand already closed at OPEN HAND (acquired all the same) and
+    still through READY: nothing to see until MAKE THE GRASP ends with no
+    frame at 50 mm/s since the GO beep. CLOSED TOO SOON, reset to OPEN
+    HAND, counted; the next round closes on the cue and is kept."""
+    actor_with(monkeypatch, close_before_cue=1, early_close_at="open")
+    timeline = spy_timeline(rp, monkeypatch)
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--prep", "1.0"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    assert entry["accepted"] is True
+    coaching = read_json(folder / entry["files"]["meta"])["coaching"]
+    assert coaching["closed_before_cue"] == 1
+    (early,) = coaching["early_closes"]
+    assert early["during"] == "make"
+    assert early["peak_speed_mm_s"] < rp.MOVE_SPEED_MM_S
+    assert early["after_s"] == pytest.approx(1.0, abs=0.2)
+    assert phases(timeline) == ["OPEN HAND", "READY", "MAKE THE GRASP",
+                                "CLOSED EARLY", "OPEN HAND (lost)", "READY",
+                                "MAKE THE GRASP", "HOLD STILL",
+                                "CHECKING THE TAKE"]
+    printed = capsys.readouterr().out
+    assert "reset 1 of 10: closed before the GO beep, at the GO beep" in printed
+    # the forming file is the second round's, which closed on the cue
+    assert coaching["transition_s"] is not None
+    assert coaching["peak_speed_mm_s"] >= rp.MOVE_SPEED_MM_S
+    assert not list(folder.glob("rejected/forming/*"))
+
+
+def test_early_closes_reset_the_attempt_and_the_eleventh_drops_it(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """The rules of 2026-10-07: a close before the GO beep is not a
+    rejection. Three of them reset the attempt three times and its fourth
+    round is kept, at attempt 1 (under the earlier rules the third dropped
+    it). Only the 11th, past the limit of 10 that ends a stuck loop, drops
+    the attempt, with a reason that says so."""
+    assert rp.RESET_LIMIT == 10
+    out = tmp_path / "three"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "tip_pinch",
+                                    "--prep", "1.0", "--retries", "0",
+                                    "--mock-close-early", "3"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    assert entry["accepted"] is True and entry["attempt"] == 1, entry["reason"]
+    coaching = read_json(folder / entry["files"]["meta"])["coaching"]
+    assert coaching["closed_before_cue"] == 3 == coaching["resets"]
+    assert all(e["during"] == "ready" for e in coaching["early_closes"])
+    assert len(coaching["acquire_rounds_s"]) == 4
+    assert coaching["forming_lost_count"] == 0
+    printed = capsys.readouterr().out
+    assert printed.count(rp.CLOSED_TEXT) == 3
+    for k in (1, 2, 3):
+        assert f"reset {k} of 10: closed before the GO beep, during READY" in printed
+    assert "REJECTED" not in printed
+
+    out = tmp_path / "eleven"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "tip_pinch",
+                                    "--prep", "1.0", "--retries", "0",
+                                    "--mock-close-early", "11"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    assert entry["accepted"] is False and entry["decided_by"] == "coach"
+    m = RESET_REASON_RE.fullmatch(entry["reason"])
+    assert m, entry["reason"]
+    assert m["n"] == "11" and m["limit"] == "10"
+    assert m["where"].startswith("during READY")
+    meta = read_json(folder / entry["files"]["meta"])
+    assert meta["reason"] == entry["reason"]
+    coaching = meta["coaching"]
+    assert coaching["closed_before_cue"] == 11 and len(coaching["early_closes"]) == 11
+    assert coaching["resets"] == 10 and coaching["reset_limit"] == 10
+    assert len(coaching["acquire_rounds_s"]) == 11
     assert entry["files"]["leap"] is None, "nothing was recorded"
     reason = (folder / entry["files"]["reason"]).read_text(encoding="utf-8")
     assert reason.splitlines()[0] == entry["reason"]
     printed = capsys.readouterr().out
-    assert printed.count("LOST YOU: open the hand, then close it slower") == 3
-    assert "REJECTED: lost the hand 3 times while forming the grasp" in printed
+    assert printed.count(rp.CLOSED_TEXT) == 11
+    assert "reset 10 of 10:" in printed and "reset 11 of" not in printed
+    assert "REJECTED: closed before the GO beep 11 times; reset to OPEN HAND " \
+           "10 times, the limit that ends a stuck loop" in printed
+
+
+def test_early_closes_and_a_loss_while_forming_do_not_count_together(
+        rp, monkeypatch, tmp_path, protocol_file):
+    """Two early closes reset the attempt; the third round's hand is lost
+    while forming and found again: one attempt, kept, its meta counting
+    each apart (under the earlier rules the three were three send-backs
+    and dropped the attempt)."""
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "tip_pinch",
+                                    "--prep", "1.5", "--retries", "0",
+                                    "--mock-close-early", "2",
+                                    "--mock-lose-forming", "1",
+                                    "--mock-back-after", "0.4"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    assert entry["accepted"] is True and entry["attempt"] == 1, entry["reason"]
+    coaching = read_json(folder / entry["files"]["meta"])["coaching"]
+    assert coaching["closed_before_cue"] == 2 and coaching["resets"] == 2
+    assert coaching["forming_lost_count"] == 1
+    assert coaching["forming_losses"][0]["found_after_s"] is not None
+    assert len(coaching["acquire_rounds_s"]) == 3
+
+
+def test_a_loss_during_ready_resets_the_attempt(rp, monkeypatch):
+    """READY watches the open hand: lost there, the attempt goes back to
+    OPEN HAND with LOST YOU, counted in `ready_losses` and `resets`, and
+    the next round goes on. Driven on the recorder's own `_coach` with a
+    READY that loses the hand once."""
+    session = object.__new__(rp.ProtocolSession)
+    session.prep, session.lost_wait, session.form_window = 1.0, 4.0, 8.0
+    session.acquire_timeout, session.hand = 30.0, "left"
+    session._now, session.view, session.panel = None, None, None
+    from types import SimpleNamespace as NS
+    hand = NS(height_cm=25.0, angle_deg=10.0, offset_cm=2.0,
+              lh=NS(hand_side="left", hand_id=7))
+    session._open_hand = lambda back=False: (hand, set(), "")
+    lost = {"after_s": 0.4, "height_cm": 25.0, "view_angle_deg": 80.0,
+            "grab": 0.0, "hand_label": "left", "cause": "palm turned away",
+            "fix": "turn it back", "during": "ready"}
+    calls = iter([(("lost", lost), hand, set()), (None, hand, set())])
+    session._ready = lambda got, others: next(calls)
+    session._make_grasp = lambda got, others: None
+    ok, why = rp.ProtocolSession._coach(session, {"id": "x"})
+    assert ok and why == ""
+    c = session._coaching
+    assert c["ready_losses"] == [lost] and c["resets"] == 1
+    assert c["forming_lost_count"] == 0 and c["closed_before_cue"] == 0
+    assert len(c["acquired"]) == 2
+    assert rp.ready_loss_where(lost).startswith(
+        "lost during READY, 0.4 s after the READY beep, at 25 cm")
+    # both kinds past the limit: the reason names both, and the last
+    early = {"during": "ready", "after_s": 0.2, "speed_mm_s": 96.0}
+    reason = rp.reset_reason([early] * 4, [lost] * 7, "lost")
+    assert reason == (
+        "closed before the GO beep 4 times and lost the hand during READY 7 "
+        "times; reset to OPEN HAND 10 times, the limit that ends a stuck "
+        "loop; the last " + rp.ready_loss_where(lost))
+
+
+def test_a_short_make_the_grasp_is_not_judged_closed_before_the_cue(
+        rp, monkeypatch, tmp_path, protocol_file):
+    """--prep under CUE_CHECK_MIN_S (a rehearsal's 0.3 s) has too few frames
+    to tell a close from none: a hand already closed is not sent back."""
+    assert rp.CUE_CHECK_MIN_S == 0.5
+    actor_with(monkeypatch, close_before_cue=1, early_close_at="open")
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--prep", "0.3"))
+    (entry,) = read_json(session_dir(out) / "session.json")["takes"]
+    coaching = read_json(session_dir(out) / entry["files"]["meta"])["coaching"]
+    assert entry["accepted"] is True and coaching["closed_before_cue"] == 0
+    # the meta still says what the forming file shows: no close after the cue
+    assert coaching["transition_s"] is None
+    assert coaching["transition_note"].startswith("no close after the cue")
+
+
+def test_mock_close_early_before_the_cue_needs_the_coached_mock(
+        rp, monkeypatch, tmp_path, protocol_file):
+    for extra in (["--no-coach"], []):
+        argv = mock_args(protocol_file, tmp_path / "x", "--mock-close-early",
+                         "1", *extra)
+        if not extra:
+            argv.remove("--mock")
+        with pytest.raises(SystemExit):
+            run(rp, monkeypatch, *argv)
+    with pytest.raises(SystemExit):
+        run(rp, monkeypatch, *mock_args(protocol_file, tmp_path / "y",
+                                        "--mock-close-early", "-1"))
 
 
 def test_no_coach_keeps_the_plain_countdown(rp, monkeypatch, tmp_path,
@@ -1097,7 +1603,8 @@ def test_a_coached_session_shows_open_hand_then_the_picture_with_the_hint(
     assert [t["accepted"] for t in session["takes"]] == [True] * 4
     for iid in ("hook", "tip_pinch"):
         mine = [x for x in timeline if x[1] == iid]
-        assert phases(mine)[:3] == ["OPEN HAND", "MAKE THE GRASP", "HOLD STILL"]
+        assert phases(mine)[:4] == ["OPEN HAND", "READY", "MAKE THE GRASP",
+                                    "HOLD STILL"]
         # the picture only once the grasp is asked for
         assert all(x[3] for x in mine if x[0] == "copy")
         assert all(x[4]["panel_box"] is None for x in mine if x[0] == "open")
@@ -1173,6 +1680,38 @@ def test_the_form_watch_calls_a_hole_a_loss_but_not_a_slow_drain(rp):
     for _sd, lh in other.generate(60):
         w.add(lh, 30.5)
     assert w.lost(30.5) is not None
+
+
+def test_the_form_watch_lists_every_hole_and_says_when_the_hand_is_gone(rp):
+    """MAKE THE GRASP waits for a lost hand instead of giving up at once:
+    `gone` while no frame of it has come for more than 0.3 s, and every
+    hole on the tracker's clock in `holes`, (last frame before, first
+    after), whichever id the hand comes back under nearby."""
+    import dataclasses
+
+    from leap_hand.mock import MockLeapStream
+
+    s = MockLeapStream(dropout_every=0, reacquire_every=0, sides=("left",))
+    lhs = [lh for _sd, lh in s.generate(200)]
+    w = rp.FormWatch(rp.hand_seen(lhs[0], 10.0), others=set())
+    for lh in lhs[1:30]:
+        w.add(lh, 10.3)
+    assert w.gone(10.3) is None and w.holes == []
+    assert w.gone(10.61).lh.frame_id == lhs[29].frame_id      # 0.31 s, no frame
+    # back after a hole of 0.4 s, under a new id where it was: found again
+    back = dataclasses.replace(lhs[66], hand_id=lhs[0].hand_id + 1)
+    w.add(back, 10.8)
+    assert w.gone(10.8) is None
+    ((before, after),) = w.holes
+    assert before.lh.frame_id == lhs[29].frame_id and after.lh is back
+    assert after.ts - before.ts == pytest.approx(37 / 90, abs=0.01)
+    assert w.hid == back.hand_id and w.new_ids == 1
+    # a second loss is a second hole; `lost` still says the first
+    for lh in lhs[67:80]:
+        w.add(dataclasses.replace(lh, hand_id=back.hand_id), 10.9)
+    w.add(dataclasses.replace(lhs[120], hand_id=back.hand_id), 11.5)
+    assert len(w.holes) == 2
+    assert w.lost(11.5).lh.frame_id == lhs[29].frame_id
 
 
 def test_the_open_hand_watch_never_acquires_a_hand_off_to_the_side(rp):
@@ -1329,6 +1868,46 @@ def test_mock_other_hand_needs_the_mock_and_the_coached_take(
     assert not (tmp_path / "a").exists() and not (tmp_path / "b").exists()
 
 
+def test_resume_says_when_the_rules_changed_and_keeps_the_sessions_wait(
+        rp, monkeypatch, tmp_path, protocol_file):
+    """A session recorded before the rules of 2026-10-07 (no recorder_rules
+    in its session.json), resumed: session.json says when it changed to
+    them and what changed, the old takes' metas stay as they were (without
+    recorder_rules), the new take's names its rules. A session that set
+    its own wait and window keeps them when resumed."""
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--lost-wait", "2.5", "--form-window", "6"))
+    folder = session_dir(out)
+    data = read_json(folder / "session.json")
+    assert data["coaching"]["lost_wait_s"] == 2.5
+    assert data["coaching"]["form_window_s"] == 6.0
+    # as the recorder before 2026-10-07 left it
+    del data["recorder_rules"], data["recorder_rules_changes"]
+    (folder / "session.json").write_text(json.dumps(data), encoding="utf-8")
+    old_meta = folder / data["takes"][0]["files"]["meta"]
+    m = read_json(old_meta)
+    del m["recorder_rules"]
+    old_meta.write_text(json.dumps(m), encoding="utf-8")
+    before = old_meta.read_bytes()
+    run(rp, monkeypatch, "--mock", "--protocol", protocol_file, "--hand", "left",
+        "--resume", folder, "--items", "hook", "--takes", "2", "--duration", "1",
+        "--auto-accept", "--no-open")
+    data = read_json(folder / "session.json")
+    (change,) = data["recorder_rules_changes"]
+    assert change["from"] is None and change["to"] == rp.RECORDER_RULES
+    assert "lost while forming is waited for" in change["what"]
+    assert data["recorder_rules"] == rp.RECORDER_RULES
+    assert data["coaching"]["lost_wait_s"] == 2.5          # the session's own
+    assert data["coaching"]["form_window_s"] == 6.0
+    assert old_meta.read_bytes() == before
+    new = read_json(folder / data["takes"][-1]["files"]["meta"])
+    assert data["takes"][-1]["take"] == 2
+    assert new["recorder_rules"] == rp.RECORDER_RULES
+    assert new["coaching"]["lost_wait_s"] == 2.5
+
+
 def test_resume_carries_on_across_a_hint_only_protocol_change(
         rp, monkeypatch, tmp_path, protocol_file, capsys):
     """Adding orientation hints changes the file's bytes; a session recorded
@@ -1370,6 +1949,350 @@ def test_resume_carries_on_across_a_hint_only_protocol_change(
     with pytest.raises(SystemExit, match="protocol file has changed"):
         run(rp, monkeypatch, "--mock", "--protocol", proto, "--hand", "left",
             "--resume", folder, "--auto-accept", "--no-open")
+
+
+# --- the change into the grasp: forming/<take>.jsonl ----------------------------------
+FORMING_KEYS = {"form_start", "forming_frames", "forming_tracked_fraction",
+                "transition_s", "peak_speed_mm_s", "peak_at_s", "last_move_s",
+                "transition_note", "transition_rule"}
+
+
+def test_a_coached_take_writes_its_forming_file_and_transition(
+        rp, monkeypatch, tmp_path, protocol_file):
+    """Every frame from the high beep until the take starts, in the take's
+    own line format, and the meta's transition_s timed from that beep: the
+    mock closes in a quarter of MAKE THE GRASP (0.25 s here), then holds."""
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--prep", "1.0"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    name = entry["name"]
+    assert entry["accepted"] is True
+    assert entry["files"]["forming"] == f"forming/{name}.jsonl"
+    meta = read_json(folder / entry["files"]["meta"])
+    assert meta["files"]["forming"] == entry["files"]["forming"]
+    coaching = meta["coaching"]
+    assert FORMING_KEYS <= set(coaching)
+
+    lines = read_lines(folder / entry["files"]["forming"])
+    take = read_lines(folder / entry["files"]["leap"])
+    assert coaching["forming_frames"] == len(lines) >= 1
+    # the same line format as the take: same keys, same session/item/take
+    assert set(lines[0]) == set(take[0])
+    assert all(x["session"] == folder.name and x["item"] == "hook"
+               and x["take"] == 1 for x in lines)
+    # from the cue on, and over before the take's first line was seen
+    t0 = coaching["form_start"]
+    assert all(x["capture_time"] >= t0 for x in lines)
+    assert max(x["capture_time"] for x in lines) <= min(
+        x["capture_time"] for x in take) + 1e-6
+    # MAKE THE GRASP took the prep's second; the file runs to the take
+    span = max(x["capture_time"] for x in lines) - t0
+    assert 0.9 <= span <= meta["take_start"] - t0 + 0.05
+    # the open palm closing into the grasp, both hands in the file
+    ours = [x for x in lines if x["hand_id"] in coaching["followed_ids"]]
+    assert {x["hand_side"] for x in lines} == {"left", "right"}
+    assert ours[0]["grab_strength"] < 0.2
+    assert ours[-1]["grab_strength"] == pytest.approx(0.6, abs=0.01)
+    assert coaching["forming_tracked_fraction"] >= 0.9
+    # closed by 0.25 s, settled at its end (the window ends well before the take)
+    assert coaching["transition_s"] == pytest.approx(0.25, abs=0.1)
+    assert coaching["transition_rule"] == {"speed_mm_s": 20.0, "window_s": 0.3,
+                                           "step_s": 0.1, "move_speed_mm_s": 50.0}
+    # the close is the main movement: its peak, when, and nothing after it
+    assert coaching["peak_speed_mm_s"] >= 50.0
+    assert 0.0 <= coaching["peak_at_s"] < coaching["transition_s"]
+    assert coaching["last_move_s"] < coaching["transition_s"]
+    assert coaching["transition_note"] == ""
+    assert coaching["ready_pause_s"] == rp.READY_PAUSE_S == 1.0
+    assert coaching["closed_before_cue"] == 0
+
+
+def test_a_reset_restarts_the_forming_file_and_a_loss_does_not(
+        rp, monkeypatch, tmp_path, protocol_file):
+    """A reset (here a close before the GO beep that MAKE THE GRASP finds:
+    no close after the cue) sends the operator back to OPEN HAND, and the
+    next MAKE THE GRASP starts the forming file again: it is the round that
+    led to the take. A loss while forming, waited out, does not: the file
+    is that one MAKE THE GRASP, the gap and both hand ids in it."""
+    from leap_hand import transition as tr
+
+    actor_with(monkeypatch, close_before_cue=1, early_close_at="open")
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--prep", "1.0"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    meta = read_json(folder / entry["files"]["meta"])
+    coaching = meta["coaching"]
+    assert coaching["resets"] == 1 and coaching["forming_lost_count"] == 0
+    lines = read_lines(folder / entry["files"]["forming"])
+    assert coaching["forming_frames"] == len(lines)
+    # form_start is the second round's cue: the file begins there
+    assert coaching["form_start"] > meta["take_start"] - 1.0 - 0.5
+    assert min(x["capture_time"] for x in lines) >= coaching["form_start"]
+    assert coaching["transition_s"] is not None
+    assert not any(tr.FORMING_LOST_KEY in x for x in lines)
+    assert not list(folder.glob("rejected/forming/*"))
+
+
+def test_a_rejected_attempt_keeps_its_forming_file_under_rejected(
+        rp, monkeypatch, tmp_path, protocol_file):
+    """A hand lost while forming and not found again rejects the attempt
+    before anything is recorded; its MAKE THE GRASP is kept with it in
+    rejected/, marked, with no transition."""
+    from leap_hand import transition as tr
+
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "tip_pinch",
+                                    "--prep", "1.5", "--retries", "0",
+                                    "--mock-lose-forming", "1",
+                                    "--lost-wait", "0.5"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    name = entry["name"]
+    assert entry["accepted"] is False and entry["files"]["leap"] is None
+    assert entry["files"]["forming"] == f"rejected/forming/{name}.jsonl"
+    meta = read_json(folder / entry["files"]["meta"])
+    assert meta["files"]["forming"] == entry["files"]["forming"]
+    lines = read_lines(folder / entry["files"]["forming"])
+    assert meta["coaching"]["forming_frames"] == len(lines) >= 1
+    assert all(x[tr.FORMING_LOST_KEY] == 1 for x in lines)
+    # the hand turned away and was gone: not timed, and the note says why
+    assert "transition_s" in meta["coaching"]
+    assert meta["coaching"]["transition_s"] is None
+    assert meta["coaching"]["transition_note"] == tr.lost_note(1)
+    assert not (folder / "forming").is_dir() or not any((folder / "forming").iterdir())
+
+
+def test_a_gate_rejected_take_takes_its_forming_file_to_rejected(
+        rp, monkeypatch, tmp_path, protocol_file):
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--prep", "0.5", "--retries", "0",
+                                    "--mock-dropout", "0.3"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    assert entry["accepted"] is False and entry["decided_by"] == "gate"
+    assert entry["files"]["forming"] == f"rejected/forming/{entry['name']}.jsonl"
+    assert (folder / entry["files"]["forming"]).is_file()
+    # the dropout is the hold's: the forming phase was whole
+    meta = read_json(folder / entry["files"]["meta"])
+    assert meta["coaching"]["forming_tracked_fraction"] >= 0.9
+
+
+def test_a_no_coach_take_has_no_forming_file(rp, monkeypatch, tmp_path,
+                                             protocol_file):
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--prep", "0.3", "--no-coach"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    assert entry["files"]["forming"] is None
+    meta = read_json(folder / entry["files"]["meta"])
+    assert meta["coaching"] is None and meta["files"]["forming"] is None
+    assert not (folder / "forming").exists()
+
+
+def test_the_e2e_mock_rehearsal_leaves_forming_files(rp, monkeypatch, tmp_path,
+                                                     protocol_file):
+    """The runbook's rehearsal command (step 2), on the fixture's grasps:
+    every take has its forming file and a transition."""
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, "--mock", "--protocol", protocol_file, "--hand", "left",
+        "--auto-accept", "--takes", "1", "--duration", "1", "--prep", "0.5",
+        "--no-open", "--out-dir", out)
+    folder = session_dir(out)
+    takes = read_json(folder / "session.json")["takes"]
+    assert [t["accepted"] for t in takes] == [True] * len(ITEMS)
+    assert len(list((folder / "forming").glob("*.jsonl"))) == len(ITEMS)
+    for t in takes:
+        coaching = read_json(folder / t["files"]["meta"])["coaching"]
+        assert coaching["forming_frames"] >= 1
+        assert coaching["transition_s"] == pytest.approx(0.15, abs=0.1)
+
+
+def _recompute_cli():
+    spec = importlib.util.spec_from_file_location(
+        "recompute_transition_cli", REPO / "scripts" / "leap" / "recompute_transition.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    return cli
+
+
+def _snapshot(folder: Path) -> dict:
+    return {p.relative_to(folder).as_posix(): p.read_bytes()
+            for p in sorted(folder.rglob("*")) if p.is_file()}
+
+
+def test_recompute_transition_rewrites_only_the_transition_keys(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """A mock session with a kept take and a rejected attempt that both have
+    forming files, put back the way the first rule wrote them (no peak,
+    no note, the old rule, a wrong transition_s). The recompute rewrites
+    those keys to what today's recorder writes, in the recorder's place and
+    format, and leaves every other byte of the session as it was."""
+    import shutil
+
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--prep", "1.0"))
+    folder = session_dir(out)
+    run(rp, monkeypatch, "--mock", "--protocol", protocol_file, "--hand", "left",
+        "--resume", folder, "--items", "tip_pinch", "--takes", "1",
+        "--duration", "1", "--prep", "1.0", "--retries", "0",
+        "--mock-lose-forming", "1", "--lost-wait", "0.5", "--auto-accept",
+        "--no-open")
+    copy = tmp_path / "copy" / folder.name
+    shutil.copytree(folder, copy)
+    cli = _recompute_cli()
+    metas = cli.forming_metas(copy)
+    assert [p.parent.relative_to(copy).as_posix() for p in metas] == [
+        "meta", "rejected/meta"]
+    recorded = {p.name: read_json(p) for p in metas}
+    capsys.readouterr()
+
+    # today's recorder and the recompute agree: nothing to change
+    before = _snapshot(copy)
+    assert cli.main([str(copy), "--dry-run"]) == 0
+    assert cli.main([str(copy)]) == 0
+    printed = capsys.readouterr().out
+    assert printed.count("(unchanged)") == 4
+    assert printed.rstrip().endswith("recompute ok")
+    assert _snapshot(copy) == before
+
+    # the first rule's metas, written as the recorder wrote them
+    for p in metas:
+        meta = read_json(p)
+        c = meta["coaching"]
+        for key in ("peak_speed_mm_s", "peak_at_s", "last_move_s",
+                    "transition_note"):
+            del c[key]
+        c["transition_s"] = 0.18
+        c["transition_rule"] = {"speed_mm_s": 20.0, "window_s": 0.3, "step_s": 0.1}
+        rp.write_json(p, meta)
+    old = _snapshot(copy)
+
+    assert cli.main([str(copy), "--dry-run"]) == 0
+    printed = capsys.readouterr().out
+    assert "transition_s 0.18 -> " in printed
+    assert printed.rstrip().splitlines()[-1] == "recompute dry-run ok"
+    assert _snapshot(copy) == old, "a dry run writes nothing"
+
+    assert cli.main([str(copy)]) == 0
+    assert capsys.readouterr().out.rstrip().splitlines()[-1] == "recompute ok"
+    new = _snapshot(copy)
+    changed = {k for k in new if new[k] != old[k]}
+    assert changed == {p.relative_to(copy).as_posix() for p in metas}
+    assert set(new) == set(old)
+    for p in metas:
+        meta, was = read_json(p), recorded[p.name]
+        # the numbers, the keys and their order are what the recorder wrote
+        assert meta == was
+        assert list(meta["coaching"]) == list(was["coaching"])
+        # and the bytes are the recorder's write_json of it
+        rp.write_json(tmp_path / "again.json", meta)
+        assert p.read_bytes() == (tmp_path / "again.json").read_bytes()
+    kept, rejected = (read_json(p)["coaching"] for p in metas)
+    assert kept["transition_s"] is not None and kept["transition_note"] == ""
+    # the hand lost while forming: the recompute reads the mark on its
+    # forming file's lines, as the recorder did, and times nothing
+    assert rejected["transition_s"] is None
+    assert rejected["transition_note"].startswith(
+        "the hand was lost while forming the grasp (1 time)")
+
+    # a meta not in the recorder's form is named and left alone
+    odd = metas[0]
+    odd.write_text(json.dumps(read_json(odd), indent=1), encoding="utf-8")
+    kept_bytes = odd.read_bytes()
+    assert cli.main([str(copy)]) == 1
+    printed = capsys.readouterr().out
+    assert "not in the recorder's json form" in printed
+    assert printed.rstrip().endswith("recompute: 1 take(s) not rewritten")
+    assert odd.read_bytes() == kept_bytes
+
+
+def _check_cli():
+    spec = importlib.util.spec_from_file_location(
+        "check_protocol_cli_rp", REPO / "scripts" / "check_protocol.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    return cli
+
+
+def _as_before_forming(folder: Path) -> None:
+    """The session as the recorder wrote it before 2026-10-02: no forming
+    folder, no `files.forming`, no forming keys in `coaching`."""
+    import shutil
+
+    shutil.rmtree(folder / "forming", ignore_errors=True)
+    session = read_json(folder / "session.json")
+    for t in session["takes"]:
+        t["files"].pop("forming", None)
+        meta_path = folder / t["files"]["meta"]
+        meta = read_json(meta_path)
+        meta["files"].pop("forming", None)
+        for key in FORMING_KEYS:
+            meta["coaching"].pop(key, None)
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    (folder / "session.json").write_text(json.dumps(session, indent=2),
+                                         encoding="utf-8")
+
+
+def test_resume_with_takes_5_records_only_takes_4_and_5(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """The professor's 5 takes per grasp: a copy of a session with 3 kept
+    takes of each grasp (as recorded before the forming files), resumed
+    with --takes 5, gets takes 4 and 5 of each and nothing else, and still
+    passes the checker, the old takes as before and the new ones with
+    their transitions."""
+    import shutil
+
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--items", "hook,tip_pinch", "--takes", "3"))
+    original = session_dir(out)
+    copy = tmp_path / "copy" / original.name
+    shutil.copytree(original, copy)
+    _as_before_forming(copy)
+    first = read_json(copy / "session.json")
+    assert [(t["item"], t["take"]) for t in first["takes"]] == [
+        ("hook", 1), ("hook", 2), ("hook", 3),
+        ("tip_pinch", 1), ("tip_pinch", 2), ("tip_pinch", 3)]
+    before = read_json(original / "session.json")
+
+    run(rp, monkeypatch, "--mock", "--protocol", protocol_file, "--hand", "left",
+        "--resume", copy, "--takes", "5", "--prep", "0.5", "--auto-accept",
+        "--no-open")
+    session = read_json(copy / "session.json")
+    assert session["takes"][:6] == first["takes"], "earlier entries untouched"
+    added = session["takes"][6:]
+    assert [(t["item"], t["take"], t["accepted"]) for t in added] == [
+        ("hook", 4, True), ("hook", 5, True),
+        ("tip_pinch", 4, True), ("tip_pinch", 5, True)]
+    assert session["takes_per_item"] == 5 and len(session["resumed"]) == 1
+    assert session["items"] == ["hook", "tip_pinch"]
+    printed = capsys.readouterr().out
+    assert "6 take(s) already kept here" in printed
+    assert "Short of" not in printed
+    # the new takes have their forming files; the original is as it was
+    for t in added:
+        assert (copy / t["files"]["forming"]).is_file()
+    assert read_json(original / "session.json") == before
+
+    # a session resumed this way still passes the checker, old and new takes
+    cli = _check_cli()
+    assert cli.main([str(copy)]) == 0
+    text = capsys.readouterr().out
+    assert "10 accepted, 0 rejected; 0 accepted take(s) fail a rule" in text
+    assert text.count("close cue to settled") == 4
 
 
 # --- the plain session is unchanged --------------------------------------------------

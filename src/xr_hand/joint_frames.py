@@ -82,9 +82,11 @@ WHICH ORDER, AND WHY
       bone out of the parent's sagittal y-z plane, flexion the angle of its
       projection inside that plane. Twist is what is left about the bone.
       LeapC builds its finger joints as pure swings (quaternion z component
-      zero), for which this twist is not 0 but about abduction times
+      zero), for which this twist is not 0 but minus abduction times
       tan(flexion / 2): 2 degrees at 45 of flexion and 5 of abduction, 5 at
       90. A twist of that size on a camera row is the order, not the finger.
+      (Measured on the 69 summary frames of the 2026-10-01 grasp session:
+      the relation holds to within 0.1 degree on every phalanx row.)
 
   For the thumb's first row (THUMB_METACARPAL relative to WRIST) the three
   angles include the thumb's resting roll: TMC_fe and TMC_aa are where the
@@ -92,10 +94,52 @@ WHICH ORDER, AND WHY
   about its own axis, which is where opposition shows. None of them is zero
   at rest. The glove's thumb CMC is flexion only and its metacarpal splay a
   fixed 5/10/15 degree template (the glove's own model), so on the glove the
-  CMC and MCP_aa values are constants; the camera measures them.
+  CMC and MCP_aa values are constants. The camera measures MCP_aa. It does
+  NOT measure the four finger CMC either: LeapC's palm is rigid (WHERE THIS
+  IS NOT THE PAPER'S MODEL, below).
 
   xr_hand.mock is a cartoon with its own axes (bones along +y, dorsal +z);
   only its flexion, about x, reads the same here.
+
+WHERE THIS IS NOT THE PAPER'S MODEL (checked against the paper, 2026-10-05)
+  The 24 names are the paper's (its Table 1: per finger CMC, MCP_fe, MCP_aa,
+  PIP, DIP; thumb TMC_fe, TMC_aa, MCP_fe, IP). The numbers under them are
+  read off a tracker's bone orientations, and differ from the paper's joint
+  variables in four ways a reader comparing the two must know:
+
+    * Order at the two-axis joints. The paper's D-H chain (its Tables 2 and
+      3) turns the MCP, and the thumb's TMC, about the abduction axis first
+      and the flexion axis second. The table here takes flexion first (WHICH
+      ORDER, AND WHY: the paper's order locks at 90 degrees of flexion). The
+      bone points the same way either way; the two numbers that say where
+      differ once both are non-zero: sin(fe_paper) = sin(fe) cos(aa),
+      tan(aa_paper) = tan(aa) / cos(fe). At 60 degrees of flexion and 10 of
+      abduction the paper's order reads 58.5 and 19.4. `mcp_paper_order`
+      gives the four MCP pairs in the paper's order.
+    * The four finger CMC are not measured on the camera. The paper's CMC
+      is the arching of the palm ("allows simulation of the palm arc").
+      LeapC's palm is rigid: against the PALM joint the four metacarpals
+      read the same in every one of the 69 summary frames of the 2026-10-01
+      grasp session (8.65, 8.53, 8.59, 6.29 degrees, I to L), constants of
+      its hand model. Measured from the WRIST joint, which on the camera is
+      the forearm (THE WRIST FRAME), the four are that rigid palm seen from
+      the forearm: they change with the bend of the wrist and with nothing
+      else. `palm_reference_angles` gives them against the palm joint, where
+      the constant shows.
+    * The thumb's TMC pair is taken about the hand's axes, not the thumb's.
+      In the paper's chain (its Table 3) the TMC flexion axis is parallel to
+      the thumb's MCP and IP flexion axes and its abduction axis is at a
+      right angle to it. Here TMC_fe and TMC_aa are where the thumb
+      metacarpal points as seen from the WRIST joint, about the wrist
+      joint's x and y. The thumb's own flexion axis (+x of
+      THUMB_METACARPAL) is 65 to 89 degrees from the palm's +x on those 69
+      frames (median 76), so the pair is roughly exchanged against the
+      paper's and must not be compared with it; and it cannot be converted,
+      because the paper's thumb reference frame is given as a drawing (its
+      Figure 1), not in numbers. Like the CMC the pair includes the bend of
+      the wrist; `palm_reference_angles` gives it against the palm joint.
+    * Twist. The paper's phalanges have no rotation about their own axis.
+      `twist_deg` is reported for every row and is not one of the 24.
 
 MEASURED ON DAY 2 (recordings/sync_day2, summary frame = medoid of the
 whole take, index PIP flexion in degrees, wrist reference)
@@ -162,6 +206,16 @@ for _letter, _finger in FINGERS[1:]:
     })
 DOF24_NAMES: List[str] = list(DOF24_SOURCE)
 assert len(DOF24_NAMES) == 24
+
+# The six of the 24 a camera take does not give (WHERE THIS IS NOT THE
+# PAPER'S MODEL, above): the four finger CMC, which LeapC's rigid palm does
+# not measure, and the thumb's TMC pair, which is about other axes than the
+# paper's and cannot be converted. `dof24` still reads their cells, because
+# a row is a row; what is handed to a reader under the paper's names leaves
+# them out (`dof24_text`, `leap_hand.grasp_handin.angle_rows`).
+CAMERA_NOT_GIVEN = ("T_TMC_fe", "T_TMC_aa", "I_CMC", "M_CMC", "R_CMC",
+                    "L_CMC")
+NOT_GIVEN_TEXT = "n/a"
 
 # The paper's name for the joint each row's angles describe, for labels.
 PAPER_JOINT: Dict[str, str] = {
@@ -405,6 +459,78 @@ def dof24(rows: Sequence[dict]) -> Dict[str, float]:
             for name, (joint, key) in DOF24_SOURCE.items()}
 
 
+# --- the paper's own reading of the same bones ---------------------------------------
+# Two places where the table above is not the paper's model (see "WHERE THIS
+# IS NOT THE PAPER'S MODEL" in the module docstring). Both are given as extra
+# numbers, never in place of the 24.
+MCP_PAPER_NAMES: List[str] = [f"{_l}_MCP_{_k}_paper_order"
+                              for _l, _f in FINGERS[1:] for _k in ("fe", "aa")]
+PALM_REF_NAMES: List[str] = (["T_TMC_fe_palm_ref", "T_TMC_aa_palm_ref"]
+                             + [f"{_l}_CMC_palm_ref" for _l, _f in FINGERS[1:]])
+
+
+def paper_order_angles(r_rel: np.ndarray, hand: str) -> Tuple[float, float]:
+    """(flexion, abduction) in degrees with abduction applied FIRST.
+
+    The same parent-to-child rotation `joint_angles` reads, with the child's
+    bone direction split the way the paper's D-H chain builds it: a turn
+    about the parent's y (abduction), then a turn about the new x (flexion),
+    R = Ry(beta) @ Rx(alpha). The bone axis is then
+    z = (cos(alpha) sin(beta), -sin(alpha), cos(alpha) cos(beta)), so
+
+        alpha = atan2(-z_y, k * hypot(z_x, z_z))
+        beta  = atan2(k * z_x, k * z_z)        k = sign(z_z), +1 at 0
+
+    and flexion = -alpha, abduction = hand_sign * beta: the signs of
+    `joint_angles`. k keeps the abduction inside +-90 degrees, so a finger
+    flexed past 90 reads as flexed past 90, not as abducted by 180. At
+    exactly 90 degrees of flexion the bone lies on the abduction axis and
+    its abduction is not defined in this order; it comes back as 0.
+
+    With one of the two angles zero this is `joint_angles` exactly. With
+    both, the pair differs: sin(flex_paper) = sin(flex) cos(abd) and
+    tan(abd_paper) = tan(abd) / cos(flex).
+    """
+    r = np.asarray(r_rel, dtype=float)
+    zx, zy, zz = float(r[0, 2]), float(r[1, 2]), float(r[2, 2])
+    k = 1.0 if zz >= 0.0 else -1.0
+    alpha = float(np.arctan2(-zy, k * np.hypot(zx, zz)))
+    beta = float(np.arctan2(k * zx, k * zz))
+    return (-float(np.degrees(alpha)) + 0.0,
+            hand_sign(hand) * float(np.degrees(beta)) + 0.0)
+
+
+def mcp_paper_order(frame_line: dict, source: str,
+                    hand: Optional[str] = None) -> Dict[str, float]:
+    """`MCP_PAPER_NAMES` -> degrees: each finger's MCP flexion and abduction
+    in the paper's order (`paper_order_angles`), the proximal phalanx against
+    its metacarpal."""
+    _pos, rots, side = world_pose(frame_line, source)
+    out: Dict[str, float] = {}
+    for letter, finger in FINGERS[1:]:
+        i = JOINT_INDEX[f"{finger}_PROXIMAL"]
+        fe, aa = paper_order_angles(rots[PARENT[i]].T @ rots[i], hand or side)
+        out[f"{letter}_MCP_fe_paper_order"] = fe
+        out[f"{letter}_MCP_aa_paper_order"] = aa
+    return out
+
+
+def palm_reference_angles(frame_line: dict, source: str,
+                          hand: Optional[str] = None) -> Dict[str, float]:
+    """`PALM_REF_NAMES` -> degrees: the six of the 24 that are measured from
+    the wrist joint (TMC_fe, TMC_aa and the four CMC), measured from the
+    palm joint instead (`reference="palm"`). On the camera the wrist joint's
+    axes are the forearm's, so the default six include however far the
+    wrist is bent; these do not. On the camera the four CMC of these are
+    constants of LeapC's rigid palm, not measurements (module docstring)."""
+    d = dof24(joint_table(frame_line, source, "palm", hand))
+    out = {"T_TMC_fe_palm_ref": d["T_TMC_fe"],
+           "T_TMC_aa_palm_ref": d["T_TMC_aa"]}
+    for letter, _finger in FINGERS[1:]:
+        out[f"{letter}_CMC_palm_ref"] = d[f"{letter}_CMC"]
+    return out
+
+
 def wrist_palm_deg(frame_line: dict, source: str) -> float:
     """Angle in degrees between the WRIST and PALM joints' orientations.
 
@@ -432,6 +558,15 @@ def line_from_hand_frame(frame: HandFrame) -> dict:
             "joints": [{"name": j.name, "x": j.x, "y": j.y, "z": j.z,
                         "qw": j.qw, "qx": j.qx, "qy": j.qy, "qz": j.qz}
                        for j in frame.joints]}
+
+
+def dof24_text(dof: Dict[str, float], name: str, source: str,
+               digits: int = 1) -> str:
+    """One of the 24 as a reader is shown it: the number, or
+    `NOT_GIVEN_TEXT` for one of `CAMERA_NOT_GIVEN` on a camera take."""
+    if source == "camera" and name in CAMERA_NOT_GIVEN:
+        return NOT_GIVEN_TEXT
+    return fmt_num(dof[name], digits)
 
 
 def fmt_num(v: float, digits: int) -> str:

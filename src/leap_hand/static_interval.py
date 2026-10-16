@@ -41,11 +41,12 @@ the label never decides whose hand a frame is.
 
 The coached recorder follows the hand it acquired, by the tracker's hand id
 (`follow_hand`). OPEN HAND acquires one hand over the module; the take is
-that id, plus every new id the tracker gives the same hand while it is
-absent under the old one and within `FOLLOW_RADIUS_M` of where it was (a
-chirality flip or a re-acquisition). An id seen in the same tracking frame
-as the followed hand, or further away, is another hand and stays another
-hand. On 2026-10-01 both failures were measured: a flip from left to right
+that id, plus every new id treated as the same hand because it appears
+while the hand is absent under the old one and within `FOLLOW_RADIUS_M` of
+where it was (taken for a chirality flip or a re-acquisition: a rule of id
+and distance, not a proof of identity). An id seen in the same tracking
+frame as the followed hand, or further away, is treated as another hand
+from then on. On 2026-10-01 both failures were measured: a flip from left to right
 mid-take split one hand's frames over two labels and the take was rejected
 as 54 % tracked, and the operator's idle right hand, held in view to help
 the tracker, had more frames than the grasping hand and was measured
@@ -90,9 +91,10 @@ MIN_TRACKED_FRACTION = 0.90
 LOSS_GAP_S = 0.100   # an id change after a hole longer than this is a real loss
                      # (the same number as leap_hand.tracking_quality.LOSS_GAP_S)
 # A new hand id whose palm is within this of the followed hand's last palm,
-# in a frame without the followed hand, is the same hand re-fitted (a
-# chirality flip or a re-acquisition). Anything further away, or present in
-# the same frame as the followed hand, is another hand. Metres.
+# in a frame without the followed hand, is treated as the same hand re-fitted
+# (a chirality flip or a re-acquisition): a rule of id and distance, not a
+# proof of identity. Anything further away, or present in the same frame as
+# the followed hand, is treated as another hand. Metres.
 FOLLOW_RADIUS_M = 0.10
 # With a label required (`summarise_take(require_label=...)`), at least this
 # share of the static interval's frames must carry it.
@@ -234,13 +236,15 @@ def follow_hand(frames: Sequence[dict], start_id: int,
 
       a frame with a line of an id already followed: the one of those
         nearest the last palm is the hand, and every other id in the frame
-        is another hand, because two hands seen at once cannot both be the
-        operator's;
+        is treated as another hand, because two hands seen at once cannot
+        both be the operator's;
       a frame without one: of the ids not known to be another hand, the one
         nearest the last palm (no palm yet: the `prefer` label, else the
-        first) is the same hand under a new id when it is within `radius_m`
-        (a line with no palm counts as near) and is followed from then on;
-        the rest, and that one when it is further, are other hands.
+        first) is treated as the same hand under a new id when it is within
+        `radius_m` (a line with no palm counts as near; a rule of id and
+        distance, not a proof of identity) and is followed from then on;
+        the rest, and that one when it is further, are treated as other
+        hands.
 
     A hand lost and back far from where it was is therefore not taken back:
     its absence counts against the take, which is the honest number.

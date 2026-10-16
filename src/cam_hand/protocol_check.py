@@ -58,6 +58,16 @@ SET B (finger_flexion)
     `recording_protocol.count_peaks`, the function the recorder's quick
     check rejects on, so a take the recorder accepted is not failed here
     for a bend count it could have been redone for.
+  * bend speed (since 2026-10-13): every counted bend is timed from 20 %
+    to 80 % of its own rise and every straighten the same way down, by
+    `recording_protocol.bend_moves`, the recorder's function. In a session
+    recorded under the bend-speed rule (session.json `speed_check`, which
+    holds the numbers that session is judged on) a bend the cue gives 2 s
+    or more for FAILS when it took under 15 % of the cue's time; in a
+    session without the rule (every one before that day, and one recorded
+    with `--no-speed-check`) the times are reported and a note says which
+    bends today's rule would have refused. The straighten is never judged:
+    the glove's reading falls fast once a finger starts to open.
   * where the camera followed the finger (camera span >= 0.50 by
     `diagnostics.camera_range`, over the take and per cycle) the transfer
     curve, hysteresis and lag are reported, per cycle and per take, with the
@@ -162,10 +172,18 @@ from cam_hand.recording_protocol import (
     PEAK_LOW as PEAK_LOW_SHARE,
     PEAK_MIN_RANGE as MIN_PEAK_RANGE,
     SINGLE_MIN_SHARE,
+    SPEED_IN_FORCE,
+    SPEED_RULE_SINCE,
     THUMB_MIN_DEG,
+    bend_moves,
+    bend_speed,
     count_peaks,
+    cue_seconds,
     glove_bends,
+    rule_marks,
+    seconds_text,
     single_usable,
+    speed_rule,
 )
 from leap_hand.diagnostics import (
     MIN_CAMERA_RANGE,
@@ -245,6 +263,8 @@ CSV_COLUMNS = [
     "paired_fraction", "clock",
     "cued_finger", "cued_span_fraction", "other_spans",
     "cycles_expected", "cycles_from_events", "cycles_from_peaks",
+    "speed_rule", "bend_cue_s", "bend_times_s", "bend_time_median_s",
+    "straighten_cue_s", "straighten_times_s", "straighten_time_median_s",
     "camera_span", "cycles_camera_followed", "frames_camera_followed",
     "lag_ms_median", "lag_ms_take", "lag_ms_cycles", "hysteresis_median",
     "bands", "steps_total", "steps_pass_glove", "steps_judged_camera",
@@ -253,7 +273,8 @@ CSV_COLUMNS = [
     "curls",
     "verdict", "failures", "notes",
 ]
-JSON_COLUMNS = ("other_spans", "lag_ms_cycles", "steps", "curls")
+JSON_COLUMNS = ("other_spans", "bend_times_s", "straighten_times_s",
+                "lag_ms_cycles", "steps", "curls")
 
 
 def finger_name(name) -> Optional[str]:
@@ -473,6 +494,41 @@ def read_warmups(session_dir: Path, meta: dict) -> Dict[str, Optional[dict]]:
         w = read_json(session_dir / n)
         out[n] = w if isinstance(w, dict) else None
     return out
+
+
+def ran_camera(meta: dict) -> bool:
+    """Whether a session ran a camera beside the glove: session.json's
+    "camera" is "none" for a glove-only run (`record_protocol.py --camera
+    none`); a session written before the key existed always ran one."""
+    return str((meta or {}).get("camera", "leap")).lower() != "none"
+
+
+def speed_rule_of(meta: dict) -> Optional[dict]:
+    """The bend-speed rule a session was recorded under: session.json's
+    `speed_check`, or None (every session before 2026-10-13, a sequences
+    session, one recorded with `--no-speed-check`)."""
+    rule = (meta or {}).get("speed_check")
+    return rule if isinstance(rule, dict) else None
+
+
+def speed_rule_text(rule: Optional[dict]) -> str:
+    """One sentence on the rule a session is judged by, for the reports."""
+    if rule is None:
+        return ("no bend-speed rule in this session (it was recorded before "
+                f"the rule was added on {SPEED_RULE_SINCE}, or with "
+                "--no-speed-check): bends and straightens are timed and "
+                "reported, not judged")
+    lo, hi = rule_marks(rule)
+    return (f"bend-speed rule in force: a bend the cue gives "
+            f"{float(rule.get('slow_from_s', 0)):g} s or more for must take "
+            f"at least {float(rule.get('min_bend_share', 0)) * 100:.0f} % of "
+            f"the cue's time to go from {lo * 100:.0f} % to {hi * 100:.0f} % "
+            "of its own rise; the straighten is timed, never judged")
+
+
+def _times_text(values) -> str:
+    """'0.07 0.15 -' for a list of seconds with gaps."""
+    return " ".join(fmt(v) for v in values) or "-"
 
 
 def mock_flags(meta: dict) -> List[str]:
@@ -919,6 +975,10 @@ def check_flexion_take(session: Session, data: TakeData
         if bends and peaks != cycles_ev:
             failures.append(f"{cycles_ev} bend cue(s) but {peaks} glove curl "
                             "peak(s)")
+        speed_lines = _bend_speed(session, data, gt, frac[:, idx], finger,
+                                  fields, failures)
+    else:
+        speed_lines = []
 
     detail: List[str] = []
     if idx is None or gt.size == 0:
@@ -933,6 +993,7 @@ def check_flexion_take(session: Session, data: TakeData
         detail.extend(_cycle_table(
             [_cycle_row(bends[k], k, gt, a, b, frac, idx)
              for k, (a, b) in enumerate(bounds)], camera=False))
+        detail.extend(speed_lines)
         return fields, failures, detail
 
     # --- the camera as the reference -------------------------------------
@@ -980,12 +1041,75 @@ def check_flexion_take(session: Session, data: TakeData
         fields["hysteresis_median"] = _rnd(_median_or_none(
             b_.hysteresis for b_ in sweep.bins), 3)
     detail.extend(_flexion_detail(ref, finger, sweep, cycles))
+    detail.extend(speed_lines)
     if sign < 0:
         detail.insert(1, "  glove thumb in degrees (TMC_fe + MCP_fe + IP); "
                          "the transfer curve and the rail show minus the "
                          "degrees, so the glove falls as the thumb bends, as "
                          "the camera's curl does")
     return fields, failures, detail
+
+
+def _bend_speed(session: Session, data: TakeData, gt: np.ndarray,
+                trace: np.ndarray, finger: str, fields: dict,
+                failures: List[str]) -> List[str]:
+    """Time the take's bends and straightens (`recording_protocol.
+    bend_moves`), put them in `fields`, fail the take on the session's own
+    bend-speed rule when it has one, and return the check.txt lines.
+
+    A session without the rule is not failed: `fields["_notes"]` then says
+    which bends today's rule would have refused, so a recording made before
+    the rule shows what it holds without changing its verdict.
+    """
+    rule = speed_rule_of(session.meta)
+    scale = float(session.meta.get("time_scale") or 1.0)
+    marks = rule_marks(rule)
+    moves = bend_moves(gt, trace, marks)
+    bend_cue = cue_seconds(data.events, "bend")
+    straighten_cue = cue_seconds(data.events, "straighten")
+    rises = [m["rise_s"] for m in moves]
+    falls = [m["fall_s"] for m in moves]
+    judged = bend_speed(moves, bend_cue, rule, scale)
+    fields.update(
+        speed_rule=judged["state"], bend_cue_s=_rnd(bend_cue),
+        bend_times_s=[_rnd(x, 3) for x in rises],
+        bend_time_median_s=_rnd(_median_or_none(rises), 3),
+        straighten_cue_s=_rnd(straighten_cue),
+        straighten_times_s=[_rnd(x, 3) for x in falls],
+        straighten_time_median_s=_rnd(_median_or_none(falls), 3))
+    if not moves:
+        return []
+    pct = f"{marks[0] * 100:.0f} to {marks[1] * 100:.0f} %"
+    line = (f"  bend times (s), {pct} of each bend's rise: "
+            + _times_text(rises))
+
+    def said(result: dict) -> str:
+        took = [rises[k] for k in result["fast"]]
+        return (f"{len(took)} of {len(moves)} bend(s) took "
+                f"{seconds_text(took)}, a {bend_cue:g} s bend cue needs "
+                f"{result['need_s']:.2f} s")
+
+    if judged["state"] == SPEED_IN_FORCE:
+        line += (f"; the {bend_cue:g} s cue needs {judged['need_s']:.2f} "
+                 "(rule in force)")
+        if judged["fast"]:
+            failures.append(f"{finger} bent too fast: {said(judged)}")
+    elif rule is None:
+        today = bend_speed(moves, bend_cue, speed_rule(), scale)
+        if today["fast"]:
+            fields["_notes"] = [
+                "bend speed not judged (this session has no speed rule): "
+                + said(today) + " under the rule of " + SPEED_RULE_SINCE]
+            line += (f"; not judged (no speed rule in this session; the "
+                     f"rule of {SPEED_RULE_SINCE} asks {today['need_s']:.2f} "
+                     f"of a {bend_cue:g} s cue)")
+        else:
+            line += "; not judged (no speed rule in this session)"
+    else:
+        line += "; not judged (not a slow cue)"
+    return [line,
+            f"  straighten times (s), back down across {pct}: "
+            + _times_text(falls) + "; reported, never judged"]
 
 
 def _cycle_row(bend: dict, k: int, gt: np.ndarray, a: float, b: float,
@@ -1503,13 +1627,16 @@ def check_session(session_dir, bands: str = FIXED) -> SessionCheck:
             f"{k} on {v} take(s)" for k, v in sorted(clocks.items()))
             or "no takes"))
         if session.set == FLEXION:
+            header.append("speed     "
+                          + speed_rule_text(speed_rule_of(session.meta)))
             for ref, data in loaded:
                 row = _base_row(session, ref)
                 row.update(data.fields)
                 fields, failures, detail = check_flexion_take(session, data)
+                extra = fields.pop("_notes", [])
                 row.update(fields)
                 row["failures"] = failures
-                row["notes"] = list(data.notes)
+                row["notes"] = list(data.notes) + extra
                 rows.append(row)
                 details[ref.name] = detail
         else:
@@ -1637,7 +1764,12 @@ def read_check_csv(path) -> List[Dict[str, str]]:
 
 def check_is_current(session: Session, rows: Sequence[Dict[str, str]]
                      ) -> bool:
-    """Does a check.csv cover exactly this session's takes, accepted or not?"""
+    """Does a check.csv cover exactly this session's takes, accepted or
+    not, with every column this checker writes? One written before a column
+    existed (the bend times, 2026-10-13) is not current: its rows would
+    read as "not measured"."""
+    if rows and not set(CSV_COLUMNS) <= set(rows[0]):
+        return False
     have = {(r.get("name"), r.get("accepted")) for r in rows}
     want = {(t.name, "true" if t.accepted else "false") for t in session.takes}
     return have == want
@@ -1650,7 +1782,7 @@ def _table(check: SessionCheck) -> List[str]:
         out.append(f"  {'take':<48} {'acc':<3} {'verdict':<7} {'glove':>6} "
                    f"{'Hz':>5} {'gap ms':>6} {'camera':>6} {'paired':>6} "
                    f"{'cued span':>15} {'cycles ev/pk/exp':>16} "
-                   f"{'lag ms':>6}")
+                   f"{'lag ms':>6} {'bend s':>7} {'open s':>7}")
     elif s.set == SEQUENCES:
         out.append(f"  {'take':<48} {'acc':<3} {'verdict':<7} {'glove':>6} "
                    f"{'Hz':>5} {'gap ms':>6} {'camera':>6} {'paired':>6} "
@@ -1660,7 +1792,7 @@ def _table(check: SessionCheck) -> List[str]:
         out.append(f"  {'take':<48} {'acc':<3} {'verdict':<7} {'frames':>6} "
                    f"{'tracked':>7} {'reacq':>5} {'grab':>5} {'pinch':>5}  "
                    "curls (thumb..pinky)")
-    out.append("  " + "-" * 126)
+    out.append("  " + "-" * (142 if s.set == FLEXION else 126))
     for r in check.rows:
         head = (f"  {r['name'][:48]:<48} "
                 f"{'yes' if r['accepted'] else 'no':<3} "
@@ -1677,7 +1809,9 @@ def _table(check: SessionCheck) -> List[str]:
                    f"{fmt(r['cycles_expected'], 'd')}")
             head += (f" {str(r['cued_finger'] or '-'):>8} "
                      f"{fmt(r['cued_span_fraction']):>6} {cyc:>16} "
-                     f"{fmt(r['lag_ms_median'], '.0f'):>6}")
+                     f"{fmt(r['lag_ms_median'], '.0f'):>6} "
+                     f"{fmt(r.get('bend_time_median_s')):>7} "
+                     f"{fmt(r.get('straighten_time_median_s')):>7}")
             out.append(head)
             if r.get("other_spans"):
                 out.append("      other fingers' spans (reported, not "
@@ -1715,11 +1849,18 @@ def rules_text(check: SessionCheck) -> List[str]:
     s = check.session
     out = ["Rules in force (fixed numbers are acquisition gates; the "
            "continuous values above are the measurement)"]
+    camera = ran_camera(s.meta)
     if s.set in (FLEXION, SEQUENCES):
         out += [
             "  fraction        (open - curl) / (open - fist), clipped to "
             f"[{FRACTION_CLIP[0]}, {FRACTION_CLIP[1]}]; curl is tip-to-wrist "
-            "over palm length",
+            "over palm length"]
+    if s.set in (FLEXION, SEQUENCES) and not camera:
+        out += [
+            "  camera          none in this session (glove only): no camera "
+            "frames, no pairing, and no transfer curve, hysteresis or lag"]
+    elif s.set in (FLEXION, SEQUENCES):
+        out += [
             "  camera frames   cam_hand.fusion.camera_trusted, default gates "
             f"(held >= {DEFAULT_GATES.min_visible_time_us / 1000:.0f} ms, "
             "stable hand id, palm within "
@@ -1750,10 +1891,16 @@ def rules_text(check: SessionCheck) -> List[str]:
             f"above {PEAK_HIGH_SHARE:.0%} of the take's range after being "
             f"below {PEAK_LOW_SHARE:.0%}); they must match, and must equal "
             "the protocol's cycles when the protocol file is readable",
-            f"  camera followed camera span >= {MIN_CAMERA_RANGE:.2f} curl "
-            "(leap_hand.diagnostics.camera_range), per take and per cycle; "
-            "only then are the transfer curve, hysteresis and lag reported",
+            "  bend s, open s  the median over the take's counted bends of "
+            "how long the reading took to cross the middle of the bend's own "
+            "rise, and of its fall; " + speed_rule_text(speed_rule_of(s.meta)),
         ]
+        if camera:
+            out.append(
+                f"  camera followed camera span >= {MIN_CAMERA_RANGE:.2f} "
+                "curl (leap_hand.diagnostics.camera_range), per take and "
+                "per cycle; only then are the transfer curve, hysteresis "
+                "and lag reported")
     if s.set == SEQUENCES:
         hold, window = check_window_s(s)
         scale = ("the warm-up range" if check.bands == FIXED else
@@ -1767,8 +1914,9 @@ def rules_text(check: SessionCheck) -> List[str]:
             "(coupling g/c = glove/camera count), not failed",
             f"  window          median over the last {window:g} s of each "
             f"{hold:g} s hold",
-            "  verdict         every step must pass on the glove; the camera "
-            "is reported beside it and never fails a take",
+            "  verdict         every step must pass on the glove"
+            + ("; the camera is reported beside it and never fails a take"
+               if camera else ""),
         ]
     if s.set == GRASPS:
         out += [
@@ -1797,12 +1945,19 @@ def render_text(check: SessionCheck) -> str:
     lines += _table(check)
     if any(check.details.values()):
         lines.append("")
-        if s.set == FLEXION:
+        camera = ran_camera(s.meta)
+        if s.set == FLEXION and camera:
             lines.append("Per item: transfer curve, hysteresis and lag where "
                          "the camera followed (span >= "
                          f"{MIN_CAMERA_RANGE:.2f})")
-        else:
+        elif s.set == FLEXION:
+            lines.append("Per item: the glove's peak in every cycle (glove "
+                         "only, so no transfer curve, hysteresis or lag)")
+        elif camera:
             lines.append("Per item: step by step, glove and camera")
+        else:
+            lines.append("Per item: step by step, glove (no camera ran; its "
+                         "columns are empty)")
         lines.append("-" * 78)
         order: List[str] = []
         for r in check.rows:

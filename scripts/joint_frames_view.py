@@ -81,8 +81,13 @@ HAND_RGB = {"left": (0, 150, 190), "right": (210, 30, 30)}    # cyan left, red r
 LIVE_HAND_BGR = {"left": (255, 220, 0), "right": (60, 60, 255)}   # camera_view.py
 HIGHLIGHT_BGR = (0, 230, 255)
 FINGER_CYCLE = [None, "THUMB", "INDEX", "MIDDLE", "RING", "LITTLE"]
+# Under the 24 angles of a camera page: why six of them read "n/a"
+# (xr_hand.joint_frames.CAMERA_NOT_GIVEN). A reader of the page alone must
+# not be handed the wrist's bend as the palm arc.
+CAMERA_24_CAVEAT = ("n/a: not given by this tracker (CMC: rigid palm; TMC: "
+                    "not the paper's axes). See the README.")
 CONVENTION_LINES = [
-    "Wrist frame: origin at the wrist joint, axes of the wrist joint (camera: the forearm), mm.",
+    "Every position and axis is in the wrist frame: origin at the wrist joint, axes of the wrist joint (camera: the forearm), mm.",
     "Angles are from the parent joint's frame, order x (flexion), y (abduction), z (twist):",
     "flex + toward the palm, abd + toward the thumb, twist + back of the bone toward the little finger.",
 ]
@@ -176,6 +181,9 @@ def static_medoid_line(lines: Sequence[dict], meta: dict,
 
 # --- the drawing (shared by the PNG and the PDF) ------------------------------------
 CANVAS_W, CANVAS_H = 1200, 680
+# where the five angle columns of the 24-angle block start, right of the
+# digit's name: wide enough for "MCP_aa -22.2" not to touch its neighbour
+DOF_COLUMNS = (78, 170, 266, 362, 432)
 
 
 def _fit(points: np.ndarray, box: Tuple[float, float, float, float]):
@@ -213,77 +221,160 @@ def _view_points(rows: Sequence[dict], view: str):
     return np.array(joints), tips
 
 
-def _dof_lines(dof: Dict[str, float]) -> List[str]:
+def _dof_lines(dof: Dict[str, float], source: str = "") -> List[str]:
     out = []
     for letter, finger in jf.FINGERS:
         names = [n for n in jf.DOF24_NAMES if n.startswith(letter + "_")]
-        cells = [f"{n[2:]} {jf.fmt_num(dof[n], 1):>6}" for n in names]
+        cells = [f"{n[2:]} {jf.dof24_text(dof, n, source):>6}" for n in names]
         out.append(f"{letter} ({finger.lower()})".ljust(11) + "   ".join(cells))
     return out
 
 
+def _arrow(prims: list, a, b, rgb, width: float) -> None:
+    """A line from `a` to `b` with a head at `b`, the positive end of an
+    axis. An axis pointing at the viewer is a stub on the page; it gets no
+    head, there being no direction to show."""
+    prims.append(("line", a[0], a[1], b[0], b[1], rgb, width))
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    n = math.hypot(dx, dy)
+    if n < 7.0:
+        return
+    head = min(7.0, 0.45 * n)
+    for turn in (math.radians(152.0), math.radians(-152.0)):
+        hx = (dx * math.cos(turn) - dy * math.sin(turn)) / n
+        hy = (dx * math.sin(turn) + dy * math.cos(turn)) / n
+        prims.append(("line", b[0], b[1], b[0] + head * hx, b[1] + head * hy,
+                      rgb, width))
+
+
+# What each view shows of the frame every number is in, under its title.
+VIEW_FRAME = {"palm": "wrist frame here: +x to the left, +z down, +y into "
+                      "the page",
+              "side": "wrist frame here: +y up, +z to the left, +x toward "
+                      "the viewer"}
+AXIS_LEGEND = [("+x", "across the finger: the axis a joint bends about"),
+               ("+y", "out of the back of the hand"),
+               ("+z", "along the bone, back toward the wrist")]
+
+
 def layout(rows: Sequence[dict], dof: Dict[str, float], title: str,
-           subtitle: str, hand: str) -> list:
+           subtitle: str, hand: str, source: str = "") -> list:
     """The drawing as primitives on a CANVAS_W x CANVAS_H canvas (y down).
 
     ("line", x1, y1, x2, y2, rgb, width), ("dot", x, y, r, rgb),
-    ("text", x, y, text, rgb, size, mono), ("rect", x0, y0, x1, y1, rgb).
-    One list, two renderers: `render_png` (OpenCV) and `render_pdf_page`
+    ("text", x, y, text, rgb, size, mono), ("rect", x0, y0, x1, y1, rgb),
+    ("tag", x, y, text, rgb, size): text on a white plate, so it reads on
+    top of bones and arrows. One list, two renderers: `render_png` (OpenCV) and `render_pdf_page`
     (reportlab, vector, no image embedded).
+
+    What tells a reader which arrow is which: each axis is a 10 mm arrow
+    from its joint, the head at the positive end, x red, y green, z blue,
+    and the legend says so with the sign; each digit carries its letter (T,
+    I, M, R, L) beyond its tip in both views; each joint its paper name in
+    the palm view; the wrist, the origin of every number on the page, is
+    named; and each view says where the wrist frame's axes point in it.
+    A camera page (`source` "camera") carries `CAMERA_24_CAVEAT` under the
+    heading of the 24 angles.
     """
     prims: list = []
     colour = HAND_RGB.get(hand, (80, 80, 80))
+    names = [r["joint"] for r in rows]
     prims.append(("text", 24, 36, title, (0, 0, 0), 22, False))
     prims.append(("text", 24, 62, subtitle, (60, 60, 60), 15, False))
     panels = {"palm": (24, 84, 640, 620), "side": (660, 84, 1176, 400)}
-    names = {"palm": "palm side view (looking at the palm, fingers up)",
-             "side": "side view from +x (fingers right, back of the hand up)"}
+    captions = {"palm": "palm side view (looking at the palm, fingers up)",
+                "side": "side view from +x (fingers right, back of the hand up)"}
     for view, box in panels.items():
         prims.append(("rect",) + box + ((200, 200, 200),))
-        prims.append(("text", box[0] + 8, box[1] + 20, names[view],
+        prims.append(("text", box[0] + 8, box[1] + 20, captions[view],
                       (90, 90, 90), 13, False))
+        prims.append(("text", box[0] + 8, box[1] + 36, VIEW_FRAME[view],
+                      (90, 90, 90), 11, False))
         pts, tips = _view_points(rows, view)
         allpts = np.vstack([pts] + [np.array(t) for t in tips])
-        inner = (box[0] + 20, box[1] + 34, box[2] - 20, box[3] - 14)
+        inner = (box[0] + 24, box[1] + 50, box[2] - 24,
+                 box[3] - (78 if view == "palm" else 34))
         to_px = _fit(allpts, inner)
         px = [to_px(p) for p in pts]
         for a, b in BONES:
             prims.append(("line", *px[a], *px[b], colour, 3))
         for i, r in enumerate(rows):
             for k in range(3):
-                prims.append(("line", *px[i], *to_px(tips[i][k]),
-                              AXIS_RGB[k], 2))
+                _arrow(prims, px[i], to_px(tips[i][k]), AXIS_RGB[k], 2)
             prims.append(("dot", *px[i], 3.5, (30, 30, 30)))
-        if view == "palm":
-            for i, r in enumerate(rows):
-                label = jf.PAPER_JOINT.get(r["joint"])
-                if label:
-                    prims.append(("text", px[i][0] + 7, px[i][1] - 5, label,
-                                  (0, 0, 0), 12, False))
-    # legend: the 24 angles, one digit per line, one angle per column
+        # which digit: its letter just beyond the fingertip, drawn last so
+        # that nothing covers it
+        letters = []
+        for letter, finger in jf.FINGERS:
+            tip, before = names.index(f"{finger}_TIP"), names.index(
+                f"{finger}_DISTAL")
+            dx, dy = px[tip][0] - px[before][0], px[tip][1] - px[before][1]
+            n = math.hypot(dx, dy) or 1.0
+            letters.append(("tag", px[tip][0] + 17 * dx / n - 5,
+                            px[tip][1] + 17 * dy / n + 6, letter, (0, 0, 0),
+                            15))
+        w = names.index("WRIST")
+        letters.append(("tag", px[w][0] + 10, px[w][1] + 19, "WRIST (origin)",
+                        (0, 0, 0), 12))
+        if view != "palm":
+            prims += letters
+            continue
+        # which joint: the paper's name at it. The five joints at the base
+        # of the hand sit within a few millimetres of each other, so their
+        # labels stand in a row under the wrist, each with its digit's
+        # letter and a thin leader to its joint.
+        base = [i for i, r in enumerate(rows)
+                if r["joint"].endswith("_METACARPAL")]
+        row_y = max(px[w][1], max(px[i][1] for i in base)) + 44
+        for k, i in enumerate(sorted(base, key=lambda i: px[i][0])):
+            letter = next(l for l, f in jf.FINGERS
+                          if rows[i]["joint"].startswith(f + "_"))
+            lx = px[w][0] + 70 * (k - (len(base) - 1) / 2.0)
+            prims.append(("line", px[i][0], px[i][1], lx, row_y - 13,
+                          (150, 150, 150), 1))
+            prims.append(("tag", lx - 22, row_y,
+                          f"{letter} {jf.PAPER_JOINT[rows[i]['joint']]}",
+                          (0, 0, 0), 12))
+        for i, r in enumerate(rows):
+            label = jf.PAPER_JOINT.get(r["joint"])
+            if label and i not in base:
+                prims.append(("text", px[i][0] + 7, px[i][1] - 5, label,
+                              (0, 0, 0), 12, False))
+        prims += letters
+    # the 24 angles, one digit per line, one angle per column
     x0, y0 = 660, 430
     prims.append(("text", x0, y0, "The paper's 24 angles (degrees)",
                   (0, 0, 0), 16, False))
+    if source == "camera":
+        prims.append(("text", x0, y0 + 14, CAMERA_24_CAVEAT, (60, 60, 60),
+                      12, False))
     for k, (letter, finger) in enumerate(jf.FINGERS):
-        yy = y0 + 30 + 24 * k
+        yy = y0 + 28 + 23 * k
         prims.append(("text", x0, yy, f"{letter} {finger.lower()}",
                       (0, 0, 0), 13, False))
-        names = [n for n in jf.DOF24_NAMES if n.startswith(letter + "_")]
-        for m, n in enumerate(names):
-            prims.append(("text", x0 + 86 + 86 * m, yy,
-                          f"{n[2:]} {jf.fmt_num(dof[n], 1)}", (0, 0, 0), 13,
-                          False))
-    y = y0 + 30 + 24 * 5 + 16
-    for k, (name, rgb) in enumerate(zip("xyz", AXIS_RGB)):
-        prims.append(("line", x0 + 150 * k, y, x0 + 150 * k + 30, y, rgb, 3))
-        prims.append(("text", x0 + 150 * k + 38, y + 5, f"{name} axis, 10 mm",
-                      (0, 0, 0), 13, False))
+        angles = [n for n in jf.DOF24_NAMES if n.startswith(letter + "_")]
+        for m, n in enumerate(angles):
+            prims.append(("text", x0 + DOF_COLUMNS[m], yy,
+                          f"{n[2:]} {jf.dof24_text(dof, n, source)}",
+                          (0, 0, 0), 13, False))
+    # the axes: colour, sign and meaning, each with its arrow
+    y = y0 + 28 + 23 * 5 + 6
+    for k, ((sign, meaning), rgb, colour_name) in enumerate(
+            zip(AXIS_LEGEND, AXIS_RGB, ("red", "green", "blue"))):
+        yy = y + 16 * k
+        _arrow(prims, (x0, yy - 4), (x0 + 30, yy - 4), rgb, 3)
+        prims.append(("text", x0 + 40, yy,
+                      f"{sign}  {colour_name}, 10 mm arrow: {meaning}",
+                      (0, 0, 0), 12, False))
     for k, text in enumerate(CONVENTION_LINES):
-        prims.append(("text", x0, y + 36 + 20 * k, text, (60, 60, 60), 10,
-                      False))
-    prims.append(("text", 24, 650,
-                  "Labels: TMC, MCP, IP (thumb); CMC, MCP, PIP, DIP (fingers), "
-                  "at the joint whose angles they name.", (60, 60, 60), 13,
+        prims.append(("text", x0, y + 16 * 3 + 6 + 15 * k, text,
+                      (60, 60, 60), 10, False))
+    prims.append(("text", 24, 644,
+                  "T I M R L: thumb, index, middle, ring, little finger, "
+                  "marked at the fingertip.", (60, 60, 60), 12, False))
+    prims.append(("text", 24, 662,
+                  "TMC, MCP, IP (thumb); CMC, MCP, PIP, DIP (fingers): the "
+                  "joint whose angles the name carries.", (60, 60, 60), 12,
                   False))
     return prims
 
@@ -310,6 +401,18 @@ def render_png(prims: list, path: Path) -> None:
             _k, x, y, text, rgb, size, mono = p
             font = cv2.FONT_HERSHEY_PLAIN if mono else cv2.FONT_HERSHEY_SIMPLEX
             scale = size / (15.0 if mono else 30.0)
+            cv2.putText(img, text, (int(x), int(y)), font, scale, rgb[::-1],
+                        1, cv2.LINE_AA)
+        elif kind == "tag":
+            _k, x, y, text, rgb, size = p
+            font, scale = cv2.FONT_HERSHEY_SIMPLEX, size / 30.0
+            (tw, th), base = cv2.getTextSize(text, font, scale, 1)
+            cv2.rectangle(img, (int(x) - 3, int(y) - th - 3),
+                          (int(x) + tw + 3, int(y) + base + 1),
+                          (255, 255, 255), -1)
+            cv2.rectangle(img, (int(x) - 3, int(y) - th - 3),
+                          (int(x) + tw + 3, int(y) + base + 1),
+                          (170, 170, 170), 1)
             cv2.putText(img, text, (int(x), int(y)), font, scale, rgb[::-1],
                         1, cv2.LINE_AA)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -362,6 +465,18 @@ def render_pdf_page(c, prims: list, rows: Sequence[dict]) -> None:
             c.setFont("Courier" if mono else "Helvetica",
                       max(4.0, size * k * (1.0 if mono else 1.05)))
             c.drawString(X(x), Y(y), text)
+        elif kind == "tag":
+            _k, x, y, text, rgb, size = p
+            pt = max(4.0, size * k * 1.05)
+            tw = c.stringWidth(text, "Helvetica", pt)
+            c.setFillColorRGB(1, 1, 1)
+            c.setStrokeColorRGB(0.67, 0.67, 0.67)
+            c.setLineWidth(0.3)
+            c.rect(X(x) - 1.2, Y(y) - 1.2, tw + 2.4, pt + 1.2, stroke=1,
+                   fill=1)
+            c.setFillColorRGB(*(v / 255.0 for v in rgb))
+            c.setFont("Helvetica", pt)
+            c.drawString(X(x), Y(y), text)
 
     # the table
     y = Y(CANVAS_H) - 18
@@ -391,15 +506,18 @@ def render_pdf_page(c, prims: list, rows: Sequence[dict]) -> None:
     c.setFont("Helvetica", 6.8)
     y -= 14
     c.drawString(margin, y, "Every row, with the joint's three unit axes, is "
-                 "in the CSV of the same name; conventions in "
-                 "docs/joint_frames.md.")
+                 "in the CSV of the same name. Conventions, and what the 24 "
+                 "are not: README.txt of the hand-in folder, sections "
+                 "10 to 13.")
 
 
 def write_pdf(pages: Sequence[dict], path: Path, title: str) -> None:
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
     path.parent.mkdir(parents=True, exist_ok=True)
-    c = canvas.Canvas(str(path), pagesize=A4)
+    # invariant: no creation time and no random document id, so the same
+    # pages give the same bytes and a rebuild does not look like a change
+    c = canvas.Canvas(str(path), pagesize=A4, invariant=1)
     c.setTitle(title)
     c.setAuthor("scripts/joint_frames_view.py")
     for page in pages:
@@ -429,7 +547,7 @@ def summarise(line: dict, source: str, reference: str, title: str,
     subtitle = (f"{source}, {hand} hand label, {how}; {ref_text}; "
                 f"forearm to palm {bend:.0f} deg" if source == "camera" else
                 f"{source}, {hand} hand, {how}; {ref_text}")
-    prims = layout(rows, dof, title, subtitle, hand)
+    prims = layout(rows, dof, title, subtitle, hand, source)
     return {"rows": rows, "dof": dof, "prims": prims, "hand": hand,
             "source": source, "title": title, "subtitle": subtitle,
             "wrist_palm_deg": bend}
@@ -480,8 +598,10 @@ def export_take(path: Path, out_dir: Optional[Path] = None,
 
 def print_dof(info: dict) -> None:
     print(f"{info['stem']}: {info['subtitle']}")
-    for text in _dof_lines(info["dof"]):
+    for text in _dof_lines(info["dof"], info.get("source", "")):
         print("  " + text)
+    if info.get("source") == "camera":
+        print("  " + CAMERA_24_CAVEAT)
 
 
 def run_take(args) -> int:
@@ -875,7 +995,8 @@ class LiveView:
                        colour)
             names = [n for n in jf.DOF24_NAMES if n.startswith(letter + "_")]
             for m, n in enumerate(names):
-                panel_text(panel, f"{n[2:]} {jf.fmt_num(dof[n], 1)}",
+                panel_text(panel,
+                           f"{n[2:]} {jf.dof24_text(dof, n, show or '')}",
                            (92 + step * m, y), 0.4, colour)
         y += 26
         if show == "camera" and lh is not None:

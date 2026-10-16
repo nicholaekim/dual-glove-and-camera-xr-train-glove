@@ -42,13 +42,17 @@ and `sides` limits the generator to one hand, the way the protocol is run.
 With no script the frames are exactly what they were before.
 
 A take that is acted out. `CoachedActor` is a script that follows the coached
-grasp take of `scripts/leap/record_poses.py --protocol` (OPEN HAND, MAKE THE
-GRASP, HOLD STILL): the recorder calls `act(phase)` on the stream as it moves
-from phase to phase, and the actor shows an open palm, closes it, and holds
-the grasp. Asked to, it loses the hand while it closes, the way the camera
-lost the operator's hand on 2026-10-01: the forearm turns until the palm is
-edge-on to the lens, then the hand is gone and stays gone until the next
-OPEN HAND, where it comes back under a new hand id.
+grasp take of `scripts/leap/record_poses.py --protocol` (OPEN HAND, READY,
+MAKE THE GRASP, HOLD STILL): the recorder calls `act(phase)` on the stream as
+it moves from phase to phase, and the actor shows an open palm, keeps it
+open until the high beep, closes it, and holds the grasp. Asked to, it loses
+the hand while it closes, the way the camera lost the operator's hand on
+2026-10-01: the forearm turns until the palm is edge-on to the lens, then
+the hand is gone and stays gone until the next OPEN HAND, where it comes
+back under a new hand id; or, with `back_after_s`, it comes back that many
+seconds later, closed and palm to the lens, under a new hand id, and stays
+that hand. Asked to, it closes before the cue instead, the way the
+operator did on 2026-10-02.
 
 Geometry is a plausible cartoon of a hand, not a calibrated one: segment
 lengths are typical adult values and the joint angles come from two
@@ -385,21 +389,49 @@ class CoachedActor:
                up. Absent for the first `absent_open_s` of every OPEN HAND,
                which makes the recorder wait for it (or time out, when that
                is longer than the recorder's timeout).
+      "ready"  the open palm held, between the acquisition beep and the
+               high one: the close waits for the cue.
       "form"   the fingers close to `grasp_curl` over `close_s`, the palm
                kept toward the lens. On a try that is to be lost the forearm
                also rolls the palm edge-on to the lens (`lost_roll_deg`)
                over `lose_at_s`, as the hand turns when a grasp is copied
                with the fingertips down, and from then on no hand is
-               reported until the next phase.
+               reported until the next phase; with `back_after_s`, only for
+               that long: then the hand is there again, in the grasp, palm
+               to the lens, under a new hand id it keeps from then on.
       "hold"   the grasp held, palm toward the lens. `hold_dropout` (0 to 1)
                drops that share of every `period` frames, counted from the
                start of the hold, so a rehearsal of the gate's rejection
                still gets through OPEN HAND and MAKE THE GRASP.
-      anything else ("idle", None)  nothing scripted: the stream's own pose.
+      anything else ("idle", None), and every frame before the first phase:
+               no hand. Between takes the operator's hand is off the module,
+               not hovering over it open. It used to be the stream's own
+               pose, which is a hand in the OPEN HAND band: frames are made
+               lazily, at the next drain, so a recorder that took more than
+               half a second to reach OPEN HAND (a slow `git rev-parse`, a
+               loaded machine) found half a second of "open hand" already
+               queued from before it asked, and acquired it at once. Now the
+               open hand exists only from the frame OPEN HAND started at,
+               and since frames are made no faster than the wall clock, it
+               takes the recorder the actor's own seconds to see it, however
+               slowly the recorder runs.
 
     The first `lose_forming` tries at MAKE THE GRASP of every attempt are
     lost; an attempt ends at "hold" or "idle". A hand that comes back after
-    a loss carries a new hand id, as LeapC gives a re-acquired hand.
+    a loss carries a new hand id, as LeapC gives a re-acquired hand: at the
+    next OPEN HAND, or `back_after_s` after it was lost (None: not before
+    the next OPEN HAND).
+
+    The first `close_before_cue` rounds of every attempt (a round starts at
+    each "open") close the hand before the cue instead, the way the
+    operator did on 2026-10-02. `early_close_at` says when: "ready" (the
+    default) closes it over `close_s` from the start of READY, on the
+    acquisition beep, which the recorder sees as the hand moving during
+    READY; "open" holds it already closed at OPEN HAND, which the camera
+    acquires all the same (OPEN HAND judges where the palm is, not the
+    fingers), so nothing moves after the high beep and the recorder finds
+    no close in MAKE THE GRASP. Either way "form" then holds the grasp
+    still.
 
     `operator` is the hand doing all that. The stream shows both hands, and
     `other_hand` says what the other one does: "same" (the default, and
@@ -415,35 +447,48 @@ class CoachedActor:
     """
 
     OTHER_HAND_MODES = ("same", "open")
+    EARLY_CLOSE_MODES = ("ready", "open")
 
     def __init__(self, hz: float = 90.0, lose_forming: int = 0,
-                 grasp_curl: float = 0.6, close_s: float = 1.0,
+                 grasp_curl: float = 0.6, close_s: float = 0.5,
                  lose_at_s: float = 0.6, lost_roll_deg: float = 85.0,
                  absent_open_s: float = 0.0, hold_dropout: float = 0.0,
                  period: int = 90, operator: str = "left",
-                 other_hand: str = "same"):
+                 other_hand: str = "same", close_before_cue: int = 0,
+                 early_close_at: str = "ready",
+                 back_after_s: Optional[float] = None):
         if operator not in ("left", "right"):
             raise ValueError(f"operator must be left or right, not {operator!r}")
         if other_hand not in self.OTHER_HAND_MODES:
             raise ValueError(f"other_hand must be one of {self.OTHER_HAND_MODES}, "
                              f"not {other_hand!r}")
+        if early_close_at not in self.EARLY_CLOSE_MODES:
+            raise ValueError(f"early_close_at must be one of "
+                             f"{self.EARLY_CLOSE_MODES}, not {early_close_at!r}")
         self.hz = float(hz)
         self.operator = operator
         self.other_hand = other_hand
         self.lose_forming = max(0, int(lose_forming))
+        self.close_before_cue = max(0, int(close_before_cue))
+        self.early_close_at = early_close_at
         self.grasp_curl = float(grasp_curl)
         self.close_s = float(close_s)
         self.lose_at_s = float(lose_at_s)
+        self.back_after_s = None if back_after_s is None else float(back_after_s)
         self.lost_roll_deg = float(lost_roll_deg)
         self.absent_open_s = float(absent_open_s)
         self.period = max(2, int(period))
         self.hold_drop_frames = (
             0 if hold_dropout <= 0
             else max(1, min(self.period - 1, round(self.period * float(hold_dropout)))))
-        self._segments: List[Tuple[int, Optional[str], bool, int]] = []
+        self._segments: List[Tuple[int, Optional[str], bool, int, bool]] = []
         self._tries = 0                  # MAKE THE GRASP tries in this attempt
+        self._rounds = 0                 # OPEN HANDs in this attempt
+        self._early = False              # this round closes before the cue
+        self._gone = False               # lost while forming, not yet back
         self._id_offset = 0
         self.lost = 0                    # tries acted out as lost, all attempts
+        self.closed_early = 0            # rounds acted out closing early, all attempts
         self.phases: List[Optional[str]] = []   # every phase asked for, in order
 
     def phase(self, name: Optional[str], i: int) -> None:
@@ -454,19 +499,36 @@ class CoachedActor:
             losing = self._tries <= self.lose_forming
             self.lost += int(losing)
         elif name == "open":
-            if self._segments and self._segments[-1][2]:
+            if self._gone:
                 self._id_offset += 1     # the hand comes back as a new hand
-        else:
+                self._gone = False
+            self._rounds += 1
+            self._early = self._rounds <= self.close_before_cue
+            self.closed_early += int(self._early)
+        elif name != "ready":
             self._tries = 0              # "hold" or "idle": the attempt is over
+            self._rounds = 0
+            self._early = False
         self.phases.append(name)
-        self._segments.append((int(i), name, losing, self._id_offset))
+        self._segments.append((int(i), name, losing, self._id_offset, self._early))
         del self._segments[:-8]
+        if losing:
+            if self.back_after_s is None:
+                self._gone = True        # back at the next OPEN HAND
+            else:
+                self._id_offset += 1     # back during this try, a new hand from then on
 
     def _segment(self, i: int):
         for seg in reversed(self._segments):
             if seg[0] <= i:
                 return seg
         return None
+
+    def _closing(self, t: float) -> float:
+        """The curl `t` seconds into a close: `grasp_curl` over `close_s`,
+        eased in and out."""
+        w = min(1.0, t / self.close_s) if self.close_s > 0 else 1.0
+        return self.grasp_curl * w * w * (3.0 - 2.0 * w)
 
     def __call__(self, i: int) -> Optional[dict]:
         extra = self._act(i)
@@ -483,19 +545,31 @@ class CoachedActor:
         """The operator's hand at frame i (both hands' with other_hand "same")."""
         seg = self._segment(i)
         if seg is None:
-            return None
-        start, name, losing, offset = seg
+            return {"drop": True}           # before the first phase: no hand
+        start, name, losing, offset, early = seg
         t = (i - start) / self.hz
         if name == "open":
             if t < self.absent_open_s:
                 return {"drop": True}
-            return {"curl": 0.0, "id_offset": offset}
+            closed = early and self.early_close_at == "open"
+            return {"curl": self.grasp_curl if closed else 0.0, "id_offset": offset}
+        if name == "ready":
+            if not early:
+                return {"curl": 0.0, "id_offset": offset}
+            if self.early_close_at == "open":
+                return {"curl": self.grasp_curl, "id_offset": offset}
+            return {"curl": self._closing(t), "id_offset": offset}
         if name == "form":
-            w = min(1.0, t / self.close_s) if self.close_s > 0 else 1.0
-            curl = self.grasp_curl * w * w * (3.0 - 2.0 * w)
+            if early:
+                return {"curl": self.grasp_curl, "id_offset": offset}
+            curl = self._closing(t)
             if not losing:
                 return {"curl": curl, "id_offset": offset}
             if t >= self.lose_at_s:
+                if (self.back_after_s is not None
+                        and t >= self.lose_at_s + self.back_after_s):
+                    # found again: in the grasp, palm to the lens, a new id
+                    return {"curl": self.grasp_curl, "id_offset": offset + 1}
                 return {"drop": True}
             turn = t / self.lose_at_s if self.lose_at_s > 0 else 1.0
             return {"curl": curl, "roll_deg": self.lost_roll_deg * turn,
@@ -506,4 +580,4 @@ class CoachedActor:
                     and k % self.period >= self.period - self.hold_drop_frames):
                 return {"drop": True}
             return {"curl": self.grasp_curl, "id_offset": offset}
-        return {"id_offset": offset} if offset else None
+        return {"drop": True}               # "idle" or None: off the module

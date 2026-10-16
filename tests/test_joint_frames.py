@@ -679,3 +679,199 @@ def test_live_view_draws_both_hands_and_h_switches_the_table():
     assert set(only.camera_hands()) == {"left"}
     assert only.camera_hand().hand_side == "left"
     assert only.keys(ord("h")) and only.camera_hand().hand_side == "left"
+
+
+# --- the paper's own reading of the same bones --------------------------------------
+@pytest.mark.parametrize("hand", ["left", "right"])
+def test_paper_order_reads_back_an_abduction_first_rotation(hand):
+    """Cobos et al.'s chain turns the MCP about the abduction axis first:
+    built that way, the two angles come back, a flexion past 90 included."""
+    s = jf.hand_sign(hand)
+    for fe, aa in ((0.0, 0.0), (35.0, 0.0), (0.0, 12.0), (60.0, 10.0),
+                   (88.0, -15.0), (104.0, 8.0), (-20.0, 20.0)):
+        r = jf.rot_y(s * aa) @ jf.rot_x(-fe)
+        got = jf.paper_order_angles(r, hand)
+        assert got == pytest.approx((fe, aa), abs=1e-9), (fe, aa)
+
+
+@pytest.mark.parametrize("hand", ["left", "right"])
+def test_paper_order_and_flexion_first_are_two_readings_of_one_bone(hand):
+    """Same rotation, two orders: equal when either angle is zero, and tied
+    by sin(fe_p) = sin(fe) cos(aa), tan(aa_p) = tan(aa) / cos(fe) otherwise.
+    The README's example: 60 with 10 reads 58.5 with 19.4."""
+    for fe, aa in ((40.0, 0.0), (0.0, 15.0)):
+        r = jf.rotation_from_angles(fe, aa, 0.0, hand)
+        assert jf.paper_order_angles(r, hand) == pytest.approx((fe, aa),
+                                                              abs=1e-9)
+    r = jf.rotation_from_angles(60.0, 10.0, 0.0, hand)
+    fe_p, aa_p = jf.paper_order_angles(r, hand)
+    assert (round(fe_p, 1), round(aa_p, 1)) == (58.5, 19.4)
+    rng = np.random.default_rng(4)
+    for _ in range(200):
+        fe, aa = rng.uniform(-30.0, 85.0), rng.uniform(-30.0, 30.0)
+        fe_p, aa_p = jf.paper_order_angles(
+            jf.rotation_from_angles(fe, aa, 0.0, hand), hand)
+        assert math.sin(math.radians(fe_p)) == pytest.approx(
+            math.sin(math.radians(fe)) * math.cos(math.radians(aa)), abs=1e-9)
+        assert math.tan(math.radians(aa_p)) == pytest.approx(
+            math.tan(math.radians(aa)) / math.cos(math.radians(fe)), abs=1e-9)
+    # twist is not part of the paper's joint: it changes neither number
+    twisted = jf.rotation_from_angles(60.0, 10.0, 25.0, hand)
+    assert jf.paper_order_angles(twisted, hand) == pytest.approx(
+        (fe_p0 := jf.paper_order_angles(r, hand)[0],
+         jf.paper_order_angles(r, hand)[1]), abs=1e-9) and fe_p0 > 0
+
+
+def test_paper_order_at_exactly_90_of_flexion_has_no_abduction_to_give():
+    r = jf.rot_x(-90.0)
+    fe, aa = jf.paper_order_angles(r, "right")
+    assert fe == pytest.approx(90.0) and aa == pytest.approx(0.0, abs=1e-9)
+
+
+@pytest.mark.parametrize("hand", ["left", "right"])
+def test_mcp_paper_order_reads_the_four_finger_knuckles(hand):
+    s = jf.hand_sign(hand)
+    rel = {"INDEX_PROXIMAL": jf.rot_y(s * 10.0) @ jf.rot_x(-60.0),
+           "RING_PROXIMAL": jf.rot_y(s * -6.0) @ jf.rot_x(-30.0)}
+    line = made_line(hand, rel)
+    got = jf.mcp_paper_order(line, "glove")
+    assert list(got) == jf.MCP_PAPER_NAMES and len(got) == 8
+    assert got["I_MCP_fe_paper_order"] == pytest.approx(60.0, abs=1e-6)
+    assert got["I_MCP_aa_paper_order"] == pytest.approx(10.0, abs=1e-6)
+    assert got["R_MCP_fe_paper_order"] == pytest.approx(30.0, abs=1e-6)
+    assert got["R_MCP_aa_paper_order"] == pytest.approx(-6.0, abs=1e-6)
+    assert got["M_MCP_fe_paper_order"] == pytest.approx(0.0, abs=1e-6)
+    # the table's own pair for the same knuckle is the other reading: the
+    # flexion nearly the same, the abduction half
+    d = jf.dof24(jf.joint_table(line, "glove"))
+    assert d["I_MCP_fe"] == pytest.approx(60.38, abs=0.01)
+    assert d["I_MCP_aa"] == pytest.approx(4.98, abs=0.01)
+    assert math.sin(math.radians(60.0)) == pytest.approx(
+        math.sin(math.radians(d["I_MCP_fe"]))
+        * math.cos(math.radians(d["I_MCP_aa"])), abs=1e-6)
+
+
+def test_palm_reference_angles_are_the_six_measured_from_the_wrist():
+    """A forearm bent 30 degrees against the hand: the four CMC values
+    carry it against the wrist joint and lose it against the palm."""
+    hand = "left"
+    bend = jf.rot_x(-30.0)             # the whole hand flexed on the forearm
+    rel = {name: bend for name in JOINT_NAMES
+           if name == "PALM" or name.endswith("_METACARPAL")}
+    line = made_line(hand, rel)
+    wrist = jf.dof24(jf.joint_table(line, "glove", "wrist"))
+    palm = jf.palm_reference_angles(line, "glove")
+    assert list(palm) == jf.PALM_REF_NAMES and len(palm) == 6
+    for letter in "IMRL":
+        assert wrist[f"{letter}_CMC"] == pytest.approx(30.0, abs=1e-6)
+        assert palm[f"{letter}_CMC_palm_ref"] == pytest.approx(0.0, abs=1e-6)
+    assert wrist["T_TMC_fe"] == pytest.approx(30.0, abs=1e-6)
+    assert palm["T_TMC_fe_palm_ref"] == pytest.approx(0.0, abs=1e-6)
+    assert jf.wrist_palm_deg(line, "glove") == pytest.approx(30.0, abs=1e-6)
+
+
+# --- the drawing says which arrow is which ---------------------------------------------
+def test_the_drawing_gives_every_axis_an_arrowhead_and_names_its_sign():
+    rows = jf.joint_table(made_line("left"), "glove")
+    prims = view.layout(rows, jf.dof24(rows), "take name", "s", "left")
+    axis = [p for p in prims if p[0] == "line" and p[5] in view.AXIS_RGB]
+    # two views x 26 joints x 3 axes, each a shaft, most with a two-line head
+    assert len(axis) > 2 * 26 * 3 * 2
+    texts = [p[3] for p in prims if p[0] == "text"]
+    legend = " | ".join(texts)
+    for sign, colour, meaning in (
+            ("+x", "red", "the axis a joint bends about"),
+            ("+y", "green", "out of the back of the hand"),
+            ("+z", "blue", "along the bone, back toward the wrist")):
+        assert f"{sign}  {colour}, 10 mm arrow: " in legend
+        assert meaning in legend
+    # each view says where the wrist frame's axes point in it
+    assert "wrist frame here: +x to the left, +z down, +y into the page" \
+        in texts
+    assert "wrist frame here: +y up, +z to the left, +x toward the viewer" \
+        in texts
+    # the wrist, the origin of every number on the page, is named in both
+    tags = [p[3] for p in prims if p[0] == "tag"]
+    assert tags.count("WRIST (origin)") == 2
+    assert "take name" in texts
+
+
+def test_a_camera_page_says_what_the_24_are_not_and_a_glove_page_does_not():
+    rows = jf.joint_table(made_line("left"), "glove")
+    plain = view.layout(rows, jf.dof24(rows), "t", "s", "left")
+    glove = view.layout(rows, jf.dof24(rows), "t", "s", "left", "glove")
+    camera = view.layout(rows, jf.dof24(rows), "t", "s", "left", "camera")
+    assert plain == glove
+    # six of the 24 read "n/a" on the camera page, under the paper's names
+    texts = [p[3] for p in camera if p[0] == "text"]
+    assert sorted(t for t in texts if t.endswith(" n/a")) == sorted(
+        ["TMC_fe n/a", "TMC_aa n/a"] + ["CMC n/a"] * 4)
+    assert not any(t.endswith(" n/a") for t in
+                   (p[3] for p in glove if p[0] == "text"))
+    assert jf.CAMERA_NOT_GIVEN == ("T_TMC_fe", "T_TMC_aa", "I_CMC", "M_CMC",
+                                   "R_CMC", "L_CMC")
+    dof = jf.dof24(rows)
+    assert jf.dof24_text(dof, "I_CMC", "camera") == "n/a"
+    assert jf.dof24_text(dof, "I_CMC", "glove") == jf.fmt_num(dof["I_CMC"], 1)
+    assert jf.dof24_text(dof, "I_PIP", "camera") == jf.fmt_num(dof["I_PIP"], 1)
+    extra = [p for p in camera if p not in glove
+             and not (p[0] == "text" and p[3].endswith(" n/a"))]
+    assert len(extra) == 1 and len(camera) == len(glove) + 1
+    kind, x, y, text = extra[0][:4]
+    assert kind == "text" and text == view.CAMERA_24_CAVEAT
+    assert text.startswith("n/a: not given by this tracker")
+    assert "CMC" in text and "TMC" in text
+    # under the heading of the 24 angles, above their first line
+    heading = next(p for p in camera
+                   if p[0] == "text" and p[3].startswith("The paper's 24"))
+    first = next(p for p in camera if p[0] == "text" and p[3] == "T thumb")
+    assert x == heading[1] and heading[2] < y < first[2]
+    # the export of a camera take hands the source on
+    stream = MockLeapStream(pose="fist", seed=3, dropout_every=0,
+                            reacquire_every=0)
+    lh = next(h for side, h in stream.generate(3) if side == "left")
+    line = jf.line_from_hand_frame(to_hand_frame(lh))
+    made = view.summarise(line, "camera", "wrist", "title", "how")
+    assert any(p[0] == "text" and p[3] == view.CAMERA_24_CAVEAT
+               for p in made["prims"])
+    made = view.summarise(made_line("left"), "glove", "wrist", "title", "how")
+    assert not any(p[0] == "text" and p[3] == view.CAMERA_24_CAVEAT
+                   for p in made["prims"])
+
+
+def test_the_drawing_names_every_digit_and_every_base_joint():
+    rows = jf.joint_table(made_line("left"), "glove")
+    prims = view.layout(rows, jf.dof24(rows), "t", "s", "left")
+    tags = [p[3] for p in prims if p[0] == "tag"]
+    # a letter at each fingertip, in both views
+    for letter in "TIMRL":
+        assert tags.count(letter) == 2
+    # the five joints at the base, each with its digit, once
+    for label in ("T TMC", "I CMC", "M CMC", "R CMC", "L CMC"):
+        assert tags.count(label) == 1
+    # a leader from each base label to its joint
+    leaders = [p for p in prims if p[0] == "line" and p[5] == (150, 150, 150)]
+    assert len(leaders) == 5
+    # the palm view puts the thumb of a left hand on the left
+    order = sorted((p for p in prims if p[0] == "tag"
+                    and p[3].endswith(("TMC", "CMC"))), key=lambda p: p[1])
+    assert [p[3] for p in order] == ["T TMC", "I CMC", "M CMC", "R CMC",
+                                     "L CMC"]
+
+
+def test_the_pdf_is_the_same_bytes_for_the_same_pages(tmp_path):
+    """No creation time and no random id in it: a rebuild that changes
+    nothing must not look like a change."""
+    rows = jf.joint_table(made_line("left"), "glove")
+    page = {"prims": view.layout(rows, jf.dof24(rows), "t", "s", "left"),
+            "rows": rows}
+    view.write_pdf([page, page], tmp_path / "a.pdf", "title")
+    view.write_pdf([page, page], tmp_path / "b.pdf", "title")
+    assert (tmp_path / "a.pdf").read_bytes() == (tmp_path / "b.pdf").read_bytes()
+    from pypdf import PdfReader
+    reader = PdfReader(str(tmp_path / "a.pdf"))
+    assert len(reader.pages) == 2
+    text = reader.pages[0].extract_text()
+    for needle in ("+x", "+y", "+z", "red", "green", "blue", "WRIST (origin)",
+                   "T TMC", "PIP", "The paper's 24 angles"):
+        assert needle in text, needle

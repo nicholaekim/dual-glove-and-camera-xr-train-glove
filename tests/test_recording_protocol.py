@@ -440,12 +440,20 @@ def test_warmup_refusal_rule():
 # --- peaks and the Set B check --------------------------------------------------
 def flexion_trace(finger="index", cycles=5, amplitude=1.0, dt=1 / 60.0,
                   bend=1.0, hold=0.5, straighten=1.0, rest=0.5, t0=100.0,
-                  amplitudes=None):
+                  amplitudes=None, bend_in=None, straighten_in=None):
     """A glove trace of one finger doing `cycles` cycles, events to match.
 
     `amplitudes` gives each cycle its own bend (a finger that folds fully
     on some cycles only); without it every cycle bends `amplitude`.
+    `bend_in` / `straighten_in`: the movement is over after that many
+    seconds of its phase and the finger then waits (0 = at once); without
+    them it takes the whole phase.
     """
+    def moved(elapsed, whole, quick):
+        if quick is None:
+            return elapsed / whole
+        return 1.0 if quick <= 0 else min(1.0, elapsed / quick)
+
     i = ALL5.index(finger)
     events = [{"t": t0, "kind": "take_start", "item": finger, "take": 1}]
     curls, t, step = [], t0, 0
@@ -459,8 +467,9 @@ def flexion_trace(finger="index", cycles=5, amplitude=1.0, dt=1 / 60.0,
             step += 1
             n = int(round(dur / dt))
             for k in range(n):
-                e = k / n
-                f = {"bend": e, "hold": 1.0, "straighten": 1.0 - e,
+                e = k * dt
+                f = {"bend": moved(e, dur, bend_in), "hold": 1.0,
+                     "straighten": 1.0 - moved(e, dur, straighten_in),
                      "rest": 0.0}[phase] * amp
                 fr = [0.0] * 5
                 fr[i] = f
@@ -889,3 +898,290 @@ def test_read_bends_measures_the_glove_thumb_in_degrees(tmp_path):
     assert got[0][1][1:] == [float(v) for v in flexion_features(
         frame_to_keypoints21(frames[0]))][1:]
     assert rp.read_curls is rp.read_bends
+
+
+# --- how fast each bend was (the speed rule of 2026-10-13) ----------------------
+def index_trace(curls):
+    """(times, fractions) of the index of a `flexion_trace`."""
+    return ([t for t, _c in curls],
+            [rp.fraction(OPEN[1], FIST[1], c[1]) for _t, c in curls])
+
+
+SLOW = dict(bend=4.0, hold=1.0, straighten=4.0, rest=1.0)
+
+
+def test_a_ramp_is_timed_across_the_middle_of_its_rise():
+    """A finger that moves evenly for the whole 4 s crosses 20 % to 80 % of
+    its rise in 0.6 x 4 s, up and down, and there are as many timed bends
+    as counted ones."""
+    curls, _events = flexion_trace(cycles=5, **SLOW)
+    times, fr = index_trace(curls)
+    moves = rp.bend_moves(times, fr)
+    assert len(moves) == rp.count_peaks(fr) == 5
+    for m in moves:
+        assert m["rise_s"] == pytest.approx(2.4, abs=0.04)
+        assert m["fall_s"] == pytest.approx(2.4, abs=0.04)
+    # each bend is where its cue was: 10 s apart, arriving in the bend phase
+    assert [round(m["at"] - 100.0 - 10.0 * k, 1) for k, m in enumerate(moves)] \
+        == [3.2] * 5
+    # other marks: 30 % to 60 % is half as wide
+    half = rp.bend_moves(times, fr, marks=(0.3, 0.6))
+    assert half[0]["rise_s"] == pytest.approx(1.2, abs=0.04)
+
+
+def test_a_snapped_bend_reads_as_fast_as_it_was():
+    for took in (1 / 60, 0.1, 0.5):
+        curls, _events = flexion_trace(cycles=5, bend_in=took,
+                                       straighten_in=took, **SLOW)
+        times, fr = index_trace(curls)
+        moves = rp.bend_moves(times, fr)
+        assert len(moves) == rp.count_peaks(fr) == 5
+        for m in moves:
+            # a jump inside one frame reads 0.6 of that frame: the least a
+            # trace sampled at 60 Hz can show
+            want = 0.6 * max(took, 1 / 60)
+            assert m["rise_s"] == pytest.approx(want, abs=0.004)
+            assert m["fall_s"] == pytest.approx(want, abs=0.004)
+    # a take that starts with the finger already bent: that first bend is
+    # not counted, so it is not timed either
+    curls, _events = flexion_trace(cycles=5, bend_in=0.0, **SLOW)
+    times, fr = index_trace(curls)
+    assert len(rp.bend_moves(times, fr)) == rp.count_peaks(fr) == 4
+
+
+def test_a_bend_that_pauses_half_way_is_as_slow_as_its_pause():
+    dt = 1 / 60.0
+    values, t = [], []
+    shape = ([0.0] * 30 + [k / 12 * 0.5 for k in range(12)]      # to 0.5
+             + [0.5] * 120                                      # 2 s pause
+             + [0.5 + k / 12 * 0.5 for k in range(12)]          # to 1.0
+             + [1.0] * 60 + [0.0] * 60)
+    for _cycle in range(3):
+        for v in shape:
+            t.append(len(t) * dt)
+            values.append(v)
+    moves = rp.bend_moves(t, values)
+    assert len(moves) == rp.count_peaks(values) == 3
+    for m in moves:
+        assert m["rise_s"] == pytest.approx(0.6 * 0.2 + 2.0 + 0.6 * 0.2,
+                                            abs=0.01)
+        assert m["fall_s"] == pytest.approx(0.6 * dt, abs=1e-6)  # a jump down
+
+
+def test_the_marks_sit_in_each_bends_own_rise():
+    """A bend that goes less far than its neighbours, and a rest level that
+    creeps up from cycle to cycle, are still timed across the middle of
+    what that bend did."""
+    curls, _events = flexion_trace(cycles=3, amplitudes=[1.0, 0.7, 1.0],
+                                   **SLOW)
+    times, fr = index_trace(curls)
+    moves = rp.bend_moves(times, fr)
+    assert len(moves) == 3
+    assert [m["rise_s"] for m in moves] == pytest.approx([2.4] * 3, abs=0.04)
+    crept = [f + 0.04 * (t - times[0]) / 10.0 for t, f in zip(times, fr)]
+    moves = rp.bend_moves(times, crept)
+    assert len(moves) == rp.count_peaks(crept) == 3
+    assert [m["rise_s"] for m in moves] == pytest.approx([2.4] * 3, abs=0.06)
+
+
+def test_a_take_that_ends_bent_has_no_time_for_its_last_straighten():
+    curls, _events = flexion_trace(cycles=2, **SLOW)
+    times, fr = index_trace(curls)
+    cut = next(k for k, t in enumerate(times) if t >= 100.0 + 10.0 + 4.5)
+    moves = rp.bend_moves(times[:cut], fr[:cut])
+    assert len(moves) == rp.count_peaks(fr[:cut]) == 2
+    assert moves[0]["fall_s"] == pytest.approx(2.4, abs=0.04)
+    assert moves[1]["fall_s"] is None and moves[1]["rise_s"] > 2.0
+
+
+def test_bend_moves_on_traces_with_nothing_to_time():
+    assert rp.bend_moves([], []) == []
+    assert rp.bend_moves([0.0, 0.1], [0.0, 1.0]) == []            # too short
+    flat = [0.01, 0.02, 0.0, 0.03] * 20
+    assert rp.bend_moves(list(range(80)), flat) == []             # no range
+    assert rp.bend_moves(range(6), [1.0, 1.0, 0.0, 0.0, 1.0, 0.0]) != []
+    with pytest.raises(ValueError):
+        rp.bend_moves([0.0, 1.0], [0.0])
+    # frames whose value or time is not a number are skipped
+    moves = rp.bend_moves([0, 1, 2, 3, 4, 5, 6],
+                          [0.0, float("nan"), 1.0, 0.0, None, 1.0, 0.0])
+    assert len(moves) == 2 == rp.count_peaks(
+        [0.0, float("nan"), 1.0, 0.0, None, 1.0, 0.0])
+
+
+def test_the_bends_timed_are_the_bends_counted_whatever_the_trace():
+    import numpy as np
+    rng = np.random.default_rng(13)
+    seen = set()
+    for _ in range(300):
+        n = int(rng.integers(3, 400))
+        kind = int(rng.integers(0, 3))
+        if kind == 0:
+            v = rng.uniform(-0.2, 1.3, n)
+        elif kind == 1:
+            v = np.cumsum(rng.normal(0.0, 0.15, n))
+        else:
+            v = (np.sin(np.linspace(0.0, rng.uniform(1, 40), n)) * 0.5 + 0.5
+                 + rng.normal(0.0, rng.uniform(0.0, 0.2), n))
+        t = np.cumsum(rng.uniform(0.005, 0.05, n))
+        moves = rp.bend_moves(t, v)
+        assert len(moves) == rp.count_peaks(v)
+        seen.add(len(moves))
+        ats = [m["at"] for m in moves]
+        assert ats == sorted(ats)
+        for m in moves:
+            assert m["rise_s"] >= 0.0
+            assert m["fall_s"] is None or m["fall_s"] >= 0.0
+    assert len(seen) > 5                      # traces with many bend counts
+
+
+def test_the_speed_rule_is_the_constants_and_applies_to_slow_cues_only():
+    rule = rp.speed_rule()
+    assert rule == {"since": "2026-10-13", "marks": [0.2, 0.8],
+                    "min_bend_share": 0.15, "slow_from_s": 2.0}
+    assert (rp.MOVE_MARKS, rp.MIN_BEND_SHARE, rp.SLOW_FROM_S) == (
+        (0.2, 0.8), 0.15, 2.0)
+    assert rp.rule_marks(None) == (0.2, 0.8)
+    assert rp.rule_marks({"marks": [0.1, 0.9]}) == (0.1, 0.9)
+    moves = [{"rise_s": 0.5}, {"rise_s": 0.7}, {"rise_s": 0.6}]
+    assert rp.bend_speed(moves, 4.0, None) == {
+        "state": rp.SPEED_OFF, "need_s": None, "fast": []}
+    assert rp.bend_speed(moves, None, rule)["state"] == rp.SPEED_OFF
+    got = rp.bend_speed(moves, 4.0, rule)
+    assert got["state"] == rp.SPEED_IN_FORCE and got["fast"] == [0]
+    assert got["need_s"] == pytest.approx(0.6)       # exactly at the bar: ok
+    assert rp.bend_speed(moves, 6.0, rule)["fast"] == [0, 1, 2]
+    assert rp.bend_speed(moves, 2.0, rule)["state"] == rp.SPEED_IN_FORCE
+    # the fast index (1 s) is not a slow cue, whatever its bends took
+    fast = rp.bend_speed([{"rise_s": 0.01}], 1.0, rule)
+    assert fast == {"state": rp.SPEED_FAST_CUE, "need_s": None, "fast": []}
+    # a rehearsal at a quarter of the time is judged as the real run is
+    quarter = rp.bend_speed([{"rise_s": 0.1}, {"rise_s": 0.2}], 1.0, rule,
+                            time_scale=0.25)
+    assert quarter["state"] == rp.SPEED_IN_FORCE
+    assert quarter["need_s"] == pytest.approx(0.15) and quarter["fast"] == [0]
+    assert rp.bend_speed([{"rise_s": 0.01}], 0.25, rule,
+                         time_scale=0.25)["state"] == rp.SPEED_FAST_CUE
+    # a session keeps the numbers it was recorded under
+    old = {"marks": [0.2, 0.8], "min_bend_share": 0.05, "slow_from_s": 5.0}
+    assert rp.bend_speed(moves, 4.0, old)["state"] == rp.SPEED_FAST_CUE
+    assert rp.bend_speed(moves, 6.0, old)["fast"] == []
+
+
+def test_the_quick_check_rejects_a_snapped_bend_and_says_what_to_do():
+    rule = rp.speed_rule()
+    curls, events = flexion_trace(cycles=5, bend_in=0.2, straighten_in=0.2,
+                                  **SLOW)
+    res = rp.check_flexion_take(curls, events, glove_ends(), "index", 5,
+                                speed=rule)
+    assert not res.accepted
+    assert res.reason == (
+        "the index bent too fast on 5 of 5 bends: 0.12 s, and a 4 s bend cue "
+        "needs at least 0.60 s (timed from 20 to 80 percent of each bend's "
+        "rise)")
+    assert res.hint == ("start on the high beep and keep the index moving "
+                        "for the whole 4 s, so it is fully bent only as the "
+                        "hold beep sounds")
+    d = res.details
+    assert d["rejected_for"] == rp.REJECT_SPEED == "speed"
+    assert d["speed_rule"] == "in force" and d["bend_need_s"] == 0.6
+    assert d["bend_cue_s"] == 4.0 and d["straighten_cue_s"] == 4.0
+    assert d["bend_times_s"] == pytest.approx([0.12] * 5, abs=0.02)
+    assert d["straighten_times_s"] == pytest.approx([0.12] * 5, abs=0.02)
+    # span and bend count were fine: the speed is the only reason
+    assert d["span_fraction"] >= rp.SPAN_GATE and d["cycles_from_peaks"] == 5
+    assert res.as_dict()["rejected_for"] == "speed"
+    assert rp.speed_line(d) == (
+        "bends took 0.12 s (a 4 s bend cue needs 0.60 s); straightens "
+        "0.12 s (reported, never judged)")
+
+    # one fast bend among slow ones is enough
+    slow, _e = flexion_trace(cycles=5, **SLOW)
+    snap, _e = flexion_trace(cycles=5, bend_in=0.2, **SLOW)
+    third = [c for c in snap if 120.0 <= c[0] < 130.0]
+    mixed = [c for c in slow if not 120.0 <= c[0] < 130.0] + third
+    mixed.sort(key=lambda c: c[0])
+    res = rp.check_flexion_take(mixed, events, glove_ends(), "index", 5,
+                                speed=rule)
+    assert res.reason.startswith(
+        "the index bent too fast on 1 of 5 bends: 0.12 s, and a 4 s bend cue")
+    assert [x < 0.6 for x in res.details["bend_times_s"]] == [
+        False, False, True, False, False]
+
+
+def test_the_quick_check_accepts_a_slow_bend_and_times_it_either_way():
+    rule = rp.speed_rule()
+    curls, events = flexion_trace(cycles=5, **SLOW)
+    res = rp.check_flexion_take(curls, events, glove_ends(), "index", 5,
+                                speed=rule)
+    assert res.accepted and res.hint == "" and res.reason == ""
+    assert res.details["rejected_for"] is None
+    assert res.details["bend_times_s"] == pytest.approx([2.4] * 5, abs=0.04)
+    assert res.details["speed_rule"] == "in force"
+    assert rp.speed_line(res.details).startswith(
+        "bends took 2.4")
+    # a slow straighten is not asked for: opening at once is still accepted
+    curls, events = flexion_trace(cycles=5, straighten_in=0.0, **SLOW)
+    res = rp.check_flexion_take(curls, events, glove_ends(), "index", 5,
+                                speed=rule)
+    assert res.accepted
+    assert max(res.details["straighten_times_s"]) < 0.05
+
+    # without the rule the snapped take is accepted, and still timed
+    curls, events = flexion_trace(cycles=5, bend_in=0.2, **SLOW)
+    res = rp.check_flexion_take(curls, events, glove_ends(), "index", 5)
+    assert res.accepted
+    assert res.details["speed_rule"] == "not in force"
+    assert res.details["bend_need_s"] is None
+    assert res.details["bend_times_s"] == pytest.approx([0.12] * 5, abs=0.02)
+    assert rp.speed_line(res.details).startswith(
+        "bends took 0.12 s (not judged: the speed rule is not in force); "
+        "straightens 2.")
+
+    # the fast item: a 1 s cue is not a slow cue, so nothing is judged
+    curls, events = flexion_trace(cycles=8, bend_in=0.05, straighten_in=0.05)
+    res = rp.check_flexion_take(curls, events, glove_ends(), "index", 8,
+                                speed=rule)
+    assert res.accepted and res.details["speed_rule"] == "not a slow cue"
+    assert "(not judged: not a slow cue)" in rp.speed_line(res.details)
+    assert rp.speed_line({}) == ""
+
+
+def test_span_and_bend_count_are_judged_before_the_speed():
+    rule = rp.speed_rule()
+    curls, events = flexion_trace(cycles=5, amplitude=0.4, bend_in=0.1,
+                                  **SLOW)
+    res = rp.check_flexion_take(curls, events, glove_ends(), "index", 5,
+                                speed=rule)
+    assert res.reason.startswith("the index moved only 0.40")
+    assert res.details["rejected_for"] == rp.REJECT_SPAN
+    curls, events = flexion_trace(cycles=5, bend_in=0.1,
+                                  amplitudes=[0.4, 0.4, 0.4, 0.4, 1.0], **SLOW)
+    res = rp.check_flexion_take(curls, events, glove_ends(), "index", 5,
+                                speed=rule)
+    assert res.reason.startswith("the index bent fully only 1 time of 5")
+    assert res.details["rejected_for"] == rp.REJECT_COUNT
+
+
+def test_check_take_hands_the_rule_to_set_b_only():
+    protocol = load("finger_flexion")
+    rule = rp.speed_rule()
+    curls, events = flexion_trace(cycles=5, bend_in=0.2, **SLOW)
+    assert rp.check_take(protocol, "index", curls, events,
+                         glove_ends()).accepted
+    res = rp.check_take(protocol, "index", curls, events, glove_ends(),
+                        speed=rule)
+    assert not res.accepted and res.details["rejected_for"] == "speed"
+    # the same hand at a quarter of the time, judged as the real run is
+    quick, qevents = flexion_trace(cycles=5, bend=1.0, hold=0.25,
+                                   straighten=1.0, rest=0.25, bend_in=0.05)
+    res = rp.check_take(protocol, "index", quick, qevents, glove_ends(),
+                        time_scale=0.25, speed=rule)
+    assert not res.accepted and res.details["bend_need_s"] == 0.15
+    # Set C has no speed rule: the same take, with or without one given
+    steps = CONTRACT_SEQUENCES["seq3_alternating"]
+    scurls, sevents = sequence_trace(steps)
+    res = rp.check_take(load("sequences"), "seq3_alternating", scurls,
+                        sevents, glove_ends(), speed=rule)
+    assert res.accepted and "rejected_for" not in res.details
+    assert "speed_rule" not in res.details

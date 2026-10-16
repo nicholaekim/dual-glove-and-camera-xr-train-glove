@@ -396,7 +396,8 @@ def test_a_far_new_id_while_the_followed_hand_is_gone_is_another_hand():
     assert {r["hand_id"] for r in s.operator_rows} == {41}
     assert s.tracked_fraction == pytest.approx(0.8, abs=0.01)
     assert not s.passed and "tracked 80 %" in s.gate_reason
-    # the same new id close by is the same hand back under a new id
+    # the same new id close by is treated as the same hand back under a new
+    # id (the rule of id and distance)
     near = make_rows(5.0, side="left", hand_id=42, shift=lambda t: 0.02)
     rows = [r for r in held if not gone[0] <= r["wall_time"] < gone[1]]
     rows += [r for r in near if gone[0] <= r["wall_time"] < gone[1]]

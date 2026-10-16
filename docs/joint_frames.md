@@ -56,6 +56,13 @@ x first means abduction is the angle that could lock, at 90 degrees, which no
 finger reaches; a fist's 90 degrees of flexion stays clean. The reasons are
 written out in the module's docstring.
 
+One exception, measured on the camera: the thumb's bones are turned about
+their length, so on its MCP and IP rows (THUMB_PROXIMAL, THUMB_DISTAL) a
+positive `abd_deg` leans the bone toward the palm's face, not toward the
+thumb side (on the 69 tables of the 2026-10-01 grasp session,
+`xr_hand.joint_key`; section 12 of the hand-in README measures it again on
+the folder's own tables at every build).
+
 One thing to keep in mind with the camera: because its wrist joint turns with
 the forearm, a bent wrist turns the whole camera hand in the wrist frame, and
 the four finger CMC angles include that bend. The PDF and the live window
@@ -93,6 +100,85 @@ start of its bone, so the PROXIMAL row holds the MCP joint's angles.
 Measured on day 2 (`recordings\sync_day2`, the medoid frame of each take),
 index PIP flexion: glove fist 89.8 to 90.0, glove open palm 4.1, camera fist
 77.3 to 80.3, camera open palm 3.6 to 5.3.
+
+## The joint key
+
+Which joint each of the 26 rows is, and which of the paper's angles it
+carries, is `src/xr_hand/joint_key.py`. Its naming rule (`NAMING_RULE`): a
+row is named after the bone that starts at its joint, and its angles are
+the turn from the bone before it (the parent row's) to that bone. So on the
+index, middle, ring and little finger `*_METACARPAL` = CMC, `*_PROXIMAL` =
+MCP, `*_INTERMEDIATE` = PIP, `*_DISTAL` = DIP; on the thumb
+`THUMB_METACARPAL` = TMC, `THUMB_PROXIMAL` = MCP, `THUMB_DISTAL` = IP;
+PALM = the wrist (the palm against the forearm); WRIST = the root (the
+forearm's frame, no angles); `*_TIP` = the fingertip, not a joint (angles
+0).
+
+For the grasp set, when the session has joint-frame tables, the packager
+writes the key beside them in the hand-in folder:
+
+| File | What it is |
+|---|---|
+| `grasps\joint_frames\joint_key.csv` | 26 rows in table order, columns `number` (1 to 26), `row`, `anatomical_joint`, `bone_before`, `bone_after`, `flex_deg_means`, `abd_deg_means`, `paper_angle_flex`, `paper_angle_abd`, `given` (`yes`, `no: not measured by this tracker` for the six of `CAMERA_NOT_GIVEN` below, or `not one of the 24`) and `landmark_in_text_files` (the joint's label in the 21-landmark keypoint files; the four finger CMC are not in them) |
+| `grasps\joint_frames\joint_key.pdf` | one A4 page: a flat left hand seen from the palm, drawn by hand (not measured), its 26 joints numbered as the rows, and the table beside it |
+
+README section 11 prints the same key (`joint_key.readme_lines`), and
+`scripts\validate_grasp_set.py` checks the CSV's 26 rows and order, that
+each given angle of the paper sits in the row and column the angle table
+takes it from, the PDF's one page, and the README's copy.
+
+## Where the 24 are not the paper's numbers
+
+The names are the paper's. The numbers are read off a tracker's bone
+orientations, and differ from the paper's joint variables in five ways
+(checked against the paper on 2026-10-05; `xr_hand.joint_frames` has the
+detail, and the professor's README states all of it). Of the 24, 18 can be
+read as named; the four finger CMC are not measured on the camera at all;
+the thumb's two TMC angles are about other axes than the paper's. Those
+six (`xr_hand.joint_frames.CAMERA_NOT_GIVEN`) are therefore not handed in
+under the paper's names: `joint_angles_24.csv` leaves them empty and every
+camera page of the PDF prints "n/a" for them, with what the tracker does
+measure at those joints under names that say what it is
+(`*_metacarpal_flex_wrist_ref`, `*_metacarpal_flex_palm_ref`,
+`T_metacarpal_abd_*`). The joint-frame tables are unchanged: a row is a
+joint against its parent, whatever a paper calls it.
+
+- Order at the two-axis joints. The paper's chain (its Tables 2 and 3) turns
+  the MCP about the abduction axis first and the flexion axis second. The
+  table here takes flexion first, because the paper's order is undefined at
+  90 degrees of flexion, which every fist reaches. The bone points the same
+  way either way; the two numbers differ once both are non-zero:
+  sin(fe_paper) = sin(fe) cos(aa), tan(aa_paper) = tan(aa) / cos(fe). 60
+  degrees of flexion with 10 of abduction here is 58.5 with 19.4 in the
+  paper's order. `joint_angles_24.csv` in the hand-in folder gives the four
+  MCP pairs both ways (`*_paper_order`).
+- The four finger CMC are not measured on the camera. The paper's CMC is
+  the arching of the palm. LeapC's palm is rigid: measured from the PALM
+  joint the four are the same numbers in every one of the 69 summary frames
+  of the 2026-10-01 grasp session (8.65, 8.53, 8.59 and 6.29 degrees, index
+  to little finger; the `*_metacarpal_flex_palm_ref` columns of
+  `joint_angles_24.csv`). The METACARPAL rows' own flexion is that rigid
+  palm seen from the WRIST joint, which on the camera is the forearm: it
+  changes with the bend of the wrist and with nothing else (-60 to 79
+  degrees over that session, against the paper's own range of 5 to 15
+  degrees for a CMC). On the glove they are constants of the glove's own
+  model as well.
+- The thumb's TMC pair is about the hand's axes, not the thumb's. In the
+  paper's chain (its Table 3) the TMC flexion axis is parallel to the
+  thumb's MCP and IP flexion axes. Here TMC_fe and TMC_aa are where the
+  thumb metacarpal points as seen from the WRIST joint. The thumb's own
+  flexion axis is 48 to 92 degrees from the wrist joint's +x on those 69
+  frames (median 77) and 65 to 89 from the palm's (median 76), so the pair
+  is not the paper's and must not be compared with it; what exactly relates
+  the two cannot be stated, because the paper gives its thumb reference
+  frame as a drawing, not in numbers. Like the CMC, the pair includes the
+  bend of the wrist; `*_palm_ref` gives it against the palm joint, with
+  `forearm_to_palm_deg` beside it.
+- PIP and DIP. The paper's are hinges. The tracker's INTERMEDIATE and
+  DISTAL rows carry a sideways part as well (abd_deg up to 13 and 17
+  degrees on that session); `*_PIP` and `*_DIP` are the flexion alone.
+- Twist. The paper's finger bones do not turn about their own axis. The
+  twist column is reported for every joint and is not one of the 24.
 
 ## The three commands
 
@@ -159,5 +245,19 @@ take, from the glove file (`<take>.csv`) and from the camera file
 summary frame: the drawing and the 26-row table.
 
 The PDF is what goes to the professor: `scripts\package_professor_set.py`
-copies the CSVs and the PDF into the hand-in folder and never the PNGs,
-because the hand-in takes no image files.
+copies the CSVs and the PDF into the hand-in folder and never the PNGs.
+The PDF is the drawing's hand-in form, and the only images a hand-in folder
+may hold are the grasp set's infrared pictures cut to the hand
+(`docs\grasp_recording.md`, step 10); the packager refuses any other. For
+the grasp set it also writes the joint key beside them (above), and
+`scripts\rebuild_grasp_set.py` runs this step, the packaging and the check
+in one command.
+
+Each drawing shows which arrow is which: every axis is a 10 mm arrow with
+its head at the positive end, +x red, +y green, +z blue, with a legend that
+says what each means; each digit has its letter (T, I, M, R, L) beyond its
+fingertip in both views; each joint has the paper's name for it, the five
+at the base of the hand in a row under the wrist with a leader to each; the
+wrist is marked as the origin; and each view says where the wrist frame's
+axes point in it. The PDF is written without a creation time, so the same
+pages give the same file.

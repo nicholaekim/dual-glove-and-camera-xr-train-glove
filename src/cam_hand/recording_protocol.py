@@ -43,8 +43,12 @@ with tests, rather than inside a loop that drives hardware:
                    the count `cam_hand.protocol_check` fails a take on, which
                    imports it from here) must number the take's bend cues,
                    so a take is redone while the gloves are on rather than
-                   failed by the checker after the session. Set C: in the
-                   last `check_window_s` of every step, a finger the step
+                   failed by the checker after the session. Since 2026-10-13
+                   a slow bend also has to BE slow (`bend_moves`,
+                   `bend_speed`): each counted bend is timed across the
+                   middle of its own rise, and one that crossed it in less
+                   than a share of its cue's time rejects the take. Set C: in
+                   the last `check_window_s` of every step, a finger the step
                    says is flexed has to read above 0.6 and a finger the step
                    says is straight must not read flexed. A straight finger
                    between 0.3 and 0.6 is reported as coupling and does not
@@ -114,6 +118,34 @@ SPAN_PERCENTILES = (5.0, 95.0)
 # checker imports these three and `count_peaks` from here, so the recorder
 # and the checker count the same bends.
 PEAK_LOW, PEAK_HIGH, PEAK_MIN_RANGE = 0.3, 0.6, 0.15
+# Bend speed (Set B, since 2026-10-13). The professor's text asks for a slow
+# bend ("slowly bend the finger until it is fully flexed"), and on that day
+# a whole session was accepted in which the finger closed in 0.05 to 0.43 s
+# of bend cues that give 4 s: the span and the bend count cannot tell a
+# snapped bend from a slow one. A bend's time is how long its reading took
+# to cross from MOVE_MARKS[0] to MOVE_MARKS[1] of that bend's own rise
+# (`bend_moves`). A bend the cue gives SLOW_FROM_S seconds or more for is a
+# slow bend and must take at least MIN_BEND_SHARE of the cue's time; a
+# shorter cue (the fast index, 1 s) asks for no such thing. The share sits
+# between what the recordings on disk show: the snapped bends of 2026-10-13
+# took at most 0.11 of their cue, the three paced bends of the one slow
+# sweep on disk (results/diagnostics/dead_zone_right_ring_20260920_212254
+# .csv, 5 s to bend) 0.24 of it or more. docs/protocol_formats.md,
+# section 8, has the figures; tests/test_protocol_check.py measures both.
+# The straighten is timed the same way and NEVER failed on: in that sweep
+# the reading fell in 0.1 to 1.1 s of a 5 s straighten, no slower than a
+# snapped one, because the glove's reading drops quickly once a finger
+# starts to open. A bar on it would reject slow openings.
+MOVE_MARKS = (0.2, 0.8)
+MIN_BEND_SHARE = 0.15
+SLOW_FROM_S = 2.0
+SPEED_RULE_SINCE = "2026-10-13"
+# Which Set B gate rejected a take (the quick check's `rejected_for`).
+REJECT_SPAN, REJECT_COUNT, REJECT_SPEED = "span", "bend count", "speed"
+# The three states of the rule for one take, as the reports print them.
+SPEED_IN_FORCE = "in force"
+SPEED_OFF = "not in force"
+SPEED_FAST_CUE = "not a slow cue"
 # A warm-up span this close to zero is not a range at all.
 MIN_SPAN = 1e-6
 # The single-finger part of the warm-up (each finger bent on its own). The
@@ -972,6 +1004,30 @@ def _endpoints(glove: Mapping, finger: str,
 range_ends = _endpoints
 
 
+def fraction_trace(curls: Sequence[Tuple[float, Sequence[float]]],
+                   glove: Mapping, finger: str,
+                   t0: Optional[float] = None,
+                   t1: Optional[float] = None,
+                   cued: bool = True) -> Tuple[List[float], List[float]]:
+    """(times, fractions) of one finger, frame by frame inside [t0, t1]
+    (None = open end): the trace the bend count and the bend times read.
+
+    `cued`: measured as the finger the cue names (`_endpoints`)."""
+    i = FINGERS.index(finger)
+    o, k = _endpoints(glove, finger, cued)
+    times, out = [], []
+    for t, c in curls:
+        if t0 is not None and t < t0:
+            continue
+        if t1 is not None and t > t1:
+            continue
+        f = fraction(o, k, c[i])
+        if f is not None:
+            times.append(float(t))
+            out.append(f)
+    return times, out
+
+
 def fractions_of(curls: Sequence[Tuple[float, Sequence[float]]],
                  glove: Mapping, finger: str,
                  t0: Optional[float] = None,
@@ -980,18 +1036,7 @@ def fractions_of(curls: Sequence[Tuple[float, Sequence[float]]],
     """One finger's fraction per frame inside [t0, t1] (None = open end).
 
     `cued`: measured as the finger the cue names (`_endpoints`)."""
-    i = FINGERS.index(finger)
-    o, k = _endpoints(glove, finger, cued)
-    out = []
-    for t, c in curls:
-        if t0 is not None and t < t0:
-            continue
-        if t1 is not None and t > t1:
-            continue
-        f = fraction(o, k, c[i])
-        if f is not None:
-            out.append(f)
-    return out
+    return fraction_trace(curls, glove, finger, t0, t1, cued)[1]
 
 
 def span_fraction(fracs: Sequence[float]) -> Optional[float]:
@@ -1069,10 +1114,211 @@ def bend_hint(finger: str) -> str:
             "then open it fully")
 
 
+# --- how fast each bend was --------------------------------------------------
+def bend_moves(times, values, marks: Sequence[float] = MOVE_MARKS,
+               low_share: float = PEAK_LOW, high_share: float = PEAK_HIGH,
+               min_range: float = PEAK_MIN_RANGE) -> List[dict]:
+    """Each bend `count_peaks` counts, in order, with how long it took.
+
+    `values` is a fraction trace (higher = more flexed) and `times` its
+    clock. The bends are found by `count_peaks`' own trigger, so there are
+    exactly as many as it counts. For each one:
+
+      rise_s   how long the reading took to climb from `marks[0]` to
+               `marks[1]` of that bend's own rise. The rise runs from the
+               lowest reading since the finger was last open (since the
+               trigger armed) to the highest reading before it opens again;
+               the time is from where the reading last left the lower mark
+               to where it first reached the upper one, so a bend that
+               pauses half way is as slow as its pause makes it. Each
+               crossing is placed between the two frames around it
+               (`_crossing`), so a ramp of T seconds reads 0.6 T at the
+               default marks whatever the frame rate, and a jump inside one
+               frame reads 0.6 of that frame.
+      fall_s   the same on the way down: from the bend's highest reading to
+               the lowest one before the next bend, where the reading last
+               left the upper mark to where it first reached the lower one.
+               None when the trace ends before the finger has opened.
+      at       the time the reading reached the upper mark on the way up.
+
+    The marks sit in each bend's own rise, not at fixed fractions: a bend
+    that goes less far than its neighbours, or a glove that creeps between
+    cycles, is still timed across the middle of what that bend did. Frames
+    whose value or time is not finite are skipped, as `count_peaks` skips
+    them.
+    """
+    t = np.asarray(times, dtype=float)
+    v = np.asarray(values, dtype=float)
+    if t.shape != v.shape:
+        raise ValueError("bend_moves: times and values differ in length")
+    keep = np.isfinite(v) & np.isfinite(t)
+    t, v = t[keep], v[keep]
+    if v.size < 3:
+        return []
+    lo, hi = (float(x) for x in np.percentile(v, list(SPAN_PERCENTILES)))
+    if hi - lo < min_range:
+        return []
+    low, high = lo + low_share * (hi - lo), lo + high_share * (hi - lo)
+    m_low, m_high = float(marks[0]), float(marks[1])
+    # `count_peaks`' trigger, keeping where it armed and where it fired.
+    fired: List[Tuple[int, int]] = []
+    armed, arm_at = False, 0
+    for i, x in enumerate(v):
+        if x <= low:
+            if not armed:
+                armed, arm_at = True, i
+        elif x >= high and armed:
+            fired.append((arm_at, i))
+            armed = False
+    n = int(v.size)
+    out = []
+    for k, (a, i) in enumerate(fired):
+        end = i                                # where the finger opens again
+        while end < n and v[end] > low:
+            end += 1
+        j_top = i + int(np.argmax(v[i:end]))
+        top = float(v[j_top])
+        j_base = a + int(np.argmin(v[a:i + 1]))
+        base = float(v[j_base])
+        up_low = base + m_low * (top - base)
+        up_high = base + m_high * (top - base)
+        j_high = next(j for j in range(j_base, end) if v[j] >= up_high)
+        j_low = max(j for j in range(j_base, j_high + 1) if v[j] <= up_low)
+        t_high = _crossing(t, v, j_high - 1, up_high)
+        t_low = _crossing(t, v, j_low, up_low)
+        fall = None
+        if end < n:
+            stop = fired[k + 1][1] if k + 1 < len(fired) else n
+            base2 = float(np.min(v[end:stop]))
+            down_low = base2 + m_low * (top - base2)
+            down_high = base2 + m_high * (top - base2)
+            d_low = next(j for j in range(j_top, stop) if v[j] <= down_low)
+            d_high = max(j for j in range(j_top, d_low + 1)
+                         if v[j] >= down_high)
+            fall = (_crossing(t, v, d_low - 1, down_low)
+                    - _crossing(t, v, d_high, down_high))
+        out.append({"rise_s": t_high - t_low, "fall_s": fall, "at": t_high})
+    return out
+
+
+def _crossing(t, v, j: int, mark: float) -> float:
+    """When the trace passed `mark` between frame `j` and frame `j + 1`: the
+    straight line through the two. The frame itself when the two read the
+    same, or when `j + 1` is past the end."""
+    if j < 0:
+        return float(t[0])
+    if j + 1 >= len(v) or v[j + 1] == v[j]:
+        return float(t[j])
+    share = (mark - float(v[j])) / (float(v[j + 1]) - float(v[j]))
+    return float(t[j] + min(1.0, max(0.0, share)) * (t[j + 1] - t[j]))
+
+
+def speed_rule() -> dict:
+    """The bend-speed rule as session.json keeps it (`speed_check`): the
+    numbers a take of that session is judged on, so a later change to the
+    constants above cannot re-judge a session recorded under these."""
+    return {"since": SPEED_RULE_SINCE, "marks": list(MOVE_MARKS),
+            "min_bend_share": MIN_BEND_SHARE, "slow_from_s": SLOW_FROM_S}
+
+
+def rule_marks(rule: Optional[Mapping]) -> Tuple[float, float]:
+    """The marks a session's bends are timed between: its own rule's, else
+    today's."""
+    marks = (rule or {}).get("marks") or MOVE_MARKS
+    return float(marks[0]), float(marks[1])
+
+
+def cue_seconds(events: Sequence[Mapping], phase: str) -> Optional[float]:
+    """How long the take's cues of `phase` last (the first one's `hold_s`;
+    one item gives every cycle the same), None with no such cue."""
+    for e in cue_events(events):
+        if e.get("phase") == phase and e.get("hold_s") is not None:
+            return float(e["hold_s"])
+    return None
+
+
+def bend_speed(moves: Sequence[Mapping], cue_s: Optional[float],
+               rule: Optional[Mapping], time_scale: float = 1.0) -> dict:
+    """What the speed rule says about a take's bends.
+
+    `rule` is the session's `speed_check` (None: the session has no rule,
+    and nothing is judged). `cue_s` is the bend cue's time in this run and
+    `time_scale` the run's, so the cue the protocol wrote lasts
+    cue_s / time_scale: a rehearsal at a quarter of the time is judged as
+    the real run is. Returns {"state": SPEED_IN_FORCE | SPEED_OFF |
+    SPEED_FAST_CUE, "need_s": the least a bend may take (None unless in
+    force), "fast": the indexes of the bends under it}.
+    """
+    if not rule or cue_s is None:
+        return {"state": SPEED_OFF, "need_s": None, "fast": []}
+    written = float(cue_s) / float(time_scale or 1.0)
+    # a hair of slack on the comparison: 4 s x 0.25 / 0.25 is not always 4.0
+    if written < float(rule.get("slow_from_s", SLOW_FROM_S)) - 1e-9:
+        return {"state": SPEED_FAST_CUE, "need_s": None, "fast": []}
+    need = float(rule.get("min_bend_share", MIN_BEND_SHARE)) * float(cue_s)
+    fast = [k for k, m in enumerate(moves)
+            if m.get("rise_s") is not None and m["rise_s"] < need]
+    return {"state": SPEED_IN_FORCE, "need_s": need, "fast": fast}
+
+
+def seconds_text(values: Sequence[float]) -> str:
+    """'0.07 s' or '0.07 to 0.15 s' for one or several times."""
+    lo, hi = min(values), max(values)
+    if f"{lo:.2f}" == f"{hi:.2f}":
+        return f"{lo:.2f} s"
+    return f"{lo:.2f} to {hi:.2f} s"
+
+
+def speed_reason(finger: str, moves: Sequence[Mapping], fast: Sequence[int],
+                 need_s: float, cue_s: float,
+                 marks: Sequence[float] = MOVE_MARKS) -> str:
+    """Why a take whose bends were too fast is rejected: how many, what the
+    glove timed them at, and the bar with where it comes from."""
+    words = FINGER_WORDS[finger]
+    took = seconds_text([moves[k]["rise_s"] for k in fast])
+    n, total = len(fast), len(moves)
+    bends = "bend" if total == 1 else "bends"
+    return (f"the {words} bent too fast on {n} of {total} {bends}: {took}, "
+            f"and a {cue_s:g} s bend cue needs at least {need_s:.2f} s (timed "
+            f"from {marks[0] * 100:.0f} to {marks[1] * 100:.0f} percent of "
+            "each bend's rise)")
+
+
+def speed_hint(finger: str, cue_s: float) -> str:
+    """What to do after a take rejected for its speed, in one line."""
+    return (f"start on the high beep and keep the {FINGER_WORDS[finger]} "
+            f"moving for the whole {cue_s:g} s, so it is fully bent only as "
+            "the hold beep sounds")
+
+
+def speed_line(details: Mapping) -> str:
+    """One console line on how fast a take's bends were, from the quick
+    check's details; '' when nothing was timed."""
+    rises = [x for x in details.get("bend_times_s") or [] if x is not None]
+    if not rises:
+        return ""
+    text = f"bends took {seconds_text(rises)}"
+    need = details.get("bend_need_s")
+    cue = details.get("bend_cue_s")
+    if need is not None and cue is not None:
+        text += f" (a {cue:g} s bend cue needs {need:.2f} s)"
+    elif details.get("speed_rule") == SPEED_FAST_CUE:
+        text += " (not judged: not a slow cue)"
+    else:
+        text += " (not judged: the speed rule is not in force)"
+    falls = [x for x in details.get("straighten_times_s") or []
+             if x is not None]
+    if falls:
+        text += f"; straightens {seconds_text(falls)} (reported, never judged)"
+    return text
+
+
 def check_flexion_take(curls: Sequence[Tuple[float, Sequence[float]]],
                        events: Sequence[Mapping], glove: Mapping,
                        finger: str, cycles: int,
-                       span_gate: float = SPAN_GATE) -> CheckResult:
+                       span_gate: float = SPAN_GATE,
+                       speed: Optional[Mapping] = None,
+                       time_scale: float = 1.0) -> CheckResult:
     """Set B's acquisition gate for one take.
 
     Rejects when the cued finger covered less than `span_gate` of its
@@ -1086,10 +1332,18 @@ def check_flexion_take(curls: Sequence[Tuple[float, Sequence[float]]],
     its neighbours). Events that disagree with the protocol's `cycles` are a
     note, not a reject: the recorder writes one bend cue per cycle, so the
     two differ only on a take cut short, which is rejected as interrupted.
+
+    `speed` is the session's bend-speed rule (`speed_rule()`, session.json's
+    `speed_check`; None: no rule) and `time_scale` the run's. Every counted
+    bend and straighten is timed whatever the rule (`bend_moves`; the times
+    are in the details), and with the rule a take whose bend cue is a slow
+    one is rejected when any bend crossed the middle of its rise in less
+    than the rule's share of the cue (`bend_speed`). The straighten is
+    never a reason.
     """
     t0, t1 = take_window(events)
     words = FINGER_WORDS[finger]
-    fracs = fractions_of(curls, glove, finger, t0, t1)
+    times, fracs = fraction_trace(curls, glove, finger, t0, t1)
     in_take = [c for t, c in curls if (t0 is None or t >= t0)
                and (t1 is None or t <= t1)]
     cycles_events = len({e.get("cycle") for e in cue_events(events)
@@ -1115,8 +1369,20 @@ def check_flexion_take(curls: Sequence[Tuple[float, Sequence[float]]],
         s = span_fraction(fractions_of(curls, glove, f, t0, t1, cued=False))
         others[f] = _r(s, 3)
     peaks = count_peaks(fracs)
+    marks = rule_marks(speed)
+    moves = bend_moves(times, fracs, marks)
+    bend_cue = cue_seconds(events, BEND)
+    judged = bend_speed(moves, bend_cue, speed, time_scale)
     details.update({"span_fraction": _r(span, 3), "other_spans": others,
-                    "cycles_from_peaks": peaks})
+                    "cycles_from_peaks": peaks,
+                    "bend_cue_s": _r(bend_cue),
+                    "bend_times_s": [_r(m["rise_s"], 3) for m in moves],
+                    "straighten_cue_s": _r(cue_seconds(events, STRAIGHTEN)),
+                    "straighten_times_s": [_r(m["fall_s"], 3)
+                                           for m in moves],
+                    "speed_rule": judged["state"],
+                    "bend_need_s": _r(judged["need_s"]),
+                    "rejected_for": None})
     short = span is None or span < span_gate
     unbent = cycles_events > 0 and peaks != cycles_events
     notes = []
@@ -1132,15 +1398,24 @@ def check_flexion_take(curls: Sequence[Tuple[float, Sequence[float]]],
         notes.append("other fingers that moved with it (span as a fraction "
                      "of their range): " + ", ".join(moved))
     if short:
+        details["rejected_for"] = REJECT_SPAN
         return CheckResult(False,
                            f"the {words} moved only {_fmt(span or 0.0)} of its "
                            f"warm-up range (needs {span_gate:.2f})",
                            notes=notes, details=details,
                            hint=bend_hint(finger))
     if unbent:
+        details["rejected_for"] = REJECT_COUNT
         return CheckResult(False, bends_reason(finger, peaks, cycles_events),
                            notes=notes, details=details,
                            hint=bend_hint(finger))
+    if judged["fast"]:
+        details["rejected_for"] = REJECT_SPEED
+        return CheckResult(False,
+                           speed_reason(finger, moves, judged["fast"],
+                                        judged["need_s"], bend_cue, marks),
+                           notes=notes, details=details,
+                           hint=speed_hint(finger, bend_cue))
     return CheckResult(True, "", notes=notes, details=details)
 
 
@@ -1241,12 +1516,15 @@ def check_sequence_take(curls: Sequence[Tuple[float, Sequence[float]]],
 def check_take(protocol: Protocol, item_id: str,
                curls: Sequence[Tuple[float, Sequence[float]]],
                events: Sequence[Mapping], glove: Mapping,
-               time_scale: float = 1.0) -> CheckResult:
-    """The quick check for one take of `item_id`, by the protocol's set."""
+               time_scale: float = 1.0,
+               speed: Optional[Mapping] = None) -> CheckResult:
+    """The quick check for one take of `item_id`, by the protocol's set.
+    `speed`: the session's bend-speed rule, Set B only (None: no rule)."""
     item = protocol.item(item_id)
     if protocol.name == FLEXION:
         return check_flexion_take(curls, events, glove, item["finger"],
-                                  int(item["cycles"]))
+                                  int(item["cycles"]), speed=speed,
+                                  time_scale=time_scale)
     if protocol.name == SEQUENCES:
         return check_sequence_take(
             curls, events, glove,

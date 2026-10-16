@@ -10,6 +10,8 @@ left hand, 3 takes of 5 seconds each, no object in the hand. The recorder is
     recordings\protocol\grasps\<YYYYMMDD_HHMMSS>_left\
       session.json                     the whole session, rewritten after every take
       leap\<take>.jsonl                every camera frame of the take
+      forming\<take>.jsonl             every camera frame from the GO beep of MAKE
+                                       THE GRASP until the take starts (since 2026-10-02)
       stills\<take>.png                one IR picture of the hand, cropped to the hand
       keypoints\<take>_keypoints.txt   the take's summary frame, professor's format
       meta\<take>.json                 the numbers and your decision
@@ -24,17 +26,24 @@ A take is named `<grasp>_left_take<N>_<YYYYMMDD_HHMMSS>`, for example
    the hand for it (the orientation rule below) and repeats the orientation
    envelope.
 2. OPEN HAND: hold your open hand still over the camera, palm toward it,
-   until it beeps.
-3. MAKE THE GRASP: at the high beep, close your hand slowly into the grasp in
-   the picture, palm still toward the camera.
-4. HOLD STILL: at the next beep, hold the grasp still until the low beep.
-5. The recorder checks the take against the acquisition gate (below). A take
+   until you hear two short, quiet, low beeps.
+3. READY: those two short low beeps are not the cue. Keep the hand open and
+   still for 1 more second while the window says "KEEP HAND OPEN" and
+   "close on the GO beep".
+4. MAKE THE GRASP: on the GO beep, one long, loud, high beep, form the grasp
+   in the picture naturally and smoothly while keeping the palm visible to
+   the cameras (a deliberately slow close would bias the transition timing).
+   Close only on the GO beep.
+5. HOLD STILL: at the next beep, hold the grasp still until the low beep.
+6. The recorder checks the take against the acquisition gate (below). A take
    that fails is moved to `rejected\` and recorded again on its own.
-6. A take that passes shows the review in the COPY THIS window: the still
+7. A take that passes shows the review in the COPY THIS window: the still
    of your hand and the numbers. You decide with one key.
 
-The camera can follow an open hand into a grasp, but it cannot pick up a
-hand that is already closed. That is why the hand opens first, every time.
+The camera can follow an open hand into a grasp. In this setup the tracker
+often failed to reacquire a hand that had already closed and was occluded
+(closed hands are tracked; the losses are self-occlusion during the close).
+That is why the hand opens first, every time.
 
 OPEN HAND waits until the palm has been 18 to 40 cm above the module, within
 50 degrees of facing the lens and over the middle of the module for half a
@@ -43,36 +52,129 @@ second without a break. The COPY THIS window says what is still wrong
 no open hand is seen within 30 seconds, the attempt is rejected with "no
 open hand acquired in 30 s" and starts again.
 
+READY is the 1 second between the two short low beeps and the GO beep,
+counted from the end of the low beeps, so the GO beep never comes sooner
+than it did before. On 2026-10-02 the two beeps came back to back and
+sounded alike, and the lateral grasp was closed on the first one: by the
+second there was nothing left to time. Now the two cues cannot be taken for
+each other (low, quiet and double against high, loud and long), and the
+recorder keeps watching the hand through READY. If the hand moves at 50 mm/s
+or faster, which is the speed of a hand closing, you hear a low beep and the
+window says "CLOSED TOO SOON - keep the hand open until the GO beep". If the
+camera loses the open hand, it says "LOST YOU: show the open hand to the
+camera again". Either way open the hand: the recorder goes back to OPEN
+HAND and the attempt carries on. That is a reset, not a rejection.
+
 MAKE THE GRASP gives you 4 seconds. If the camera loses your hand for more
 than 0.3 seconds while you close it, you hear a low beep and the window says
-"LOST YOU: open the hand, then close it slower". Open the hand: the recorder
-goes back to OPEN HAND. The third loss in one attempt rejects the attempt,
-and the reason says how often the hand was lost and where it was.
+"LOST YOU: keep the grasp, turn the palm to the camera". Keep the grasp and
+bring the palm back toward the camera: the recorder waits for a hand it
+treats as the same one (the same id, or a new id within 10 cm of where it
+was lost: a rule of id and distance, not a proof of identity, so keep the
+other hand out of view meanwhile), up to 4
+seconds each time (`--lost-wait`) and never later than 8 seconds after the
+GO beep (`--form-window`). Once it has the hand again, it holds it tracked
+for 1 second, and then HOLD STILL starts as always (never before the 4
+seconds are up). The take is then judged by the same acquisition gate as
+every take. If the hand is not found again in time, the attempt is
+rejected. At the end of the 4 seconds, if the hand was never lost, the
+recorder checks that the hand did close after the GO beep: if nothing moved
+at 50 mm/s or faster since then, the hand was already closed, and you get
+CLOSED TOO SOON and go back to OPEN HAND (a reset). An attempt is reset at
+most 10 times; the 11th close before the GO beep (or loss during READY)
+rejects it. The limit only ends a loop that would not end otherwise.
 
-Each take's meta file records how it went under `coaching`: `acquire_s`
-(seconds to find the open hand) and `lost_while_forming` (how often the
-hand was lost while you closed it), with the height and palm angle of every
-loss. `--no-coach` brings back the old 5 second countdown without OPEN HAND.
+These rules date from 2026-10-07. Until then a loss while forming sent you
+back to OPEN HAND, and the third send-back of an attempt, a loss or an
+early close, rejected it before its hold was ever recorded. The hold and
+its gate did not change.
+
+Each take's meta file says which rules it was recorded under,
+`recorder_rules` ("2026-10-07"; takes recorded before have none), and
+records how it went under `coaching`: `acquire_s` (seconds to find the open
+hand), `ready_pause_s` (the READY seconds), `forming_lost_count` (how often
+the hand was lost while you closed it and found again) with the height, palm
+angle, seconds gone and when it was found of every loss in
+`forming_losses`, `ready_losses` (lost during READY), `closed_before_cue`
+(how often it closed before the GO beep) with how fast and when in
+`early_closes`, `resets` (the returns to OPEN HAND), and the limits it ran
+with (`lost_wait_s`, `form_window_s`, `relock_s`, `reset_limit`).
+`--no-coach` brings back the old 5 second countdown without OPEN HAND,
+unchanged.
+
+The change into the grasp is recorded too, because the professor asked for
+the time it takes to change from one pose to the next. Every camera frame
+from the GO beep of MAKE THE GRASP until the take starts goes to
+`forming\<take>.jsonl`, in the same format as the take's own file. After a
+reset the next MAKE THE GRASP starts that file again, so it holds the try
+that led to the take. A hand lost while you close it and found again stays
+in the one file, with the gap: that file then has `"forming_lost_count": N`
+on every line, and nothing is timed from it, because a change of pose that
+the camera did not see cannot be timed (`transition_s` null with the note
+"the hand was lost while forming the grasp (N time(s)): ..."; the
+professor's folder marks its row invalid, with no duration, and the take's
+note says so). From the file the recorder
+measures `transition_s`: the seconds from the GO beep until your hand has
+settled after its close. The close is the fastest movement after the beep
+(`peak_speed_mm_s`, at `peak_at_s` seconds), and settled means the average
+speed of the hand's 26 joints stayed under 20 mm/s for 0.3 s, searched for
+after that peak, so a twitch on the beep and a pause before the real close
+are not taken for the grasp. A still hand moves its joints at about 6 mm/s
+in the camera's data, so 20 mm/s is still; a real close peaks at 180 mm/s
+or more. `last_move_s` is the end of the hand's last movement at 50 mm/s or
+faster. `transition_note` is empty for a plain close, and otherwise says:
+
+- "no close after the cue (peak X mm/s): the hand was already in the
+  grasp": nothing after the GO beep moved at 50 mm/s; `transition_s` is
+  null. With READY this should no longer happen in a kept take.
+- "settled, then moved again at T s": the hand settled after the close, then
+  adjusted its grip from T s on; `transition_s` is the settle after the
+  close, `last_move_s` the end of the adjustment.
+- "never settled before the hold": no settled moment after the close before
+  the take began; `transition_s` is null.
+- "the hand was lost while forming the grasp (N time(s)): a change of pose
+  is not timed across a gap in the tracking": the file is marked (above);
+  `transition_s` and every other number are null.
+
+The meta keeps all of these under `coaching` beside `forming_frames` (the
+file's frame count) and `forming_tracked_fraction`, and `transition_rule`
+the thresholds they were measured with. `transition_s` runs from the cue,
+so it holds your reaction time as well as the movement; the professor's
+folder times the movement alone, from its own start (see "The time to
+change pose" at the end). Takes recorded before 2026-10-02
+have no forming file. The six takes recorded on 2026-10-02 before this rule
+were re-timed in place with step 8c.
 
 Your other hand. You may hold your right hand open in view, palm to the
 camera, at least 20 cm to the side of the module at about the same height,
-if that helps the camera tell left from right. OPEN HAND only takes a hand
-within about 31 degrees of the module's axis (nearer the axis than 0.6
-times its height), so the hand off to the side is never the one acquired.
-The take follows the hand OPEN HAND acquired by the tracker's id, including
-a new id the tracker gives that same hand in the same place. The other
-hand's frames stay in the take's file and are listed in the meta under
-`other_hand_ids`; they are never measured.
+if that helps the camera tell left from right. During MAKE THE GRASP, and
+during a reacquisition after a loss (LOST YOU, until the hand is found
+again), keep it out of the camera's view: the reacquisition rule is by id
+and distance, not identity, and could adopt another hand that appears
+within 10 cm of where yours was lost. OPEN HAND only takes a hand within
+about 31 degrees of the module's axis (nearer the axis than 0.6 times its
+height), so the hand off to the side is never the one acquired. The take
+follows the hand OPEN HAND acquired by the tracker's id, including a new id
+within 10 cm of where that hand was last seen, in a frame without it, which
+the recorder treats as the same hand. The other hand's frames stay in the
+take's file and are listed in the meta under `other_hand_ids`; they are
+never measured.
 
 ## The COPY THIS window
 
 During OPEN HAND the window says "OPEN HAND, palm to the camera" in large
 letters, with what the camera sees of your hand and the seconds left. The
 paper's picture is not shown yet: copying it before the camera has the hand
-is what lost the hand on 2026-10-01. At the high beep the picture to copy,
-cut from the paper's figure, appears large with the grasp's name, the take
-number and MAKE THE GRASP with its countdown; the grasp's orientation hint
-is under that line. HOLD STILL and the seconds left follow while the take
+is what lost the hand on 2026-10-01. During READY it says "KEEP HAND OPEN"
+and "close on the GO beep" in large letters, still without the picture.
+After a reset (CLOSED TOO SOON, or LOST YOU during READY), the next OPEN
+HAND says why in red above the large letters. At the GO beep the picture to
+copy, cut from the paper's figure, appears large with the grasp's name, the
+take number and MAKE THE GRASP with its countdown; the grasp's orientation
+hint is under that line. If the hand is lost while you close it, the line
+reads LOST YOU with the seconds left to find it, and "keep the grasp, turn
+the palm to the camera" in red where the hint was. HOLD STILL and the
+seconds left follow while the take
 records. After the take the same window shows the review, the paper's
 picture beside your still, and then the next grasp's OPEN HAND. The sheet
 `grasp sheet.pdf` beside the papers is only a backup. If a picture is
@@ -183,7 +285,7 @@ module); the gate needs 90 percent`. Every loss is also listed in the take's
 meta file under `gate.losses`, and `docs\tracking_quality.md` explains each
 cause. The attempt's files move to `rejected\` beside a `<take>.reason.txt`, and the
 recorder starts the same take again at OPEN HAND, up to 2 more times. Before
-the next high beep, fix the cause:
+the next GO beep, fix the cause:
 
 - tracked under 90 %: bring the hand inside 20 to 40 cm, keep the wrist in
   view, and turn the hand so no finger is edge-on;
@@ -191,17 +293,29 @@ the next high beep, fix the cause:
   the beep that starts the recording to the low beep and keep the hand
   over the middle of the module, 25 to 35 cm up;
 - the tracker fitted the hand as a right hand: hold your right hand open in
-  view, 20 cm or more to the side (Your other hand, above), and keep the
-  left palm toward the camera while you close it.
+  view, 20 cm or more to the side, but out of view while you close the left
+  and while a lost hand is found again (Your other hand, above), and keep
+  the left palm toward the camera while you close it.
 
-Two rejections happen before anything is recorded, and the console prints
+Three rejections happen before anything is recorded, and the console prints
 `REJECTED:` with the reason:
 
 - `no open hand acquired in 30 s`: hold the open hand flat over the middle
   of the module, 18 to 40 cm up, palm toward the lens;
-- `lost the hand 3 times while forming the grasp, the last at 21 cm with
-  the palm 75 degrees from the lens (palm turned away: ...)`: follow the
-  orientation rule above and close the hand more slowly.
+- `lost the hand while forming the grasp and it was not found again within
+  the 4 s wait for it: at 21 cm with the palm 75 degrees from the lens (palm
+  turned away: ...)` (or `... before the forming window ended, 8 s after the
+  GO beep`): follow the orientation rule above, and when LOST YOU comes, turn
+  the palm back to the camera without opening the hand;
+- `closed before the GO beep 11 times; reset to OPEN HAND 10 times, the limit
+  that ends a stuck loop; the last during READY, 0.3 s after the READY beep,
+  at 96 mm/s`: keep the hand open through READY and close only on the GO
+  beep. A reason that also says `lost the hand during READY N times` counts
+  both kinds of reset.
+
+Sessions recorded before 2026-10-07 also hold the earlier rules' reasons,
+`lost the hand 3 times while forming the grasp, ...` and `closed before the
+cue 3 times, ...`. The professor's README counts each kind apart.
 
 After 3 failed attempts the recorder moves on to the next take. The end
 table then lists that grasp as short of its takes, and step 8 below records
@@ -226,19 +340,42 @@ Every command below runs from this folder.
 
 It takes about a minute and ends with a table in which every grasp says
 yes. The rehearsal is written to `recordings\protocol_mock\grasps\`, never
-beside the real sessions, and its stills say MOCK.
+beside the real sessions, and its stills say MOCK. Every take there also
+has a file in `forming\`, and its meta a `transition_s` of about 0.15 s:
+the synthetic hand closes in an eighth of a second.
 
 ### Step 3. No hardware: rehearse a lost hand
 
 ```
-.venv\Scripts\python.exe scripts\leap\record_poses.py --mock --protocol protocols\grasps.json --hand left --items p1_tip --takes 1 --duration 2 --auto-accept --no-open --mock-lose-forming 1
+.venv\Scripts\python.exe scripts\leap\record_poses.py --mock --protocol protocols\grasps.json --hand left --items p1_tip --takes 1 --duration 2 --auto-accept --no-open --mock-lose-forming 1 --mock-back-after 0.5
 ```
 
 The synthetic hand turns its palm edge-on and disappears while it closes,
-the way the camera lost the tip grasp on 2026-10-01. The console prints
-`LOST YOU: open the hand, then close it slower` once, goes back to OPEN
-HAND, and keeps the take on the second try. That take's meta file says
-`"lost_while_forming": 1`. It takes about 10 seconds.
+the way the camera lost the tip grasp on 2026-10-01, and is back half a
+second later, closed. The console prints `LOST YOU: keep the grasp, turn the
+palm to the camera` once, then `found again after 0.5 s: hold the grasp
+there 1 s before the take`, and keeps the take at its first attempt. That
+take's meta file says `"forming_lost_count": 1`, and every line of its
+forming file carries the same. It takes about 10 seconds. Without
+`--mock-back-after 0.5` the hand stays gone: each attempt is rejected after
+the 4 second wait, `lost the hand while forming the grasp and it was not
+found again within the 4 s wait for it: ...`.
+
+### Step 3b. No hardware: rehearse closing before the beep
+
+```
+.venv\Scripts\python.exe scripts\leap\record_poses.py --mock --protocol protocols\grasps.json --hand left --items p1_tip --takes 1 --duration 2 --auto-accept --no-open --mock-close-early 1
+```
+
+The synthetic hand closes on the two short READY beeps, during READY, the
+way the lateral grasp was closed on 2026-10-02. The console prints `CLOSED
+TOO SOON - keep the hand open until the GO beep` once and `reset 1 of 10:
+closed before the GO beep, during READY, ...`, goes back to OPEN HAND, and
+keeps the take on the next round of the same attempt. That take's meta file
+says `"closed_before_cue": 1` and `"resets": 1`. It takes about 10 seconds.
+With `--mock-close-early 11` the attempt is dropped at the 11th close, with
+the reason `closed before the GO beep 11 times; reset to OPEN HAND 10 times,
+the limit that ends a stuck loop; ...`.
 
 ### Step 4. Camera only, no hand over it: check the camera
 
@@ -288,7 +425,7 @@ Before you press Enter: the module flat on the table with the lenses up, no
 sunlight on it, and your right hand resting on the table away from the
 module, or held open at least 20 cm to the side of it (Your other hand,
 above). Each take starts with OPEN HAND; the picture of each grasp appears
-in the COPY THIS window at the high beep.
+in the COPY THIS window at the GO beep.
 
 ```
 .venv\Scripts\python.exe scripts\leap\record_poses.py --protocol protocols\grasps.json --hand left --operator "N Kim"
@@ -316,6 +453,114 @@ session (plan D9). A session recorded before the orientation hints were
 added to `protocols\grasps.json` resumes too: the hints are the only change
 it lets through, and session.json notes it under `protocol_changes`.
 
+### Step 8b. Camera only, bare left hand: top every grasp up to 5 takes
+
+The professor asked for 5 takes of every grasp. The session of 2026-10-01
+has 3. This adds takes 4 and 5 of every grasp to that same session folder
+and records nothing else:
+
+```
+.venv\Scripts\python.exe scripts\leap\record_poses.py --protocol protocols\grasps.json --hand left --operator "N Kim" --resume "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\recordings\protocol\grasps\20261001_101621_left" --takes 5
+```
+
+`resume_set_a.cmd` on the Desktop runs exactly this command. A grasp that
+already has 5 kept takes is skipped; one with fewer gets only the takes it
+is missing. From then on session.json says 5 takes per grasp, so the end
+table's "Short of 5 kept takes" and its printed command count to 5 too. The
+new takes have forming files; the first three do not. The command is the
+same under the rules of 2026-10-07 (above); the takes it adds from then on
+are recorded under them and say so in their meta (`recorder_rules`), and
+session.json notes when the session changed to them
+(`recorder_rules_changes`). The takes already in the session keep their
+meta as it was.
+
+### Step 8c. No hardware: re-time the takes recorded before the READY pause
+
+The six takes with forming files recorded on 2026-10-02 before READY and the
+peak-anchored rule existed were timed by the first rule. This rewrites only
+their transition numbers in the meta files (`transition_s`,
+`peak_speed_mm_s`, `peak_at_s`, `last_move_s`, `transition_note`,
+`transition_rule`) and leaves every other byte of the session as it was:
+
+```
+.venv\Scripts\python.exe scripts\leap\recompute_transition.py recordings\protocol\grasps\20261001_101621_left
+```
+
+It prints one line per take, the old `transition_s` and the new one, and
+ends with `recompute ok`. Running it again changes nothing and says
+`(unchanged)` on every line. Add `--dry-run` to see the lines without
+writing anything. `check_protocol.py` notes "recompute needed" on a take
+whose meta still lacks these keys; it is not a failure.
+
+### Step 8d. Transitions (grasp to grasp). No hardware: rehearse them
+
+The forming files time one change only, the open hand into the grasp. A
+change from one grasp into another is recorded by
+`scripts\leap\record_transitions.py` (steps 8d to 8f): you hold grasp A
+still over the camera, a high beep sounds after a random wait, you change
+to grasp B and hold it still until the next instruction. A take is kept
+when its timing is valid or questionable, and asked for again otherwise
+(twice at most).
+
+Double-click `rehearse_transitions.cmd` on the Desktop. It runs:
+
+```
+.venv\Scripts\python.exe scripts\leap\record_transitions.py --mock --hand left --pairs "open_hand>p1_cylindrical,p1_cylindrical>p1_spherical" --takes 2 --operator "N Kim"
+```
+
+A synthetic hand does the changes: two pairs, two takes each, about half a
+minute. It ends with `kept 4 of 4 take(s) in
+...\recordings\protocol_mock\transitions\<date>_<time>_left`. The rebuild
+never takes this folder.
+
+### Step 8e. Transitions (grasp to grasp). Camera only, bare left hand: one change as a dry run
+
+In PowerShell:
+
+```
+& "C:\Users\nkim2\OneDrive\Desktop\record_transitions_left.cmd" '"open_hand>p1_cylindrical"'
+```
+
+Type the pair in single quotes around double quotes, as shown: Windows
+PowerShell drops plain double quotes, and the launcher then reads `>` as
+"write into a file" and records nothing. (Double-clicking the launcher
+records nothing either: it prints this command and the one of step 8f.)
+Each take: hold the open hand still, palm to the camera, 25 to 35 cm above
+the module; on the high beep form the cylindrical grasp and hold it. The
+launcher records 3 kept takes and ends with `kept 3 of 3 take(s) in
+...\recordings\protocol\transitions\<date>_<time>_left`. These are real
+recordings of the open hand into the cylindrical grasp, and the rebuild
+puts them into the table with the others.
+
+### Step 8f. Transitions (grasp to grasp). Camera only, bare left hand: the professor's pairs
+
+The same launcher with the pairs the professor asks for: each pair
+`<from>><to>` with the grasp ids of `protocols\grasps.json`, the pairs
+separated by commas, the whole list in single quotes around double quotes.
+For example:
+
+```
+& "C:\Users\nkim2\OneDrive\Desktop\record_transitions_left.cmd" '"p1_cylindrical>p1_spherical,p1_spherical>p1_tip"'
+```
+
+It records 3 kept takes of every pair. Each run is one folder,
+`recordings\protocol\transitions\<YYYYMMDD_HHMMSS>_left\`: `session.json`
+(rewritten after every attempt), `pose_transitions.csv` (one row per
+attempt), `leap\<from>_to_<to>_left_take<N>_<time>.jsonl` (every frame from
+1 s before the beep to the end of the hold) and `meta\` (the beep, the hand
+followed, its timing). An attempt that was not kept stays there with its
+reason. Then run step 10 as it is: it prints `transition session <folder>:
+<N> kept take(s)`, puts the kept takes into `transitions\` of the
+professor's folder, and its `TRANSITION TIMING` line counts how many of
+them are between two grasp types.
+
+A duration from these recordings is quoted with its thresholds, never
+alone: the movement starts at the first frame of 0.1 s or longer of pose
+speed at or above 25 mm/s, and is settled once the pose speed stays below
+10 mm/s for 0.3 s (every row's `movement_start_method` and
+`settled_method`). How much the reading moves with them is in "The time to
+change pose" below.
+
 ### Step 9. No hardware: look at the session folder
 
 ```
@@ -323,19 +568,166 @@ explorer recordings\protocol\grasps
 ```
 
 Open the newest folder. Every grasp should have 3 files in `leap\`,
-`stills\`, `keypoints\` and `meta\`. The stills stay on this machine: they
-are for our own checking and are not handed in.
+`stills\`, `keypoints\` and `meta\` (5 after step 8b), and every take
+recorded since 2026-10-02 one in `forming\`. The stills themselves stay
+in the session folder and never go into the professor's folder as they
+are: the camera looks up past the hand, so most of them show your face.
+What goes in is a cut of each: the rebuild (step 10) cuts every still that
+has your hand's skeleton drawn on it to that hand.
 
-### Step 10. No hardware: write the joint frames of the session
+### Step 10. No hardware: rebuild the professor's folder
+
+Double-click `rebuild_professor_grasp_set.cmd` on the Desktop. It runs:
 
 ```
-.venv\Scripts\python.exe scripts\joint_frames_view.py --session recordings\protocol\grasps\20260928_140501_left
+.venv\Scripts\python.exe scripts\rebuild_grasp_set.py --session recordings\protocol\grasps\20261001_101621_left --out "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set for professor 2026-10-01" --operator "N Kim"
 ```
 
-Put your session's folder name in place of `20260928_140501_left`: it is
-the newest folder you opened in step 9. For every kept take the script
-writes the summary frame's 26 joints (position, axes, angles) to
-`joint_frames\<take>.csv` inside the session folder, a drawing of it to
-`joint_frames\<take>.png`, and one `joint_frames\joint_frames.pdf` with a
-page per take. The packager later copies the CSVs and the PDF into the
-hand-in folder, never the PNGs.
+Run it again after every recording session. It does three things, and
+prints `1/3`, `2/3`, `3/3` as it goes:
+
+1. The joint frames: for every kept take, the 26 joints of its summary
+   frame (position, axes, angles) to `joint_frames\<take>.csv` inside the
+   session folder, a drawing to `joint_frames\<take>.png`, and one
+   `joint_frames\joint_frames.pdf` with a page per take.
+2. The folder: the kept recordings and their keypoints, each grasp's
+   frame-by-frame file, `grasps_summary.csv`, `grasp_types_audit.csv`,
+   `joint_angles_24.csv`, the joint-frame CSVs and the PDF (never the
+   PNGs), the joint key (`grasps\joint_frames\joint_key.csv` and
+   `joint_key.pdf`, `docs\joint_frames.md`), each kept take's still cut to
+   the recorded hand (`grasps\images\<grasp>_left_take<N>.png`) with
+   `grasps\images\grasp_images.pdf` (one page per grasp type),
+   `transitions\pose_transitions.csv` with the forming files, and
+   `README.txt`.
+3. The check: the finished folder is read back and measured again, and the
+   report is printed and written to `validation_report.txt`.
+
+The command needs no change for transition sessions (steps 8e and 8f).
+Under `2/3` it looks in `recordings\protocol\transitions`
+(`--transitions-dir`, by default the `transitions` folder beside the
+session's own `grasps` folder) and adds every session of the transition
+recorder there to `transitions\pose_transitions.csv`, in name order. It prints
+`transition session <folder>: <N> kept take(s)` for each one, and
+`no transition sessions in ...` when there is none. A rehearsal session
+(`--mock`) is never in that folder; if one is put there, it is skipped with
+a line that says so (`--allow-mock` takes it, for rehearsing only). A
+folder named with `--transitions` is added as well, and none twice.
+
+The last four lines it prints are the ones to read:
+
+```
+STATIC-POSE TASK: COMPLETE (...)
+FULL MULTI-TAKE DATA COLLECTION: INCOMPLETE (69 of 115 recordings against our replication target; 46 still to record)
+TRANSITION TIMING: PARTIAL (2 valid and 2 questionable of 6 recording(s) of a change of pose; none between two grasp types)
+
+FOLDER CHECK: PASSED
+```
+
+The first is the task as the professor set it: one labelled static pose for
+every grasp type. The second is our replication target of 5 takes per grasp. The
+third says whether any recorded change of pose has a valid timing; it reads
+PARTIAL or MISSING and never more, because no number of them was asked for.
+The fourth is the folder itself: `FAILED` means a file in it is wrong or
+missing, and the lines above it say which. Among the counts above them,
+`pictures cut to the hand: PNGs that open and are not black`,
+`recordings without a picture`, `grasp_images.pdf pages` and
+`joint key rows` are the pictures and the key.
+
+Then look at the pictures, every time a new session went into the folder,
+before the folder is handed in: open `grasps\images\grasp_images.pdf` in
+the professor's folder and check every picture for a face or anything of
+the room. The cut keeps every pixel within 0.3 hand radii of the drawn
+skeleton and, out to 0.5 radii, those at least 0.7 times as bright as the
+hand (the whole rule is in README section 5 and
+`src\leap_hand\grasp_images.py`). It is a cut
+by distance and brightness, not a face detector: its numbers were set on
+the 69 stills of `20261001_101621_left`, every result looked at on
+2026-10-06, and a new session's stills can differ. A take with no still,
+or with no skeleton of your hand drawn on it, gets no picture; README
+section 5 names it.
+
+Those pictures are the only images the folder may hold. If the build
+would put any other image in it, or the folder already holds one (by its
+name or its first bytes), the build stops with `REFUSED` and exit code 1,
+names the file and writes nothing.
+
+What the README says the pictures show in or against the hand comes from
+`protocols\grasps_still_notes.json`: read by eye on 2026-10-06, not
+confirmed by the operator, and for the session it names only. For any
+other session the build ignores it and the README says that the pictures
+were not read for it.
+
+The recordings in the session folder are only read. A file of the hand-in
+folder that the rebuild changes, or no longer makes, is moved to
+`xr trainer\_superseded\grasp set for professor 2026-10-01\<time>\` first;
+nothing is deleted. Running it twice in a row changes nothing the second
+time.
+
+Durations in the summary come from the timestamps in each recording, never
+from the number of lines: a take recorded with your other hand in view has
+two lines per camera frame.
+
+### Step 11. No hardware: check a folder without rebuilding it
+
+```
+.venv\Scripts\python.exe scripts\validate_grasp_set.py "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set for professor 2026-10-01"
+```
+
+It prints the same report as step 10's third part and changes nothing.
+
+## The time to change pose
+
+Two different things are called this, and only one is recorded so far.
+
+Open hand into a grasp. Every coached take records it: the forming file
+(above). In the professor's folder each forming file becomes a row of
+`transitions\pose_transitions.csv`, timed from the start of the change of
+pose: `transition_duration_s` = settled minus movement start, with
+`reaction_time_s` (cue to movement start) beside it. The forming file of a
+take kept after the hand was lost while forming (since 2026-10-07) is not
+timed: its row is invalid, "the hand was lost while forming the grasp", with
+no duration, and README section 17 counts it among the invalid.
+
+What is timed is the pose, not the hand over the camera. The rule reads the
+pose speed: the joints' speed after the whole hand's movement has been
+taken out (each frame laid on the earlier one by the rigid fit of the
+palm's joints). The movement is the stretch of pose speed at 25 mm/s or
+faster, 0.1 s or longer, that holds the fastest frame after the cue;
+settled is the first frame after its fastest from which the pose speed
+stays under 10 mm/s for 0.3 s. A pose that was already changing at the cue
+gets no start and no duration.
+
+A first version, the same day, read the speed over the camera, and an
+independent review showed what that does: it passed one take of
+2026-10-02 (p1_cylindrical take 4) and gave it 1.50 s, most of which was
+the open hand being carried 25 mm sideways and back. On the pose speed the
+six forming files of that day read: four changes of pose, starting 0.57 to
+0.81 s after the cue and lasting 0.80 to 1.11 s (two valid, two
+questionable), and two takes whose hand was already in the grasp at the
+cue. In three of the four the hand as a whole was being moved over the
+camera at the cue with its pose still, which the READY step now prevents.
+
+Three cautions, all stated in the professor's README. The closes are
+coached and unhurried, and one of the four is a close the recorder had just
+asked to be made slower (`lost_while_forming` in its meta). The length
+depends on the thresholds by a factor of three: at twice the thresholds
+(50 and 20 mm/s) the same four read 0.30 to 0.46 s, the fast part of the
+close alone, and the README prints both that and the reading at half. And
+the reading depends on the size of the change: on a synthetic hand whose
+fingers move for exactly 0.50 s it reads 0.34 s for a change of 15 mm RMS,
+0.43 s at 30 mm, 0.49 s at 61 mm and 0.51 s at 122 mm, and does not see a
+change of 8 mm at all (`leap_hand.transition.known_move_reading`);
+`pose_change_mm` in the table is that size for every row.
+
+A `--mock` rehearsal closes the synthetic hand at the instant of the cue,
+with no reaction time, so its rows read "already changing at the cue".
+That is the rule working, not a fault in the rehearsal.
+
+One grasp into another. Not in the protocol; step 8f records it (camera
+only, bare hand): you hold grasp A still, a high beep sounds after a random
+wait, you change to grasp B and hold it. As of 2026-10-07 it has been run
+on synthetic hands only (`rehearse_transitions.cmd`); no take has been
+recorded with the camera.
+
+The static recordings are never timed: not from the time between two
+files, not from the gaps between takes.

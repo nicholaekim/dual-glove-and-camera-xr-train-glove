@@ -117,10 +117,13 @@ that names the hardware setup of every step:
   follows the hand OPEN HAND acquired by the tracker's id and ignores the
   other one, which the meta lists under `other_hand_ids`.
 - Set B, single-finger flexion (5 cycles per finger, index also slow and
-  fast) and Set C, the seven cued finger sequences, gloves on with the camera
-  as the reference, one hand per run: `scripts/record_protocol.py --set
-  finger_flexion|sequences --hand left|right` (runbook
-  `docs/protocol_recording.md`). The sequences are data in
+  fast) and Set C, the seven cued finger sequences, gloves on and no camera
+  (glove only since 2026-10-12; the camera beside the gloves is optional),
+  one hand per run: `scripts/record_protocol.py --set
+  finger_flexion|sequences --hand left|right --camera none` (runbook
+  `docs/protocol_recording.md`). The hand-in carries each take's joint
+  angles frame by frame and at every held cue
+  (`cam_hand.angle_series`). The sequences are data in
   `protocols/sequences.json`, so a new order is a new entry, not code.
   The cue window shows five live bars, each finger's glove reading against
   today's warm-up, green when the cued finger is where the cue wants it
@@ -128,7 +131,13 @@ that names the hardware setup of every step:
   the fist, a cued finger is measured against that bend, and the glove
   thumb is read as its joint angles in degrees. A session that stopped
   carries on in its own folder with `--resume latest` (a new warm-up, the
-  same round order), and `s` skips the rest of an item.
+  same round order), and `s` skips the rest of an item. Since 2026-10-13 a
+  slow bend has to be slow: a bend the cue gives 2 s or more for is timed
+  across the middle of its own rise and a take with one under 15 % of its
+  cue is recorded again (`recording_protocol.bend_moves`; the rule is the
+  session's, in session.json's `speed_check`, and `--no-speed-check`
+  records without it). `scripts/render_glove_video.py <session>` draws
+  each take's glove data as a video.
 - `scripts/check_protocol.py <session folder>` grades a session against the
   plan's rules and writes `check.csv` / `check.txt`;
   `scripts/package_professor_set.py` builds the hand-in folder (JSONL, the
@@ -1677,7 +1686,7 @@ docs/ultraleap_ir170_plan.md Ultraleap Stereo IR 170 integration plan (next phas
 docs/grasp_and_flexion_protocol_plan.md  the professor's three recording sets: plan
 docs/protocol_formats.md     file-format contract for those sets
 docs/grasp_recording.md      runbook, Set A (camera only, bare left hand)
-docs/protocol_recording.md   runbook, Sets B and C (gloves on + camera)
+docs/protocol_recording.md   runbook, Sets B and C (gloves on, no camera)
 protocols/                   grasps.json (placeholder list), finger_flexion.json,
                              sequences.json (the seven sequences as data)
 scripts/record_protocol.py   cue-driven recorder for Sets B and C

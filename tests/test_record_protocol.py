@@ -923,3 +923,305 @@ def test_s_during_a_take_rejects_it_and_skips_the_item(tmp_path,
     assert second["item"] == "index_fast" and second["accepted"] is True
     assert session["skipped"] == [{"item": "index", "at": session["skipped"][
         0]["at"], "take": 1}]
+
+
+# --- 2026-10-13: a slow bend has to be slow -----------------------------------
+SPEED_TAIL = ("and a 0.4 s bend cue needs at least 0.06 s (timed from 20 to "
+              "80 percent of each bend's rise)")
+
+
+def test_a_snapped_bend_is_rejected_on_the_spot_and_recorded_again(
+        tmp_path, monkeypatch, capsys):
+    """The session of 2026-10-13 as a mock hand: it follows every cue and
+    folds fully, but at once. Span and bend count pass; the speed rule
+    rejects the slow item right after the take, says what to do, and the
+    retry is recorded. The fast item (a 1 s cue) is not judged on speed."""
+    module = load_script()
+    code = _in_process(module, monkeypatch, tmp_path, [], "--items",
+                       "ring,index_fast", "--mock-glove-snap", "--retries",
+                       "1")
+    out = capsys.readouterr().out
+    assert code == 1, out
+    folder = only_session(tmp_path, "finger_flexion")
+    session = json.loads((folder / "session.json").read_text())
+    assert session["speed_check"] == rp.speed_rule()
+    assert session["mock_flags"] == {"glove": True,
+                                     "glove_follows_cues": True,
+                                     "leap": False, "glove_snaps": True}
+    ring = [t for t in session["takes"] if t["item"] == "ring"]
+    [fast] = [t for t in session["takes"] if t["item"] == "index_fast"]
+    assert [(t["accepted"], t["attempt"]) for t in ring] == [(False, 1),
+                                                           (False, 2)]
+    for t in ring:
+        assert t["reason"].startswith(
+            "the ring bent too fast on 5 of 5 bends: 0.0"), t["reason"]
+        assert t["reason"].endswith(SPEED_TAIL), t["reason"]
+        check = t["check"]
+        assert check["rejected_for"] == "speed"
+        assert check["speed_rule"] == "in force"
+        assert check["bend_need_s"] == 0.06 and check["bend_cue_s"] == 0.4
+        assert len(check["bend_times_s"]) == 5
+        assert max(check["bend_times_s"]) < 0.06
+        # the old gates had nothing against this take
+        assert check["span_fraction"] >= rp.SPAN_GATE
+        assert check["cycles_from_peaks"] == check["cycles_from_events"] == 5
+        name = t["name"]
+        assert t["decided_by"] == "auto"
+        assert t["files"]["glove"] == f"rejected/glove/{name}.jsonl"
+        assert (folder / t["files"]["glove"]).is_file()
+        note = (folder / "rejected" / f"{name}.reason.txt").read_text()
+        assert note.splitlines()[0] == t["reason"]
+        events = rp.read_events(folder / t["files"]["events"])
+        assert events[-1]["accepted"] is False
+        assert events[-1]["reason"] == t["reason"]
+    assert fast["accepted"] is True and fast["attempt"] == 1
+    assert fast["check"]["speed_rule"] == "not a slow cue"
+    assert fast["check"]["rejected_for"] is None
+    assert fast["check"]["bend_need_s"] is None
+    assert len(fast["check"]["bend_times_s"]) == 8
+
+    assert ("  Bend speed: a bend the cue gives 2 s or more for has to be "
+            "slow.") in out
+    assert f"      REJECTED: {ring[0]['reason']}\n" in out
+    assert ("      what to do: start on the high beep and keep the ring "
+            "moving for the whole 0.4 s, so it is fully bent only as the "
+            "hold beep sounds\n") in out
+    assert "      speed: bends took 0.0" in out
+    assert "(a 0.4 s bend cue needs 0.06 s); straightens " in out
+    assert "(not judged: not a slow cue)" in out
+    assert "retrying (1/1)" in out
+    assert "FAILED: ring take 1 after 2 attempt(s)" in out
+    # after the last retry: how to go on if the hand did move slowly
+    assert "record this session with --no-speed-check" in out
+    assert "MOCK (follows the cues, bends at once)" in out
+
+
+def test_without_the_rule_a_snapped_bend_is_recorded_and_only_timed(
+        tmp_path, monkeypatch, capsys):
+    module = load_script()
+    code = _in_process(module, monkeypatch, tmp_path, [], "--items", "ring",
+                       "--mock-glove-snap", "--no-speed-check", "--retries",
+                       "0")
+    out = capsys.readouterr().out
+    assert code == 0, out
+    folder = only_session(tmp_path, "finger_flexion")
+    session = json.loads((folder / "session.json").read_text())
+    assert session["speed_check"] is None
+    [take] = session["takes"]
+    assert take["accepted"] is True and take["reason"] == ""
+    assert take["check"]["speed_rule"] == "not in force"
+    assert take["check"]["bend_need_s"] is None
+    assert max(take["check"]["bend_times_s"]) < 0.06       # still measured
+    assert ("  Bend speed: timed and reported, not judged "
+            "(--no-speed-check).") in out
+    assert "(not judged: the speed rule is not in force)" in out
+    assert "what to do:" not in out
+
+
+def test_the_mock_hand_that_takes_the_whole_cue_passes_the_speed_rule(
+        tmp_path, monkeypatch, capsys):
+    """The stock mock hand ramps over the whole bend, so the slow items
+    pass with room: a rehearsal still rehearses the accept path."""
+    module = load_script()
+    code = _in_process(module, monkeypatch, tmp_path, [], "--items",
+                       "index,index_slow", "--retries", "0")
+    out = capsys.readouterr().out
+    assert code == 0, out
+    folder = only_session(tmp_path, "finger_flexion")
+    session = json.loads((folder / "session.json").read_text())
+    assert session["speed_check"] == rp.speed_rule()
+    assert "glove_snaps" not in session["mock_flags"]
+    needs = {"index": 0.06, "index_slow": 0.09}       # 15 % of 0.4 and 0.6 s
+    for t in session["takes"]:
+        check = t["check"]
+        assert t["accepted"] is True and t["attempt"] == 1, t
+        assert check["speed_rule"] == "in force"
+        assert check["bend_need_s"] == needs[t["item"]]
+        # joints that turn evenly for the whole cue: the curl crosses
+        # the middle of its rise in a little under half of the cue, three
+        # times the bar
+        assert min(check["bend_times_s"]) > 2.5 * needs[t["item"]]
+        assert max(check["bend_times_s"]) < 0.6 * check["bend_cue_s"]
+        assert check["rejected_for"] is None
+    assert "(a 0.4 s bend cue needs 0.06 s)" in out
+    assert "(a 0.6 s bend cue needs 0.09 s)" in out
+
+
+def test_a_sequences_session_has_no_speed_rule(tmp_path, monkeypatch, capsys):
+    module = load_script()
+    monkeypatch.setattr(module, "console_key", lambda: "")
+    monkeypatch.setattr(module, "flush_console_keys", lambda: None)
+    args = module.parse_args([
+        "--set", "sequences", "--hand", "left", "--items",
+        "seq3_alternating", "--takes", "1", "--camera", "none",
+        "--mock-glove-snap", "--no-view", "--no-open", "--no-beep",
+        "--calibrated-at", "2026-10-13T19:00:00", "--time-scale", "0.1",
+        "--out-dir", str(tmp_path)])
+    assert module.run(args) == 0
+    out = capsys.readouterr().out
+    assert "Bend speed" not in out and "speed:" not in out
+    session = json.loads((only_session(tmp_path, "sequences")
+                          / "session.json").read_text())
+    assert session["speed_check"] is None
+    assert session["takes"][0]["accepted"] is True
+
+
+def test_a_session_keeps_its_speed_rule_through_resume(tmp_path, monkeypatch,
+                                                       capsys):
+    """Three sessions cut short (the first hand ignores the cues), carried
+    on by the hand that snaps: the one started under the rule rejects it,
+    the one started with --no-speed-check and the one from before the rule
+    (no `speed_check` in its session.json) accept it, and the rule cannot
+    be switched off half way through a session that has it."""
+    module = load_script()
+    monkeypatch.setattr(module, "console_key", lambda: "")
+    monkeypatch.setattr(module, "flush_console_keys", lambda: None)
+
+    def base(root):
+        return ["--set", "finger_flexion", "--hand", "left", "--camera",
+                "none", "--no-view", "--no-open", "--no-beep", "--time-scale",
+                "0.1", "--calibrated-at", "2026-10-13T19:00:00", "--out-dir",
+                str(root)]
+
+    def start(root, *extra):
+        args = module.parse_args(base(root) + [
+            "--mock-glove-ignore-cues", "--retries", "0", "--items", "ring",
+            "--takes", "1", *extra])
+        assert module.run(args) == 1
+        capsys.readouterr()
+        return only_session(root, "finger_flexion")
+
+    def resume(root, *extra):
+        args = module.parse_args(base(root) + ["--mock-glove-snap",
+                                               "--retries", "0", "--resume",
+                                               "latest", *extra])
+        code = module.run(args)
+        return code, capsys.readouterr().out
+
+    # started under the rule: the snapped bend is rejected on resume
+    ruled = start(tmp_path / "ruled")
+    code, out = resume(tmp_path / "ruled")
+    assert code == 1, out
+    takes = json.loads((ruled / "session.json").read_text())["takes"]
+    assert [t["accepted"] for t in takes] == [False, False]
+    assert takes[1]["check"]["rejected_for"] == "speed"
+    assert "has to be slow" in out
+    # ... and it cannot be switched off for the rest of that session
+    code, out = resume(tmp_path / "ruled", "--no-speed-check")
+    assert code == 2
+    assert "Cannot resume" in out
+    assert ("it was started under the bend-speed rule and this run has "
+            "--no-speed-check") in out
+    assert len(json.loads((ruled / "session.json").read_text())["takes"]) == 2
+
+    # started without it: accepted, and the banner says why it is not judged
+    free = start(tmp_path / "free", "--no-speed-check")
+    code, out = resume(tmp_path / "free")
+    assert code == 0, out
+    session = json.loads((free / "session.json").read_text())
+    assert session["speed_check"] is None
+    assert [t["accepted"] for t in session["takes"]] == [False, True]
+    assert session["takes"][1]["check"]["speed_rule"] == "not in force"
+    assert ("  Bend speed: timed and reported, not judged (the session was "
+            "started without the rule).") in out
+
+    # recorded before the rule existed: no key at all, and none is added
+    old = start(tmp_path / "old")
+    meta = json.loads((old / "session.json").read_text())
+    del meta["speed_check"]
+    (old / "session.json").write_text(json.dumps(meta))
+    code, out = resume(tmp_path / "old")
+    assert code == 0, out
+    session = json.loads((old / "session.json").read_text())
+    assert "speed_check" not in session
+    assert [t["accepted"] for t in session["takes"]] == [False, True]
+    assert "started without the rule" in out
+
+
+def test_the_cue_window_tells_a_slow_move_from_a_position_to_be_at():
+    """While a slow bend or straighten is cued the small line says to use
+    the whole time and the finger's bar has no phase (it is drawn white):
+    there is nowhere to be yet. Hold and rest are judged as before, the
+    fast item's cues are untouched, and so is a session without the rule."""
+    import types
+
+    module = load_script()
+    protocol = rp.load_protocol(ROOT / "protocols" / "finger_flexion.json")
+
+    def session(rule, scale=1.0):
+        fake = types.SimpleNamespace(meta={"speed_check": rule}, scale=scale)
+        cls = module.ProtocolSession
+        fake.speed = cls.speed.fget(fake)
+        fake.slow_move = lambda cue: cls.slow_move(fake, cue)
+        fake.cue_bars = lambda cue, item: cls._cue_bars(fake, cue, None, item)
+        fake.cue_sub = lambda cue, where: cls.cue_sub(fake, cue, where)
+        return fake
+
+    ruled = session(rp.speed_rule())
+    item = protocol.item("index")
+    bend, hold, straighten, rest = rp.build_schedule(protocol, "index")[:4]
+    assert ruled.slow_move(bend) and ruled.slow_move(straighten)
+    assert not ruled.slow_move(hold) and not ruled.slow_move(rest)
+    assert ruled.cue_bars(bend, item) == (["index"], None)
+    assert ruled.cue_bars(straighten, item) == (["index"], None)
+    assert ruled.cue_bars(hold, item) == (["index"], "hold")
+    assert ruled.cue_bars(rest, item) == (["index"], "rest")
+    assert ruled.cue_sub(bend, "cycle 1/5") == (
+        "cycle 1/5: slowly, use the whole 4 s")
+    assert ruled.cue_sub(straighten, "cycle 1/5") == (
+        "cycle 1/5: slowly, use the whole 4 s")
+    assert ruled.cue_sub(hold, "cycle 1/5") == "cycle 1/5"
+    slow = rp.build_schedule(protocol, "index_slow")[0]
+    assert ruled.cue_sub(slow, "cycle 1/5").endswith("use the whole 6 s")
+    # the fast index: 1 s cues are not slow moves
+    fast_item = protocol.item("index_fast")
+    fast = rp.build_schedule(protocol, "index_fast")[0]
+    assert not ruled.slow_move(fast)
+    assert ruled.cue_bars(fast, fast_item) == (["index"], "bend")
+    assert ruled.cue_sub(fast, "cycle 1/8") == "cycle 1/8"
+    # a rehearsal at a quarter of the time: the same cues are slow moves
+    quarter = session(rp.speed_rule(), scale=0.25)
+    qbend = rp.build_schedule(protocol, "index", 0.25)[0]
+    assert qbend.hold_s == 1.0 and quarter.slow_move(qbend)
+    assert quarter.cue_sub(qbend, "cycle 1/5").endswith("use the whole 1 s")
+    qfast = rp.build_schedule(protocol, "index_fast", 0.25)[0]
+    assert not quarter.slow_move(qfast)
+    # no rule: everything as it was
+    free = session(None)
+    assert not free.slow_move(bend)
+    assert free.cue_bars(bend, item) == (["index"], "bend")
+    assert free.cue_sub(bend, "cycle 1/5") == "cycle 1/5"
+    # a bar with no phase is the white one, whatever its reading
+    win = module.CueWindow
+    assert win.bar_colour(0.1, None) == win.bar_colour(0.9, None) \
+        == win.NEUTRAL
+    img = win.render("t", "BEND THE INDEX", 3.0,
+                     ruled.cue_sub(bend, "cycle 1/5"),
+                     {"fractions": {f: 0.4 for f in rp.FINGERS},
+                      "cued": ["index"], "phase": None})
+    assert _bar_pixels(img, module, "index", win.NEUTRAL) > 20
+    assert _bar_pixels(img, module, "index", win.AMBER) == 0
+    assert _bar_pixels(img, module, "index", win.GREEN) == 0
+
+
+def test_the_snapping_mock_hand_moves_at_once_and_the_stock_one_does_not():
+    module = load_script()
+    slow = module.CueFollowingGlove("left", time_scale=1.0)
+    snap = module.CueFollowingGlove("left", time_scale=1.0, snap=True)
+    for g in (slow, snap):
+        g.follow(("index",), 4.0, "bend", t=100.0)
+        g.follow(("index",), 1.0, "hold", t=104.0)
+        g.follow((), 4.0, "straighten", t=105.0)
+    lag = module.CueFollowingGlove.LAG_S["left"]
+    assert slow.bend_at(101.0 + lag)["index"] == pytest.approx(0.25)
+    assert snap.bend_at(101.0 + lag)["index"] == pytest.approx(1.0)
+    assert snap.bend_at(100.4 + lag)["index"] == pytest.approx(0.5)
+    assert slow.bend_at(106.0 + lag)["index"] == pytest.approx(0.75)
+    assert snap.bend_at(106.0 + lag)["index"] == pytest.approx(0.0)
+    with pytest.raises(SystemExit):
+        module.parse_args(["--set", "finger_flexion", "--hand", "left",
+                           "--mock-glove-snap", "--mock-glove-ignore-cues"])
+    args = module.parse_args(["--set", "finger_flexion", "--hand", "left",
+                              "--mock-glove-snap"])
+    assert args.mock_glove is True and args.mock is True
+    assert args.no_speed_check is False

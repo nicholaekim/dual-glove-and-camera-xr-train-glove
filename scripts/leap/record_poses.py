@@ -41,6 +41,8 @@ and the packager read it without knowing who wrote it:
     recordings/protocol/grasps/<YYYYMMDD_HHMMSS>_<hand>/
       session.json                      rewritten after every take
       leap/<take>.jsonl                 every frame, both hands if two were seen
+      forming/<take>.jsonl              coached takes: every frame from the
+                                        close cue until the take starts
       stills/<take>.png                 one hand-cropped IR still per take
       keypoints/<take>_keypoints.txt    the take's summary frame, his format
       meta/<take>.json                  the numbers and the decision
@@ -113,40 +115,110 @@ What changes from the plain session, and why:
     OPEN HAND       "OPEN HAND, palm to the camera" until one hand has been
                     18 to 40 cm above the module, palm within 50 degrees of
                     the lens, centred over the module (nearer its axis than
-                    0.6 times its height), for 0.5 s without a break; a
-                    beep. Not within 30 s: rejected, "no open hand acquired
-                    in 30 s".
-    MAKE THE GRASP  a high beep, the paper's picture, the grasp's
-                    orientation hint, 4 s (`--prep`) to close the hand while
-                    it stays tracked. Gone for more than 0.3 s: a low beep,
-                    "LOST YOU: open the hand, then close it slower", and back
-                    to OPEN HAND; the third loss rejects the attempt, naming
-                    the losses and where the hand was.
+                    0.6 times its height), for 0.5 s without a break. Not
+                    within 30 s: rejected, "no open hand acquired in 30 s".
+    READY           the READY cue, two short quiet low beeps (`cue_ready`),
+                    and "KEEP HAND OPEN - close on the GO beep" for 1 s
+                    (`READY_PAUSE_S`), the hand held open and watched: lost,
+                    or moving at 50 mm/s or faster (closing), and the
+                    attempt is reset (below). On 2026-10-02 the acquisition
+                    beep and the cue sounded back to back, alike, and the
+                    operator closed on the first, so the forming file had no
+                    close in it.
+    MAKE THE GRASP  the GO cue, one long loud high beep (`cue_go`), the
+                    paper's picture, the grasp's orientation hint, 4 s
+                    (`--prep`) to close the hand. Gone for more than 0.3 s:
+                    a low beep, "LOST YOU: keep the grasp, turn the palm to
+                    the camera", and the recorder waits for a hand it treats
+                    as the same one (the same id, or a new id within 10 cm of
+                    where it was lost, `FormWatch`: a rule of id and distance,
+                    not a proof of identity): at most `--lost-wait` (4 s)
+                    for each loss and never past `--form-window` (8 s) after
+                    the GO beep. Found, the hand must stay tracked
+                    `RELOCK_S` (1 s) before HOLD STILL, and the hold starts
+                    no earlier than the 4 s would have ended. Not found in
+                    time: rejected, "lost the hand while forming the grasp
+                    and it was not found again within the 4 s wait for it:
+                    at 25 cm ...". At the end, if the hand was never lost, no
+                    frame at 50 mm/s or faster since the GO beep
+                    (`leap_hand.transition`, MOVE_SPEED_MM_S): the hand was
+                    already closed, and the attempt is reset. (After a loss
+                    the close may have happened out of sight, so this is not
+                    judged.)
     HOLD STILL      the take, exactly as before: beep, file, gate, review.
-  Each take's meta says how it went in `coaching` (`acquire_s`,
-  `lost_while_forming`, and where every loss happened). An item's optional
-  `orientation` text in the protocol file is its hint ("palm toward the
-  camera" without one). `--no-coach` restores the plain countdown.
+  A reset is a low beep, "CLOSED TOO SOON - keep the hand open until the GO
+  beep" (after a loss during READY, "LOST YOU: show the open hand to the
+  camera again") and back to OPEN HAND. It is not a rejection: an attempt is
+  reset up to `RESET_LIMIT` (10) times, a limit that only ends a loop that
+  would not end otherwise, and the 11th early close or READY loss drops it,
+  "closed before the GO beep 11 times; reset to OPEN HAND 10 times, the
+  limit that ends a stuck loop; the last during READY, ...".
+
+  The rules changed on 2026-10-07 (`RECORDER_RULES`). Until then any loss
+  while forming sent the hand back to OPEN HAND, and the third send-back of
+  an attempt, a loss or an early close, dropped it, with "lost the hand N
+  times while forming the grasp, ..." or "closed before the cue N times,
+  ...": attempts whose static hold was never tried. The static hold and
+  its gate did not change. Every take's meta names the rules it was
+  recorded under (`recorder_rules`) and says how it went in `coaching`
+  (`acquire_s`, `ready_pause_s`, `forming_lost_count` with where every loss
+  while forming happened and when the hand was found again, `ready_losses`,
+  `closed_before_cue` and how fast each early close was, `resets`, and the
+  limits it ran with). An item's optional `orientation` text in the
+  protocol file is its hint ("palm toward the camera" without one).
+  `--no-coach` restores the plain countdown.
+
+  The change into the grasp is kept too. The professor asked for the time
+  it takes to change from one pose to the next, which the hold cannot show:
+  by its beep the hand is already closed. So every frame from the GO beep
+  of MAKE THE GRASP until the take's own file opens is written to
+  `forming/<take>.jsonl` (`FormingCapture`; after a reset the next MAKE THE
+  GRASP starts it again, so it holds the round that led to the take), and
+  the meta's `coaching` gains `forming_frames`, `forming_tracked_fraction`
+  and `transition_s`: the seconds from the GO beep until the hand OPEN HAND
+  acquired has settled after its close, its mean joint speed under 20 mm/s
+  for 0.3 s after its fastest frame (`leap_hand.transition`, which says
+  where those numbers come from), with `peak_speed_mm_s`, `peak_at_s`,
+  `last_move_s` and `transition_note` beside it. Null, with the note saying
+  why, when there was no close after the cue or the hand never settled
+  before the take began. A forming file in which the hand was lost has a
+  gap in the change it records: every line of it carries
+  `forming_lost_count` (`leap_hand.transition.FORMING_LOST_KEY`), and every
+  reading of it gives no time ("the hand was lost while forming the grasp
+  ..."). `scripts/leap/recompute_transition.py <session>` rewrites those
+  keys of the takes recorded before the rule changed.
 
   One session per set (plan D9). A grasp still short of its takes at the
   end is recorded with `--resume <session folder>`, which adds the missing
   takes to that same folder and carries the take numbering on, instead of
   starting a second session that restarts at take 1. The end table prints
-  the exact command.
+  the exact command. `--takes` with `--resume` raises the session's takes
+  per grasp: `--resume <session folder> --takes 5` tops every grasp up to
+  five kept takes, recording only takes 4 and 5 of a grasp that has three,
+  and the session then counts five as its target.
 
   python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left
   python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left --items hook,lateral_key --takes 1
   python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left --resume recordings/protocol/grasps/<session>
+  python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left --resume recordings/protocol/grasps/<session> --takes 5
   python scripts/leap/record_poses.py --mock --protocol protocols/grasps.json --hand left --auto-accept --takes 1 --duration 1 --prep 0.5 --no-open
+  python scripts/leap/record_poses.py --mock --protocol protocols/grasps.json --hand left --items p1_tip --takes 1 --duration 2 --auto-accept --no-open --mock-lose-forming 1 --mock-back-after 0.5
   python scripts/leap/record_poses.py --mock --protocol protocols/grasps.json --hand left --items p1_tip --takes 1 --duration 2 --auto-accept --no-open --mock-lose-forming 1
+  python scripts/leap/record_poses.py --mock --protocol protocols/grasps.json --hand left --items p1_tip --takes 1 --duration 2 --auto-accept --no-open --mock-close-early 1
   python scripts/leap/record_poses.py --mock --protocol protocols/grasps.json --hand left --items p1_tip --takes 1 --duration 2 --auto-accept --no-open --mock-other-hand
 
 A --mock session is written to recordings/protocol_mock/grasps/ instead, with
 the same layout, so a rehearsal on synthetic hands can never be collected
 with the real sessions. The mock acts the coached take out
-(`leap_hand.mock.CoachedActor`): an open palm, then the hand closing, then
-the grasp held; `--mock-lose-forming N` loses the hand while it closes on
-the first N tries of every attempt, the way the camera did, and
+(`leap_hand.mock.CoachedActor`): an open palm, held open through READY,
+then the hand closing on the GO beep in a quarter of MAKE THE GRASP (at
+most 0.5 s, so the forming file settles and has a transition_s), then the
+grasp held; `--mock-lose-forming N` loses the hand while it closes on the
+first N tries of every attempt, the way the camera did, and gone it stays
+(the attempt is rejected when the wait runs out) unless `--mock-back-after
+S` brings it back S seconds later, in the grasp, under a new id;
+`--mock-close-early N` closes it on the READY cue instead, during READY,
+the way the operator did on 2026-10-02 (each one a reset), and
 `--mock-other-hand` holds the other hand open 25 cm to the side instead of
 copying the operator's. The runbook is docs/grasp_recording.md.
 """
@@ -176,6 +248,9 @@ from leap_hand.stream import LeapUnavailable, open_stream
 from leap_hand.tracking_quality import (LOSS_GAP_S, cause_label, causes_for,
                                         fix_for, state_from_leaphand,
                                         take_losses, take_reason)
+from leap_hand.transition import (FORMING_LOST_KEY, MOVE_SPEED_MM_S,
+                                  SPEED_STEP_S, FormingSummary,
+                                  centred_speeds, summarise_forming)
 from xr_hand.recorder import finalize_pose_name, hand_tag, pose_filename, slugify
 
 # The same list the glove records, so the two datasets are comparable pose for
@@ -207,13 +282,62 @@ LEGACY_HZ = 5.0
 LEGACY_OUT = Path("recordings") / "leap" / "poses"
 
 
-def beep(freq: int = 880, ms: int = 180) -> None:
-    """Audible cue; falls back to the terminal bell off Windows."""
+def beep(freq: int = 880, ms: int = 180, volume: Optional[float] = None) -> None:
+    """Audible cue; falls back to the terminal bell off Windows.
+
+    `volume` None plays `winsound.Beep`, at whatever loudness Windows gives
+    it. A number from 0 to 1 plays the same tone as a sine wave at that
+    share of full scale (`tone_wav`, through `winsound.PlaySound`), so that
+    two cues can differ in loudness as well as in pitch and length; if that
+    cannot be played, `winsound.Beep`. Either way it returns when the sound
+    is over, as `winsound.Beep` always did.
+    """
     try:
         import winsound
-        winsound.Beep(freq, ms)
+    except ImportError:
+        print("\a", end="", flush=True)
+        return
+    if volume is not None:
+        try:
+            winsound.PlaySound(tone_wav(freq, ms, volume), winsound.SND_MEMORY)
+            return
+        except Exception:
+            pass
+    try:
+        winsound.Beep(int(freq), int(ms))
     except Exception:
         print("\a", end="", flush=True)
+
+
+TONE_RATE = 22050             # samples per second of `tone_wav`
+TONE_RAMP_S = 0.005           # fade in and out, so the tone does not click
+
+
+def tone_wav(freq: float, ms: float, volume: float) -> bytes:
+    """A WAV file in memory: a sine at `freq` Hz lasting `ms`, 16-bit mono,
+    its peak `volume` (0 to 1) of full scale, faded in and out over
+    `TONE_RAMP_S`."""
+    import io
+    import wave
+
+    import numpy as np
+
+    n = max(1, int(round(TONE_RATE * float(ms) / 1000.0)))
+    env = np.ones(n)
+    ramp = min(n // 2, int(round(TONE_RATE * TONE_RAMP_S)))
+    if ramp:
+        env[:ramp] = np.linspace(0.0, 1.0, ramp)
+        env[n - ramp:] = np.linspace(1.0, 0.0, ramp)
+    amp = 32767.0 * max(0.0, min(1.0, float(volume)))
+    t = np.arange(n) / TONE_RATE
+    pcm = np.round(amp * env * np.sin(2.0 * np.pi * float(freq) * t))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(TONE_RATE)
+        w.writeframes(pcm.astype("<i2").tobytes())
+    return buf.getvalue()
 
 
 class Session:
@@ -255,7 +379,7 @@ class Session:
                 recorder.record(lh)
         return seen
 
-    def _discard_backlog(self) -> int:
+    def _discard_backlog(self, observe=None) -> int:
         """Drop everything the tracker queued while the start beep blocked.
 
         `winsound.Beep` blocks for its whole duration and LeapC's polling
@@ -263,11 +387,13 @@ class Session:
         after a 250 ms beep are up to 250 ms old — and the recorder stamps
         each one with the time of the WRITE. Recording through that backdates
         the head of every take. Counters and hand ids still go through
-        `_consume`, so the re-acquisition count stays honest.
+        `_consume`, so the re-acquisition count stays honest. Dropped from
+        the take, not lost: `observe` still sees every one (the coached take
+        writes them to the end of its forming file).
         """
         dropped = 0
         for _ in range(MAX_DRAIN_ROUNDS):
-            n = self._consume()
+            n = self._consume(observe=observe)
             dropped += n
             if not n:
                 break
@@ -424,16 +550,28 @@ STILL_WAIT_S = 1.5             # how long the viewer gets to write the still
 REVIEW_KEYS = "Enter or space = keep   r = redo   q = quit"
 MIN_TRACKED = MIN_TRACKED_FRACTION   # plan section 4, the acquisition gate
 LEAP_DIR, STILLS_DIR, KEYPOINTS_DIR, META_DIR = "leap", "stills", "keypoints", "meta"
+FORMING_DIR = "forming"        # coached takes: MAKE THE GRASP, every frame
 REJECTED_DIR = "rejected"
 # An item id goes into every file name between separators, so it must be
 # file-name safe and must not contain the `_take` that the name is split on.
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 # --- the coached take (see the module docstring for why) -----------------------
+# The rules the coached take is recorded under, in every take's meta
+# (`recorder_rules`): a hand lost while forming is waited for, a close before
+# the GO beep resets the attempt (at most RESET_LIMIT times), and READY and GO
+# are two different cues. Takes recorded before have no `recorder_rules`.
+RECORDER_RULES = "2026-10-07"
 OPEN_HAND_TEXT = "OPEN HAND, palm to the camera"
 MAKE_TEXT = "MAKE THE GRASP, keep the palm toward the camera"
-LOST_TEXT = "LOST YOU: open the hand, then close it slower"
+# A hyphen, not a dash: OpenCV's font draws nothing past ASCII.
+READY_TEXT = "KEEP HAND OPEN - close on the GO beep"
+CLOSED_TEXT = "CLOSED TOO SOON - keep the hand open until the GO beep"
+LOST_TEXT = "LOST YOU: show the open hand to the camera again"   # lost in READY
+FORM_LOST_TEXT = "LOST YOU: keep the grasp, turn the palm to the camera"
+FORM_LOST_HINT = "keep the grasp, turn the palm to the camera"   # under LOST YOU
 OPEN_STATUS, MAKE_STATUS, LOST_STATUS = "OPEN HAND", "MAKE THE GRASP", "LOST YOU"
+READY_STATUS, CLOSED_STATUS = "READY", "CLOSED EARLY"
 # An item's `orientation` text in the protocol file, or this.
 DEFAULT_ORIENTATION = "palm toward the camera"
 OPEN_BAND_CM = (18.0, 40.0)    # palm height above the module that counts
@@ -441,17 +579,70 @@ OPEN_MAX_ANGLE_DEG = 50.0      # the palm within this of facing the lens
 OPEN_HOLD_S = 0.5              # both, without a break, for this long
 OPEN_GAP_S = LOSS_GAP_S        # a longer hole in the hand starts the 0.5 s again
 OPEN_HAND_TIMEOUT_S = 30.0     # no open hand by then: the attempt is rejected
+# READY: the open hand held this long between the READY cue and the GO cue.
+# On 2026-10-02 the two beeps sounded back to back and the operator closed
+# on the first: the lateral takes 4 and 5 had nothing left to close at the
+# cue (`leap_hand.transition`, MOVE_SPEED_MM_S). Counted from the end of the
+# READY cue, so the GO cue never comes sooner after it than this.
+READY_PAUSE_S = 1.0
 FORM_S = 4.0                   # MAKE THE GRASP, unless --prep says otherwise
 FORM_LOST_S = 0.3              # gone longer than this while forming: LOST YOU
-FORM_MAX_LOSSES = 3            # the third loss in one attempt rejects it
+# A hand lost while forming is waited for (since RECORDER_RULES): this long
+# for each loss (--lost-wait), and never past this long after the GO cue
+# (--form-window); found again, it is held tracked RELOCK_S before HOLD STILL.
+LOST_WAIT_S = 4.0
+FORM_WINDOW_S = 8.0
+RELOCK_S = READY_PAUSE_S
+# A close before the GO cue, or a loss during READY, resets the attempt to
+# OPEN HAND; the attempt is dropped only when that would happen a
+# (RESET_LIMIT + 1)th time, which ends a loop that would not end otherwise.
+RESET_LIMIT = 10
+# A MAKE THE GRASP shorter than this (a rehearsal's --prep 0) is not judged
+# for a close after the cue: too few frames to tell a close from none.
+CUE_CHECK_MIN_S = 0.5
 NOT_RECORDED = "not_recorded"  # still_missing_reason of an attempt never recorded
-BEEP_ACQUIRED = (880, 120)
-BEEP_MAKE = (1400, 200)        # the high beep
-BEEP_LOST = (300, 450)         # the low beep
+# The two cues the operator acts on, as unlike as two beeps can be: READY
+# (the open hand acquired, keep it open) is two short, quiet, low beeps; GO
+# (close now) one long, loud, high beep. (Hz, ms, share of full scale.)
+BEEP_READY = (520, 70, 0.3)
+BEEP_READY_GAP_S = 0.07        # between the two READY beeps
+BEEP_GO = (1760, 450, 1.0)
+BEEP_LOST = (300, 450)         # the low beep: lost, or reset
+# The mock closes its hand in this share of MAKE THE GRASP, at most
+# MOCK_CLOSE_MAX_S (`CoachedActor`'s own default), so that even a 0.5 s
+# rehearsal has the hand settled with time to spare and its transition_s is
+# a number, and the close peaks above MOVE_SPEED_MM_S: in 0.5 s at 100
+# mm/s, where a 1 s close barely reached 55.
+MOCK_CLOSE_SHARE = 0.25
+MOCK_CLOSE_MAX_S = 0.5
 # A protocol file line holding nothing but an item's orientation hint.
 _HINT_LINE = re.compile(
     rb'^[ \t]*"orientation"[ \t]*:[ \t]*"(?:[^"\\\r\n]|\\.)*"[ \t]*,[ \t]*\r?\n',
     re.MULTILINE)
+
+
+def cue_ready() -> None:
+    """The READY cue, the open hand acquired: two short, quiet, low beeps
+    (`BEEP_READY`). Returns when the second is over."""
+    beep(*BEEP_READY)
+    time.sleep(BEEP_READY_GAP_S)
+    beep(*BEEP_READY)
+
+
+def cue_go() -> None:
+    """The GO cue, the operator's cue to close the hand: one long, loud,
+    high beep (`BEEP_GO`)."""
+    beep(*BEEP_GO)
+
+
+def cue_sounds() -> dict:
+    """The two cues as session.json's `coaching.cues` records them."""
+    def one(beeps, sound):
+        freq, ms, volume = sound
+        return {"beeps": beeps, "hz": freq, "ms": ms, "volume": volume}
+    return {"ready": {**one(2, BEEP_READY), "gap_s": BEEP_READY_GAP_S,
+                      "text": READY_TEXT},
+            "go": one(1, BEEP_GO)}
 
 
 class QuitSession(Exception):
@@ -613,6 +804,24 @@ def write_json(path: Path, data: dict) -> None:
             time.sleep(0.05)
 
 
+def write_jsonl(path: Path, rows: List[dict]) -> None:
+    """Rewrite a frame file with these lines, one JSON object each, in the
+    form `LeapRecorder` writes them, through a temporary file as
+    `write_json` does (a forming file marked `FORMING_LOST_KEY`)."""
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+    for attempt in range(20):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.05)
+
+
 def read_rows(path: Path) -> List[dict]:
     """A take's lines, parsed. The bytes actually written, not a copy of them."""
     if not path.is_file():
@@ -647,6 +856,66 @@ class _KeysWriter:
 
     def close(self) -> None:
         self._fh.close()
+
+
+class FormingCapture:
+    """MAKE THE GRASP on disk: `forming/<take>.jsonl`, the change into the grasp.
+
+    The professor asked for the time it takes to change from one pose to
+    the next, and the hold alone cannot show it: by the beep that starts the
+    take the hand is already in the grasp. So every frame the tracker
+    reports from the close cue (the GO beep) until the hold's own file
+    opens is written here, in the hold file's line format exactly
+    (`LeapRecorder`, with the same `session` and `item` keys through
+    `_KeysWriter`), both hands if two are in view. Two differences, both on
+    purpose: a hand younger than 0.3 s is written too (the hold drops it as
+    settling, but a re-acquired hand is young, and the forming phase is
+    where re-acquisitions happen), and a frame the camera saw before the cue
+    (one that queued behind the READY beeps) is not, so the file begins
+    at the cue it is timed from. A hand lost while forming and found again
+    stays in the one file, the gap with it; the attempt's `_place_forming`
+    then marks every line (`FORMING_LOST_KEY`).
+
+    `start(t0)` opens it fresh at each MAKE THE GRASP of an attempt: a
+    reset sends the operator back to OPEN HAND, and the next round's file
+    replaces the earlier one, so what is left is the round that led to the
+    take. `stop()` closes it and remembers when. `follow` is the hand OPEN
+    HAND acquired for that round, the one
+    `leap_hand.transition.summarise_forming` follows.
+    """
+
+    def __init__(self, path: Path, item: str, take: int, keys: dict):
+        self.path = Path(path)
+        self.item = item
+        self.take = take
+        self.keys = dict(keys)
+        self.t0: Optional[float] = None
+        self.t_end: Optional[float] = None
+        self.follow: Optional[Tuple[int, List[int], List[float]]] = None
+        self._rec: Optional[LeapRecorder] = None
+
+    def start(self, t0: float, follow=None) -> None:
+        self.stop()
+        self.t0, self.t_end, self.follow = float(t0), None, follow
+        rec = LeapRecorder(hz=None, pose=self.item, take=self.take)
+        rec.start(self.path)                  # "w": a retry starts it again
+        rec._file = _KeysWriter(rec._file, self.keys)
+        self._rec = rec
+
+    def add(self, lh) -> None:
+        """Write one drained hand, if the camera saw it at or after the cue."""
+        if self._rec is None:
+            return
+        seen = getattr(lh, "capture_time", None)
+        if seen is not None and float(seen) < self.t0:
+            return
+        self._rec.record(lh)
+
+    def stop(self) -> None:
+        if self._rec is not None:
+            self._rec.stop()
+            self._rec = None
+            self.t_end = time.time()
 
 
 class _Tap:
@@ -946,7 +1215,8 @@ _BG, _WHITE, _GREY = (32, 32, 32), (255, 255, 255), (200, 200, 200)
 _HINT, _RED = (0, 200, 255), (60, 60, 255)
 _STATUS_COLOURS = {"GET READY": (0, 220, 255), "HOLD STILL": (70, 70, 255),
                    OPEN_STATUS: (255, 210, 60), MAKE_STATUS: (90, 230, 90),
-                   LOST_STATUS: _RED}
+                   LOST_STATUS: _RED, READY_STATUS: (255, 255, 255),
+                   CLOSED_STATUS: _RED}
 # Statuses that count down in whole seconds; HOLD STILL shows tenths.
 _WHOLE_SECONDS = ("GET READY", MAKE_STATUS)
 
@@ -1064,12 +1334,14 @@ def compose_copy(item: dict, panel, take: int, takes: int, status: str,
     ("GET READY 3", "MAKE THE GRASP 3") or "HOLD STILL 2.4 s" above the
     paper's picture, drawn 700 px tall (narrower when the picture is wide).
     During MAKE THE GRASP the grasp's orientation hint (`orientation_text`)
-    sits under the status line and the picture gives up the room it takes.
+    sits under the status line and the picture gives up the room it takes;
+    during LOST YOU (a hand lost while forming, waited for) the same place
+    says, in red, what to do (`FORM_LOST_HINT`).
     Without a picture (`panel` None) the grasp's shape is written in its
     place, large, with where it is in the papers. Returns (image, info):
     info["lines"] is every text drawn, info["label"] the label's lines,
     info["status"] the status text, info["hint"] the hint's lines (empty
-    outside MAKE THE GRASP), info["panel_box"] the picture's (x, y, w, h)
+    outside MAKE THE GRASP and LOST YOU), info["panel_box"] the picture's (x, y, w, h)
     or None, and info["label_bottom"] and info["status_top"] the rows where
     the label's letters end and the status line's begin.
     """
@@ -1089,13 +1361,17 @@ def compose_copy(item: dict, panel, take: int, takes: int, status: str,
     label = str(item.get("label") or item.get("id"))
     top = COPY_BAND_H
     hint_lines: List[str] = []
-    if status == MAKE_STATUS:
-        hint_lines, hscale = _fit_text(orientation_text(item), COPY_W - 32, 2,
-                                       (0.9, 0.85, 0.8, 0.75, 0.7, 0.65), 2)
+    if status in (MAKE_STATUS, LOST_STATUS):
+        # LOST YOU, while the recorder waits for a hand lost while forming:
+        # what to do instead of the orientation hint, in red
+        lost = status == LOST_STATUS
+        hint_lines, hscale = _fit_text(
+            FORM_LOST_HINT if lost else orientation_text(item), COPY_W - 32,
+            2, (0.9, 0.85, 0.8, 0.75, 0.7, 0.65), 2)
         y = top + 6
         for line in hint_lines:
             y += cv2.getTextSize(line, font, hscale, 2)[0][1] + 14
-            put(line, (16, y), hscale, _HINT, 2)
+            put(line, (16, y), hscale, _RED if lost else _HINT, 2)
         top = y + 18
 
     box = None
@@ -1128,19 +1404,22 @@ def compose_copy(item: dict, panel, take: int, takes: int, status: str,
 
 
 def compose_open(item: dict, take: int, takes: int, state: str,
-                 seconds: Optional[float] = None, lost: bool = False,
+                 seconds: Optional[float] = None, lost=False,
                  status: str = OPEN_STATUS):
     """One frame of COPY THIS while the open hand is being acquired.
 
-    The band as always (the grasp coming up, the take, OPEN HAND or LOST
-    YOU), then "OPEN HAND, palm to the camera" in the largest letters that
-    fit, what the camera sees of the hand now (`state`), and the seconds
-    left. `lost` puts "LOST YOU: open the hand, then close it slower" in
-    red above it, for the OPEN HAND that follows a loss. The paper's
-    picture is deliberately NOT drawn: copying it before the hand is
-    tracked is exactly what lost the hand on 2026-10-01; it comes with
-    MAKE THE GRASP. Returns (image, info) like `compose_copy`, with
-    info["big"] the large lines and info["lost"] the red ones.
+    The band as always (the grasp coming up, the take, OPEN HAND, LOST YOU
+    or CLOSED EARLY), then "OPEN HAND, palm to the camera" in the largest
+    letters that fit, what the camera sees of the hand now (`state`), and
+    the seconds left. `lost` puts a line in red above it, for the OPEN HAND
+    that follows a reset: True for `LOST_TEXT` (the hand lost during READY),
+    or the text itself (`CLOSED_TEXT`). With `status` READY, the hand just
+    acquired and held open until the GO beep, the large letters are "KEEP
+    HAND OPEN" and "close on the GO beep" instead. The paper's picture is
+    deliberately NOT drawn: copying it before the hand is tracked is
+    exactly what lost the hand on 2026-10-01; it comes with MAKE THE GRASP.
+    Returns (image, info) like `compose_copy`, with info["big"] the large
+    lines and info["lost"] the red ones.
     """
     import cv2
     import numpy as np
@@ -1158,14 +1437,19 @@ def compose_open(item: dict, take: int, takes: int, state: str,
     y = COPY_BAND_H + 20
     lost_lines: List[str] = []
     if lost:
-        lost_lines, lscale = _fit_text(LOST_TEXT, COPY_W - 32, 2,
-                                       (1.1, 1.0, 0.9, 0.8), 2)
+        lost_lines, lscale = _fit_text(LOST_TEXT if lost is True else str(lost),
+                                       COPY_W - 32, 2, (1.1, 1.0, 0.9, 0.8), 2)
         for line in lost_lines:
             y += cv2.getTextSize(line, font, lscale, 2)[0][1] + 18
             put(line, (16, y), lscale, _RED, 2)
         y += 20
-    head, tail = OPEN_HAND_TEXT.split(", ", 1)
-    big = [head + ",", tail]
+    ready = status == READY_STATUS
+    if ready:
+        head, tail = READY_TEXT.split(" - ", 1)
+        big = [head, tail]
+    else:
+        head, tail = OPEN_HAND_TEXT.split(", ", 1)
+        big = [head + ",", tail]
     bscale = 1.2
     for s in (2.6, 2.4, 2.2, 2.0, 1.8, 1.6, 1.4, 1.2):
         if max(cv2.getTextSize(b, font, s, 5)[0][0] for b in big) <= COPY_W - 32:
@@ -1176,17 +1460,22 @@ def compose_open(item: dict, take: int, takes: int, state: str,
         (w, h), _b = cv2.getTextSize(line, font, bscale, 5)
         y += h + 30
         put(line, ((COPY_W - w) // 2, y), bscale,
-            _STATUS_COLOURS[OPEN_STATUS], 5)
+            _STATUS_COLOURS[READY_STATUS if ready else OPEN_STATUS], 5)
     y += 40
     if state:
         for line in _wrap_text(state, 0.9, 2, COPY_W - 32):
             y += 42
             put(line, (16, y), 0.9, _WHITE, 2)
     y += 30
-    notes = [f"{OPEN_BAND_CM[0]:g} to {OPEN_BAND_CM[1]:g} cm above the module, "
-             f"palm within {OPEN_MAX_ANGLE_DEG:g} degrees of the lens, "
-             f"held {OPEN_HOLD_S:g} s",
-             "the grasp's picture comes after the beep"]
+    if ready:
+        notes = ["keep the hand open and still until the GO beep (one long "
+                 "high beep)",
+                 "the grasp's picture comes with the GO beep"]
+    else:
+        notes = [f"{OPEN_BAND_CM[0]:g} to {OPEN_BAND_CM[1]:g} cm above the "
+                 f"module, palm within {OPEN_MAX_ANGLE_DEG:g} degrees of the "
+                 f"lens, held {OPEN_HOLD_S:g} s",
+                 "the grasp's picture comes with the GO beep"]
     if seconds is not None:
         notes.append(f"{max(0, math.ceil(seconds - 1e-9))} s left")
     for note in notes:
@@ -1277,7 +1566,7 @@ class CopyWindow:
         self.show(img)
 
     def show_open(self, item: dict, take: int, takes: int, state: str,
-                  seconds: Optional[float] = None, lost: bool = False,
+                  seconds: Optional[float] = None, lost=False,
                   status: str = OPEN_STATUS, force: bool = False) -> None:
         """The OPEN HAND frame (`compose_open`), throttled like `show_copy`."""
         if not self.enabled:
@@ -1509,6 +1798,14 @@ class FormWatch:
     blocking beep is not a loss: the frames that queued behind it arrive
     first. `follow_start` hands the hand over to the take's analysis
     (`leap_hand.static_interval.follow_hand`).
+
+    `lost` answers whether the hand was lost at all (READY sends the hand
+    back on the first loss); MAKE THE GRASP waits for a lost hand instead,
+    and reads `gone` (no frame of it for more than `lost_s` now) and
+    `holes` (every hole longer than `lost_s` between two of its frames, on
+    the tracker's clock, as (its last frame before, its first frame after):
+    the hand lost and found again). A hand found again is one of the ids
+    above: the same id, or a new one near where it was lost.
     """
 
     def __init__(self, start: HandSeen, others: Set[int],
@@ -1519,6 +1816,7 @@ class FormWatch:
         self.others = set(others) - self.mine
         self.lost_s = float(lost_s)
         self.hole: Optional[HandSeen] = None
+        self.holes: List[Tuple[HandSeen, HandSeen]] = []
         self.new_ids = 0
 
     def add(self, lh, now: float) -> None:
@@ -1537,14 +1835,21 @@ class FormWatch:
             self.new_ids += 1
         self.hid = hid
         h = hand_seen(lh, now)
-        if self.hole is None and h.ts - self.last.ts > self.lost_s:
-            self.hole = self.last
+        if h.ts - self.last.ts > self.lost_s:
+            if self.hole is None:
+                self.hole = self.last
+            self.holes.append((self.last, h))
         self.last = h
 
     def lost(self, now: float) -> Optional[HandSeen]:
         """The hand's last frame before it was lost, or None if it was not."""
         if self.hole is not None:
             return self.hole
+        return self.gone(now)
+
+    def gone(self, now: float) -> Optional[HandSeen]:
+        """The hand's last frame while no frame of it has come for more than
+        `lost_s` (since the drain that brought the last one), else None."""
         if now - self.last.wall > self.lost_s:
             return self.last
         return None
@@ -1554,6 +1859,69 @@ class FormWatch:
         """(hand id, other hands' ids, last palm position in metres): what
         `summarise_take(follow=...)` follows through the take."""
         return self.hid, sorted(self.others), [float(v) for v in self.last.lh.palm_pos]
+
+
+class ReadyWatch(FormWatch):
+    """READY: is the acquired hand still tracked, and still open?
+
+    `FormWatch`'s hand and its loss rule, and the hand's mean joint speed
+    as the forming summary measures it (`leap_hand.transition`, the
+    centred difference over `SPEED_STEP_S` on the camera's capture clock),
+    on its frames labelled `label`, the operator's hand: a jump between the
+    two skeletons of a chirality flip is not motion. A frame at
+    `MOVE_SPEED_MM_S` or faster is the hand closing before the GO beep.
+    A frame's speed is judged once the frames half a step after it are in.
+    """
+
+    def __init__(self, start: HandSeen, others: Set[int],
+                 label: Optional[str] = None, lost_s: float = FORM_LOST_S,
+                 move_mm_s: float = MOVE_SPEED_MM_S):
+        super().__init__(start, others, lost_s)
+        self.label = label
+        self.move_mm_s = float(move_mm_s)
+        self._t: List[float] = []
+        self._pos: list = []
+        self._judged = 0                 # frames whose speed has been looked at
+        self.fastest: Optional[Tuple[float, float]] = None   # (mm/s, seen at)
+
+    def add(self, lh, now: float) -> None:
+        before = self.last
+        super().add(lh, now)
+        if self.last is before or self.last.lh is not lh:
+            return                       # another hand's frame
+        if self.label is not None and lh.hand_side != self.label:
+            return
+        import numpy as np
+
+        seen = getattr(lh, "capture_time", None)
+        seen = self.last.ts if seen is None else float(seen)
+        if self._t and seen <= self._t[-1]:
+            return
+        self._t.append(seen)
+        self._pos.append(np.asarray(lh.abs26, dtype=float))
+
+    def closing(self) -> Optional[Tuple[float, float]]:
+        """(speed in mm/s, when the camera saw it) of the first frame at
+        `move_mm_s` or faster, or None while the hand stays slower."""
+        import numpy as np
+
+        if len(self._t) < 2:
+            return None
+        t = np.asarray(self._t)
+        ready = int(np.searchsorted(t, t[-1] - SPEED_STEP_S / 2.0, side="right"))
+        if ready <= self._judged:
+            return None
+        speeds = centred_speeds(t, self._pos, SPEED_STEP_S,
+                                start=self._judged)[:ready - self._judged]
+        for k, v in enumerate(speeds):
+            if np.isnan(v):
+                continue
+            if self.fastest is None or v > self.fastest[0]:
+                self.fastest = (float(v), float(t[self._judged + k]))
+            if v >= self.move_mm_s:
+                return float(v), float(t[self._judged + k])
+        self._judged = ready
+        return None
 
 
 def form_loss(h: HandSeen, t0: float) -> dict:
@@ -1576,11 +1944,55 @@ def form_loss_where(loss: dict) -> str:
     return f"{where} ({loss['cause']}: {loss['fix']})"
 
 
-def forming_reason(losses: List[dict]) -> str:
-    """The reason an attempt is rejected after the hand was lost while forming."""
+def _times(n: int) -> str:
+    return f"{n} time{'' if n == 1 else 's'}"
+
+
+def lost_not_found_reason(losses: List[dict], why: str) -> str:
+    """The reason an attempt is rejected when the hand lost while forming
+    was not found again in time (`why`: "within the 4 s wait for it" or
+    "before the forming window ended, 8 s after the GO beep"); `losses` are
+    the attempt's losses while forming, the last of them the one not found.
+    """
     n = len(losses)
-    return (f"lost the hand {n} time{'' if n == 1 else 's'} while forming the "
-            f"grasp, the last {form_loss_where(losses[-1])}")
+    head = ("lost the hand while forming the grasp and it was" if n == 1 else
+            f"lost the hand {n} times while forming the grasp and the last "
+            "time it was")
+    return f"{head} not found again {why}: {form_loss_where(losses[-1])}"
+
+
+def early_close_where(early: dict) -> str:
+    """`during READY, 0.4 s after the READY beep, at 96 mm/s` or
+    `at the GO beep: the fastest frame after it 12 mm/s (...)`."""
+    if early.get("during") == "ready":
+        return (f"during READY, {early['after_s']:.1f} s after the READY "
+                f"beep, at {early['speed_mm_s']:.0f} mm/s")
+    return (f"at the GO beep: the fastest frame after it "
+            f"{early['peak_speed_mm_s']:.0f} mm/s (a close is "
+            f"{MOVE_SPEED_MM_S:g} or more)")
+
+
+def ready_loss_where(loss: dict) -> str:
+    """`lost during READY, 0.4 s after the READY beep, at 25 cm ...`."""
+    return (f"lost during READY, {loss['after_s']:.1f} s after the READY "
+            f"beep, {form_loss_where(loss)}")
+
+
+def reset_reason(early: List[dict], ready_losses: List[dict], last_kind: str,
+                 limit: int = RESET_LIMIT) -> str:
+    """The reason an attempt is rejected when it would be reset to OPEN
+    HAND once more than `limit` times: how often the hand closed before the
+    GO beep (`early`) and was lost during READY (`ready_losses`), that the
+    limit was reached, and where the last ("closed" or "lost") happened."""
+    parts = []
+    if early:
+        parts.append(f"closed before the GO beep {_times(len(early))}")
+    if ready_losses:
+        parts.append(f"lost the hand during READY {_times(len(ready_losses))}")
+    last = (early_close_where(early[-1]) if last_kind == "closed"
+            else ready_loss_where(ready_losses[-1]))
+    return (f"{' and '.join(parts)}; reset to OPEN HAND {_times(limit)}, the "
+            f"limit that ends a stuck loop; the last {last}")
 
 
 def hand_line(s) -> str:
@@ -1671,12 +2083,15 @@ class ProtocolSession(Session):
     """Set A: one guided session over a protocol file's grasps, one hand.
 
     Per take: announce the grasp and the orientation envelope, coach the
-    hand into the grasp (OPEN HAND, then MAKE THE GRASP for `prep` seconds;
-    with `coach` off, a plain `prep` second countdown), record every frame
-    for the take's seconds, then read the file back and measure it
-    (`leap_hand.static_interval.summarise_take`). An attempt the coaching
-    gives up on (no open hand in `acquire_timeout` seconds, or the hand
-    lost three times while forming) and a take that fails the acquisition
+    hand into the grasp (OPEN HAND, READY, then MAKE THE GRASP for `prep`
+    seconds; with `coach` off, a plain `prep` second countdown), record
+    every frame for the take's seconds, then read the file back and measure
+    it (`leap_hand.static_interval.summarise_take`). An attempt the coaching
+    gives up on (no open hand in `acquire_timeout` seconds, a hand lost
+    while forming and not found again within `lost_wait` seconds or
+    `form_window` seconds of the GO cue, or more than `RESET_LIMIT` resets
+    for closing before the GO cue or a loss during READY) and a take that
+    fails the acquisition
     gate move to `rejected/` with their reason and are retried up to
     `retries` times; a take that passes is shown to the operator, whose
     decision is final. session.json is rewritten after every decision, so
@@ -1691,7 +2106,9 @@ class ProtocolSession(Session):
                  auto_accept: bool = False,
                  resume: Optional[Tuple[Path, dict]] = None, panel=None,
                  coach: bool = True,
-                 acquire_timeout: float = OPEN_HAND_TIMEOUT_S):
+                 acquire_timeout: float = OPEN_HAND_TIMEOUT_S,
+                 lost_wait: float = LOST_WAIT_S,
+                 form_window: float = FORM_WINDOW_S):
         self.session_dir = (Path(resume[0]) if resume is not None
                             else make_session_dir(out_root, hand))
         super().__init__(_Tap(source), hz=None, out_dir=self.session_dir, raw=raw)
@@ -1715,7 +2132,14 @@ class ProtocolSession(Session):
         self.panel = panel                     # the COPY THIS window, or None
         self.coach = bool(coach)
         self.acquire_timeout = float(acquire_timeout)
+        self.lost_wait = float(lost_wait)
+        # MAKE THE GRASP never waits past this after the GO cue, nor ends
+        # before its own `prep` seconds
+        self.form_window = max(float(form_window), self.prep)
+        self.rules_changes: List[dict] = []    # session.json, see _pick_up
         self._coaching: Optional[dict] = None  # this attempt's, for its meta
+        # this attempt's MAKE THE GRASP frames on disk; None with --no-coach
+        self._forming: Optional[FormingCapture] = None
         # (hand id, other ids, last palm) of the hand the coaching acquired
         # and kept through MAKE THE GRASP; None with --no-coach
         self._follow: Optional[Tuple[int, List[int], List[float]]] = None
@@ -1753,6 +2177,18 @@ class ProtocolSession(Session):
                 "at": iso_now(), "from_sha256": old.get("protocol_sha256"),
                 "to_sha256": self.sha256,
                 "what": "per-grasp orientation hints added; nothing else changed"})
+        # The coached take's rules may have changed since the session's
+        # earlier runs: said here, with when (each take's meta says which
+        # rules it was recorded under, `recorder_rules`).
+        self.rules_changes = list(old.get("recorder_rules_changes") or [])
+        if self.coach and old.get("recorder_rules") != RECORDER_RULES:
+            self.rules_changes.append({
+                "at": iso_now(), "from": old.get("recorder_rules"),
+                "to": RECORDER_RULES,
+                "what": "a hand lost while forming is waited for and the "
+                        "take kept when the hold passes the gate; a close "
+                        "before the GO cue resets the attempt (at most "
+                        f"{RESET_LIMIT} times); distinct READY and GO cues"})
         earlier = [str(i) for i in (old.get("items") or [])]
         self.item_ids = earlier + [i for i in self.item_ids if i not in earlier]
         self.resumed = list(old.get("resumed") or []) + [iso_now()]
@@ -1808,14 +2244,25 @@ class ProtocolSession(Session):
             # coached: the MAKE THE GRASP seconds; --no-coach: the countdown
             "prep_s": self.prep,
             "coach": self.coach,
+            # the rules this run of the recorder used (module docstring), and
+            # when a resumed session changed to them; every take's meta says
+            # which it was recorded under
+            "recorder_rules": RECORDER_RULES,
+            "recorder_rules_changes": self.rules_changes,
             "coaching": None if not self.coach else {
                 "open_band_cm": list(OPEN_BAND_CM),
                 "open_max_angle_deg": OPEN_MAX_ANGLE_DEG,
                 "open_hold_s": OPEN_HOLD_S,
                 "open_timeout_s": self.acquire_timeout,
+                "ready_pause_s": READY_PAUSE_S,
+                "move_speed_mm_s": MOVE_SPEED_MM_S,
                 "form_s": self.prep,
                 "form_lost_s": FORM_LOST_S,
-                "form_max_losses": FORM_MAX_LOSSES},
+                "lost_wait_s": self.lost_wait,
+                "form_window_s": self.form_window,
+                "relock_s": RELOCK_S,
+                "reset_limit": RESET_LIMIT,
+                "cues": cue_sounds()},
             "static_s": self.static_s,
             "retries": self.retries,
             "min_tracked_fraction": MIN_TRACKED,
@@ -1846,7 +2293,7 @@ class ProtocolSession(Session):
             self.panel.show_copy(item, n, self.takes, status, seconds, force=force)
 
     def _copy_open(self, state: str, seconds: Optional[float] = None,
-                   lost: bool = False, status: str = OPEN_STATUS,
+                   lost=False, status: str = OPEN_STATUS,
                    force: bool = False) -> None:
         """The OPEN HAND frame for the current grasp, in COPY THIS."""
         if self.panel is not None and self._now is not None:
@@ -1867,16 +2314,39 @@ class ProtocolSession(Session):
                 break
 
     def _coach(self, item: dict) -> Tuple[bool, str]:
-        """OPEN HAND, then MAKE THE GRASP, until the hand has closed into
-        the grasp without being lost. (True, "") or (False, the reason the
-        attempt is rejected); what happened is left in `self._coaching`."""
-        info = {"acquire_s": 0.0, "lost_while_forming": 0, "form_s": self.prep,
-                "acquire_rounds_s": [], "acquired": [], "forming_losses": []}
+        """OPEN HAND, READY, then MAKE THE GRASP, until the hand has closed
+        into the grasp after the GO cue and is tracked. (True, "") or
+        (False, the reason the attempt is rejected); what happened is left
+        in `self._coaching`.
+
+        Two things reset the attempt to OPEN HAND: the hand lost during
+        READY (`ready_losses`), and the hand closed before the GO cue
+        (`early_closes`: moving at `MOVE_SPEED_MM_S` during READY, or no
+        frame that fast after the GO cue, the hand already in the grasp).
+        The attempt is rejected only when that would happen more than
+        `RESET_LIMIT` times. A hand lost while forming is waited for by
+        `_make_grasp` (`forming_losses`), and rejects the attempt only when
+        it is not found again in time.
+        """
+        info = {"acquire_s": 0.0, "form_s": self.prep,
+                "ready_pause_s": READY_PAUSE_S,
+                "lost_wait_s": self.lost_wait, "form_window_s": self.form_window,
+                "relock_s": RELOCK_S, "reset_limit": RESET_LIMIT,
+                "acquire_rounds_s": [], "acquired": [],
+                # MAKE THE GRASP: every loss, each found again (`found_after_s`)
+                # or, the last of a rejected attempt, not. A new name on
+                # purpose: the earlier rules' `lost_while_forming` counted
+                # send-backs to OPEN HAND (READY losses too), each followed by
+                # "close it slower", which no longer happen; it is not written
+                "forming_lost_count": 0, "forming_losses": [],
+                # the resets: losses during READY, closes before the GO cue
+                "ready_losses": [], "closed_before_cue": 0, "early_closes": [],
+                "resets": 0}
         self._coaching = info
+        back = False                     # the red line on OPEN HAND, after a reset
         while True:
-            lost = bool(info["forming_losses"])
             t0 = time.time()
-            got, others, missing = self._open_hand(lost)
+            got, others, missing = self._open_hand(back)
             info["acquire_rounds_s"].append(round(time.time() - t0, 2))
             info["acquire_s"] = round(sum(info["acquire_rounds_s"]), 2)
             if got is None:
@@ -1891,31 +2361,50 @@ class ProtocolSession(Session):
                 "offset_cm": round(got.offset_cm, 1),
                 "hand_label": got.lh.hand_side,
                 "hand_id": int(got.lh.hand_id)})
-            loss = self._make_grasp(got, others)
-            if loss is None:
+            sent, got, others = self._ready(got, others)
+            if sent is None:
+                sent = self._make_grasp(got, others)
+            if sent is None:
                 return True, ""
-            info["forming_losses"].append(loss)
-            k = info["lost_while_forming"] = len(info["forming_losses"])
-            self._caption(LOST_TEXT)
-            self._copy_open("", lost=True, status=LOST_STATUS, force=True)
-            print(f"      {LOST_TEXT}")
-            print(f"        loss {k} of {FORM_MAX_LOSSES}, "
-                  f"{loss['after_s']:.1f} s into the grasp, "
-                  f"{form_loss_where(loss)}")
-            beep(*BEEP_LOST)
-            if k >= FORM_MAX_LOSSES:
-                reason = forming_reason(info["forming_losses"])
+            kind, what = sent
+            if kind == "gone":
+                # lost while forming and not found again in time
+                reason = lost_not_found_reason(info["forming_losses"], what)
                 print(f"      REJECTED: {reason}")
                 return False, reason
+            if kind == "lost":
+                info["ready_losses"].append(what)
+                text, status, back = LOST_TEXT, LOST_STATUS, True
+                detail = ready_loss_where(what)
+            else:
+                info["early_closes"].append(what)
+                info["closed_before_cue"] = len(info["early_closes"])
+                text, status, back = CLOSED_TEXT, CLOSED_STATUS, CLOSED_TEXT
+                detail = f"closed before the GO beep, {early_close_where(what)}"
+            k = len(info["ready_losses"]) + len(info["early_closes"])
+            self._caption(text)
+            self._copy_open("", lost=back, status=status, force=True)
+            print(f"      {text}")
+            beep(*BEEP_LOST)
+            if k > RESET_LIMIT:
+                print(f"        {detail}")
+                reason = reset_reason(info["early_closes"], info["ready_losses"],
+                                      kind)
+                print(f"      REJECTED: {reason}")
+                return False, reason
+            info["resets"] = k
+            print(f"        reset {k} of {RESET_LIMIT}: {detail}")
 
-    def _open_hand(self, lost: bool) -> Tuple[Optional[HandSeen], Set[int], str]:
+    def _open_hand(self, lost=False) -> Tuple[Optional[HandSeen], Set[int], str]:
         """OPEN HAND: wait for the open palm. (its newest frame, the other
         hands in view, "") once acquired, or (None, set(), what was still
-        wrong) after `acquire_timeout` seconds."""
+        wrong) after `acquire_timeout` seconds. `lost` is the red line
+        that says why the hand was sent back (`compose_open`). Acquired,
+        the READY cue sounds (`cue_ready`) before this returns."""
         self._act("open")
         lo, hi = OPEN_BAND_CM
         print(f"      {OPEN_HAND_TEXT}: {lo:g} to {hi:g} cm above the module, "
-              "held still until the beep")
+              "held still until the READY beeps")
         watch = OpenHandWatch(prefer=self.hand)
         deadline = time.time() + self.acquire_timeout
         need = None
@@ -1924,7 +2413,7 @@ class ProtocolSession(Session):
             self._watch(lambda lh: watch.add(lh, now))
             got = watch.acquired()
             if got is not None:
-                beep(*BEEP_ACQUIRED)
+                cue_ready()
                 return got, watch.others(int(got.lh.hand_id), now), ""
             if now >= deadline:
                 return None, set(), watch.status(now)
@@ -1934,41 +2423,202 @@ class ProtocolSession(Session):
             self._copy_open(watch.status(now), deadline - now, lost)
             time.sleep(0.02)
 
-    def _make_grasp(self, start: HandSeen, others: Set[int]) -> Optional[dict]:
-        """MAKE THE GRASP: `prep` seconds to close the hand while it stays
-        tracked. None when it did, else where it was lost (`form_loss`).
-        Kept, the hand it followed is what the take follows (`_follow`),
-        and the coaching record names its ids and the other hands'."""
-        label = str(self._now[0]["label"]) if self._now else ""
-        # The seconds start with the high beep, the operator's cue to close.
+    def _ready(self, start: HandSeen, others: Set[int]):
+        """READY: the acquired hand held open `READY_PAUSE_S` after the
+        READY cue and before the GO cue, so the two cannot be taken for
+        one; the seconds start when the READY cue is over, so the GO cue is
+        never sooner. (None, the hand's newest frame, the other hands) when
+        it was; (("lost", where it was lost) or ("closed", how fast it
+        moved), ...) when the hand was lost or closed before the cue
+        (`ReadyWatch`), which resets the attempt."""
+        if READY_PAUSE_S <= 0:
+            return None, start, others
         t0 = time.time()
-        t_end = t0 + self.prep
-        self._act("form")
-        beep(*BEEP_MAKE)
-        print(f"      {MAKE_TEXT}: {self.prep:g} s")
-        watch = FormWatch(start, others)
-        self._copy(MAKE_STATUS, self.prep, force=True)
-        shown = None
+        t_end = t0 + READY_PAUSE_S
+        self._act("ready")
+        print(f"      {READY_TEXT}: {READY_PAUSE_S:g} s")
+        self._caption(READY_TEXT)
+        watch = ReadyWatch(start, others, label=self.hand)
+        state = "hand acquired: keep it open and still"
+        self._copy_open(state, READY_PAUSE_S, status=READY_STATUS, force=True)
         while True:
             now = time.time()
             self._watch(lambda lh: watch.add(lh, now))
             gone = watch.lost(now)
             if gone is not None:
-                self._follow = None
-                return form_loss(gone, t0)
+                loss = form_loss(gone, t0)
+                loss["during"] = "ready"
+                return ("lost", loss), start, others
+            fast = watch.closing()
+            if fast is not None:
+                speed, seen = fast
+                return ("closed", {"during": "ready",
+                                   "after_s": round(max(0.0, seen - t0), 2),
+                                   "speed_mm_s": round(speed, 1)}), start, others
             left = t_end - now
             if left <= 0:
-                self._follow = watch.follow_start
-                if self._coaching is not None:
-                    self._coaching["followed_ids"] = sorted(watch.mine)
-                    self._coaching["other_hands"] = sorted(watch.others)
-                return None
-            whole = math.ceil(left)
-            if whole != shown:
-                shown = whole
-                self._caption(f"MAKE THE GRASP: {label}   {whole}s")
-            self._copy(MAKE_STATUS, left)
+                return None, watch.last, set(watch.others)
+            self._copy_open(state, left, status=READY_STATUS)
             time.sleep(0.02)
+
+    def _closed_before_cue(self, forming: Optional[FormingCapture],
+                           now: float) -> Optional[dict]:
+        """At the end of MAKE THE GRASP: was there a close after the GO cue
+        at all? The forming file so far, summarised as the meta will
+        be (`summarise_forming`): no frame at `MOVE_SPEED_MM_S` or faster
+        means the hand was already in the grasp, and the dict says how fast
+        it went; None when it closed, when nothing could be measured, and
+        for a MAKE THE GRASP shorter than `CUE_CHECK_MIN_S`."""
+        if forming is None or forming.t0 is None or self.prep < CUE_CHECK_MIN_S:
+            return None
+        rows = read_rows(forming.path)
+        if not rows:
+            return None
+        s = summarise_forming(rows, forming.t0, now, follow=forming.follow,
+                              require_label=self.hand, prefer=self.hand)
+        if s.peak_speed_mm_s is None or s.peak_speed_mm_s >= MOVE_SPEED_MM_S:
+            return None
+        return {"during": "make", "after_s": round(max(0.0, now - forming.t0), 2),
+                "peak_speed_mm_s": round(s.peak_speed_mm_s, 1),
+                "peak_at_s": round(s.peak_at_s, 3)}
+
+    def _make_grasp(self, start: HandSeen, others: Set[int]):
+        """MAKE THE GRASP: `prep` seconds to close the hand. None when it
+        closed and is tracked, ("closed", the forming summary's fastest
+        frame, `_closed_before_cue`) when no close followed the cue, or
+        ("gone", why) when the hand was lost and not found again in time.
+
+        A loss (no frame of the hand for more than `FORM_LOST_S`) is not the
+        end of the attempt: LOST YOU, and the recorder waits for the tracker
+        to find the hand again (`FormWatch`: the same id, or a new one near
+        where it was lost), at most `lost_wait` seconds from its last frame
+        and never past `form_window` seconds after the GO cue. Found, it
+        must stay tracked `RELOCK_S` before the hold, which also starts no
+        earlier than `prep` after the cue. Every loss is in the coaching
+        record's `forming_losses` (`form_loss`, with `gone_s` and
+        `found_after_s`, the latter None for the one not found), and
+        `forming_lost_count` counts them. After a loss the hand may have
+        closed out of sight, so it is not judged for a close after the cue.
+
+        Kept, the hand it followed is what the take follows (`_follow`), and
+        the coaching record names its ids and the other hands'. Every frame
+        from the GO cue on goes to the forming file (`_forming`), the frames
+        around a loss too; it stays open on success until the hold starts,
+        and is closed when the attempt is reset, so the next round can
+        start it again."""
+        label = str(self._now[0]["label"]) if self._now else ""
+        info = self._coaching if self._coaching is not None else {}
+        losses = info.setdefault("forming_losses", [])
+        # The seconds start with the GO cue, the operator's cue to close.
+        t0 = time.time()
+        t_end = t0 + self.prep
+        window_end = t0 + self.form_window
+        forming = self._forming
+        if forming is not None:
+            forming.start(t0, follow=(int(start.lh.hand_id), sorted(others),
+                                      [float(v) for v in start.lh.palm_pos]))
+        self._act("form")
+        cue_go()
+        print(f"      {MAKE_TEXT}: {self.prep:g} s")
+        watch = FormWatch(start, others)
+
+        def observe(lh, now):
+            watch.add(lh, now)
+            if forming is not None:
+                forming.add(lh)
+
+        def count() -> None:
+            info["forming_lost_count"] = len(losses)
+
+        self._copy(MAKE_STATUS, self.prep, force=True)
+        shown = None
+        waiting = None       # (the loss being waited out, the wall time of its last frame)
+        holes = 0            # watch.holes already read
+        relock = None        # when the hand was last found again (wall clock)
+        try:
+            while True:
+                now = time.time()
+                self._watch(lambda lh: observe(lh, now))
+                # a hole in the hand's frames on the tracker's clock, closed:
+                # lost and found again (one not seen live as well: its frames
+                # can come in late, behind a slow redraw)
+                while holes < len(watch.holes):
+                    before, after = watch.holes[holes]
+                    holes += 1
+                    if waiting is not None:
+                        loss, waiting = waiting[0], None
+                    else:
+                        loss = form_loss(before, t0)
+                        losses.append(loss)
+                    loss["gone_s"] = round(max(0.0, after.ts - before.ts), 2)
+                    loss["found_after_s"] = round(max(0.0, after.wall - t0), 2)
+                    relock = after.wall
+                    count()
+                    print(f"        found again after {loss['gone_s']:.1f} s: "
+                          f"hold the grasp there {RELOCK_S:g} s before the take")
+                    self._caption(f"MAKE THE GRASP: {label}   found again")
+                gone = watch.gone(now)
+                if gone is not None and waiting is None:
+                    loss = form_loss(gone, t0)
+                    losses.append(loss)
+                    waiting = (loss, gone.wall)
+                    count()
+                    self._caption(FORM_LOST_TEXT)
+                    self._copy(LOST_STATUS, self.lost_wait, force=True)
+                    print(f"      {FORM_LOST_TEXT}")
+                    print(f"        loss {len(losses)}, {loss['after_s']:.1f} s "
+                          f"after the GO beep, {form_loss_where(loss)}; "
+                          f"waiting up to {self.lost_wait:g} s for it")
+                    beep(*BEEP_LOST)
+                    continue
+                if waiting is not None and gone is None:
+                    # back on the wall clock with no hole on the tracker's:
+                    # the frames were only late (a slow drain), not a loss
+                    losses.remove(waiting[0])
+                    waiting = None
+                    count()
+                if waiting is not None:
+                    deadline = min(waiting[1] + self.lost_wait, window_end)
+                    if now >= deadline:
+                        loss = waiting[0]
+                        loss["gone_s"] = round(max(0.0, now - waiting[1]), 2)
+                        loss["found_after_s"] = None
+                        self._follow = None
+                        if forming is not None:
+                            forming.stop()
+                        return "gone", (
+                            f"within the {self.lost_wait:g} s wait for it"
+                            if waiting[1] + self.lost_wait <= window_end else
+                            f"before the forming window ended, "
+                            f"{self.form_window:g} s after the GO beep")
+                    self._copy(LOST_STATUS, deadline - now)
+                    time.sleep(0.02)
+                    continue
+                end = t_end if relock is None else max(t_end, relock + RELOCK_S)
+                left = end - now
+                if left <= 0:
+                    early = (None if losses
+                             else self._closed_before_cue(forming, now))
+                    if early is not None:
+                        self._follow = None
+                        forming.stop()
+                        return "closed", early
+                    self._follow = watch.follow_start
+                    if self._coaching is not None:
+                        self._coaching["followed_ids"] = sorted(watch.mine)
+                        self._coaching["other_hands"] = sorted(watch.others)
+                    return None
+                whole = math.ceil(left)
+                if whole != shown:
+                    shown = whole
+                    self._caption(f"MAKE THE GRASP: {label}   {whole}s")
+                self._copy(MAKE_STATUS, left)
+                time.sleep(0.02)
+        except BaseException:
+            # Ctrl+C: the file is closed, so it can move with its attempt.
+            if forming is not None:
+                forming.stop()
+            raise
 
     # --- one grasp ----------------------------------------------------------
     def announce(self, item: dict, index: int, count: int) -> None:
@@ -2092,6 +2742,9 @@ class ProtocolSession(Session):
         self._now = (item, n)
         self._coaching = None
         self._follow = None              # stays None with --no-coach
+        self._forming = None if not self.coach else FormingCapture(
+            self.folder(FORMING_DIR) / f"{name}.jsonl", iid, n,
+            {"session": self.session_dir.name, "item": iid})
         if self.coach:
             ok, why = self._coach(item)
             if not ok:
@@ -2112,8 +2765,14 @@ class ProtocolSession(Session):
         try:
             with self._raw_capture(leap_path.with_suffix(".lmt")):
                 # Beep, drop what queued behind it, and only then open the file.
+                # Coached, what queued goes to the end of the forming file,
+                # which closes here: it runs from the cue to the hold.
                 beep(1000, 250)
-                self._discard_backlog()
+                forming = self._forming
+                self._discard_backlog(
+                    observe=None if forming is None else forming.add)
+                if forming is not None:
+                    forming.stop()
                 recorder.start(leap_path)
                 recorder._file = _KeysWriter(recorder._file, {
                     "session": self.session_dir.name, "item": iid})
@@ -2281,6 +2940,9 @@ class ProtocolSession(Session):
         leap = place(leap_src, LEAP_DIR, f"{name}.jsonl")
         place(leap_src.with_suffix(".lmt"), LEAP_DIR, f"{name}.lmt")
         files["leap"] = self.rel(leap)
+        # The forming file goes with its take too (coached takes only; null
+        # with --no-coach, and when MAKE THE GRASP wrote no frame at all).
+        files["forming"] = self.rel(self._place_forming(place))
         # The still goes wherever its take goes, and so does the viewer's
         # note when it skipped the still. Whatever is on disk NOW decides,
         # so a still the viewer wrote after the wait is still found.
@@ -2337,6 +2999,52 @@ class ProtocolSession(Session):
                       by=by)
         self.attempts.append(got)
         return got
+
+    def _place_forming(self, place) -> Optional[Path]:
+        """Close this attempt's forming file, move it with the attempt
+        (`place`, `_conclude`'s), and put its numbers in the coaching record.
+
+        `forming_frames` is every line in it, both hands; `form_start` the
+        close cue it is timed from (wall clock); `forming_tracked_fraction`,
+        `transition_s`, `peak_speed_mm_s`, `peak_at_s`, `last_move_s` and
+        `transition_note` are `leap_hand.transition.summarise_forming`'s, on
+        the hand OPEN HAND acquired, and `transition_rule` the thresholds
+        they were measured with. A file MAKE THE GRASP wrote no line to is
+        deleted rather than handed on empty, and an attempt that never
+        reached MAKE THE GRASP has none: both say 0 frames and null.
+
+        When the hand was lost while forming (`coaching.forming_lost_count`
+        above 0), every line of the file is first given that count under
+        `FORMING_LOST_KEY`, so the file says so wherever it goes, and its
+        transition is null with the note (`summarise_forming`).
+        """
+        forming = self._forming
+        if forming is None:
+            return None
+        forming.stop()
+        rows = read_rows(forming.path)
+        lost = int((self._coaching or {}).get("forming_lost_count") or 0)
+        if rows and lost:
+            rows = [dict(r, **{FORMING_LOST_KEY: lost}) for r in rows]
+            write_jsonl(forming.path, rows)
+        if not rows:
+            forming.path.unlink(missing_ok=True)
+        dst = place(forming.path, FORMING_DIR, forming.path.name) if rows else None
+        numbers = {"form_start": (None if forming.t0 is None
+                                  else round(forming.t0, 6)),
+                   "forming_frames": len(rows),
+                   "forming_tracked_fraction": None,
+                   **FormingSummary().coaching_numbers()}
+        if rows:
+            s = summarise_forming(rows, forming.t0, forming.t_end,
+                                  follow=forming.follow,
+                                  require_label=self.hand, prefer=self.hand)
+            numbers["forming_tracked_fraction"] = (
+                None if s.tracked_fraction is None else round(s.tracked_fraction, 4))
+            numbers.update(s.coaching_numbers())
+        if self._coaching is not None:
+            self._coaching.update(numbers)
+        return dst
 
     def meta_dict(self, item: dict, n: int, attempt: int, name: str, s,
                   span: Tuple[float, float], files: dict,
@@ -2430,10 +3138,21 @@ class ProtocolSession(Session):
             # 0 = palm square to the lens, 90 = edge-on.
             "palm_height_cm": None if height is None else round(height, 1),
             "view_angle_deg": None if angle is None else round(angle, 1),
+            # The rules the take was recorded under (RECORDER_RULES, module
+            # docstring); absent in takes recorded before them.
+            "recorder_rules": RECORDER_RULES,
             # The orientation the operator was asked for (the item's hint),
             # and how the hand got into the grasp: seconds to acquire the
-            # open hand (every OPEN HAND of the attempt summed), how often it
-            # was lost while forming the grasp and where. None with --no-coach.
+            # open hand (every OPEN HAND of the attempt summed), the READY
+            # pause before the GO cue, how often it was lost while forming
+            # the grasp, where, and when it was found again
+            # (`forming_lost_count`, `forming_losses`), the resets: lost during
+            # READY (`ready_losses`) or closed before the cue
+            # (`closed_before_cue`, `early_closes`), the limits it ran with,
+            # and the change into the grasp: the forming file's frames and
+            # tracked fraction, transition_s (cue to settled after the
+            # close), the close's peak speed and when, the last movement and
+            # the note (`_place_forming`). None with --no-coach.
             "orientation_hint": orientation_text(item),
             "coaching": self._coaching,
             "still": files.get("still"),
@@ -2476,14 +3195,22 @@ class ProtocolSession(Session):
 
 def make_mock_source(dropout: float = 0.0, coach: bool = True,
                      lose_forming: int = 0, hand: str = "left",
-                     other_hand: str = "same"):
+                     other_hand: str = "same",
+                     close_s: Optional[float] = None,
+                     close_early: int = 0,
+                     back_after: Optional[float] = None):
     """The synthetic camera behind `--mock`, started.
 
     Coached, the `hand` acts the take out (`leap_hand.mock.CoachedActor`):
-    an open palm at OPEN HAND, closing at MAKE THE GRASP (lost on the first
-    `lose_forming` tries of every attempt), the grasp held at HOLD STILL;
-    `dropout` then drops frames during the hold only, so a rehearsal of the
-    gate's rejection still reaches the take. `other_hand` "open"
+    an open palm at OPEN HAND, held open through READY, closing at the
+    GO cue of MAKE THE GRASP in `close_s` seconds (None: the actor's own
+    0.5 s; lost on the first `lose_forming` tries of every attempt, and
+    back `back_after` seconds later when that is given; closed on the
+    READY cue instead, during READY, on the first `close_early`), the
+    grasp held at HOLD STILL, so the forming
+    file has a change into the grasp that settles; `dropout` then drops
+    frames during the hold only, so a rehearsal of the gate's rejection
+    still reaches the take. `other_hand` "open"
     (`--mock-other-hand`) holds the other hand open 25 cm to the side
     instead of copying the operator's. With `coach` off it is the
     plain mock it always was. Either way it is clean otherwise: the default
@@ -2492,11 +3219,16 @@ def make_mock_source(dropout: float = 0.0, coach: bool = True,
     """
     from leap_hand.mock import CoachedActor, MockLeapStream
     if coach:
+        acting = {} if close_s is None else {"close_s": float(close_s)}
+        if back_after is not None:
+            acting["back_after_s"] = float(back_after)
         source = MockLeapStream(dropout_every=0, reacquire_every=0,
                                 script=CoachedActor(lose_forming=lose_forming,
+                                                    close_before_cue=close_early,
                                                     hold_dropout=dropout,
                                                     operator=hand,
-                                                    other_hand=other_hand))
+                                                    other_hand=other_hand,
+                                                    **acting))
     elif dropout > 0:
         source = MockLeapStream(dropout_every=90, reacquire_every=0,
                                 dropout_frames=max(1, min(89, round(90 * dropout))))
@@ -2506,8 +3238,15 @@ def make_mock_source(dropout: float = 0.0, coach: bool = True,
     # recorder drops as settling: a live hand has been in view that long
     # by the time the stream wait is over, and with --prep 0 the first
     # take would otherwise start on a hand too young to record.
-    source.generate(int(math.ceil(MIN_VISIBLE_TIME_US / 1e6 * source.hz)) + 9)
+    skipped = int(math.ceil(MIN_VISIBLE_TIME_US / 1e6 * source.hz)) + 9
+    source.generate(skipped)
     source.start()
+    # Those frames are in the past: back-date the mock's clock by them, so a
+    # frame's capture_time is the wall-clock instant the mock "saw" it, as a
+    # live frame's is. Left alone, every capture_time ran 0.4 s ahead of the
+    # wall clock, and a forming file timed from the GO beep (`time.time()`)
+    # put the start of the close 0.4 s late.
+    source._t0_us -= int(round(skipped * 1e6 / source.hz))
     return source
 
 
@@ -2536,12 +3275,35 @@ def run_protocol(args, parser) -> None:
                          "drop --no-coach")
         if args.mock_lose_forming < 0:
             parser.error("--mock-lose-forming cannot be negative")
+    if args.mock_close_early is not None:
+        if not args.mock:
+            parser.error("--mock-close-early only applies with --mock")
+        if not coach:
+            parser.error("--mock-close-early acts out the coached take; "
+                         "drop --no-coach")
+        if args.mock_close_early < 0:
+            parser.error("--mock-close-early cannot be negative")
     if args.mock_other_hand:
         if not args.mock:
             parser.error("--mock-other-hand only applies with --mock")
         if not coach:
             parser.error("--mock-other-hand acts out the coached take; "
                          "drop --no-coach")
+    if args.mock_back_after is not None:
+        if not args.mock or not args.mock_lose_forming:
+            parser.error("--mock-back-after brings back the hand "
+                         "--mock-lose-forming loses; it needs --mock and "
+                         "--mock-lose-forming 1 or more")
+        if args.mock_back_after < 0:
+            parser.error("--mock-back-after cannot be negative")
+    for flag, value in (("--lost-wait", args.lost_wait),
+                        ("--form-window", args.form_window)):
+        if value is None:
+            continue
+        if not coach:
+            parser.error(f"{flag} is a rule of the coached take; drop --no-coach")
+        if value <= 0:
+            parser.error(f"{flag} must be above 0 seconds")
 
     protocol, sha = load_protocol(args.protocol)
     resume = None
@@ -2555,6 +3317,10 @@ def run_protocol(args, parser) -> None:
             "prep_s": FORM_S if coach else protocol["prep_s"],
             "static_s": protocol.get("static_s", DEFAULT_STATIC_S),
             "still": "hand", "items": None}
+    # the wait for a hand lost while forming, and the forming window: from
+    # the command line, else the resumed session's own (when a run of it
+    # already used them), else LOST_WAIT_S and FORM_WINDOW_S
+    waits = {"lost_wait_s": LOST_WAIT_S, "form_window_s": FORM_WINDOW_S}
     if args.resume is not None:
         old = load_session(args.resume, args.hand, sha, bool(args.mock),
                            raw=Path(args.protocol).read_bytes())
@@ -2566,6 +3332,9 @@ def run_protocol(args, parser) -> None:
                 continue
             if old.get(key) is not None:
                 base[key] = old[key]
+        for key in waits:
+            if (old.get("coaching") or {}).get(key) is not None:
+                waits[key] = float(old["coaching"][key])
     items = select_items(protocol, args.items if args.items else (
         ",".join(base["items"]) if base["items"] else None))
     takes = int(base["takes_per_item"]) if args.takes is None else args.takes
@@ -2576,15 +3345,29 @@ def run_protocol(args, parser) -> None:
     if takes < 1 or duration <= 0 or prep < 0 or static_s <= 0:
         parser.error("takes must be at least 1, duration and static-s above 0, "
                      "prep 0 or more")
+    lost_wait = waits["lost_wait_s"] if args.lost_wait is None else args.lost_wait
+    form_window = (waits["form_window_s"] if args.form_window is None
+                   else args.form_window)
+    if args.form_window is not None and form_window < prep:
+        parser.error(f"--form-window ({form_window:g} s) cannot be shorter "
+                     f"than MAKE THE GRASP itself (--prep, {prep:g} s)")
 
     if args.mock:
         # --mock-dropout puts a dropout back on purpose, to rehearse the
-        # gate's rejection; --mock-lose-forming rehearses LOST YOU;
-        # --mock-other-hand puts the idle hand in view, off to the side.
+        # gate's rejection; --mock-lose-forming rehearses LOST YOU (with
+        # --mock-back-after, a hand found again); --mock-close-early
+        # rehearses CLOSED TOO SOON; --mock-other-hand puts the idle hand in
+        # view, off to the side. The mock's hand closes in a quarter of MAKE
+        # THE GRASP (at most MOCK_CLOSE_MAX_S), so it has settled well before
+        # the hold and the forming file is timed.
         source = make_mock_source(args.mock_dropout or 0.0, coach,
                                   args.mock_lose_forming or 0, hand=args.hand,
                                   other_hand=("open" if args.mock_other_hand
-                                              else "same"))
+                                              else "same"),
+                                  close_s=min(MOCK_CLOSE_MAX_S,
+                                              MOCK_CLOSE_SHARE * prep),
+                                  close_early=args.mock_close_early or 0,
+                                  back_after=args.mock_back_after)
     else:
         try:
             source = open_stream(mode=args.mode)
@@ -2607,10 +3390,12 @@ def run_protocol(args, parser) -> None:
             view=view, mock=args.mock, raw=args.raw, note=args.note or "",
             operator=args.operator, auto_accept=args.auto_accept,
             resume=resume, panel=panel, coach=coach,
-            acquire_timeout=OPEN_HAND_TIMEOUT_S)
+            acquire_timeout=OPEN_HAND_TIMEOUT_S, lost_wait=lost_wait,
+            form_window=form_window)
 
-        # coached: about 2 s to show the open hand, plus the beeps
-        eta = len(items) * takes * (prep + duration + (3.0 if coach else 1.0))
+        # coached: about 2 s to show the open hand, READY, plus the beeps
+        eta = len(items) * takes * (prep + duration + (
+            3.0 + READY_PAUSE_S if coach else 1.0))
         print("=" * 62)
         print(f"Grasp protocol (Set A): {protocol.get('name')} v"
               f"{protocol.get('version')}, {len(items)} grasp(s) x {takes} "
@@ -2622,8 +3407,18 @@ def run_protocol(args, parser) -> None:
                   f"{OPEN_BAND_CM[1]:g} cm up, palm within "
                   f"{OPEN_MAX_ANGLE_DEG:g} degrees of the lens, centred "
                   f"over the module, {OPEN_HOLD_S:g} s; "
-                  f"{OPEN_HAND_TIMEOUT_S:g} s to get there), MAKE THE "
-                  f"GRASP {prep:g} s, HOLD STILL {duration:g} s")
+                  f"{OPEN_HAND_TIMEOUT_S:g} s to get there), READY "
+                  f"{READY_PAUSE_S:g} s, MAKE THE GRASP {prep:g} s from the "
+                  f"GO beep, HOLD STILL {duration:g} s")
+            print("  cues:    READY = two short low beeps, KEEP HAND OPEN; "
+                  "GO = one long high beep, close the hand")
+            print("           close only on the GO beep: a hand that closes "
+                  "before it goes back to OPEN HAND (reset, at most "
+                  f"{RESET_LIMIT} times)")
+            print(f"           a hand lost while forming is waited for: "
+                  f"{session.lost_wait:g} s each time, at most "
+                  f"{session.form_window:g} s after the GO beep, then held "
+                  f"{RELOCK_S:g} s before the take (rules {RECORDER_RULES})")
             print("  other:   the other hand may be in view, open and at "
                   "least 20 cm to the side; it is ignored")
         else:
@@ -2740,6 +3535,15 @@ def main() -> None:
     g.add_argument("--no-coach", action="store_true",
                    help="the plain GET READY countdown instead of the coached "
                         "take (OPEN HAND, then MAKE THE GRASP, then HOLD STILL)")
+    g.add_argument("--lost-wait", type=float, default=None, metavar="S",
+                   help=f"coached: how long to wait for a hand lost while "
+                        f"forming the grasp to be found again, each time "
+                        f"(default: {LOST_WAIT_S:g}, or the resumed session's)")
+    g.add_argument("--form-window", type=float, default=None, metavar="S",
+                   help=f"coached: the latest, in seconds after the GO beep, "
+                        f"that a hand lost while forming may be found again "
+                        f"(default: {FORM_WINDOW_S:g}, or the resumed "
+                        "session's; at least --prep)")
     g.add_argument("--mock-dropout", type=float, default=None,
                    help="with --mock: fraction of frames the mock drops, to "
                         "rehearse the gate's rejection (e.g. 0.3); coached, "
@@ -2747,7 +3551,19 @@ def main() -> None:
     g.add_argument("--mock-lose-forming", type=int, default=None, metavar="N",
                    help="with --mock: lose the hand while it closes into the "
                         "grasp on the first N tries of every attempt, to "
-                        "rehearse LOST YOU (3 or more rejects every attempt)")
+                        "rehearse LOST YOU; it stays lost, and the attempt "
+                        "is rejected when the wait runs out, unless "
+                        "--mock-back-after brings it back")
+    g.add_argument("--mock-back-after", type=float, default=None, metavar="S",
+                   help="with --mock-lose-forming: the lost hand is back S "
+                        "seconds later, in the grasp, under a new id, to "
+                        "rehearse a hand found again while forming")
+    g.add_argument("--mock-close-early", type=int, default=None, metavar="N",
+                   help="with --mock: close the hand on the READY beeps, "
+                        "during READY, instead of on the GO beep, on the "
+                        "first N rounds of every attempt, to rehearse CLOSED "
+                        f"TOO SOON (each a reset; {RESET_LIMIT + 1} or more "
+                        "rejects every attempt)")
     g.add_argument("--mock-other-hand", action="store_true",
                    help="with --mock: the other hand stays open 25 cm to the "
                         "side instead of copying the operator's hand, to "
@@ -2765,8 +3581,11 @@ def main() -> None:
         ("--no-panel", args.no_panel),
         ("--note", args.note), ("--operator", args.operator),
         ("--no-coach", args.no_coach),
+        ("--lost-wait", args.lost_wait), ("--form-window", args.form_window),
         ("--mock-dropout", args.mock_dropout),
         ("--mock-lose-forming", args.mock_lose_forming),
+        ("--mock-back-after", args.mock_back_after),
+        ("--mock-close-early", args.mock_close_early),
         ("--mock-other-hand", args.mock_other_hand))
         if value not in (None, False)]
     if protocol_only:

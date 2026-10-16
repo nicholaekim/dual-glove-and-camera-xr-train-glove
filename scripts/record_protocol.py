@@ -1,6 +1,12 @@
 """Record the professor's Set B (finger flexion) and Set C (sequences), hands-free.
 
-Gloves on, camera as the reference, one hand per run. Every movement is cued:
+Gloves on, one hand per run. The professor's Sets B and C are glove
+recordings: since 2026-10-12 they are recorded with `--camera none`, the glove
+alone, which is what every Desktop launcher of these sets passes. The camera
+beside the gloves (`--camera leap`, still this script's default so the
+earlier sessions resume and the camera rehearsals run) is the reference of
+the glove-against-camera comparison, not part of the professor's protocol.
+Every movement is cued:
 a beep (higher to bend or flex, lower to straighten or extend, as
 `scripts/leap/finger_sweep.py` cues them), the cue's words on a window and a
 console line, and the same cue written to the take's events file at the
@@ -29,6 +35,22 @@ Why it is built this way (plan: `docs/grasp_and_flexion_protocol_plan.md`):
     is MOVED to `rejected/` with its reason, never deleted: the two sensors
     under evaluation are the ones judging, so every exclusion has to stay
     countable.
+  * a slow bend has to be slow (Set B, since 2026-10-13). On that day a
+    whole session was accepted in which the finger closed in 0.05 to
+    0.43 s of bend cues that give 4 s, against the professor's "slowly
+    bend the finger until it is fully flexed": the span and the bend count
+    cannot tell a snapped bend from a slow one. The quick check now times
+    every counted bend across the middle of its own rise
+    (`recording_protocol.bend_moves`) and rejects a take, with what to do
+    about it, when a bend the cue gives 2 s or more for took under 15 % of
+    the cue's time. The rule is written to session.json (`speed_check`), so
+    a session is judged by the rule it was started under and `--resume`
+    carries it on; `--no-speed-check` records a session without it (the
+    times are then reported, not judged). The straighten is timed and never
+    judged: the glove's reading falls quickly once a finger starts to open,
+    however slowly the finger moves. While a slow bend or straighten is
+    cued, the cue window says to use the whole time and draws the finger's
+    bar white, not green or amber: there is no position to be at yet.
   * each finger is measured against its own range for THIS session (the
     warm-up: open palm, full fist, then each finger bent on its own), not a
     number from another day. A glove that barely moves between open and
@@ -64,15 +86,21 @@ camera, a quarter of the real durations):
       --calibrated-at 2026-09-28T14:00:00 --time-scale 0.25
 
 `--mock-glove-ignore-cues` keeps the mock hand open through every take, so
-the reject path (and `rejected/`) can be rehearsed too. A run with any mock
+the reject path (and `rejected/`) can be rehearsed too, and
+`--mock-glove-snap` follows the cues but bends at once, which rehearses the
+speed rule's rejection. A run with any mock
 sensor writes under `recordings/protocol_mock/` unless `--out-dir` says
 otherwise, and its session.json says `"mock": true`, which the packager
 refuses: a rehearsal cannot be handed in as data.
 
-Real session (XR Trainer streaming to 127.0.0.1:9002, camera plugged in):
+Real session, glove only (gloves on, no camera; XR Trainer streaming to
+127.0.0.1:9002):
 
-  python scripts/record_protocol.py --set finger_flexion --hand left
-  python scripts/record_protocol.py --set sequences --hand left
+  python scripts/record_protocol.py --set finger_flexion --hand left --camera none
+  python scripts/record_protocol.py --set sequences --hand left --camera none
+
+Without `--camera none` the Ultraleap runs beside the gloves (gloves on +
+camera): the acquire gate, the camera window and one IR still per take.
 
 During the few seconds after each take, `r` redoes it (the operator's own
 verdict, which does not use up a retry), `s` skips the rest of that item in
@@ -271,6 +299,11 @@ class CueFollowingGlove:
     the warm-up (or the session would be refused before any take) and then
     stays open through every take, so the reject path gets rehearsed.
 
+    `snap=True` is `--mock-glove-snap`: the hand follows every cue but makes
+    a bend or a straighten the way it makes a sequence step, at once
+    (MOVE_S) and then held, the way the session of 2026-10-13 was recorded.
+    The bend count and the span pass; the speed rule does not.
+
     Built on `xr_hand.mock.MockHandGenerator` for the wire layout and packet
     counter; only the finger joints' rotations are replaced.
     """
@@ -282,10 +315,11 @@ class CueFollowingGlove:
     NOISE = 0.01                          # bend noise, fraction of full
 
     def __init__(self, hand: str, follow_cues: bool = True,
-                 time_scale: float = 1.0, seed: int = 7):
+                 time_scale: float = 1.0, seed: int = 7, snap: bool = False):
         from xr_hand.mock import MockHandGenerator
         self.hand = hand
         self.follow_cues = bool(follow_cues)
+        self.snap = bool(snap)
         self.lag = self.LAG_S[hand] * float(time_scale)
         self.move = self.MOVE_S * float(time_scale)
         self.gens = {side: MockHandGenerator(hand=side)
@@ -321,9 +355,11 @@ class CueFollowingGlove:
         dur, e = seg["dur"], max(0.0, elapsed)
         for f in rp.FINGERS:
             p = seg["start"][f]
-            if seg["phase"] == rp.BEND and f in seg["flexed"]:
+            slow = not self.snap
+            if slow and seg["phase"] == rp.BEND and f in seg["flexed"]:
                 v = p + (1.0 - p) * min(1.0, e / dur)
-            elif seg["phase"] == rp.STRAIGHTEN and f not in seg["flexed"]:
+            elif slow and seg["phase"] == rp.STRAIGHTEN and \
+                    f not in seg["flexed"]:
                 v = p * (1.0 - min(1.0, e / dur))
             else:
                 target = 1.0 if f in seg["flexed"] else 0.0
@@ -865,6 +901,25 @@ class ProtocolSession:
              sub: str = "") -> None:
         self.display = (title, words, deadline, sub)
 
+    @property
+    def speed(self) -> Optional[dict]:
+        """The session's bend-speed rule (session.json `speed_check`), or
+        None: a sequences session, one recorded with --no-speed-check, or
+        one started before the rule existed."""
+        rule = self.meta.get("speed_check")
+        return rule if isinstance(rule, dict) else None
+
+    def slow_move(self, cue: rp.Cue) -> bool:
+        """Is this cue a bend or a straighten the speed rule calls slow
+        (the protocol gives it `slow_from_s` or more)? False without the
+        rule."""
+        rule = self.speed
+        if rule is None or cue.phase not in (rp.BEND, rp.STRAIGHTEN):
+            return False
+        written = cue.hold_s / self.scale
+        return written >= float(rule.get("slow_from_s",
+                                         rp.SLOW_FROM_S)) - 1e-9
+
     def bars_now(self, now: Optional[float] = None) -> Optional[dict]:
         """The cue window's bars from the newest glove frame, or None.
 
@@ -1273,17 +1328,29 @@ class ProtocolSession:
                   item: dict) -> Tuple[List[str], Optional[str]]:
         """(cued fingers, phase) for the bars during one cue.
 
-        Set B: the item's finger, in the cue's phase. Set C: the step's
+        Set B: the item's finger, in the cue's phase; no phase while a
+        slow bend or straighten is under way (`slow_move`), so the bar is
+        drawn white: the finger has nowhere to be yet, and a bar that
+        turned green on arrival would ask for the snapped bend the speed
+        rule rejects. Set C: the step's
         flexed fingers; the phase by `cue_pitch`'s rule (a step that flexes
         a finger is "flex", one that only straightens is "extend", one that
         changes nothing is "hold", and its flexed fingers stay bent).
         """
         if cue.phase is not None:
-            return [item["finger"]], cue.phase
+            return [item["finger"]], (None if self.slow_move(cue)
+                                      else cue.phase)
         pitch = rp.cue_pitch(cue, previous)
         phase = {rp.PITCH_FLEX: "flex",
                  rp.PITCH_EXTEND: "extend"}.get(pitch, rp.HOLD)
         return list(cue.flexed), phase
+
+    def cue_sub(self, cue: rp.Cue, where: str) -> str:
+        """The small line under the cue's words: where in the take it is,
+        and for a slow bend or straighten how to make it."""
+        if not self.slow_move(cue):
+            return where
+        return f"{where}: slowly, use the whole {cue.hold_s:g} s"
 
     def run_take(self, item_id: str, take: int, attempt: int, round_no: int
                  ) -> dict:
@@ -1343,7 +1410,8 @@ class ProtocolSession:
                 where = (f"cycle {cue.cycle}/{item['cycles']}"
                          if cue.cycle is not None else f"step {cue.step}")
                 self.show(name, cue.label.upper(),
-                          t0 + offsets[k] + cue.hold_s, where)
+                          t0 + offsets[k] + cue.hold_s,
+                          self.cue_sub(cue, where))
                 self.say(f"      [{k + 1:>2}/{len(cues)}] {where:<11} "
                          f"{cue.label}  ({cue.hold_s:g} s)")
                 previous = cue
@@ -1383,7 +1451,8 @@ class ProtocolSession:
             curls = rp.read_bends(paths["glove"], self.hand)
             check = rp.check_take(self.protocol, item_id, curls,
                                   rp.read_events(paths["events"]),
-                                  self.warmup["glove"], self.scale)
+                                  self.warmup["glove"], self.scale,
+                                  speed=self.speed)
         except KeyboardInterrupt:
             # Ctrl+C while the take was being checked: it gets a verdict
             # like any other interrupted take, so no file is left behind
@@ -1440,6 +1509,12 @@ class ProtocolSession:
             # in one line: the reason says what the glove measured, this
             # says what the hand should do about it.
             self.say(f"      what to do: {check.hint}")
+        if not interrupted and not skipped:
+            speed = rp.speed_line(check.details)
+            if speed:
+                # Every Set B take, accepted or not: how fast the glove
+                # timed its bends, so a pass that was close is seen.
+                self.say(f"      speed: {speed}")
         for note in check.notes:
             self.say(f"      note: {note}")
         gap = health.get("max_gap_ms") or 0
@@ -1574,6 +1649,14 @@ class ProtocolSession:
             if auto_rejects > self.args.retries:
                 self.say(f"      FAILED: {item_id} take {take} after "
                          f"{attempt} attempt(s)")
+                if entry["check"].get("rejected_for") == rp.REJECT_SPEED:
+                    # The bar was set on one paced sweep of one finger. If
+                    # the finger did move slowly, say how to go on.
+                    self.say("      if the finger did move for the whole "
+                             "cue and the glove still timed a fast bend, "
+                             "the glove is reading it as a jump: record "
+                             "this session with --no-speed-check (the "
+                             "times are then reported, not judged)")
                 self.failed.append(f"{item_id} take {take}")
                 return
             self.say(f"      retrying ({auto_rejects}/{self.args.retries})")
@@ -1642,8 +1725,10 @@ def parse_args(argv=None):
                    help="the operator's hand for this run (the other rests "
                         "on the table)")
     p.add_argument("--camera", default="leap", choices=CAMERA_CHOICES,
-                   help="leap (default): the Ultraleap as the reference; "
-                        "none: glove only")
+                   help="none: glove only, how the professor's Sets B and "
+                        "C are recorded (the Desktop launchers pass it); "
+                        "leap (default): the Ultraleap beside the gloves as "
+                        "a reference")
     p.add_argument("--out-dir", type=Path, default=None,
                    help=f"where the session folder goes (default: {OUT_DIR}, "
                         f"or {MOCK_OUT_DIR} with a mock sensor)")
@@ -1687,8 +1772,18 @@ def parse_args(argv=None):
     p.add_argument("--mock-glove-ignore-cues", action="store_true",
                    help="synthetic glove that does the warm-up and then "
                         "stays open (rehearses the reject path)")
+    p.add_argument("--mock-glove-snap", action="store_true",
+                   help="synthetic glove that follows the cues but bends "
+                        "and straightens at once (rehearses the speed "
+                        "rule's rejection)")
     p.add_argument("--mock-leap", action="store_true",
                    help="synthetic Ultraleap stream")
+    p.add_argument("--no-speed-check", action="store_true",
+                   help="Set B: record this session without the bend-speed "
+                        "rule (a slow bend that the glove timed under 15 %% "
+                        "of its cue is then reported, not rejected). The "
+                        "rule is a session's from its first take: --resume "
+                        "keeps the session's own")
     p.add_argument("--no-view", action="store_true",
                    help="no cue window (the console still shows every cue)")
     p.add_argument("--no-bars", action="store_true",
@@ -1709,7 +1804,10 @@ def parse_args(argv=None):
     p.add_argument("--address", default="/v1/animation/kinematic/all")
     args = p.parse_args(argv)
 
-    if args.mock_glove_ignore_cues:
+    if args.mock_glove_ignore_cues and args.mock_glove_snap:
+        p.error("--mock-glove-ignore-cues and --mock-glove-snap are two "
+                "different mock hands; give one")
+    if args.mock_glove_ignore_cues or args.mock_glove_snap:
         args.mock_glove = True
     args.mock = bool(args.mock_glove or args.mock_leap)
     if args.out_dir is None:
@@ -1792,7 +1890,9 @@ def resume_folder(args, protocol: rp.Protocol) -> Tuple[Path, dict]:
     the session on: another set, hand or protocol file (its sha256), a
     mock session resumed for real or the other way round (`mock` only, not
     which mock: a rehearsal can change its mock glove), another camera or
-    time scale, no saved round order, or a session whose warm-up predates
+    time scale, `--no-speed-check` on a session started under the
+    bend-speed rule, no saved round order, or a session whose warm-up
+    predates
     the thumb in degrees (its takes and new ones would measure the thumb two
     ways; the checker could not put them on one scale).
     """
@@ -1831,6 +1931,12 @@ def resume_folder(args, protocol: rp.Protocol) -> Tuple[Path, dict]:
     scale = float(meta.get("time_scale") or 1.0)
     if args.time_scale_given and scale != float(args.time_scale):
         why.append(f"it ran at --time-scale {scale:g}")
+    if getattr(args, "no_speed_check", False) and \
+            isinstance(meta.get("speed_check"), dict):
+        why.append("it was started under the bend-speed rule and this run "
+                   "has --no-speed-check: a session keeps one rule from its "
+                   "first take to its last (drop the option, or record a "
+                   "new session without the rule)")
     if not isinstance(meta.get("rounds"), list) or not meta["rounds"]:
         why.append("its session.json has no round order to carry on")
     first = folder / WARMUP_FILE
@@ -1932,6 +2038,8 @@ def run(args) -> int:
     if shuffle:
         print(f"  rounds shuffled, seed {seed}")
     glove_text = ("MOCK (ignores the cues)" if args.mock_glove_ignore_cues
+                  else "MOCK (follows the cues, bends at once)"
+                  if args.mock_glove_snap
                   else "MOCK (follows the cues)" if args.mock_glove
                   else f"{args.host}:{args.port}")
     cam_text = ("none" if camera == "none" else
@@ -1950,6 +2058,20 @@ def run(args) -> int:
               "wants it)."))
     print("  After a take: r = redo, s = skip the rest of this item, q = "
           "stop. During a take: s = skip it now.")
+    if protocol.name == rp.FLEXION:
+        rule = (resumed[1].get("speed_check") if resumed is not None
+                else None if args.no_speed_check else rp.speed_rule())
+        if isinstance(rule, dict):
+            print(f"  Bend speed: a bend the cue gives "
+                  f"{rule['slow_from_s']:g} s or more for has to be slow. "
+                  "Start on the beep and keep moving")
+            print(f"  for the whole cue; a bend the glove times under "
+                  f"{rule['min_bend_share'] * 100:.0f} % of its cue is "
+                  "recorded again.")
+        else:
+            why = ("--no-speed-check" if resumed is None else
+                   "the session was started without the rule")
+            print(f"  Bend speed: timed and reported, not judged ({why}).")
     print("=" * 72)
     if resumed is not None and not left:
         print(f"Nothing left to record in {resumed[0]}: every item has its "
@@ -1962,7 +2084,8 @@ def run(args) -> int:
     if args.mock_glove:
         glove = CueFollowingGlove(args.hand,
                                   follow_cues=not args.mock_glove_ignore_cues,
-                                  time_scale=args.time_scale)
+                                  time_scale=args.time_scale,
+                                  snap=args.mock_glove_snap)
     else:
         glove = OSCHandReceiver(host=args.host, port=args.port,
                                 kinematic_addr=args.address)
@@ -2031,6 +2154,12 @@ def run(args) -> int:
             "takes_per_item": takes,
             "retries": args.retries,
             "time_scale": args.time_scale,
+            # The bend-speed rule this session is judged on (Set B; None
+            # for a sequences session and with --no-speed-check). Resume
+            # and the checker read it from here, never from the code.
+            "speed_check": (rp.speed_rule()
+                            if protocol.name == rp.FLEXION
+                            and not args.no_speed_check else None),
             # The packager refuses a session with "mock": true (contract 7);
             # which sensor was synthetic, and how, is in "mock_flags".
             "mock": args.mock,
@@ -2038,7 +2167,9 @@ def run(args) -> int:
                            "glove_follows_cues": bool(
                                args.mock_glove
                                and not args.mock_glove_ignore_cues),
-                           "leap": bool(args.mock_leap)},
+                           "leap": bool(args.mock_leap),
+                           **({"glove_snaps": True}
+                              if args.mock_glove_snap else {})},
             "warmup": WARMUP_FILE,
             # Every warm-up file of the session, in order; a take entry's
             # "warmup" names the one it was judged against.
