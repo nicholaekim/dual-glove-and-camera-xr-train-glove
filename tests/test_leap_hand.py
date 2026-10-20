@@ -591,6 +591,14 @@ def test_stream_rejects_an_unknown_tracking_mode():
 # go in as a C array of strings ending in NULL. Every call lands in one list,
 # so the order of the tracking-mode calls, the device wait and the hint
 # calls can be read off it.
+#
+# And like the camera on 2026-10-17: on a multi-device aware connection (the
+# kind hints need) the plain LeapGetTrackingMode is never answered, so the
+# bindings' get_tracking_mode() times out; LeapGetTrackingModeEx on the open
+# device is answered with a TrackingMode event, reporting the mode the
+# device was set to with LeapSetTrackingModeEx. What the plain
+# LeapSetTrackingMode does to a device there is unknown: the fake says
+# nothing, so a device never set with the Ex call reports HMD.
 FAKE_NULL = object()                     # ffi.NULL
 FAKE_CONNECTION_PTR = "LEAP_CONNECTION#1"
 
@@ -601,7 +609,15 @@ class FakeTrackingMode(Enum):
     ScreenTop = 2
 
 
+class FakeEventType(Enum):
+    TrackingMode = 13
+
+
 class FakeCannotOpenDevice(Exception):
+    pass
+
+
+class FakeLeapTimeoutError(Exception):
     pass
 
 
@@ -659,6 +675,7 @@ class FakeConnection:
         self.listeners = []
         self.mode = None
         self.disconnected = False
+        self._waiting = None             # (event type, events caught)
         sdk.connections.append(self)
 
     def add_listener(self, listener):
@@ -679,7 +696,27 @@ class FakeConnection:
 
     def get_tracking_mode(self):
         self.sdk.calls.append("get_tracking_mode")
+        if self.options.get("multi_device_aware"):
+            raise FakeLeapTimeoutError("Did not received expected event in time")
         return self.mode
+
+    def _call_and_wait_for_event(self, event_type, func=None, args=None, *,
+                                 timeout=None):
+        """The bindings' own: listen for `event_type`, THEN call `func`."""
+        caught = []
+        self._waiting = (event_type, caught)
+        try:
+            if func is not None:
+                func(*(args or ()))
+        finally:
+            self._waiting = None
+        if not caught:
+            raise FakeLeapTimeoutError("Did not received expected event in time")
+        return caught[-1]
+
+    def emit(self, event_type, event):
+        if self._waiting is not None and self._waiting[0] == event_type:
+            self._waiting[1].append(event)
 
     def get_connection_ptr(self):
         return FAKE_CONNECTION_PTR
@@ -724,6 +761,22 @@ class FakeLeapC:
         enabled[0] = self.sdk.licensed
         return self.sdk.license_code
 
+    def LeapSetTrackingModeEx(self, conn, device, mode):
+        self.sdk.calls.append(("LeapSetTrackingModeEx", conn, device, mode))
+        if self.sdk.set_mode_code == 0:
+            self.sdk.device_modes[device] = FakeTrackingMode(mode)
+        return self.sdk.set_mode_code
+
+    def LeapGetTrackingModeEx(self, conn, device):
+        from types import SimpleNamespace
+        self.sdk.calls.append(("LeapGetTrackingModeEx", conn, device))
+        if self.sdk.answer_mode and self.sdk.get_mode_code == 0:
+            mode = self.sdk.device_modes.get(device, FakeTrackingMode.HMD)
+            self.sdk.connections[-1].emit(
+                FakeEventType.TrackingMode,
+                SimpleNamespace(current_tracking_mode=mode))
+        return self.sdk.get_mode_code
+
     def LeapSetDeviceHints(self, conn, device, hints):
         decoded = [None if h is FAKE_NULL else h.value.decode("ascii")
                    for h in hints]
@@ -748,6 +801,10 @@ class FakeLeapSDK:
         self.licensed = True
         self.license_code = 0
         self.hints_code = 0
+        self.set_mode_code = 0           # LeapSetTrackingModeEx's result
+        self.get_mode_code = 0           # LeapGetTrackingModeEx's result
+        self.answer_mode = True          # a TrackingMode event comes back
+        self.device_modes = {}           # LEAP_DEVICE -> mode set with the Ex call
         self.ffi = FakeFFI()
         self.lib = FakeLeapC(self)
         module = types.ModuleType("leap")
@@ -755,7 +812,9 @@ class FakeLeapSDK:
         module.Listener = type("FakeListener", (), {})
         module.LeapError = Exception
         module.exceptions = types.SimpleNamespace(
-            LeapCannotOpenDeviceError=FakeCannotOpenDevice)
+            LeapCannotOpenDeviceError=FakeCannotOpenDevice,
+            LeapTimeoutError=FakeLeapTimeoutError)
+        module.EventType = FakeEventType
         module.TrackingMode = FakeTrackingMode
         module.get_now = lambda: 0
         self.module = module
@@ -818,10 +877,10 @@ def test_hint_is_set_once_per_device_after_the_device_wait(fake_sdk):
     names = fake_sdk.names()
     assert names.index("set_tracking_mode") < names.index("device_wait_done")
     assert names.index("device_wait_done") < names.index("LeapCheckLicenseFlag")
-    assert names.index("LeapCheckLicenseFlag") < names.index("LeapSetDeviceHints")
-    # the mode is confirmed after the hint: a multi-device aware connection
-    # gets a device's events only once it has subscribed to the device
-    assert names.index("LeapSetDeviceHints") < names.index("get_tracking_mode")
+    assert names.index("LeapCheckLicenseFlag") < names.index("LeapSetTrackingModeEx")
+    # per device: the mode set, the hint, then the mode confirmed
+    assert names.index("LeapSetTrackingModeEx") < names.index("LeapSetDeviceHints")
+    assert names.index("LeapSetDeviceHints") < names.index("LeapGetTrackingModeEx")
     assert ("LeapCheckLicenseFlag", FAKE_CONNECTION_PTR, b"Hyperion") in fake_sdk.calls
 
     # the frame tracked while the hint was being set was discarded
@@ -851,15 +910,77 @@ def test_hint_opens_an_unopened_device_subscribes_and_closes_it(fake_sdk):
     device = fake_sdk.devices[0]
     sequence = [c for c in fake_sdk.calls if isinstance(c, tuple)
                 and c[0] != "LeapCheckLicenseFlag"]
+    # the mode set, the hint and the mode check all on the one open handle
     assert sequence == [
         ("open_device", "LEAP_DEVICE#1"),
         ("subscribe_events", "LEAP_DEVICE#1"),
+        ("LeapSetTrackingModeEx", FAKE_CONNECTION_PTR, "LEAP_DEVICE#1",
+         FakeTrackingMode.Desktop.value),
         ("LeapSetDeviceHints", FAKE_CONNECTION_PTR, "LEAP_DEVICE#1",
          ["hand_on_object", None]),
+        ("LeapGetTrackingModeEx", FAKE_CONNECTION_PTR, "LEAP_DEVICE#1"),
         ("close_device", "LEAP_DEVICE#1"),
     ]
     assert device.c_data_device is None
     stream.stop()
+
+
+def test_hint_connection_confirms_the_mode_per_device_not_with_the_plain_call(
+        fake_sdk):
+    """The camera, 2026-10-17: on the multi-device aware connection the
+    plain LeapGetTrackingMode is never answered. The hinted start sets and
+    confirms the mode on the open device with the Ex calls instead."""
+    stream = _hinted(fake_sdk, mode="hmd")
+    stream.start()
+    names = fake_sdk.names()
+    assert "get_tracking_mode" not in names, "it times out on this connection"
+    assert names.count("set_tracking_mode") == 1, "the plain set stays, once"
+    ex = [c for c in fake_sdk.calls if isinstance(c, tuple)
+          and c[0] in ("LeapSetTrackingModeEx", "LeapGetTrackingModeEx")]
+    assert ex == [
+        ("LeapSetTrackingModeEx", FAKE_CONNECTION_PTR, "LEAP_DEVICE#1",
+         FakeTrackingMode.HMD.value),
+        ("LeapGetTrackingModeEx", FAKE_CONNECTION_PTR, "LEAP_DEVICE#1"),
+    ]
+    assert len(fake_sdk.hint_calls()) == 1
+    assert stream.tracking_mode_confirmed is True
+    assert stream.hints_confirmed is True
+    stream.stop()
+
+
+def test_hint_device_reporting_another_mode_is_fatal(fake_sdk):
+    fake_sdk.lib.LeapSetTrackingModeEx = (
+        lambda conn, device, mode: fake_sdk.calls.append(
+            ("LeapSetTrackingModeEx", conn, device, mode)) or 0)  # sets nothing
+    stream = _hinted(fake_sdk)
+    with pytest.raises(LeapUnavailable, match="not FakeTrackingMode.Desktop"):
+        stream.start()
+    assert stream.tracking_mode_confirmed is False
+    assert stream.hints_confirmed is False
+    assert fake_sdk.connections[0].disconnected
+    assert ("close_device", "LEAP_DEVICE#1") in fake_sdk.calls
+
+
+def test_hint_device_mode_set_refused_names_the_code(fake_sdk):
+    fake_sdk.set_mode_code = 0xE2010001 - (1 << 32)
+    stream = _hinted(fake_sdk)
+    with pytest.raises(LeapUnavailable) as e:
+        stream.start()
+    message = str(e.value)
+    assert "could not set the desktop tracking mode" in message
+    assert "LeapSetTrackingModeEx returned 0xE2010001" in message
+    assert fake_sdk.hint_calls() == [], "no hint on a device in an unknown mode"
+    assert fake_sdk.connections[0].disconnected
+
+
+def test_hint_device_mode_never_confirmed_is_fatal(fake_sdk):
+    fake_sdk.answer_mode = False
+    stream = _hinted(fake_sdk)
+    with pytest.raises(LeapUnavailable, match="never confirmed the desktop"):
+        stream.start()
+    assert stream.tracking_mode_confirmed is False
+    assert stream.hints_confirmed is False
+    assert fake_sdk.connections[0].disconnected
 
 
 def test_hint_uses_an_already_open_device_handle_as_it_is(fake_sdk):
@@ -871,6 +992,8 @@ def test_hint_uses_an_already_open_device_handle_as_it_is(fake_sdk):
     assert "open_device" not in names
     assert fake_sdk.hint_calls() == [("LeapSetDeviceHints", FAKE_CONNECTION_PTR,
                                       "LEAP_DEVICE#7", ["hand_on_object", None])]
+    assert ("LeapGetTrackingModeEx", FAKE_CONNECTION_PTR,
+            "LEAP_DEVICE#7") in fake_sdk.calls
     stream.stop()
 
 
@@ -895,6 +1018,7 @@ def test_hint_none_requested_calls_nothing_and_leaves_the_license_unread(fake_sd
     stream.start()
     names = fake_sdk.names()
     for never in ("_leapc", "LeapCheckLicenseFlag", "LeapSetDeviceHints",
+                  "LeapSetTrackingModeEx", "LeapGetTrackingModeEx",
                   "get_devices", "subscribe_events", "open_device"):
         assert never not in names, never
     # the connection is exactly the one it always was

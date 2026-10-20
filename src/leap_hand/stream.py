@@ -39,7 +39,10 @@ LeapC.h decide how:
   * the hints "will only be interpreted for multi-device aware clients" and
     the call "will return an error if the client is not", so a stream with
     hints opens its connection multi-device aware, and then subscribes to
-    each device's events, which such a client must do to receive them;
+    each device's events, which such a client must do to receive them. On
+    that connection the plain LeapGetTrackingMode is never answered (the
+    camera, 2026-10-17), so the mode is also set and confirmed per device,
+    with LeapSetTrackingModeEx and LeapGetTrackingModeEx;
   * the call takes an OPEN device handle (`LeapOpenDevice`), and the
     bindings' `connection.get_devices()` returns unopened devices whose
     `c_data_device` is None, so each device is opened for the call.
@@ -325,13 +328,13 @@ class LeapStream:
         is up and the queue is emptied straight after, so not one frame
         captured in some previous session's mode can reach a recording.
 
-        With hints, the device wait is followed by the Hyperion check and the
-        hints on every device (`_apply_hints`), then the mode is verified
-        and the queue emptied once more, so no frame from before the hint
-        took effect is counted either. The hints come before the mode
-        verification, not after it: a multi-device aware connection has to
-        subscribe to a device before that device's events reach it, and the
-        verification waits for one of those events.
+        With hints, the device wait is followed by the Hyperion check and,
+        on every device, the mode set, the hint and the mode confirmed
+        (`_apply_hints`); then the queue is emptied once more, so no frame
+        from before the hint took effect is counted either. The mode is set
+        and confirmed per device because on the multi-device aware
+        connection hints need, the plain LeapGetTrackingMode is never
+        answered (the camera, 2026-10-17: the mode check timed out).
 
         Raises:
             LeapUnavailable: bindings missing, service not running, no device
@@ -374,8 +377,12 @@ class LeapStream:
             self._set_tracking_mode()
             self._discard_pending()
             self._wait_for_device()
-            self._apply_hints()
-            self._verify_tracking_mode()
+            if self.hints_requested:
+                # per device: the mode set and confirmed with the Ex calls,
+                # the hint between them (`_apply_hints`)
+                self._apply_hints()
+            else:
+                self._verify_tracking_mode()
             # Frames that arrived between the set and its confirmation were
             # queued in an unconfirmed mode, and with hints, before the hint
             # took effect; only what follows counts.
@@ -384,9 +391,13 @@ class LeapStream:
             self._safe_disconnect()
             raise
 
-    def _set_tracking_mode(self) -> None:
+    def _set_tracking_mode(self, set_mode=None) -> None:
+        """The connection-wide set, or `set_mode()` (one device's, with hints)."""
         try:
-            self._connection.set_tracking_mode(self._tracking_mode())
+            if set_mode is None:
+                self._connection.set_tracking_mode(self._tracking_mode())
+            else:
+                set_mode()
         except Exception as e:
             raise LeapUnavailable(
                 f"could not set the {self.mode} tracking mode ({e}).\n"
@@ -429,7 +440,7 @@ class LeapStream:
             "  No camera to hand? Every script here takes --mock."
         )
 
-    def _verify_tracking_mode(self) -> None:
+    def _verify_tracking_mode(self, ask=None) -> None:
         """Confirm the server really is in the mode we asked for.
 
         This runs after the device wait, not straight after the set, because
@@ -439,10 +450,13 @@ class LeapStream:
         "no camera plugged in" into a slow, misleading mode error. The set
         itself already happened before any frame was counted, which is what
         keeps the data honest; this is the confirmation.
+
+        `ask()`, when given, replaces the connection-wide question with one
+        device's (the hinted start, `_hint_open_device`).
         """
         want = self._tracking_mode()
         try:
-            got = self._connection.get_tracking_mode()
+            got = self._connection.get_tracking_mode() if ask is None else ask()
         except Exception as e:
             raise LeapUnavailable(
                 f"a device is tracking but the service never confirmed the "
@@ -537,11 +551,11 @@ class LeapStream:
                 f"  Next step: run {CHECK_SCRIPT}, or record without --hint")
 
     def _hint_device(self, libleapc, conn, device, array) -> None:
-        """Subscribe to one device and set the hints on it, opening it if
-        it is not open. A device the bindings list is not open: its
-        `c_data_device` is None until `device.open()` gives it a handle."""
+        """`_hint_open_device` on one device, opening it if it is not open.
+        A device the bindings list is not open: its `c_data_device` is None
+        until `device.open()` gives it a handle."""
         if getattr(device, "c_data_device", None) is not None:
-            self._subscribe_and_hint(libleapc, conn, device, array)
+            self._hint_open_device(libleapc, conn, device, array)
             return
         with ExitStack() as opened:
             try:
@@ -555,9 +569,13 @@ class LeapStream:
                 ) from e
             # closed again on the way out, as the bindings' own
             # multi-device example does after subscribing
-            self._subscribe_and_hint(libleapc, conn, device, array)
+            self._hint_open_device(libleapc, conn, device, array)
 
-    def _subscribe_and_hint(self, libleapc, conn, device, array) -> None:
+    def _hint_open_device(self, libleapc, conn, device, array) -> None:
+        """Subscribe, set the mode, set the hints, confirm the mode: all on
+        the one open handle. The mode goes through LeapSetTrackingModeEx and
+        LeapGetTrackingModeEx because on this multi-device aware connection
+        the plain LeapGetTrackingMode is never answered."""
         try:
             self._connection.subscribe_events(device)
         except Exception as e:
@@ -567,7 +585,26 @@ class LeapStream:
                 f"to receive them ({type(e).__name__}: {e}).\n"
                 f"  Next step: {CHECK_SCRIPT}, or record without --hint"
             ) from e
-        code = libleapc.LeapSetDeviceHints(conn, device.c_data_device, array)
+        handle = device.c_data_device
+        mode = self._tracking_mode()
+
+        def checked(name: str, code) -> None:
+            if code != LEAP_SUCCESS:
+                raise RuntimeError(f"{name} returned {self._rs_text(code)}")
+
+        def ask():
+            # the bindings' get_tracking_mode() for one device: listen for
+            # the TrackingMode event first, then ask
+            event = self._connection._call_and_wait_for_event(
+                self._leap.EventType.TrackingMode,
+                lambda: checked("LeapGetTrackingModeEx",
+                                libleapc.LeapGetTrackingModeEx(conn, handle)))
+            return event.current_tracking_mode
+
+        self._set_tracking_mode(lambda: checked(
+            "LeapSetTrackingModeEx",
+            libleapc.LeapSetTrackingModeEx(conn, handle, mode.value)))
+        code = libleapc.LeapSetDeviceHints(conn, handle, array)
         if code != LEAP_SUCCESS:
             raise LeapUnavailable(
                 f"the service refused the {self._hint_text()} hint "
@@ -575,6 +612,7 @@ class LeapStream:
                 f"{self.device_serial}), so the recording would be labelled "
                 "with a condition it was not made under.\n"
                 f"  Next step: run {CHECK_SCRIPT}, or record without --hint")
+        self._verify_tracking_mode(ask)
 
     def _hint_text(self) -> str:
         return ", ".join(self.hints_requested)

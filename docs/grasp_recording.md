@@ -343,8 +343,11 @@ was not made under". The service ignores a hint it is not licensed for
 without an error, which is why the flag is read first. The recorder also
 refuses when the license check or the hint call returns an error code, and
 names the code. With a hint, the connection to the service is opened
-multi-device aware, which LeapC requires for hints. Without one it is the
-same connection as before.
+multi-device aware, which LeapC requires for hints, and the tracking mode
+is set and confirmed on each device (`LeapSetTrackingModeEx`,
+`LeapGetTrackingModeEx`), because on that connection the service does not
+answer the connection-wide mode check. Without a hint it is the same
+connection and the same mode check as before.
 
 Every take records what was asked and what was confirmed, in three fields:
 
@@ -372,9 +375,11 @@ with the webcam or with `--hand both`, neither of which writes a meta file.
 The same goes for `--note` in `record_simultaneous.py`.
 
 Not checked yet: that the service accepts the hint from these recorders
-with the Stereo IR 170 attached. The tests run the whole sequence against
-fake LeapC objects. The first camera run with `--hint` is the check:
-`hints_confirmed` true in its meta.
+with the Stereo IR 170 attached. The first camera run with `--hint`, on
+2026-10-17, stopped at the connection-wide mode check, which timed out;
+the per-device check that replaced it has not run on the camera yet. The
+tests run the whole sequence against fake LeapC objects. The next camera
+run with `--hint` is the check: `hints_confirmed` true in its meta.
 
 ## Steps
 
