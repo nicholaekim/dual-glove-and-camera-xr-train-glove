@@ -24,10 +24,10 @@ Scope: a `--hint hand_on_object` option on both recorders that requests Ultralea
   EXPECT: / passed/
   EVIDENCE: automatic-evidence=v1; definition-sha256=5433153bfb121243819369ed1f6aa40c107cf5814f1f387ab83b8c1568551795; exit=0; EXPECT=matched; output-sha256=ede7084bbaa436ff262f8da695001f7efe2c9030a20e7eed31e52b31611e1da2; output-bytes=100; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=d640fd9d8f83/37 entries
 
-- [ ] H5: the whole test suite still passes
+- [x] H5: the whole test suite still passes
   CHECK: .venv\Scripts\python.exe -m pytest tests -q -x
   EXPECT: / passed/
-  EVIDENCE: pending
+  EVIDENCE: automatic-evidence=v1; definition-sha256=82d9daa730e6f68dcc71f03b8a43c11ff501ce9ad583b6a269b29ac693626b8b; exit=0; EXPECT=matched; output-sha256=3639e36a23de71de5c3f949701d1db255ff711de47b37c560d355b2de6c859f9; output-bytes=1331; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=d640fd9d8f83/37 entries
 
 - [x] H6: the live service on this machine reports the Hyperion flag (no hardware); the live dry run with the camera attached is step 2 of docs/pilot_hand_on_object.md and belongs to the operator
   EVIDENCE: 2026-10-16: probe_hyperion.py (session scratchpad) against the running service 6.2.0+2025.07.11, no device attached: LeapCheckLicenseFlag("Hyperion") result 0, enabled True; "SetClassifierThresholds" also True. 2026-10-19, camera attached (IR 170, desktop mode), the protocol's step 2 dry run: `record_simultaneous.py --camera leap --mock-glove --hand left --poses open_palm --takes 1 --hint hand_on_object` printed "hint: hand_on_object (confirmed by the service, Hyperion license present)", accepted the take on attempt 2, and wrote tracking_hints ["hand_on_object"], hints_confirmed true, license_hyperion true into recordings/pilot_hoo/dry_run/leap/open_palm_left_take1_20261019_225024.meta.json. The first camera attempt on 2026-10-17 had failed: on the multi-device-aware connection the plain LeapGetTrackingMode is never answered; fixed by per-device LeapSetTrackingModeEx / LeapGetTrackingModeEx on the open handle (stream.py), with tests.
