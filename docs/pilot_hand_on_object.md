@@ -1,6 +1,7 @@
 # Pilot: how much does the Leap lose when an object is in the hand, and does the hand-on-object hint get it back?
 
-Written 2026-10-16. One session of recording, about an hour and a half with the gloves on, that produces the
+Written 2026-10-16; step 9 (the comparison script) written and pre-registered 2026-10-21, before any pilot data.
+One session of recording, about an hour and a half with the gloves on, that produces the
 three numbers any object-aware correction project has to be justified by: the camera's disagreement with the
 glove for a mimed grasp, for the same grasp around a real object, and for the same grasp around the object with
 Ultraleap's `hand_on_object` tracking requested. No model is built here. If the object makes little difference, or
@@ -27,17 +28,30 @@ Every step below names its hardware setup. Do one step at a time.
   its own calibration (the pinch procedure of 5 October), it drifts with fit, and it does not measure abduction or the
   thumb's base joint usefully. So the comparison is flexion only, at the MCP and PIP joints of the index, middle, ring
   and little fingers (8 joints), on a still hand.
-* The quantity: for each take, ONE common held window for both sensors, the last 3 s of the 5 s hold by the shared
-  wall clock the two recorders stamp (never a window each sensor picks for itself: when the object unsettles the
-  camera, its own stillest 2 s would pick a kinder interval than the glove's and flatter the camera). Inside that
-  window, pair every camera frame with the nearest glove frame in time (as `scripts/fuse_poses.py` pairs), take
-  the flexion angles from `xr_hand.joint_frames` on both, and the absolute difference per joint per pair. Per take:
-  the median paired-frame difference per joint, and the camera's coverage of the window (frames with the hand over
-  frames expected at its rate) and its losses. Per condition: the median and the largest of the per-take medians over
-  the takes and the 8 joints, per-joint medians, and coverage reported SEPARATELY from angle error, because a method
-  that drops the hardest frames looks accurate if the two are mixed. Each sensor's representative frame (the stillest
-  2 s, as in the grasp set) is kept as a secondary summary and for pictures only. Both sensors' values are kept; a
-  difference is not attributed to either.
+* The quantity: for each take, ONE common held window for both sensors, the last 3 s of the 5 s hold on the clock
+  the two recorders share (`capture_time`, the sensor's own capture instant, when every frame of both files has it;
+  else `wall_time`; both are `time.time()`), never a window each sensor picks for itself: when the object unsettles
+  the camera, its own stillest 2 s would pick a kinder interval than the glove's and flatter the camera. The window
+  ends at the recorder's commanded end of the hold, `hold_end` in the take's meta (the recorder stops both sensors
+  together, so a sensor that lost the hand before the end shows up as missing coverage, not as a shorter window);
+  a take recorded before that key existed ends at the later of the two sensors' last stamps, and the report counts
+  such takes. Inside that window, pair every camera frame of the hand with the nearest glove frame in time, within
+  50 ms, with no lag shift (the hand is held still, see below); camera frames with no glove frame that close are
+  counted as unpaired, and the paired fraction is reported. Take the flexion angles from `xr_hand.joint_frames`
+  (wrist reference, flexion positive toward the palm) on both; per pair the DISAGREEMENT camera minus glove, wrapped
+  to [-180, 180), signed and absolute. It is a disagreement, not an error: the glove is a reference, not truth. Per
+  take: the median absolute and the median signed disagreement per joint, each sensor's own median per joint, each
+  sensor's within-window stability per joint (the median absolute deviation, MAD, of its own angle over the paired
+  frames, so a hand that adjusted during the window is visible rather than excluded), and each sensor's coverage of
+  the window and its losses by the recorder's own definitions (`leap_hand.protocol.coverage`: the fraction of the
+  window not inside a hole longer than 0.25 s; and the count of gaps over 100 ms). Per run and grasp: the PRIMARY
+  quantity is the median over all take x joint values of the per-take median absolute disagreement; beside it the
+  largest of those values, the per-joint medians (absolute and signed), the take counts (valid, expected, invalid,
+  unusable), the paired fraction, the worst gap and the stability, and coverage reported SEPARATELY from
+  disagreement, because a method that drops the hardest frames looks accurate if the two are mixed. No
+  representative frame is computed; the picture of a take is the still the recorder saves at the midpoint of the
+  hold (`stills/<take>.jpg`), which cannot be picked for a moment the camera looked best. Both sensors' values are
+  kept; a difference is not attributed to either.
 * Why a still hand: the glove's delay is not settled. The measurement of 5 October 2026 (`xr trainer/measure_glove_lag.py`
   v3, rank correlation on repeated closes and opens, both gloves on the Bluetooth 4.0 dongle; traces
   `xr trainer/glove lag tests/20261005_114958_both_left.csv` and `_right.csv`, summary `lag_tests.csv`) gave the LEFT
@@ -139,30 +153,59 @@ view. The objects are the three of objects.txt and no others.
 
 Take the gloves off. The hardware part is over.
 
-**Step 9. No hardware.** Export both sensors' joint angles for every take of the five sessions:
+**Step 9. No hardware.** The comparison. The script exists before the data does: `scripts/pilot_compare.py`, written
+on 2026-10-21, when `recordings\pilot_hoo` held nothing but the dry run of 19 October (`GATES_pilot_compare.md`,
+gate P4), so it cannot have been tuned to the result. Its behaviour is pinned by `tests/test_pilot_compare.py` on
+synthetic takes in the recorder's own file layout. Run it once, from the repo root:
 
-    .venv\Scripts\python.exe scripts\joint_frames_view.py --session recordings\pilot_hoo\A_mimed --no-window
+    .venv\Scripts\python.exe scripts\pilot_compare.py --root recordings\pilot_hoo
 
-and the same for `B1_object`, `C_object_hint`, `B2_object`, `A_mimed_again`. The per-take tables (26 joints, flexion
-and abduction, for the glove take and the camera take of the same name) are the secondary summary; the paired-frame
-comparison reads the raw takes themselves.
+It reads the five run folders by name (`A_mimed`, `B1_object`, `C_object_hint`, `B2_object`, `A_mimed_again`), every
+accepted take's `.meta.json`, camera file and glove file, and writes three files into `recordings\pilot_hoo\comparison`:
 
-**Step 10. No hardware.** The comparison itself is a small script to write once the data exists (it is not written
-yet, on purpose: the files it reads should exist first). What it must do, so that nobody argues about it afterwards:
-for each take, cut the common window (last 3 s of the hold, shared wall clock), pair camera frames to the nearest
-glove frames, take the 8 flexion angles (index, middle, ring, little; MCP and PIP) from both through
-`xr_hand.joint_frames`, form the absolute differences per pair, and report per take the per-joint medians and the
-camera's coverage and losses over that window. The PRIMARY report is per grasp: for each of cylindrical, spherical
-and tip, the five runs A, B1, C, B2 and A-check side by side, each with its per-joint medians, the median and largest
-of its per-take medians over the 8 joints, and its coverage, kept apart from error. B1 and B2 stay separate columns;
-a pooled B over the five takes may be added as a descriptive value only, because the bracketing exists to show
-time-on-hand drift and pooling throws that away. A three-grasp pooled summary is secondary, so that one grasp's
-failure cannot hide inside a condition's average. The glove's drift between step 4 and step 8 is reported on the
-glove alone. Put the result beside the data as one CSV and one page of text.
+* `takes.csv`, one row per accepted take: run, condition, grasp, take, note, `hints_confirmed`, status, the clock
+  used, the window and where its end came from (`meta hold_end` or `later last stamp`), frame counts, pairs and
+  unpaired camera frames, each sensor's coverage and gaps, and per joint the median absolute disagreement
+  (`absdiff_med_*`), the median signed disagreement camera minus glove (`signed_med_*`), each sensor's own median
+  (`cam_med_*`, `glove_med_*`) and each sensor's stability (`cam_mad_*`, `glove_mad_*`). The per-sensor medians are
+  the secondary summary (an earlier draft of this step exported per-take tables with `joint_frames_view.py
+  --session`; that mode reads protocol sessions with a `session.json`, which `record_simultaneous.py` never writes,
+  so it was replaced by these columns).
+* `summary.csv`, over the valid takes only: one row per grasp and run (`run_grasp`), a pooled-B row per grasp
+  (`run_grasp_pooledB`, B1 and B2 together, descriptive only), one row per run over all grasps (`run_all`, secondary) with its own pooled B
+  (`run_all_pooledB`), each with the primary quantity `absdiff_median`, `absdiff_largest`, per-joint `absdiff_*` and `signed_*`, the take
+  counts (`n_valid_takes`, `n_expected_takes` by this protocol, `n_invalid_takes`, `n_unusable_takes`,
+  `n_missing_takes`), paired fraction, worst gaps, stability and coverage, with a row for every run x grasp of the
+  fixed grid whether or not it has takes; per grasp the glove's drift between step 4 and step 8 on the glove
+  alone (`glove_drift_A2_minus_A`: the glove's median flexion in A-check, one take per grasp, minus its median in A,
+  per joint, signed); and the pre-stated contrasts on the primary quantity (`contrast` rows, per grasp and pooled:
+  `Bpooled_minus_A`, `C_minus_Bpooled`, `B2_minus_B1`, `A2_minus_A`, `abs_B2_minus_B1_minus_abs_C_minus_Bpooled`).
+* `report.txt`: the PRIMARY report, per grasp, with the five runs A, B1, C, B2 and A-check side by side and the pooled
+  B beside them: the take counts, per-joint absolute and signed medians, the primary quantity and the largest value,
+  paired fraction, each sensor's coverage, gaps and stability, kept apart from disagreement, then the contrasts. B1
+  and B2 stay separate columns because the bracketing exists to show time-on-hand drift and pooling throws that away.
+  The three-grasp pooled block is secondary, so that one grasp's failure cannot hide inside a condition's average. The
+  report prints numbers only; the reading is the table in the next section.
+
+A take whose `hints_confirmed` contradicts its run (false in C, true in A or B) is listed under "invalid takes" with
+its numbers kept in `takes.csv`, and left out of every summary; record it again. A run folder that is missing or has
+no accepted take is reported as absent, so the script also runs on a partial session.
 
 ## How the result is read, decided before recording
 
-No numerical threshold is set in advance. The patterns are:
+No numerical threshold is set in advance. Every pattern below is read on ONE number, the primary quantity of
+`summary.csv` (`absdiff_median`: the median over take x joint of the per-take median absolute disagreement, per
+grasp), through the contrasts the script prints: "B worse than A" is `Bpooled_minus_A` positive, "C better than B"
+is `C_minus_Bpooled` negative, each with its size stated beside the `largest` and stability rows. The pilot makes
+NO categorical "about equal" or "as much as" claim: no equivalence margin is fixed in advance (nothing is known yet
+about the camera-glove disagreement on a mimed grasp, so any margin chosen now would be a guess), and the script
+assigns no pattern. For the rows below that speak of "about equal" and "differ as much as", the report gives the
+contrasts (`B2_minus_B1`, `abs_B2_minus_B1_minus_abs_C_minus_Bpooled`) and the spread, and the reader sees how far
+from zero they are. Coverage, paired fraction and the gap counts are read beside these, never inside them. The
+summary grid is fixed before recording: the three grasps named above, the five runs and the pooled B, with the
+expected take counts of this protocol (A 15, B1 9, C 15, B2 6, A-check 3 in all); a run x grasp with no take still
+has its row and its `n_missing_takes`, so a grasp that was never recorded cannot disappear from the table. Per grasp
+first; the pooled contrasts second.
 
 | Pattern | Reading |
 |---|---|
@@ -178,7 +221,7 @@ error on the rest has not done better. The medians and the coverage go to the pr
 ## What would make the pilot invalid
 
 * A take whose meta shows `hints_confirmed` false in condition C, or true in A or B: the condition was not what its
-  folder says. Drop it and record again.
+  folder says. The comparison script lists it as invalid and leaves it out; record it again.
 * The glove recalibrated between conditions. If it has to be recalibrated, start the five sessions again.
 * An object that hides the glove's back-of-finger sensors from nothing but the camera is the point; an object that
   presses the sensors (a tight grip on a hard edge) changes the glove reading itself. Hold the objects, do not squeeze.

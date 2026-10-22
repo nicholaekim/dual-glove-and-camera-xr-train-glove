@@ -813,6 +813,11 @@ class Attempt:
     rejected_to: str = ""
     # Why there is no still, when there is none (see `still_status`).
     still_missing: str = ""
+    # The REC hold as commanded, time.time() seconds: its start (the moment
+    # both take files were started) and that plus the duration. None for an
+    # attempt that never reached the hold (lost during the settle).
+    hold_start: Optional[float] = None
+    hold_end: Optional[float] = None
 
 
 @dataclass
@@ -1241,6 +1246,10 @@ class CoachedLeapSession(LeapSyncSession):
             second_hand=self.second_hand - before[1],
             still=still_name or "",
             still_missing=still_missing or "",
+            # On the meta's microsecond grid, the end from the rounded start,
+            # so that hold_end - hold_start is the duration to the microsecond.
+            hold_start=round(t0, 6),
+            hold_end=round(round(t0, 6) + duration, 6),
         )
         # Read the glove file back rather than counting frames: `glove_frames`
         # cannot tell a steady stream from one that stopped for three seconds
@@ -1482,6 +1491,10 @@ class CoachedLeapSession(LeapSyncSession):
             "still_missing_reason": (None if still
                                      else got.still_missing or STILL_UNKNOWN),
             "file": file,
+            # The REC hold as commanded (`Attempt.hold_start`), None when the
+            # attempt never reached it: what a comparison's window ends on.
+            "hold_start": got.hold_start,
+            "hold_end": got.hold_end,
             # The tracking hints the camera was asked for (--hint), whether
             # the service confirmed them and its Hyperion flag as read, as
             # they stood when the attempt was judged; then --note as typed.

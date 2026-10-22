@@ -195,3 +195,29 @@ def test_hint_and_note_are_refused_where_they_would_be_lost(argv, said, tmp_path
     else:
         assert e.value.code == said
     assert not out.exists(), "refused before anything was recorded"
+
+
+def test_every_meta_carries_the_commanded_hold(tmp_path, monkeypatch):
+    """`hold_start` / `hold_end`: the REC hold as commanded (its start plus
+    --duration), which scripts/pilot_compare.py ends its window on; written
+    for a kept and a refused attempt alike."""
+    sync = load_sync()
+    session = posed_session(sync, tmp_path, monkeypatch, leap_pose="fist",
+                            glove_curl=1.0, retries=0)
+    session.run_take("fist", 1, 1, 1, 2, duration=0.6, prep=0)        # kept
+    session.run_take("open_palm", 1, 1, 2, 2, duration=0.6, prep=0)   # refused
+    session.finish()
+
+    out = tmp_path / "sync"
+    (path,) = sorted((out / "leap").glob("*.meta.json"))
+    meta = read(path)
+    assert meta["accepted"] is True
+    assert meta["hold_end"] - meta["hold_start"] == pytest.approx(0.6,
+                                                                  abs=1e-6)
+    first = json.loads((out / "leap" / meta["file"]).read_text(
+        encoding="utf-8").splitlines()[0])
+    assert abs(meta["hold_start"] - first["wall_time"]) < 0.5
+    (path,) = sorted((out / "rejected" / "leap").glob("*.meta.json"))
+    refused = read(path)
+    assert refused["accepted"] is False
+    assert "hold_start" in refused and "hold_end" in refused

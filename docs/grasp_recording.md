@@ -374,12 +374,21 @@ it: `record_poses.py` without `--protocol`, and `record_simultaneous.py`
 with the webcam or with `--hand both`, neither of which writes a meta file.
 The same goes for `--note` in `record_simultaneous.py`.
 
-Not checked yet: that the service accepts the hint from these recorders
-with the Stereo IR 170 attached. The first camera run with `--hint`, on
-2026-10-17, stopped at the connection-wide mode check, which timed out;
-the per-device check that replaced it has not run on the camera yet. The
-tests run the whole sequence against fake LeapC objects. The next camera
-run with `--hint` is the check: `hints_confirmed` true in its meta.
+Checked on the camera: the first camera run with `--hint`, on 2026-10-17,
+stopped at the connection-wide mode check, which timed out; with the
+per-device check that replaced it, the dry run of 2026-10-19 (Stereo IR
+170, desktop mode, `--mock-glove`) was accepted with `hints_confirmed`
+true and `license_hyperion` true in its meta
+(`recordings\pilot_hoo\dry_run\leap\`). The tests run the whole sequence
+against fake LeapC objects.
+
+Since 2026-10-21 `record_simultaneous.py` also writes the commanded hold
+into every `<take>.meta.json`, kept or rejected: `hold_start`, the
+`time.time()` at which the REC recorders started, and `hold_end`,
+`hold_start` plus `--duration`. They are null for an attempt that ended
+during the settle. The pilot's comparison (`scripts/pilot_compare.py`)
+cuts its window to end at `hold_end`, so a sensor that stopped early shows
+up as missing coverage rather than as a shorter window.
 
 ## Steps
 
