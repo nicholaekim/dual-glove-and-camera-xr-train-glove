@@ -113,8 +113,32 @@ Open the take's `.meta.json` in `recordings\pilot_hoo\dry_run\leap\`: `tracking_
 `["hand_on_object"]`, `hints_confirmed` true, `license_hyperion` true. If not, stop and fix before recording.
 
 **Step 2b. No sensors (a ruler and a kitchen scale).** Choose the three objects, measure each (diameter, length,
-mass) and write `recordings\pilot_hoo\objects.txt`: one line per object, identifier, what it is, dimensions, mass.
-These three objects are the only ones used for the rest of the pilot.
+mass) and write `recordings\pilot_hoo\objects.txt`: one line per object, five fields separated by `|`, identifier,
+what it is, diameter in mm, length in mm, mass in g (or the words `not measured`); `#` lines are comments:
+
+    OBJ-CYL | <what it is> | <diameter_mm> | <length_mm> | <mass_g>
+    OBJ-BALL | tennis ball | <diameter_mm> | <diameter_mm> | <mass_g>
+    OBJ-PEN | <what it is> | <diameter_mm> | <length_mm> | <mass_g>
+
+The object runs (steps 5 to 7) refuse to start until this file exists with all three lines. These three objects are
+the only ones used for the rest of the pilot.
+
+From step 3 on, every step is one Desktop launcher (copies in `launchers\pilot\`), each running
+`scripts\pilot_run.py <run>`. It runs the command printed under the step, but one grasp at a time
+(`--poses <grasp>`), so that the object for the grasp is announced before its takes (`USE OBJ-CYL: <its line>`)
+and written into every take's `--note`. Before anything is recorded it checks, and prints every unmet check:
+the glove setup, ONE for the whole pilot (`recordings\pilot_hoo\glove_setup.txt`, written once in step 3; a
+different setup later is refused); for the object runs, `recordings\pilot_hoo\objects.txt`, which is frozen when
+B1 starts (`objects.lock`: a changed file refuses C and B2); and the order. A run is COMPLETE when every grasp has
+its expected takes (A 5, B1 3, C 5, B2 2, A-check 1 per grasp); a run has STARTED once its folder holds any
+attempt, kept or rejected, or its label is in `runs_started.txt`. A run may start only when the previous run is
+complete and no later run has started; a run that is short of takes is topped up for the missing takes only, with
+the numbering continued (`--first-take`); a complete run is refused, so no take beyond the protocol is added. The
+grasps of a run are recorded in order, and if one ends short (the recorder was quit with q, or lost takes), the
+launcher stops there instead of moving to the next grasp. If the recorder itself prints a "redo" command at the end
+of a run, do not type it (it has no `--first-take`): double-click the same step's launcher again, which records only
+what is missing. In the commands below `<glove setup>` is `left glove only` or `both gloves connected`, as written in step 3; the
+launcher fills it in. Nothing is hidden: the printed commands are the ones that run.
 
 **Step 3. Gloves on + camera.** Put the gloves on as the vendor advised (sleeve gussets to the webbing, wiggle and bend
 for a few seconds, then calibrate in XR Trainer; a closed hand in the calibration is closed, not squeezed). Right hand
@@ -122,18 +146,24 @@ rests on the table for the whole pilot, outside the camera's view. Connect the L
 a single glove; an unused second glove adds nothing and the glove stream's timing has varied between sessions. If
 the software insists on both, connect both for every one of the five runs, never a mix, and say so in every
 `--note` ("both gloves connected"). XR Trainer streaming to port 9002, no other glove client running. Place the
-three measured objects within reach, and the paper's three pictures on screen.
+three measured objects within reach, and the paper's three pictures on screen. Then double-click
+`pilot_step3_gloves_left_only.cmd` (or `pilot_step3_gloves_both.cmd` if the software insisted on both): it writes the
+glove setup once (`pilot_run.py A --gloves left --print`) and shows the step 4 command without recording.
 
 **Step 4. Gloves on + camera.** Condition A, mimed, 15 takes:
 
-    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 5 --out-dir recordings\pilot_hoo\A_mimed --note "condition A mimed, no object"
+    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 5 --out-dir recordings\pilot_hoo\A_mimed --note "condition A mimed, no object; <glove setup>"
+
+Launcher: `pilot_step4_A_mimed.cmd` (`pilot_run.py A`).
 
 Each take is the coached protocol: open hand steady over the module, beep, form the grasp in the air, hold still for
 the 5 s, open. Nothing in the hand.
 
 **Step 5. Gloves on + camera.** Condition B1, object, 9 takes (3 per grasp):
 
-    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 3 --out-dir recordings\pilot_hoo\B1_object --note "condition B1 object: OBJ-CYL, OBJ-BALL, OBJ-PEN as in objects.txt; <left glove only | both gloves connected>"
+    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 3 --out-dir recordings\pilot_hoo\B1_object --note "condition B1 object: OBJ-CYL, OBJ-BALL, OBJ-PEN as in objects.txt; <glove setup>"
+
+Launcher: `pilot_step5_B1_object.cmd` (`pilot_run.py B1`).
 
 Pick the object up with the right hand and place it into the open left hand after the tracker has acquired the open
 hand, then close on it at the beep and hold. Put it down between takes, keeping the right hand out of the camera's
@@ -141,15 +171,21 @@ view. The objects are the three of objects.txt and no others.
 
 **Step 6. Gloves on + camera.** Condition C, object with the hint, 15 takes, the same way as step 5:
 
-    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 5 --hint hand_on_object --out-dir recordings\pilot_hoo\C_object_hint --note "condition C object with hand_on_object: OBJ-CYL, OBJ-BALL, OBJ-PEN as in objects.txt; <glove setup as before>"
+    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 5 --hint hand_on_object --out-dir recordings\pilot_hoo\C_object_hint --note "condition C object with hand_on_object: OBJ-CYL, OBJ-BALL, OBJ-PEN as in objects.txt; <glove setup>"
+
+Launcher: `pilot_step6_C_object_hint.cmd` (`pilot_run.py C`).
 
 **Step 7. Gloves on + camera.** Condition B2, object, 6 takes (2 per grasp), the same way as step 5:
 
-    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 2 --out-dir recordings\pilot_hoo\B2_object --note "condition B2 object after C: OBJ-CYL, OBJ-BALL, OBJ-PEN as in objects.txt; <glove setup as before>"
+    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 2 --out-dir recordings\pilot_hoo\B2_object --note "condition B2 object after C: OBJ-CYL, OBJ-BALL, OBJ-PEN as in objects.txt; <glove setup>"
+
+Launcher: `pilot_step7_B2_object.cmd` (`pilot_run.py B2`).
 
 **Step 8. Gloves on + camera.** Drift check, condition A again, 1 take per grasp:
 
-    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 1 --out-dir recordings\pilot_hoo\A_mimed_again --note "condition A repeated at the end, drift check"
+    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 1 --out-dir recordings\pilot_hoo\A_mimed_again --note "condition A repeated at the end, drift check; <glove setup>"
+
+Launcher: `pilot_step8_A_mimed_again.cmd` (`pilot_run.py A2`).
 
 Take the gloves off. The hardware part is over.
 
@@ -159,6 +195,13 @@ gate P4), so it cannot have been tuned to the result. Its behaviour is pinned by
 synthetic takes in the recorder's own file layout. Run it once, from the repo root:
 
     .venv\Scripts\python.exe scripts\pilot_compare.py --root recordings\pilot_hoo
+
+Launcher: `pilot_step9_compare.cmd` (`pilot_run.py compare`; no hardware). The launcher refuses to run the
+comparison while A-check is incomplete, so a half-collected pilot cannot produce what looks like the final report
+by accident; a pilot that cannot be finished is closed on purpose with `pilot_run.py close --reason "<why>"`,
+which writes `pilot_closed.txt` (time, per-run counts, reason) and then lets the comparison run with its missing
+rows showing. The script itself, `pilot_compare.py --root recordings\pilot_hoo`, stays usable at any time for a
+look at partial data.
 
 It reads the five run folders by name (`A_mimed`, `B1_object`, `C_object_hint`, `B2_object`, `A_mimed_again`), every
 accepted take's `.meta.json`, camera file and glove file, and writes three files into `recordings\pilot_hoo\comparison`:

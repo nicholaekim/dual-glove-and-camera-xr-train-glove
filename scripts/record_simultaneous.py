@@ -1608,6 +1608,9 @@ def main() -> None:
         description="Guided pose session recording glove and camera together.")
     p.add_argument("--poses", default=",".join(DEFAULT_POSES))
     p.add_argument("--takes", type=int, default=3)
+    p.add_argument("--first-take", type=int, default=1,
+                   help="number of the first take (default 1); a top-up of a "
+                        "folder that already holds takes 1..N gives N+1")
     p.add_argument("--duration", type=float, default=5.0)
     p.add_argument("--prep", type=float, default=5.0)
     p.add_argument("--hz", type=float, default=None,
@@ -1687,6 +1690,8 @@ def main() -> None:
     poses = [slugify(x) for x in args.poses.split(",") if slugify(x)]
     if not poses:
         raise SystemExit("no poses given")
+    if args.first_take < 1:
+        raise SystemExit("--first-take must be 1 or more")
 
     backend = str(args.camera).strip().lower()
     if backend != LEAP:
@@ -1842,8 +1847,9 @@ def main() -> None:
         try:
             session.wait_for_both()
             for i, pose in enumerate(poses, 1):
-                for take in range(1, args.takes + 1):
-                    session.run_take(pose, take, args.takes, i, len(poses),
+                last = args.first_take + args.takes - 1    # "take 4/5"
+                for take in range(args.first_take, last + 1):
+                    session.run_take(pose, take, last, i, len(poses),
                                      args.duration, args.prep)
         except (KeyboardInterrupt, QuitSession):
             session.finish()

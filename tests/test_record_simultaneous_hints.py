@@ -221,3 +221,22 @@ def test_every_meta_carries_the_commanded_hold(tmp_path, monkeypatch):
     refused = read(path)
     assert refused["accepted"] is False
     assert "hold_start" in refused and "hold_end" in refused
+
+
+def test_first_take_numbers_the_takes_from_n(tmp_path, monkeypatch):
+    """`--first-take 3`: a top-up of a run that already holds takes 1 and 2
+    (scripts/pilot_run.py) is numbered on from 3, file and meta alike."""
+    sync = load_sync()
+    monkeypatch.setattr(sync, "beep", lambda *a, **k: None)
+    out = tmp_path / "sync"
+    run_main(sync, monkeypatch, "--camera", "leap", "--hand", "left",
+             "--mock-glove", "--mock-leap", "--poses", "fist",
+             "--takes", "1", "--first-take", "3", "--duration", "0.5",
+             "--settle", "0", "--prep", "0", "--retries", "6",
+             "--out-dir", out)
+    (path,) = sorted((out / "leap").glob("*.meta.json"))
+    meta = read(path)
+    assert meta["accepted"] is True and meta["take"] == 3
+    assert "_take3_" in path.name and "_take3_" in meta["file"]
+    for aside in (out / "rejected" / "leap").glob("*.meta.json"):
+        assert read(aside)["take"] == 3, aside.name

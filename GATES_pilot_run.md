@@ -1,0 +1,33 @@
+# Gates: one command per pilot step (scripts/pilot_run.py and its launchers)
+
+OWNS: scripts/pilot_run.py, tests/test_pilot_run.py, launchers/pilot/*.cmd, docs/pilot_hand_on_object.md, scripts/record_simultaneous.py (--first-take only), tests/test_record_simultaneous_hints.py
+
+Scope: `scripts/pilot_run.py <A|B1|C|B2|A2|compare|close>` builds and runs the exact recorder command of docs/pilot_hand_on_object.md for that run, one grasp at a time (poses, takes, hint, out-dir, note naming the grasp's object and the glove setup), refuses to start an object run without a valid `recordings\pilot_hoo\objects.txt`, keeps one glove setup per pilot (`glove_setup.txt`, written by `--gloves left|both` once), tops up only the takes a grasp is short of (`--first-take`) and refuses a complete run, requires the predecessor complete and no later run started (`runs_started.txt`; rejected attempts count), freezes objects.txt when B1 starts (`objects.lock`), gates the comparison on A2 complete or an explicit `close --reason`, prints the step's hardware setup and handling before recording; one Desktop launcher per step double-clicks it.
+
+- [x] R1: the per-grasp commands for every run, the top-up and complete-run rules, the objects.txt rules and lock, the glove-setup file, the started/complete order guards, --print, close and the compare gate are pinned by tests (the recorder is never started in a test)
+  CHECK: .venv\Scripts\python.exe -m pytest tests/test_pilot_run.py -q
+  EXPECT: / passed/
+  EVIDENCE: automatic-evidence=v1; definition-sha256=2873a2d500f999771141b4427e7c9acc970d7772314e4d5937e6c886d2a7587d; exit=0; EXPECT=matched; output-sha256=62d06ef035f391a8cf4c8a9341bd8a294d000a54553335884256f776417bfa44; output-bytes=101; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+
+- [x] R2: on the real pilot folder, `A --print` shows the protocol's step 4 command for the first grasp exactly (glove setup read from the file written for this check, then removed; --print writes no marker)
+  CHECK: .venv\Scripts\python.exe -c "from pathlib import Path; import subprocess, sys; p = Path(r'recordings\pilot_hoo\glove_setup.txt'); p.write_text('left\n'); r = subprocess.run([sys.executable, r'scripts\pilot_run.py', 'A', '--print'], capture_output=True, text=True); p.unlink(); print(r.stdout); sys.exit(r.returncode)"
+  EXPECT: /scripts\\record_simultaneous\.py --camera leap --hand left --poses cylindrical_object --takes 5 --first-take 1 --out-dir recordings\\pilot_hoo\\A_mimed --note "condition A mimed, no object; grasp cylindrical_object, nothing in the hand; left glove only"/
+  EVIDENCE: automatic-evidence=v1; definition-sha256=b90723b81964f6f3dbcf686cbfc4552e69a6f3410435be677f684db57651c942; exit=0; EXPECT=matched; output-sha256=e909ed454cc2c88d065eca375d73a4d1c63afa89fa1fa52e7f011eb04f0c3cfb; output-bytes=810; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+
+- [x] R3: on the real pilot folder, an object run refuses to start (exit code 2) while objects.txt is missing, and names the missing file
+  CHECK: .venv\Scripts\python.exe -c "import subprocess, sys; r = subprocess.run([sys.executable, r'scripts\pilot_run.py', 'B1', '--print'], capture_output=True, text=True); print(r.stdout); sys.exit(0 if r.returncode == 2 else 1)"
+  EXPECT: /no recordings\\pilot_hoo\\objects\.txt yet/
+  EVIDENCE: automatic-evidence=v1; definition-sha256=306b51eb7c861c2a042aea8500604952b243a9670629f54cbd547b5eaf3d99b5; exit=0; EXPECT=matched; output-sha256=b90679ef70ee25c65aae5c7625349526739897e95f1efc31c71c51071fd4c98a; output-bytes=492; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+
+- [x] R4: the whole test suite still passes
+  CHECK: .venv\Scripts\python.exe -m pytest tests -q -x
+  EXPECT: / passed/
+  EVIDENCE: automatic-evidence=v1; definition-sha256=82d9daa730e6f68dcc71f03b8a43c11ff501ce9ad583b6a269b29ac693626b8b; exit=0; EXPECT=matched; output-sha256=28d7c242ee273c8700780349337b05ef1d641c2c3a854bf24bcfba23a0b51975; output-bytes=1412; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+
+- [x] R6: the recorder numbers takes from --first-take, so a top-up continues a grasp's numbering instead of writing a second take 1
+  CHECK: .venv\Scripts\python.exe -m pytest tests/test_record_simultaneous_hints.py -q -k first_take
+  EXPECT: / passed/
+  EVIDENCE: automatic-evidence=v1; definition-sha256=d0407dcbcc42bbbd0f4f8a030213f51b16e63c9ac6d9e8a1e380e08ec73f3a95; exit=0; EXPECT=matched; output-sha256=7393687b26ffad89b35b1805c66f0067b7529a7b1dfc4a280efffa1922570f87; output-bytes=114; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+
+- [x] R5: docs/pilot_hand_on_object.md gives, for steps 3 to 9, the launcher to double-click and the command it runs, the run states (complete, started, top-up, objects lock, close) and the objects.txt line format; the launchers are on the Desktop; the step and the review's four corrections were verified in the ChatGPT thread
+  EVIDENCE: 2026-10-22. docs/pilot_hand_on_object.md: step 2b shows the objects.txt line format and that object runs refuse without it; the paragraph before step 3 states the per-grasp recording with the object announced and written into the note, the glove setup file, the objects lock at B1, complete/started run states, the top-up with --first-take, the refusal of a complete run, the stop when a grasp ends short, and to ignore the recorder's own redo command; step 3 names pilot_step3_gloves_left_only.cmd / pilot_step3_gloves_both.cmd; steps 4 to 8 each name their launcher under the command (pilot_step4_A_mimed, pilot_step5_B1_object, pilot_step6_C_object_hint, pilot_step7_B2_object, pilot_step8_A_mimed_again); step 9 names pilot_step9_compare.cmd and the compare gate with close --reason. docs/grasp_recording.md documents --first-take. The eight .cmd files are in launchers/pilot/ and copied to C:\Users\nkim2\OneDrive\Desktop (8 of 8 present). ChatGPT thread 'Open source hand object models' (conversation 6ad8dcfe): round 1 four corrections (completion rule and duplicate takes on re-run; rejected-only later runs count as started; freeze objects.txt and label the object per grasp; gate compare on A2 complete or an explicit close; glove setup as the written word accepted); round 2 one point (stop when a grasp ends short); round 3 verdict: VERIFIED.

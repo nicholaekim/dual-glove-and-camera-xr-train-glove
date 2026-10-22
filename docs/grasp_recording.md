@@ -388,7 +388,10 @@ into every `<take>.meta.json`, kept or rejected: `hold_start`, the
 `hold_start` plus `--duration`. They are null for an attempt that ended
 during the settle. The pilot's comparison (`scripts/pilot_compare.py`)
 cuts its window to end at `hold_end`, so a sensor that stopped early shows
-up as missing coverage rather than as a shorter window.
+up as missing coverage rather than as a shorter window. `--first-take N`
+(default 1) numbers the takes of an invocation from N, so a top-up of a
+grasp that is short of takes continues its numbering instead of writing a
+second take 1; `scripts/pilot_run.py` uses it for the pilot.
 
 ## Steps
 
