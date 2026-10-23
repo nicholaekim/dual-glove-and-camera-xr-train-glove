@@ -264,6 +264,24 @@ The same classifier (`leap_hand.tracking_quality`) drives the camera
 window's `tracking:` line and names the losses in the grasp recorder's
 reject reasons and in each take's `gate.losses`.
 
+**Replay a recorded take and check it against itself (no hardware).**
+`scripts\leap\replay_view.py` plays every selected-hand frame of a take from
+the organized grasp dataset on the camera's own clock, with the tracking
+gaps, hand-id changes and dropped frames marked on the timeline, exact
+source-frame stepping, optional interpolation that never crosses a declared
+discontinuity, the recorded `abs26` positions overlaid on the reconstructed
+skeleton with the residual in the HUD, joint axes, a camera / wrist / palm
+reference frame, and a separate Paper 3 panel (Cobos et al. 2009
+relationships with page citations, no pass/fail). `scripts\leap\replay_verify.py`
+runs the same reconstruction over all 115 static takes and 52 transitions
+and writes the numbers to `results\replay_fidelity\`. Method, tolerances and
+measured errors: `docs/replay_fidelity.md`; plan: `docs/replay_plan.md`;
+handoff for the independent review: `docs/replay_handoff_codex.md`.
+
+```powershell
+.venv\Scripts\python.exe scripts\leap\replay_view.py --dataset "..\xr trainer\grasp set 2026-10-08 organized" --grasp p3_circular_power --take 1
+```
+
 Full plan, phases and acceptance: `docs/ultraleap_ir170_plan.md`. This section
 is the operating procedure.
 
