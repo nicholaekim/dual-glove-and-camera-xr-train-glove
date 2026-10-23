@@ -393,6 +393,17 @@ up as missing coverage rather than as a shorter window. `--first-take N`
 grasp that is short of takes continues its numbering instead of writing a
 second take 1; `scripts/pilot_run.py` uses it for the pilot.
 
+`--keep-all-tracking` (coached leap sessions; since the pilot amendment of
+2026-10-23) keeps every attempt whose hold ran: the open-hand acquisition and
+the settle stay strict, but during the hold a camera loss, a re-acquisition
+or wrong-chirality frames are logged, not used to reject, and the hold runs
+its full duration. It exists for the pilot's object runs, where a hand
+hidden by the object is the measurement, not a bad take. Every meta now
+records `acceptance_policy` ("strict" or "object_keep_all_tracking"),
+`protocol_amendment_date`, `hold_completed`, `cam_tracked_fraction` over
+the commanded hold, `cam_max_gap_ms`, `cam_gaps_over_100ms`,
+`cam_reacquisitions` and `tracking_note`.
+
 ## Steps
 
 ### Step 1. No hardware: open PowerShell in the repo folder

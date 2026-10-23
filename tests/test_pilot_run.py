@@ -161,6 +161,8 @@ def expected_argv(root, run, grasp, takes, first):
     argv = [sys.executable, "scripts\\record_simultaneous.py",
             "--camera", "leap", "--hand", "left", "--poses", grasp,
             "--takes", str(takes), "--first-take", str(first)]
+    if run in OBJECT_RUNS:                 # the amendment of 2026-10-23
+        argv += ["--keep-all-tracking"]
     if run == "C":
         argv += ["--hint", "hand_on_object"]
     return argv + ["--out-dir", str(Path(root) / FOLDER[run]),
@@ -171,6 +173,7 @@ def shell_line(root, run, grasp, takes, first):
     return (".venv\\Scripts\\python.exe scripts\\record_simultaneous.py "
             f"--camera leap --hand left --poses {grasp} --takes {takes} "
             f"--first-take {first}"
+            + (" --keep-all-tracking" if run in OBJECT_RUNS else "")
             + (" --hint hand_on_object" if run == "C" else "")
             + f" --out-dir {Path(root) / FOLDER[run]}"
             + f' --note "{note_of(run, grasp)}"')
@@ -250,7 +253,12 @@ def test_every_command_is_the_protocols_step(pr, calls, capsys, tmp_path,
     assert doc_poses == ",".join(GRASPS)
     got = [options(ln) for ln in lines]
     assert [g[1] for g in got] == list(GRASPS)
+    flag = "--keep-all-tracking"           # the object runs, from 2026-10-23
     for (opts, _, note), grasp in zip(got, GRASPS):
+        assert (flag in opts) == (run in OBJECT_RUNS)
+        # the protocol document may not show the amendment's flag yet
+        if flag not in doc_options:
+            opts = [w for w in opts if w != flag]
         assert opts == doc_options
         assert note.startswith(doc_note.split(";")[0] + f"; grasp {grasp}")
         assert note.endswith("; left glove only")
@@ -274,6 +282,7 @@ def test_default_root_lines_exactly(pr, calls, capsys, tmp_path, monkeypatch):
     assert capsys.readouterr().out.splitlines()[2] == (
         r".venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap"
         r" --hand left --poses tip_object --takes 5 --first-take 1"
+        r" --keep-all-tracking"
         r" --hint hand_on_object --out-dir recordings\pilot_hoo\C_object_hint"
         r' --note "condition C object with hand_on_object: OBJ-CYL, OBJ-BALL,'
         r" OBJ-PEN as in objects.txt; grasp tip_object with OBJ-PEN | blue"

@@ -20,9 +20,7 @@ Scope: `scripts/pilot_compare.py` reads the five run folders `record_simultaneou
   EVIDENCE: automatic-evidence=v1; definition-sha256=82d9daa730e6f68dcc71f03b8a43c11ff501ce9ad583b6a269b29ac693626b8b; exit=0; EXPECT=matched; output-sha256=e123c025342d2b65a5e3f720f5cd99ddd7cff77e6aa52b9a9f063d5ce5d2e643; output-bytes=1331; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
 
 - [x] P4: the script is pre-registered: at the time it was written, the pilot folder held nothing but the 19 October dry run (no condition data)
-  CHECK: .venv\Scripts\python.exe -c "import os; print(sorted(d for d in os.listdir(r'recordings\pilot_hoo') if not d.endswith('_comparison')))"
-  EXPECT: /^\['dry_run'\]/
-  EVIDENCE: automatic-evidence=v1; definition-sha256=2ea2fff04e52cbbe92db25e6f90761db97761ea7795f90d9298f23fef7e7b209; exit=0; EXPECT=matched; output-sha256=37384826d49693b0ccdf67af15a55f07bc609def18c5491f0dc892683bf21c3b; output-bytes=13; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+  EVIDENCE: a point-in-time fact, so it is not re-run once data exists. Recorded on 2026-10-21 by the listing check `os.listdir(r'recordings\pilot_hoo')` (excluding *_comparison), which printed ['dry_run'] (automatic evidence of that day: definition-sha256 2ea2fff0..., output-sha256 37384826..., exit 0). The script, its tests and the protocol's definitions were committed as 07bfe1a on 2026-10-21 23:13 -0400 and the launcher step as 0d8b31e on 2026-10-22 00:23 -0400; the first pilot take was recorded on 2026-10-23 at 08:59 -0400 (recordings\pilot_hoo\runs_started.txt, A_mimed metas). The attempt-count rows added on 2026-10-23 during run B1 read the recorder's rejected attempts and change no definition of the pre-registered quantities.
 
 - [x] P6: the recorder writes the commanded hold (hold_start, hold_end) into every take's meta, kept or rejected
   CHECK: .venv\Scripts\python.exe -m pytest tests/test_record_simultaneous_hints.py -q -k hold

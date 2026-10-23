@@ -8,9 +8,11 @@
 
 A run records its three grasps one at a time, each with its exact
 scripts/record_simultaneous.py command: one grasp (--poses), only the takes
-it still lacks (--takes), numbered on from the kept ones (--first-take), the
-hint, the out-dir, and a --note naming the grasp's object and the glove
-setup. So no command is ever edited by hand, and a run that was cut short is
+it still lacks (--takes), numbered on from the kept ones (--first-take),
+--keep-all-tracking for the object runs B1, C and B2 (the amendment of
+2026-10-23: every attempt whose hold ran is kept, the camera's losses logged
+in its meta), the hint, the out-dir, and a --note naming the grasp's object
+and the glove setup. So no command is ever edited by hand, and a run that was cut short is
 topped up by running the same step again.
 
 Before anything is recorded it checks, in this order: the glove setup, one
@@ -380,6 +382,10 @@ def main(argv=None) -> int:
         cmd = [sys.executable, r"scripts\record_simultaneous.py",
                "--camera", "leap", "--hand", "left", "--poses", grasp,
                "--takes", str(missing), "--first-take", str(first)]
+        if a.run in OBJECT_RUNS:
+            # protocol amendment 2026-10-23: with an object in the hand the
+            # camera's losses are the result, so every completed hold is kept
+            cmd += ["--keep-all-tracking"]
         if hint:
             cmd += ["--hint", hint]
         cmd += ["--out-dir", str(root / folder),

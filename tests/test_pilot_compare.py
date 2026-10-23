@@ -34,7 +34,9 @@ FOLDER = {"A": "A_mimed", "B1": "B1_object", "C": "C_object_hint",
 TOL = 0.05
 TAKE_COLUMNS = (
     ["run", "condition", "grasp", "take", "file", "hand", "note",
-     "hints_confirmed", "status", "clock", "window_start", "window_end",
+     "hints_confirmed", "acceptance_policy", "hold_completed",
+     "cam_tracked_fraction", "cam_reacquisitions", "tracking_note",
+     "status", "clock", "window_start", "window_end",
      "window_end_source", "n_cam_frames_window", "n_glove_frames_window",
      "n_pairs", "n_cam_unpaired", "cam_coverage", "cam_max_gap_ms",
      "cam_gaps_over_100ms", "glove_coverage", "glove_max_gap_ms",
@@ -113,6 +115,20 @@ def make_take(run_dir, pose="cylindrical_object", take=1, hand="left",
     (run_dir / "leap" / f"{stem}.meta.json").write_text(
         json.dumps(meta, indent=2), encoding="utf-8")
     return stem
+
+
+def rejected_meta(run_dir, pose, take, attempt, why, coverage, hand="left"):
+    """A refused attempt's meta where the recorder moves it:
+    <run>/rejected/leap/<stem>_attempt<N>.meta.json, accepted false."""
+    stem = f"{pose}_{hand}_take{take}_20261021_120000_attempt{attempt}"
+    folder = Path(run_dir) / "rejected" / "leap"
+    folder.mkdir(parents=True, exist_ok=True)
+    meta = {"accepted": False, "hand": hand, "pose": pose, "take": take,
+            "coverage": coverage, "why": why, "file": f"{stem}.jsonl",
+            "tracking_hints": [], "hints_confirmed": False,
+            "license_hyperion": None, "note": "synthetic attempt"}
+    (folder / f"{stem}.meta.json").write_text(json.dumps(meta, indent=2),
+                                              encoding="utf-8")
 
 
 def read_rows(path):
@@ -520,6 +536,132 @@ def test_a_protocol_grasp_with_no_takes_still_has_its_rows_and_block(
     assert missing.split()[-6:] == ["5", "3", "5", "2", "1", "5"]
 
 
+def test_rejected_attempts_are_counted_by_reason_beside_the_kept_takes(
+        tmp_path):
+    """In the object conditions the camera losing the hand shows as refused
+    attempts under rejected/leap/, not as low coverage in the kept takes."""
+    root = tmp_path / "pilot"
+    run_a = root / FOLDER["A"]
+    for take in (1, 2):
+        make_take(run_a, "cylindrical_object", take, length=0.7)
+    for n, (why, cov) in enumerate([
+            ("the left hand was lost for 0.5 s during the take", 0.0),
+            ("the tracker let go and re-acquired the hand (id 26 -> 27) "
+             "during the take", 0.95),
+            ("the left hand covered only 73 % of the take (need 90 %)", 0.73),
+    ], start=1):
+        rejected_meta(run_a, "cylindrical_object", 3, n, why, cov)
+    make_take(run_a, "spherical_object", 1, length=0.7)
+    rejected_meta(run_a, "spherical_object", 2, 1,
+                  "both sensors saw a FIST, expected OPEN PALM", 1.0)
+    for take in (1, 2):                              # no rejected folder
+        make_take(root / FOLDER["B1"], "cylindrical_object", take, length=0.7)
+    out = tmp_path / "out"
+    assert load_compare().main(["--root", str(root), "--out", str(out),
+                                "--window", "0.5"]) == 0
+    rows = {(r["level"], r["run"], r["grasp"]): r
+            for r in read_rows(out / "summary.csv")}
+
+    def counts(r):
+        return tuple(int(r[k]) for k in (
+            "n_attempts", "n_rejected", "n_rejected_hand_lost",
+            "n_rejected_reacquired", "n_rejected_low_coverage",
+            "n_rejected_other"))
+
+    a = rows[("run_grasp", "A", "cylindrical_object")]
+    assert counts(a) == (5, 3, 1, 1, 1, 0)
+    assert a["n_valid_takes"] == "2"                 # attempts are not takes
+    assert num(a, "attempt_coverage_median") == 0.95  # 1, 1, 0, 0.95, 0.73
+    assert num(a, "attempt_coverage_min") == 0.0
+    assert counts(rows[("run_grasp", "A", "spherical_object")]) == (
+        2, 1, 0, 0, 0, 1)
+    b1 = rows[("run_grasp", "B1", "cylindrical_object")]
+    assert counts(b1) == (2, 0, 0, 0, 0, 0)
+    assert num(b1, "attempt_coverage_median") == num(
+        b1, "attempt_coverage_min") == 1.0
+    assert counts(rows[("run_grasp_pooledB", "B", "cylindrical_object")]) == (
+        2, 0, 0, 0, 0, 0)
+    assert counts(rows[("run_all", "A", "all")]) == (7, 4, 1, 1, 1, 1)
+    tip = rows[("run_grasp", "A", "tip_object")]
+    assert counts(tip) == (0, 0, 0, 0, 0, 0)
+    assert tip["attempt_coverage_median"] == tip["attempt_coverage_min"] == ""
+
+    report = (out / "report.txt").read_text(encoding="ascii")
+    assert ("attempts: every attempt the recorder made, kept or rejected "
+            "(rejected/leap), with the recorder's own coverage of each"
+            in report.splitlines())
+    lines = report.splitlines()
+    block = lines[lines.index("== cylindrical_object =="):
+                  lines.index("== spherical_object ==")]
+
+    def cells(label):
+        (line,) = [s for s in block if s.startswith(label)]
+        return line.split()[-6:]                     # A B1 C B2 A2 B(pooled)
+
+    assert cells("attempts (kept + rejected)") == ["5", "2", "0", "0", "0",
+                                                   "2"]
+    assert cells("rejected: hand lost") == ["1", "0", "0", "0", "0", "0"]
+    assert cells("rejected: re-acquired") == ["1", "0", "0", "0", "0", "0"]
+    assert cells("rejected: low coverage") == ["1", "0", "0", "0", "0", "0"]
+    assert cells("rejected: other") == ["0", "0", "0", "0", "0", "0"]
+    assert cells("coverage over all attempts median") == [
+        "0.95", "1.00", "-", "-", "-", "1.00"]
+    assert cells("coverage over all attempts min") == [
+        "0.00", "1.00", "-", "-", "-", "1.00"]
+    takes_missing = next(i for i, s in enumerate(block)
+                         if s.startswith("takes missing"))
+    assert block[takes_missing + 1].startswith("attempts (kept + rejected)")
+
+
+def test_a_run_whose_every_attempt_was_rejected_is_not_called_absent(
+        tmp_path, capsys):
+    """The object run the camera lost every time is recorded, not absent."""
+    root = tmp_path / "pilot"
+    make_take(root / FOLDER["A"], length=0.7)
+    for n in (1, 2):
+        rejected_meta(root / FOLDER["B1"], "cylindrical_object", 1, n,
+                      "the left hand was lost for 0.5 s during the take", 0.1)
+    out = tmp_path / "out"
+    assert load_compare().main(["--root", str(root), "--out", str(out),
+                                "--window", "0.5"]) == 0
+    said = "B1 (B1_object): 0 takes kept (2 attempts, all rejected)"
+    text = capsys.readouterr().out
+    assert f"run {said}" in text.splitlines()
+    assert "run C (C_object_hint): absent" in text.splitlines()
+    report = (out / "report.txt").read_text(encoding="ascii").splitlines()
+    assert said in report
+    assert "C (C_object_hint): absent" in report
+    rows = {(r["level"], r["run"], r["grasp"]): r
+            for r in read_rows(out / "summary.csv")}
+    for key in (("run_grasp", "B1", "cylindrical_object"),
+                ("run_all", "B1", "all")):
+        r = rows[key]
+        assert (r["n_valid_takes"], r["n_attempts"], r["n_rejected"]) == (
+            "0", "2", "2"), key
+
+
+def test_attempts_alone_are_still_written_out(tmp_path, capsys):
+    """No take kept anywhere, but attempts were made: the counts are the
+    result, so the three files are written; the return is 1 (nothing
+    compared)."""
+    root = tmp_path / "pilot"
+    for n in (1, 2):
+        rejected_meta(root / FOLDER["B1"], "cylindrical_object", 1, n,
+                      "the left hand was lost for 0.5 s during the take", 0.1)
+    out = tmp_path / "out"
+    assert load_compare().main(["--root", str(root), "--out", str(out)]) == 1
+    assert capsys.readouterr().out.splitlines()[-1].startswith(
+        "compared 0 of 0 takes; wrote ")
+    assert read_rows(out / "takes.csv") == []
+    rows = {(r["level"], r["run"], r["grasp"]): r
+            for r in read_rows(out / "summary.csv")}
+    b1 = rows[("run_grasp", "B1", "cylindrical_object")]
+    assert (b1["n_attempts"], b1["n_rejected"], b1["absdiff_median"]) == (
+        "2", "2", "")
+    report = (out / "report.txt").read_text(encoding="ascii").splitlines()
+    assert "B1 (B1_object): 0 takes kept (2 attempts, all rejected)" in report
+
+
 def test_the_command_line_end_to_end(tmp_path, capsys):
     root = tmp_path / "pilot"
     for label in ("A", "B1", "C", "A2"):                 # B2 never recorded
@@ -577,3 +719,101 @@ def test_a_short_take_and_a_take_with_no_glove_file_get_a_status_and_no_numbers(
                     "absdiff_med_I_MCP_fe", "signed_med_I_MCP_fe",
                     "cam_med_L_PIP", "glove_med_L_PIP", "cam_mad_max"):
             assert row[key] == "", key
+
+
+def test_the_recorders_acceptance_policy_is_read_per_take(tmp_path):
+    """The amendment of 2026-10-23: object takes recorded with
+    --keep-all-tracking say so in their meta, with the camera's tracking over
+    the hold. takes.csv carries it; the summary and the report give its
+    median, minimum and worst re-acquisition count over the valid takes, and
+    how many were kept under each policy. A meta without the keys (recorded
+    before them) leaves the columns empty and counts as strict."""
+    root = tmp_path / "pilot"
+    for take in (1, 2):                              # recorded before the keys
+        make_take(root / FOLDER["A"], "cylindrical_object", take, length=0.7)
+    note = "the left hand was lost for 0.7 s during the take"
+    keep_all = {"acceptance_policy": "object_keep_all_tracking",
+                "protocol_amendment_date": "2026-10-23",
+                "hold_completed": True}
+    run_b1 = root / FOLDER["B1"]
+    make_take(run_b1, "cylindrical_object", 1, length=0.7, meta_extra={
+        **keep_all, "cam_tracked_fraction": 0.8, "cam_reacquisitions": 1,
+        "tracking_note": note})
+    make_take(run_b1, "cylindrical_object", 2, length=0.7, meta_extra={
+        **keep_all, "cam_tracked_fraction": 0.6, "cam_reacquisitions": 2,
+        "tracking_note": note})
+    make_take(run_b1, "cylindrical_object", 3, length=0.7, meta_extra={
+        "acceptance_policy": "strict", "protocol_amendment_date": None,
+        "hold_completed": True, "cam_tracked_fraction": 1.0,
+        "cam_reacquisitions": 0, "tracking_note": ""})
+    # kept although its hold was cut short: should not exist; not usable
+    make_take(run_b1, "spherical_object", 1, length=0.7, meta_extra={
+        "acceptance_policy": "strict", "hold_completed": False,
+        "cam_tracked_fraction": 0.3, "cam_reacquisitions": 5})
+    out = tmp_path / "out"
+    assert load_compare().main(["--root", str(root), "--out", str(out),
+                                "--window", "0.5"]) == 0
+
+    takes = {(r["run"], r["grasp"], r["take"]): r
+             for r in read_rows(out / "takes.csv")}
+    first = takes[("B1", "cylindrical_object", "1")]
+    assert (first["acceptance_policy"], first["hold_completed"],
+            first["cam_tracked_fraction"], first["cam_reacquisitions"],
+            first["tracking_note"], first["status"]) == (
+                "object_keep_all_tracking", "True", "0.8", "1", note, "ok")
+    old = takes[("A", "cylindrical_object", "1")]
+    assert [old[k] for k in ("acceptance_policy", "hold_completed",
+                             "cam_tracked_fraction", "cam_reacquisitions",
+                             "tracking_note")] == [""] * 5
+    assert old["status"] == "ok"
+    cut = takes[("B1", "spherical_object", "1")]
+    assert cut["status"] == "unusable: hold not completed"
+    assert cut["absdiff_med_all8"] != "", "measured, but left out"
+
+    summary = read_rows(out / "summary.csv")
+    with open(out / "summary.csv", encoding="utf-8", newline="") as f:
+        header = next(csv.reader(f))
+    at = header.index("attempt_coverage_min")
+    assert header[at + 1:at + 6] == [
+        "cam_tracked_fraction_median", "cam_tracked_fraction_min",
+        "cam_reacquisitions_worst", "n_strict_policy_takes",
+        "n_keep_all_takes"]
+    rows = {(r["level"], r["run"], r["grasp"]): r for r in summary}
+
+    def policy(r):
+        return (r["cam_tracked_fraction_median"], r["cam_tracked_fraction_min"],
+                r["cam_reacquisitions_worst"], r["n_strict_policy_takes"],
+                r["n_keep_all_takes"])
+
+    for key in (("run_grasp", "B1", "cylindrical_object"),
+                ("run_grasp_pooledB", "B", "cylindrical_object"),
+                ("run_all", "B1", "all"), ("run_all_pooledB", "B", "all")):
+        assert policy(rows[key]) == ("0.8", "0.6", "2", "1", "2"), key
+    assert policy(rows[("run_grasp", "A", "cylindrical_object")]) == (
+        "", "", "", "2", "0")
+    spherical = rows[("run_grasp", "B1", "spherical_object")]
+    assert policy(spherical) == ("", "", "", "0", "0")
+    assert spherical["n_unusable_takes"] == "1"
+    assert policy(rows[("run_grasp", "C", "cylindrical_object")]) == (
+        "", "", "", "0", "0")
+
+    lines = (out / "report.txt").read_text(encoding="ascii").splitlines()
+    assert any(s.startswith("policy: ") for s in lines)
+    block = lines[lines.index("== cylindrical_object =="):
+                  lines.index("== spherical_object ==")]
+
+    def cells(label):
+        (line,) = [s for s in block if s.startswith(label)]
+        return line[len(label):].split()             # A B1 C B2 A2 B(pooled)
+
+    labels = ["camera tracked fraction of hold median",
+              "camera tracked fraction of hold min",
+              "camera re-acquisitions worst",
+              "takes under strict / keep-all policy"]
+    after = next(i for i, s in enumerate(block)
+                 if s.startswith("coverage over all attempts min"))
+    assert [s[:len(t)] for s, t in zip(block[after + 1:], labels)] == labels
+    assert cells(labels[0]) == ["-", "0.80", "-", "-", "-", "0.80"]
+    assert cells(labels[1]) == ["-", "0.60", "-", "-", "-", "0.60"]
+    assert cells(labels[2]) == ["-", "2", "-", "-", "-", "2"]
+    assert cells(labels[3]) == ["2/0", "1/2", "0/0", "0/0", "0/0", "1/2"]

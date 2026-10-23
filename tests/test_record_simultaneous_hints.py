@@ -240,3 +240,152 @@ def test_first_take_numbers_the_takes_from_n(tmp_path, monkeypatch):
     assert "_take3_" in path.name and "_take3_" in meta["file"]
     for aside in (out / "rejected" / "leap").glob("*.meta.json"):
         assert read(aside)["take"] == 3, aside.name
+
+
+# --- --keep-all-tracking: the object runs' acceptance (amendment 2026-10-23) ---
+TRACKING_KEYS = ("acceptance_policy", "protocol_amendment_date",
+                 "hold_completed", "cam_tracked_fraction", "cam_max_gap_ms",
+                 "cam_gaps_over_100ms", "cam_reacquisitions", "tracking_note")
+
+
+def lossy_session(sync, tmp_path, monkeypatch, keep_all: bool, **kwargs):
+    """A coached session on a mock camera that loses the hand during every
+    hold and finds it again under a new id. The mock's hand id changes every
+    100 frames (`reacquire_every`, visible_time back to zero) and the last 50
+    of every 100 are dropped (`dropout_every` / `dropout_frames`): a hand is
+    acquirable (visible >= 0.5 s) only in frames 45 to 49 of each id, so the
+    hold starts there; the hand is gone from frame 50 (0.56 s, past LOST_S)
+    and back under the next id at frame 100, about 0.6 s into a 1 s hold."""
+    monkeypatch.setattr(sync, "beep", lambda *a, **k: None)
+    leap = MockLeapStream(pose="fist", noise_mm=0.0, dropout_every=100,
+                          dropout_frames=50, reacquire_every=100)
+    leap.start()
+    return sync.CoachedLeapSession(
+        leap, sync.MockGloveSource(), hz=None, out_dir=tmp_path / "sync",
+        hand="left", settle=0.0, acquire_timeout=10.0, pose_check=False,
+        retries=0, keep_all_tracking=keep_all, **kwargs)
+
+
+def only_meta(folder: Path) -> dict:
+    (path,) = sorted(folder.glob("*.meta.json"))
+    return read(path)
+
+
+def test_keep_all_tracking_keeps_a_take_that_lost_the_hand(tmp_path,
+                                                           monkeypatch,
+                                                           capsys):
+    """With the flag the REC hold runs its full duration whatever the camera
+    does, the take is kept, and the loss is written down instead."""
+    sync = load_sync()
+    session = lossy_session(sync, tmp_path, monkeypatch, keep_all=True)
+    session.run_take("cylindrical_object", 1, 1, 1, 1, duration=1.0, prep=0)
+    session.finish()
+    session.print_summary()
+
+    out = tmp_path / "sync"
+    assert not (out / "rejected").exists(), "nothing was rejected"
+    meta = only_meta(out / "leap")
+    assert meta["accepted"] is True
+    assert meta["acceptance_policy"] == "object_keep_all_tracking"
+    assert meta["protocol_amendment_date"] == "2026-10-23"
+    assert meta["hold_completed"] is True
+    assert 0.0 < meta["cam_tracked_fraction"] < 1.0
+    assert meta["cam_reacquisitions"] >= 1
+    assert meta["cam_max_gap_ms"] > 500 and meta["cam_gaps_over_100ms"] >= 1
+    # the strict rule's own words, as information on a kept take
+    assert meta["why"] == ""
+    assert "the left hand was lost for" in meta["tracking_note"]
+    assert "re-acquired the hand (id 2001 -> 2002)" in meta["tracking_note"]
+    assert meta["tracking_note"].endswith("during the take")
+    assert meta["coverage"] == meta["cam_tracked_fraction"]
+    assert meta["hand_id"] == 2001, "the id acquired at ACQUIRE"
+    # the hold ran to the end: the glove file spans the commanded duration
+    glove = [json.loads(s) for s in (out / "glove" / meta["file"]).read_text(
+        encoding="utf-8").splitlines()]
+    assert glove[-1]["wall_time"] - glove[0]["wall_time"] >= 1.0 - 0.1
+    assert meta["hold_end"] - meta["hold_start"] == pytest.approx(1.0,
+                                                                  abs=1e-6)
+    # the re-acquired hand is followed, so the camera file has its frames too
+    cam = [json.loads(s) for s in (out / "leap" / meta["file"]).read_text(
+        encoding="utf-8").splitlines()]
+    assert {d["hand_id"] for d in cam} == {2001, 2002}
+    text = capsys.readouterr().out
+    assert "kept (tracking lost " in text and "1 re-acquisition)" in text
+    assert "--keep-all-tracking" in text            # the printed summary
+    assert session.redo_command(["cylindrical_object"], 1).endswith(
+        "--takes 1 --keep-all-tracking")
+
+
+def test_without_the_flag_the_same_camera_rejects_the_attempt(tmp_path,
+                                                              monkeypatch):
+    sync = load_sync()
+    session = lossy_session(sync, tmp_path, monkeypatch, keep_all=False)
+    session.run_take("cylindrical_object", 1, 1, 1, 1, duration=1.0, prep=0)
+    session.finish()
+
+    out = tmp_path / "sync"
+    assert list((out / "leap").glob("*.meta.json")) == [], "nothing kept"
+    meta = only_meta(out / "rejected" / "leap")
+    assert meta["accepted"] is False
+    assert meta["why"] == "the left hand was lost for 0.5 s during the take"
+    assert meta["tracking_note"] == meta["why"]
+    assert meta["acceptance_policy"] == "strict"
+    assert meta["protocol_amendment_date"] is None
+    assert meta["hold_completed"] is False
+    # over the COMMANDED hold, so the part the early end cut off counts as lost
+    assert meta["cam_tracked_fraction"] < 0.5
+    assert meta["cam_reacquisitions"] == 0
+    assert session.redo_command(["cylindrical_object"], 1).endswith(
+        "--takes 1")
+
+
+def test_a_clean_strict_take_has_the_tracking_keys(tmp_path, monkeypatch):
+    sync = load_sync()
+    session = posed_session(sync, tmp_path, monkeypatch, leap_pose="fist",
+                            glove_curl=1.0, retries=0)
+    session.run_take("fist", 1, 1, 1, 1, duration=0.6, prep=0)
+    session.finish()
+    meta = only_meta(tmp_path / "sync" / "leap")
+    assert set(TRACKING_KEYS) <= set(meta)
+    assert meta["accepted"] is True
+    assert meta["acceptance_policy"] == "strict"
+    assert meta["protocol_amendment_date"] is None
+    assert meta["hold_completed"] is True
+    assert meta["cam_tracked_fraction"] == 1.0
+    assert meta["cam_reacquisitions"] == 0
+    assert meta["cam_gaps_over_100ms"] == 0 and meta["cam_max_gap_ms"] < 100
+    assert meta["tracking_note"] == "" and meta["why"] == ""
+
+
+def test_keep_all_tracking_through_main_writes_the_policy(tmp_path,
+                                                          monkeypatch):
+    """The flag on the command line reaches every meta, kept or rejected."""
+    sync = load_sync()
+    monkeypatch.setattr(sync, "beep", lambda *a, **k: None)
+    out = tmp_path / "sync"
+    run_main(sync, monkeypatch, "--camera", "leap", "--hand", "left",
+             "--mock-glove", "--mock-leap", "--poses", "cylindrical_object",
+             "--takes", "1", "--duration", "0.5", "--settle", "0",
+             "--prep", "0", "--retries", "6", "--keep-all-tracking",
+             "--out-dir", out)
+    metas = [read(p) for p in sorted(out.rglob("*.meta.json"))]
+    assert [m["accepted"] for m in metas].count(True) == 1
+    for meta in metas:
+        assert meta["acceptance_policy"] == "object_keep_all_tracking"
+        assert meta["protocol_amendment_date"] == "2026-10-23"
+
+
+@pytest.mark.parametrize("argv", [
+    ["--camera", "0", "--keep-all-tracking"],
+    ["--camera", "leap", "--hand", "both", "--keep-all-tracking"],
+])
+def test_keep_all_tracking_is_refused_where_hint_is(argv, tmp_path,
+                                                    monkeypatch):
+    sync = load_sync()
+    out = tmp_path / "sync"
+    with pytest.raises(SystemExit) as e:
+        run_main(sync, monkeypatch, "--mock-glove", "--mock-leap"
+                 if "leap" in argv else "--no-preview", *argv, "--out-dir", out)
+    assert "--keep-all-tracking needs --camera leap --hand left|right" in str(
+        e.value)
+    assert not out.exists(), "refused before anything was recorded"

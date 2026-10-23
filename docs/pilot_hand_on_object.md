@@ -161,7 +161,7 @@ the 5 s, open. Nothing in the hand.
 
 **Step 5. Gloves on + camera.** Condition B1, object, 9 takes (3 per grasp):
 
-    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 3 --out-dir recordings\pilot_hoo\B1_object --note "condition B1 object: OBJ-CYL, OBJ-BALL, OBJ-PEN as in objects.txt; <glove setup>"
+    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 3 --keep-all-tracking --out-dir recordings\pilot_hoo\B1_object --note "condition B1 object: OBJ-CYL, OBJ-BALL, OBJ-PEN as in objects.txt; <glove setup>"
 
 Launcher: `pilot_step5_B1_object.cmd` (`pilot_run.py B1`).
 
@@ -171,13 +171,13 @@ view. The objects are the three of objects.txt and no others.
 
 **Step 6. Gloves on + camera.** Condition C, object with the hint, 15 takes, the same way as step 5:
 
-    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 5 --hint hand_on_object --out-dir recordings\pilot_hoo\C_object_hint --note "condition C object with hand_on_object: OBJ-CYL, OBJ-BALL, OBJ-PEN as in objects.txt; <glove setup>"
+    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 5 --keep-all-tracking --hint hand_on_object --out-dir recordings\pilot_hoo\C_object_hint --note "condition C object with hand_on_object: OBJ-CYL, OBJ-BALL, OBJ-PEN as in objects.txt; <glove setup>"
 
 Launcher: `pilot_step6_C_object_hint.cmd` (`pilot_run.py C`).
 
 **Step 7. Gloves on + camera.** Condition B2, object, 6 takes (2 per grasp), the same way as step 5:
 
-    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 2 --out-dir recordings\pilot_hoo\B2_object --note "condition B2 object after C: OBJ-CYL, OBJ-BALL, OBJ-PEN as in objects.txt; <glove setup>"
+    .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 2 --keep-all-tracking --out-dir recordings\pilot_hoo\B2_object --note "condition B2 object after C: OBJ-CYL, OBJ-BALL, OBJ-PEN as in objects.txt; <glove setup>"
 
 Launcher: `pilot_step7_B2_object.cmd` (`pilot_run.py B2`).
 
@@ -218,8 +218,12 @@ accepted take's `.meta.json`, camera file and glove file, and writes three files
   (`run_grasp_pooledB`, B1 and B2 together, descriptive only), one row per run over all grasps (`run_all`, secondary) with its own pooled B
   (`run_all_pooledB`), each with the primary quantity `absdiff_median`, `absdiff_largest`, per-joint `absdiff_*` and `signed_*`, the take
   counts (`n_valid_takes`, `n_expected_takes` by this protocol, `n_invalid_takes`, `n_unusable_takes`,
-  `n_missing_takes`), paired fraction, worst gaps, stability and coverage, with a row for every run x grasp of the
-  fixed grid whether or not it has takes; per grasp the glove's drift between step 4 and step 8 on the glove
+  `n_missing_takes`), the ATTEMPT counts read from `leap/` and `rejected/leap/` together (`n_attempts`,
+  `n_rejected`, split into hand lost / re-acquired / low coverage / other by the recorder's own reason, and the
+  recorder's coverage over all attempts, median and min: the recorder keeps a take only when the hand stayed
+  tracked, so a camera that loses the hand with the object in it shows up here as rejected attempts, not as low
+  coverage inside kept takes), paired fraction, worst gaps, stability and coverage, with a row for every run x
+  grasp of the fixed grid whether or not it has takes; per grasp the glove's drift between step 4 and step 8 on the glove
   alone (`glove_drift_A2_minus_A`: the glove's median flexion in A-check, one take per grasp, minus its median in A,
   per joint, signed); and the pre-stated contrasts on the primary quantity (`contrast` rows, per grasp and pooled:
   `Bpooled_minus_A`, `C_minus_Bpooled`, `B2_minus_B1`, `A2_minus_A`, `abs_B2_minus_B1_minus_abs_C_minus_Bpooled`).
@@ -260,6 +264,45 @@ first; the pooled contrasts second.
 
 Coverage is read beside error, never folded into it: a condition that loses the hardest frames and reports a low
 error on the rest has not done better. The medians and the coverage go to the professor with these readings.
+
+## Amendment of 2026-10-23: the object runs keep every attempt
+
+Made during the first recording day, after run A was complete and before any object take was kept; reviewed in the
+ChatGPT thread (agreed, with the four requirements below) before it was applied.
+
+What happened. The first B1 attempt, the can in the gloved left hand over the desk-mounted IR 170, was tracked for
+81 % of the 5 s hold and then lost for 0.5 s, so the coached recorder rejected it under its strict rule (coverage of
+at least 0.90 and never lost for 0.5 s; the hold is cut short at the loss and the files go to `rejected\`). That
+rule exists for the grasp set, where a lost hand means a bad take. Here it throws away exactly the frames the pilot
+is about, and any object take it did keep would be one where the camera happened to cope: a selection toward
+camera-friendly moments. The operator then recorded nine takes under the B1 label without any object ("I didn't use
+objects at all, since the camera can't detect it and since it covers the glove"); they are kept as protocol
+deviations in `B1_object\set_aside_no_object\` with a manifest (`protocol_valid` false, the reason, the statement,
+the date), counted in no condition and never relabelled as mimed. The one object attempt stays where the recorder
+put it, a pre-amendment rejected attempt, counted in the attempt audit and never as a kept take.
+
+The rule from now on. The object runs B1, C and B2 are recorded with `--keep-all-tracking` (the launcher passes it;
+the commands under steps 5 to 7 show it). With it: the open-hand acquisition and the settle stay strict, as before;
+during the hold a camera loss, a re-acquisition (hand id change) or wrong-chirality frames are LOGGED and never used
+to reject, and the hold always runs its full 5 s, so the glove is recorded for the whole hold whatever the camera
+does; an attempt is kept unless the glove side failed or the hand was never acquired open. Runs A and A-check keep
+the strict rule, which is how run A was recorded. Every meta, strict or not, now records `acceptance_policy`
+(`strict` or `object_keep_all_tracking`), `protocol_amendment_date`, `hold_completed`, `cam_tracked_fraction` over
+the commanded hold (the recorder's own hole-based coverage), `cam_max_gap_ms`, `cam_gaps_over_100ms`,
+`cam_reacquisitions` and a `tracking_note` with the loss text that would have rejected the take. The comparison
+carries them into `takes.csv` and, per run and grasp, the tracked fraction's median and min, the worst
+re-acquisition count and the strict / keep-all take counts, beside the attempt rows: the professor can tell "the
+angles agree when the hand is visible" from "the camera was hardly ever visible". No pre-registered quantity
+changes: coverage, paired fraction and the attempt rows were always to be read beside the disagreement, never inside
+it. Option rejected: coaching the hand position so the camera copes, which would tune the condition to the sensor
+under test. The operator's second concern, that the object presses the glove, is the standing rule "hold, do not
+squeeze", and the per-take stability (MAD) rows show adjustment.
+
+Consequence for the recording day: the gloves came off while the recorder was changed. Because the glove's fit and
+calibration must not change between conditions, the five runs are recorded again from step 3, run A included (15
+takes, a few minutes). The first attempt's folder was renamed `recordings\pilot_hoo_2026-10-23_attempt1` (run A
+valid, the B1 deviations, the pre-amendment attempt, its own objects.txt and glove_setup.txt) and the launchers
+record the new session into a fresh `recordings\pilot_hoo`, so no launcher changes.
 
 ## What would make the pilot invalid
 

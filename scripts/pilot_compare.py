@@ -30,7 +30,14 @@ window, kept apart from the angles. The glove is a reference, not truth.
 
 A take whose meta's hints_confirmed contradicts its run (true outside C, false
 in C) is invalid: its row stays in takes.csv, numbers included; the summary
-counts it and leaves its numbers out.
+counts it and leaves its numbers out. A kept take whose meta says
+hold_completed false (its hold was cut short) is unusable the same way.
+
+Each take's acceptance as the recorder wrote it (amendment of 2026-10-23):
+acceptance_policy ("strict", or "object_keep_all_tracking" for the object
+runs, which keep every completed hold), hold_completed, the camera's tracked
+fraction of the hold, its re-acquisitions and tracking_note, empty for a
+meta written before them, which counts as strict.
 
 Writes takes.csv, summary.csv and report.txt into --out (default
 <root>\\comparison).
@@ -68,12 +75,24 @@ JOINTS = ["I_MCP_fe", "I_PIP", "M_MCP_fe", "M_PIP",
           "R_MCP_fe", "R_PIP", "L_MCP_fe", "L_PIP"]
 OK = "ok"
 INVALID = "invalid:"
+# Why the recorder refused an attempt (its meta's `why`), by the words of its
+# messages; a refused attempt is counted once, under the first that matches.
+REJECTED_BY = [("n_rejected_hand_lost", "was lost"),
+               ("n_rejected_reacquired", "re-acquired"),
+               ("n_rejected_low_coverage", "covered only")]
+REJECTED_OTHER = "n_rejected_other"
 META_END, LAST_STAMP = "meta hold_end", "later last stamp"
+# The recorder's acceptance_policy (a meta without one was recorded strict);
+# KEEP_ALL keeps every completed hold, its losses in tracking_note.
+STRICT, KEEP_ALL = "strict", "object_keep_all_tracking"
+HOLD_CUT = "unusable: hold not completed"
 TITLE = ("Pilot comparison: camera (Ultraleap, desktop) against glove "
          "(StretchSense), flexion only, 8 joints")
 TAKE_COLUMNS = (
     ["run", "condition", "grasp", "take", "file", "hand", "note",
-     "hints_confirmed", "status", "clock", "window_start", "window_end",
+     "hints_confirmed", "acceptance_policy", "hold_completed",
+     "cam_tracked_fraction", "cam_reacquisitions", "tracking_note",
+     "status", "clock", "window_start", "window_end",
      "window_end_source", "n_cam_frames_window", "n_glove_frames_window",
      "n_pairs", "n_cam_unpaired", "cam_coverage", "cam_max_gap_ms",
      "cam_gaps_over_100ms", "glove_coverage", "glove_max_gap_ms",
@@ -84,7 +103,12 @@ TAKE_COLUMNS = (
     + ["cam_mad_med", "cam_mad_max", "glove_mad_med", "glove_mad_max"])
 SUMMARY_COLUMNS = (
     ["level", "run", "condition", "grasp", "n_valid_takes", "n_expected_takes",
-     "n_invalid_takes", "n_unusable_takes", "n_missing_takes", "absdiff_median",
+     "n_invalid_takes", "n_unusable_takes", "n_missing_takes", "n_attempts",
+     "n_rejected", "n_rejected_hand_lost", "n_rejected_reacquired",
+     "n_rejected_low_coverage", "n_rejected_other", "attempt_coverage_median",
+     "attempt_coverage_min", "cam_tracked_fraction_median",
+     "cam_tracked_fraction_min", "cam_reacquisitions_worst",
+     "n_strict_policy_takes", "n_keep_all_takes", "absdiff_median",
      "absdiff_largest", "paired_fraction_median", "paired_fraction_min",
      "cam_coverage_median", "cam_coverage_min", "cam_gaps_over_100ms_total",
      "cam_max_gap_ms_worst", "glove_coverage_median", "glove_coverage_min",
@@ -191,12 +215,19 @@ def compare_take(run_dir: Path, label: str, condition: str, expected: bool,
     row = {"run": label, "condition": condition, "grasp": str(meta["pose"]),
            "take": int(meta["take"]), "file": meta["file"],
            "hand": meta["hand"], "note": meta.get("note") or "",
-           "hints_confirmed": hints}
+           "hints_confirmed": hints,
+           # the recorder's acceptance (amendment of 2026-10-23), None in a
+           # meta written before it
+           **{k: meta.get(k) for k in (
+               "acceptance_policy", "hold_completed", "cam_tracked_fraction",
+               "cam_reacquisitions", "tracking_note")}}
     data = measure(row, run_dir, meta.get("hold_end"), window_s, max_dt)
     problems = []
     if hints != expected:
         problems.append(f"{INVALID} hints_confirmed {hints} in run {label} "
                         f"(expected {expected})")
+    if meta.get("hold_completed") is False:     # kept, but the hold was cut
+        problems.append(HOLD_CUT)
     if data != OK:
         problems.append(data)
     row["status"] = "; ".join(problems) or OK
@@ -212,18 +243,57 @@ def accepted_metas(run_dir: Path) -> list:
     return sorted(metas, key=lambda m: (str(m["pose"]), int(m["take"])))
 
 
+def attempt_rows(run_dir: Path, label: str) -> list:
+    """Every attempt the recorder made in the run: the kept takes' metas in
+    leap/ and the refused attempts' in rejected/leap/, any `accepted` value.
+    Under the strict policy the recorder keeps a take only while the hand
+    stayed tracked, so the camera losing the hand shows HERE, not in the kept
+    takes' coverage; under keep-all it shows in their tracked fraction."""
+    rows = []
+    for folder in (run_dir / "leap", run_dir / "rejected" / "leap"):
+        for path in sorted(folder.glob("*.meta.json")):
+            meta = json.loads(path.read_text(encoding="utf-8"))
+            rows.append({"run": label, "grasp": str(meta["pose"]),
+                         "accepted": bool(meta.get("accepted")),
+                         "why": meta.get("why") or "",
+                         "coverage": meta.get("coverage")})
+    return rows
+
+
 # --- the summary --------------------------------------------------------------------
 def summarise(level: str, run: str, condition: str, grasp: str, takes: list,
-              expected: int) -> dict:
+              expected: int, attempts: list) -> dict:
     """One row over `takes` (any status): every take counted, only the valid
-    ones measured."""
+    ones measured; and every attempt of the group, kept or refused, whatever
+    its take's validity."""
     valid = [t for t in takes if t["status"] == OK]
     invalid = sum(t["status"].startswith(INVALID) for t in takes)
+    refused = [a["why"] for a in attempts if not a["accepted"]]
+    reasons = [next((key for key, words in REJECTED_BY if words in why),
+                    REJECTED_OTHER) for why in refused]
+    covered = [float(a["coverage"]) for a in attempts
+               if isinstance(a["coverage"], (int, float))]
+    # the recorder's own camera numbers over the hold, valid takes only
+    tracked = [float(t["cam_tracked_fraction"]) for t in valid
+               if isinstance(t["cam_tracked_fraction"], (int, float))]
+    reacq = [int(t["cam_reacquisitions"]) for t in valid
+             if isinstance(t["cam_reacquisitions"], int)]
+    policies = [t["acceptance_policy"] or STRICT for t in valid]
     row = {"level": level, "run": run, "condition": condition, "grasp": grasp,
            "n_valid_takes": len(valid), "n_expected_takes": expected,
            "n_invalid_takes": invalid,
            "n_unusable_takes": len(takes) - len(valid) - invalid,
-           "n_missing_takes": max(0, expected - len(takes))}
+           "n_missing_takes": max(0, expected - len(takes)),
+           "n_attempts": len(attempts), "n_rejected": len(refused),
+           **{key: reasons.count(key)
+              for key in [k for k, _ in REJECTED_BY] + [REJECTED_OTHER]},
+           "attempt_coverage_median": median(covered) if covered else None,
+           "attempt_coverage_min": min(covered) if covered else None,
+           "cam_tracked_fraction_median": median(tracked) if tracked else None,
+           "cam_tracked_fraction_min": min(tracked) if tracked else None,
+           "cam_reacquisitions_worst": max(reacq) if reacq else None,
+           "n_strict_policy_takes": policies.count(STRICT),
+           "n_keep_all_takes": policies.count(KEEP_ALL)}
     if not valid:
         return row
     per = [t[f"absdiff_med_{j}"] for t in valid for j in JOINTS]
@@ -278,15 +348,20 @@ def contrasts(grasp: str, rows: list) -> list:
              "absdiff_median": value} for name, value in out.items()]
 
 
-def grid_grasps(takes: list) -> list:
-    """GRASPS, then any other grasp the accepted takes hold (a dry run's)."""
-    return GRASPS + sorted({t["grasp"] for t in takes} - set(GRASPS))
+def grid_grasps(rows: list) -> list:
+    """GRASPS, then any other grasp the takes or attempts hold (a dry
+    run's)."""
+    return GRASPS + sorted({t["grasp"] for t in rows} - set(GRASPS))
 
 
-def summary_rows(takes: list) -> list:
+def summary_rows(takes: list, attempts: list) -> list:
     """Every run x grasp of the grid, recorded or not: every take counted,
-    only the valid ones measured."""
-    grasps = grid_grasps(takes)
+    only the valid ones measured, every attempt counted."""
+    grasps = grid_grasps(takes + attempts)
+
+    def tried(runs, grasp=None):
+        return [t for t in attempts
+                if t["run"] in runs and grasp in (None, t["grasp"])]
 
     def pick(runs, grasp=None, valid=False):
         return [t for t in takes
@@ -301,10 +376,11 @@ def summary_rows(takes: list) -> list:
         factor = (len(GRASPS) if grasp == "all"
                   else 1 if grasp in GRASPS else 0)
         rows = [summarise(level, label, condition, grasp, pick({label}, one),
-                          EXPECTED[label] * factor)
+                          EXPECTED[label] * factor, tried({label}, one))
                 for label, _, condition, _ in RUNS]
         rows.append(summarise(pooled_level, "B", "B", grasp,
-                              pick({"B1", "B2"}, one), EXPECTED["B"] * factor))
+                              pick({"B1", "B2"}, one), EXPECTED["B"] * factor,
+                              tried({"B1", "B2"}, one)))
         return rows
 
     per_grasp = {g: scope(g, "run_grasp", "run_grasp_pooledB")
@@ -383,6 +459,23 @@ def table(cols: list) -> list:
     line("takes invalid", "n_invalid_takes", "{}")
     line("takes unusable", "n_unusable_takes", "{}")
     line("takes missing", "n_missing_takes", "{}")
+    line("attempts (kept + rejected)", "n_attempts", "{}")
+    line("rejected: hand lost", "n_rejected_hand_lost", "{}")
+    line("rejected: re-acquired", "n_rejected_reacquired", "{}")
+    line("rejected: low coverage", "n_rejected_low_coverage", "{}")
+    line("rejected: other", "n_rejected_other", "{}")
+    line("coverage over all attempts median", "attempt_coverage_median",
+         "{:.2f}")
+    line("coverage over all attempts min", "attempt_coverage_min", "{:.2f}")
+    line("camera tracked fraction of hold median",
+         "cam_tracked_fraction_median", "{:.2f}")
+    line("camera tracked fraction of hold min", "cam_tracked_fraction_min",
+         "{:.2f}")
+    line("camera re-acquisitions worst", "cam_reacquisitions_worst", "{}")
+    label = "takes under strict / keep-all policy"
+    lines.append(f"{label:<{LABEL_W}}" + "".join(
+        f"{r['n_strict_policy_takes']}/{r['n_keep_all_takes']}".rjust(COL_W)
+        for _, r in cols))
     lines.append("per joint: median over takes of the per-take median "
                  "|camera - glove|, deg")
     for j in JOINTS:
@@ -426,10 +519,16 @@ def report(root, window_s, max_dt, run_lines, takes, summary) -> str:
         f"coverage: leap_hand.protocol.coverage (holes longer than "
         f"{LOSS_GAP_S:g} s) and gaps over 100 ms, per sensor, inside the "
         "window",
+        "attempts: every attempt the recorder made, kept or rejected "
+        "(rejected/leap), with the recorder's own coverage of each",
+        f"policy: the recorder's acceptance_policy per valid take, {STRICT} "
+        f"when the meta has none; {KEEP_ALL} (amendment of 2026-10-23) keeps "
+        "every completed hold, so its losses show in the camera tracked "
+        "fraction of the hold, not as rejected attempts",
         "", "runs:", *run_lines,
         "", "invalid takes:", *(invalid or ["none"]),
     ]
-    grasps = grid_grasps(takes)
+    grasps = list(dict.fromkeys(r["grasp"] for r in level("run_grasp")))
     for g in grasps:
         cols = ([(r["run"], r) for r in level("run_grasp", g)]
                 + [("B(pooled)", r) for r in level("run_grasp_pooledB", g)])
@@ -491,7 +590,7 @@ def main(argv=None) -> int:
     out = a.out or ((a.root if a.root is not None
                      else next(iter(given.values())).parent) / "comparison")
 
-    takes, run_lines, absent = [], [], []
+    takes, attempts, run_lines, unkept = [], [], [], []
     for label, folder, condition, expected in RUNS:
         if label in given:
             run_dir, name = given[label], str(given[label])
@@ -499,9 +598,17 @@ def main(argv=None) -> int:
             run_dir = a.root / folder if a.root is not None else None
             name = folder
         metas = accepted_metas(run_dir) if run_dir is not None else []
+        # counted even for a run with no take kept: its refusals are the data
+        tried = attempt_rows(run_dir, label) if run_dir is not None else []
+        attempts += tried
         if not metas:
-            run_lines.append(f"{label} ({name}): absent")
-            absent.append(f"run {label} ({name}): absent")
+            # "absent" only when nothing was attempted: a run the camera lost
+            # every time was recorded, and must not read as never recorded
+            said = (f"{label} ({name}): 0 takes kept ({len(tried)} attempt"
+                    f"{'' if len(tried) == 1 else 's'}, all rejected)"
+                    if tried else f"{label} ({name}): absent")
+            run_lines.append(said)
+            unkept.append(f"run {said}")
             continue
         got = [compare_take(run_dir, label, condition, expected, m,
                             a.window, a.max_dt) for m in metas]
@@ -510,11 +617,13 @@ def main(argv=None) -> int:
         run_lines.append(f"{label} ({name}): {len(got)} take"
                          f"{'' if len(got) == 1 else 's'} ({n_ok} valid)")
 
-    if not takes:
+    # Nothing to write only when no run folder holds any meta at all: attempts
+    # with no take kept are a result (the camera lost the hand every time).
+    if not takes and not attempts:
         where = (a.root if a.root is not None
                  else ", ".join(str(v) for v in given.values()))
         print(f"nothing to compare under {where}")
-        for s in absent:
+        for s in unkept:
             print(s)
         return 1
 
@@ -528,10 +637,10 @@ def main(argv=None) -> int:
               f"{t['absdiff_med_all8']:.1f} deg, largest "
               f"{t['absdiff_max_all8']:.1f} deg, window end "
               f"{t['window_end_source']}")
-    for s in absent:
+    for s in unkept:
         print(s)
 
-    summary = summary_rows(takes)
+    summary = summary_rows(takes, attempts)
     out.mkdir(parents=True, exist_ok=True)
     write_csv(out / "takes.csv", TAKE_COLUMNS, takes)
     write_csv(out / "summary.csv", SUMMARY_COLUMNS, summary)
