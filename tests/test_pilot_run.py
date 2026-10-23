@@ -3,14 +3,17 @@
 Gate R1 of GATES_pilot_run.md. The recorder is never started here:
 `subprocess.run` is replaced by a fake that records argv and cwd, prints a
 marker, writes the accepted takes a recorder call asks for (fewer where a
-test says a grasp falls short), and returns 0 (or the exit codes a test
-sets). Every test uses `tmp_path` as
+test says a grasp falls short) and the files an ir_snapshot.py call would
+write (none where a test says the still fails), and returns 0 (or the exit
+codes a test sets); `input` answers the object gate's prompt with the right
+ID unless a test scripts the answers. Every test uses `tmp_path` as
 `--root`, or points the script's REPO at `tmp_path` to pin the lines printed
 for the default `recordings\\pilot_hoo`.
 """
 import hashlib
 import importlib.util
 import json
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -74,22 +77,47 @@ class Calls(list):
     """(argv, kwargs) of every subprocess.run call; `codes` are the exit
     codes returned in turn, 0 after them; `short` {grasp: k} makes the
     recorder keep k takes fewer than asked for that grasp (as when the
-    operator quits with q)."""
+    operator quits with q); `snapshot_fails` makes ir_snapshot.py write
+    nothing (as with "Allow images" off); `typed` None answers every prompt
+    with the ID it asks for, a list gives the answers in turn; `prompts`
+    are the prompts input() was called with."""
 
     def __init__(self):
         super().__init__()
         self.codes, self.short = (), {}
+        self.snapshot_fails, self.typed, self.prompts = False, None, []
+
+    def recorder(self):
+        return [argv for argv, _ in self if "--poses" in argv]
+
+    def kinds(self):
+        return ["snapshot" if "--label" in argv else "recorder"
+                for argv, _ in self]
 
 
 @pytest.fixture
 def calls(pr, monkeypatch):
     got = Calls()
 
+    def fake_input(prompt=""):
+        got.prompts.append(prompt)
+        answer = (prompt.split()[1] if got.typed is None    # "With <ID> held"
+                  else got.typed.pop(0))
+        print(f"{prompt}{answer}")
+        return answer
+
     def fake_run(argv, **kwargs):
         argv = list(argv)
         got.append((argv, kwargs))
-        if "--poses" in argv:            # the recorder: keep the takes
-            arg = lambda name: argv[argv.index(name) + 1]   # noqa: E731
+        arg = lambda name: argv[argv.index(name) + 1]   # noqa: E731
+        if "--label" in argv:            # ir_snapshot.py: one still, both eyes
+            if not got.snapshot_fails:   # write_snapshot's <label>_000 files
+                out = Path(kwargs["cwd"]) / arg("--out")
+                out.mkdir(parents=True, exist_ok=True)
+                for end in ("_L.png", "_R.png", ".json"):
+                    (out / f"{arg('--label')}_000{end}").write_bytes(b"")
+            print("[snapshot]")
+        elif "--poses" in argv:          # the recorder: keep the takes
             grasp, takes, first = (arg("--poses"), int(arg("--takes")),
                                    int(arg("--first-take")))
             leap = Path(kwargs["cwd"]) / arg("--out-dir") / "leap"
@@ -108,7 +136,12 @@ def calls(pr, monkeypatch):
             returncode=got.codes[n - 1] if n <= len(got.codes) else 0)
 
     monkeypatch.setattr(pr.subprocess, "run", fake_run)
+    monkeypatch.setattr("builtins.input", fake_input)
     return got
+
+
+def no_input(prompt=""):
+    raise AssertionError(f"input() was called: {prompt!r}")
 
 
 def take_meta(root: Path, run: str, pose="cylindrical_object", take=1,
@@ -179,6 +212,41 @@ def shell_line(root, run, grasp, takes, first):
             + f' --note "{note_of(run, grasp)}"')
 
 
+def ident(grasp):
+    return OBJECT_OF[grasp].split(" |")[0]
+
+
+def label_re(grasp):
+    """The audit still's --label: grasp, object ID, local HHMMSS."""
+    return re.escape(f"{grasp}_{ident(grasp)}_") + r"\d{6}"
+
+
+def listing(root, run, takes, first=1, grasps=GRASPS):
+    """The lines a run prints first, as regular expressions: per grasp its
+    recorder line; in an object run after its audit still's line and before
+    the line saying the typed confirmation is needed."""
+    rows = []
+    for g in grasps:
+        recorder = re.escape(shell_line(root, run, g, takes, first))
+        if run not in OBJECT_RUNS:
+            rows.append(recorder)
+            continue
+        rows += [re.escape(".venv\\Scripts\\python.exe scripts\\leap\\"
+                           "ir_snapshot.py --out "
+                           f"{Path(root) / FOLDER[run] / 'audit'} --label ")
+                 + label_re(g) + re.escape(" --count 1"),
+                 recorder,
+                 re.escape(f"typed confirmation of {ident(g)} required "
+                           "before this grasp")]
+    return rows
+
+
+def assert_listing(lines, patterns):
+    assert len(lines) >= len(patterns)
+    for line, pattern in zip(lines, patterns):
+        assert re.fullmatch(pattern, line), (line, pattern)
+
+
 def main(pr, *argv):
     return pr.main([str(a) for a in argv])
 
@@ -191,12 +259,16 @@ def test_every_run_records_each_grasp_with_its_exact_command(
     n = EXPECTED[run]
     assert main(pr, run, "--root", tmp_path) == 0
     out = capsys.readouterr().out
-    assert [c[0] for c in calls] == [expected_argv(tmp_path, run, g, n, 1)
-                                     for g in GRASPS]
+    assert calls.recorder() == [expected_argv(tmp_path, run, g, n, 1)
+                                for g in GRASPS]
+    # the object gate's audit still before each object grasp's recorder
+    assert calls.kinds() == (["snapshot", "recorder"] * 3
+                             if run in OBJECT_RUNS else ["recorder"] * 3)
     assert all(Path(kwargs["cwd"]) == REPO for _, kwargs in calls)
     lines = out.splitlines()
-    assert lines[:3] == [shell_line(tmp_path, run, g, n, 1) for g in GRASPS]
-    assert lines[3] == ""
+    shown = listing(tmp_path, run, n)
+    assert_listing(lines, shown)
+    assert lines[len(shown)] == ""
     assert "Gloves on + camera." in out
     assert f"{3 * n} takes ({n} per grasp)" in out
     assert "Right hand on the table, outside the camera's view." in out
@@ -246,7 +318,9 @@ def test_every_command_is_the_protocols_step(pr, calls, capsys, tmp_path,
     monkeypatch.setattr(pr, "REPO", tmp_path)
     prepare(tmp_path / "recordings" / "pilot_hoo", run)
     assert main(pr, run, "--print") == 0
-    lines = capsys.readouterr().out.splitlines()[:3]
+    lines = [ln for ln in capsys.readouterr().out.splitlines()
+             if "record_simultaneous.py" in ln]
+    assert len(lines) == 3
     (doc_line,) = [ln for ln in DOC.read_text(encoding="utf-8").splitlines()
                    if f"--out-dir recordings\\pilot_hoo\\{FOLDER[run]} " in ln]
     doc_options, doc_poses, doc_note = options(doc_line)
@@ -279,7 +353,15 @@ def test_default_root_lines_exactly(pr, calls, capsys, tmp_path, monkeypatch):
     fill(root, "B1")
     (root / "objects.lock").write_text(lock_text(), encoding="utf-8")
     assert main(pr, "C", "--print") == 0
-    assert capsys.readouterr().out.splitlines()[2] == (
+    lines = capsys.readouterr().out.splitlines()
+    assert re.fullmatch(
+        re.escape(r".venv\Scripts\python.exe scripts\leap\ir_snapshot.py --out"
+                  r" recordings\pilot_hoo\C_object_hint\audit --label"
+                  r" tip_object_OBJ-PEN_") + r"\d{6}" + re.escape(" --count 1"),
+        lines[6])
+    assert lines[8] == ("typed confirmation of OBJ-PEN required before this "
+                        "grasp")
+    assert lines[7] == (
         r".venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap"
         r" --hand left --poses tip_object --takes 5 --first-take 1"
         r" --keep-all-tracking"
@@ -291,14 +373,26 @@ def test_default_root_lines_exactly(pr, calls, capsys, tmp_path, monkeypatch):
 
 
 # --- 2. --print ------------------------------------------------------------------
-def test_print_runs_nothing_and_writes_no_marker(pr, calls, capsys, tmp_path):
+def test_print_runs_nothing_and_writes_no_marker(pr, calls, capsys, tmp_path,
+                                                monkeypatch):
+    """--print shows each object grasp's audit still command before its
+    recorder line and says the typed confirmation is needed; it asks
+    nothing, runs nothing and writes nothing."""
     prepare(tmp_path, "B1")
+    monkeypatch.setattr("builtins.input", no_input)
     assert main(pr, "B1", "--print", "--root", tmp_path) == 0
-    assert capsys.readouterr().out.splitlines() == [
-        shell_line(tmp_path, "B1", g, 3, 1) for g in GRASPS]
+    lines = capsys.readouterr().out.splitlines()
+    shown = listing(tmp_path, "B1", 3)
+    assert len(lines) == len(shown) == 9
+    assert_listing(lines, shown)
+    assert "ir_snapshot.py" in lines[0]
+    assert "record_simultaneous.py" in lines[1]
+    assert lines[2] == ("typed confirmation of OBJ-CYL required before this "
+                        "grasp")
     assert calls == []
     assert not (tmp_path / "runs_started.txt").exists()
     assert not (tmp_path / "objects.lock").exists()
+    assert not (tmp_path / "B1_object").exists()
 
 
 # --- 3. the glove setup ----------------------------------------------------------
@@ -337,9 +431,11 @@ def test_gloves_written_once_and_kept(pr, calls, capsys, tmp_path):
 def test_both_gloves_note(pr, calls, tmp_path):
     prepare(tmp_path, "B1", gloves=None)
     assert main(pr, "B1", "--gloves", "both", "--root", tmp_path) == 0
-    assert calls[0][0][-1] == note_of("B1", GRASPS[0], "both gloves connected")
+    assert calls.recorder()[0][-1] == note_of("B1", GRASPS[0],
+                                              "both gloves connected")
     assert main(pr, "C", "--root", tmp_path) == 0      # B1 is complete
-    assert calls[-1][0][-1] == note_of("C", GRASPS[2], "both gloves connected")
+    assert calls.recorder()[-1][-1] == note_of("C", GRASPS[2],
+                                               "both gloves connected")
 
 
 def test_glove_setup_file_with_another_word_refuses(pr, calls, capsys,
@@ -728,3 +824,123 @@ def test_ctrl_c_during_a_run_ends_quietly(pr, capsys, tmp_path, monkeypatch):
     assert pr.main(["A", "--gloves", "left", "--root", str(tmp_path)]) == 130
     out = capsys.readouterr().out
     assert "stopped with Ctrl+C" in out and "Traceback" not in out
+
+
+# --- 9. the object gate (second amendment of 2026-10-23) ---------------------------
+PROMPT = ("With {0} held in the LEFT hand over the camera, type {0} and press "
+          "Enter to confirm (q to stop): ")
+
+
+def confirmations(root: Path, run="B1") -> list:
+    path = root / FOLDER[run] / "audit" / "confirmations.txt"
+    return path.read_text(encoding="utf-8").splitlines()
+
+
+def test_a_wrong_id_three_times_stops_before_the_grasp(pr, calls, capsys,
+                                                       tmp_path):
+    prepare(tmp_path, "B1")
+    calls.typed = ["OBJ-BALL", "cylinder", "OBJ-CY"]
+    assert main(pr, "B1", "--root", tmp_path) == 4
+    assert calls == []                              # no still, no recorder
+    assert calls.prompts == [PROMPT.format("OBJ-CYL")] * 3
+    lines = capsys.readouterr().out.splitlines()
+    assert lines.count("that is not OBJ-CYL; type exactly OBJ-CYL, or q to "
+                       "stop") == 2                 # before the 2nd and 3rd
+    assert lines[-1] == ("stopped: cylindrical_object not confirmed with "
+                         "OBJ-CYL in the hand; nothing recorded for it")
+    assert not (tmp_path / "B1_object" / "audit").exists()
+    assert not any("run B1 now" in s for s in lines)
+
+
+@pytest.mark.parametrize("typed", [["q"], ["Q"], ["OBJ-PEN", " q "]])
+def test_q_stops_before_the_grasp(pr, calls, capsys, tmp_path, typed):
+    prepare(tmp_path, "B1")
+    calls.typed = list(typed)
+    assert main(pr, "B1", "--root", tmp_path) == 4
+    assert calls == []
+    assert len(calls.prompts) == len(typed)
+    assert capsys.readouterr().out.splitlines()[-1] == (
+        "stopped: cylindrical_object not confirmed with OBJ-CYL in the hand; "
+        "nothing recorded for it")
+    assert not (tmp_path / "B1_object" / "audit").exists()
+
+
+def test_the_id_in_lower_case_is_confirmed_then_pictured_then_recorded(
+        pr, calls, capsys, tmp_path):
+    prepare(tmp_path, "B1")
+    calls.typed = ["obj-cyl", "q"]                  # q at the second grasp
+    assert main(pr, "B1", "--root", tmp_path) == 4
+    (snapshot, _), (recorder, _) = calls
+    audit = tmp_path / "B1_object" / "audit"
+    assert snapshot[:5] == [sys.executable, "scripts\\leap\\ir_snapshot.py",
+                            "--out", str(audit), "--label"]
+    assert re.fullmatch(label_re("cylindrical_object"), snapshot[5])
+    assert snapshot[6:] == ["--count", "1"]
+    assert recorder == expected_argv(tmp_path, "B1", "cylindrical_object", 3,
+                                     1)
+    (line,) = confirmations(tmp_path)
+    stamp, grasp, obj, typed = line.split(" ", 3)
+    assert datetime.fromisoformat(stamp).tzinfo is not None
+    assert (grasp, obj, typed) == ("cylindrical_object", "OBJ-CYL",
+                                   'typed "obj-cyl"')
+    lines = capsys.readouterr().out.splitlines()
+    order = [lines.index(f"USE OBJ-CYL: {OBJECT_OF['cylindrical_object']}"),
+             lines.index(PROMPT.format("OBJ-CYL") + "obj-cyl"),
+             lines.index("[snapshot]"),
+             lines.index(f"audit still: {audit / snapshot[5]}_000_L.png"),
+             lines.index("[recorder cylindrical_object]")]
+    assert order == sorted(order)
+    assert lines[-1] == ("stopped: spherical_object not confirmed with "
+                         "OBJ-BALL in the hand; nothing recorded for it")
+    # the next run of the step appends: the first line stays as written
+    calls.typed = ["OBJ-BALL", "OBJ-PEN"]
+    assert main(pr, "B1", "--root", tmp_path) == 0
+    rows = confirmations(tmp_path)
+    assert rows[0] == line
+    assert [r.split(" ")[1] for r in rows] == list(GRASPS)
+
+
+def test_no_audit_still_stops_before_the_takes(pr, calls, capsys, tmp_path):
+    """No new <label>*_L.png (e.g. "Allow images" off): nothing recorded."""
+    prepare(tmp_path, "B1")
+    calls.snapshot_fails = True
+    assert main(pr, "B1", "--root", tmp_path) == 5
+    assert calls.kinds() == ["snapshot"]
+    assert capsys.readouterr().out.splitlines()[-1] == (
+        "stopped: no audit picture of OBJ-CYL in the hand was taken (is "
+        '"Allow images" on in the Ultraleap Control Panel?); nothing '
+        "recorded for cylindrical_object")
+    assert len(confirmations(tmp_path)) == 1        # typed, then no picture
+
+
+def test_a_full_object_run_confirms_and_pictures_every_grasp(pr, calls, capsys,
+                                                             tmp_path):
+    prepare(tmp_path, "B1")
+    calls.typed = ["OBJ-CYL", "obj-ball ", " OBJ-PEN"]
+    assert main(pr, "B1", "--root", tmp_path) == 0
+    assert calls.kinds() == ["snapshot", "recorder"] * 3
+    assert calls.recorder() == [expected_argv(tmp_path, "B1", g, 3, 1)
+                                for g in GRASPS]
+    assert calls.prompts == [PROMPT.format(ident(g)) for g in GRASPS]
+    labels = [argv[argv.index("--label") + 1] for argv, _ in calls
+              if "--label" in argv]
+    for grasp, label in zip(GRASPS, labels):
+        assert re.fullmatch(label_re(grasp), label)
+    audit = tmp_path / "B1_object" / "audit"
+    assert sorted(p.name for p in audit.glob("*_L.png")) == sorted(
+        f"{label}_000_L.png" for label in labels)
+    assert [r.split(" ", 3)[1:] for r in confirmations(tmp_path)] == [
+        ["cylindrical_object", "OBJ-CYL", 'typed "OBJ-CYL"'],
+        ["spherical_object", "OBJ-BALL", 'typed "obj-ball "'],
+        ["tip_object", "OBJ-PEN", 'typed " OBJ-PEN"']]
+    assert ("run B1 now: cylindrical_object 3/3, spherical_object 3/3, "
+            "tip_object 3/3; complete.") in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("run", ["A", "A2"])
+def test_mimed_runs_have_no_gate(pr, calls, tmp_path, monkeypatch, run):
+    prepare(tmp_path, run)
+    monkeypatch.setattr("builtins.input", no_input)
+    assert main(pr, run, "--root", tmp_path) == 0
+    assert calls.kinds() == ["recorder"] * 3
+    assert not (tmp_path / FOLDER[run] / "audit").exists()

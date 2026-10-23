@@ -817,3 +817,80 @@ def test_the_recorders_acceptance_policy_is_read_per_take(tmp_path):
     assert cells(labels[1]) == ["-", "0.60", "-", "-", "-", "0.60"]
     assert cells(labels[2]) == ["-", "2", "-", "-", "-", "2"]
     assert cells(labels[3]) == ["2/0", "1/2", "0/0", "0/0", "0/0", "1/2"]
+
+
+def test_the_object_gate_is_counted_per_run_and_grasp(tmp_path):
+    """The second amendment of 2026-10-23: per run x grasp, the raw IR audit
+    stills (<run>/audit/<grasp>_*_L.png) and the typed confirmations (the
+    lines of <run>/audit/confirmations.txt whose second field is the grasp);
+    a run without an audit folder counts 0, a run with no take still counts
+    its audit."""
+    root = tmp_path / "pilot"
+    make_take(root / FOLDER["A"], length=0.7)              # no audit folder
+    run_b1 = root / FOLDER["B1"]
+    make_take(run_b1, "cylindrical_object", 1, length=0.7)
+    audit = run_b1 / "audit"
+    audit.mkdir()
+    for stamp in ("101500", "102000"):
+        for end in ("_L.png", "_R.png", ".json"):
+            name = f"cylindrical_object_OBJ-CYL_{stamp}_000{end}"
+            (audit / name).write_bytes(b"")
+    (audit / "confirmations.txt").write_text(
+        '2026-10-24T10:15:00-04:00 cylindrical_object OBJ-CYL typed "OBJ-CYL"\n'
+        '2026-10-24T10:20:00-04:00 cylindrical_object OBJ-CYL typed "obj-cyl"\n'
+        '2026-10-24T10:25:00-04:00 spherical_object OBJ-BALL typed '
+        '"OBJ-BALL"\n', encoding="utf-8")
+    audit_b2 = root / FOLDER["B2"] / "audit"     # gated, then no take kept
+    audit_b2.mkdir(parents=True)
+    (audit_b2 / "tip_object_OBJ-PEN_110000_000_L.png").write_bytes(b"")
+    (audit_b2 / "confirmations.txt").write_text(
+        '2026-10-24T11:00:00-04:00 tip_object OBJ-PEN typed "OBJ-PEN"\n',
+        encoding="utf-8")
+    out = tmp_path / "out"
+    assert load_compare().main(["--root", str(root), "--out", str(out),
+                                "--window", "0.5"]) == 0
+    with open(out / "summary.csv", encoding="utf-8", newline="") as f:
+        header = next(csv.reader(f))
+    at = header.index("n_keep_all_takes")
+    assert header[at + 1:at + 3] == ["n_audit_stills", "n_object_confirmations"]
+    rows = {(r["level"], r["run"], r["grasp"]): r
+            for r in read_rows(out / "summary.csv")}
+
+    def gate(level, run, grasp):
+        r = rows[(level, run, grasp)]
+        return r["n_audit_stills"], r["n_object_confirmations"]
+
+    assert [gate("run_grasp", "B1", g) for g in GRASPS] == [
+        ("2", "2"), ("0", "1"), ("0", "0")]
+    assert gate("run_all", "B1", "all") == ("2", "3")
+    assert [gate("run_grasp", "B2", g) for g in GRASPS] == [
+        ("0", "0"), ("0", "0"), ("1", "1")]
+    assert [gate("run_grasp_pooledB", "B", g) for g in GRASPS] == [
+        ("2", "2"), ("0", "1"), ("1", "1")]
+    assert gate("run_all_pooledB", "B", "all") == ("3", "4")
+    for run in ("A", "C", "A2"):
+        assert gate("run_all", run, "all") == ("0", "0"), run
+        for g in GRASPS:
+            assert gate("run_grasp", run, g) == ("0", "0"), (run, g)
+
+    lines = (out / "report.txt").read_text(encoding="ascii").splitlines()
+    labels = ["object audit stills (raw IR, per grasp)",
+              "object confirmations typed"]
+
+    def cells(block, label):
+        (line,) = [s for s in block if s.startswith(label)]
+        return line[len(label):].split()             # A B1 C B2 A2 B(pooled)
+
+    for start, end, stills, typed in (
+            ("== cylindrical_object ==", "== spherical_object ==",
+             ["0", "2", "0", "0", "0", "2"], ["0", "2", "0", "0", "0", "2"]),
+            ("== all grasps pooled (secondary) ==", None,
+             ["0", "2", "0", "1", "0", "3"], ["0", "3", "0", "1", "0", "4"])):
+        block = lines[lines.index(start):
+                      lines.index(end) if end else len(lines)]
+        policy = next(i for i, s in enumerate(block)
+                      if s.startswith("takes under strict / keep-all policy"))
+        assert [s[:len(t)] for s, t in zip(block[policy + 1:], labels)] == \
+            labels
+        assert cells(block, labels[0]) == stills
+        assert cells(block, labels[1]) == typed

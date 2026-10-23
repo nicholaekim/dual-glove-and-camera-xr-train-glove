@@ -39,6 +39,10 @@ runs, which keep every completed hold), hold_completed, the camera's tracked
 fraction of the hold, its re-acquisitions and tracking_note, empty for a
 meta written before them, which counts as strict.
 
+The object gate (second amendment of 2026-10-23), per run and grasp: the raw
+IR audit stills <run>/audit/<grasp>_*_L.png and the typed confirmations in
+<run>/audit/confirmations.txt; a run without them counts 0.
+
 Writes takes.csv, summary.csv and report.txt into --out (default
 <root>\\comparison).
 
@@ -108,7 +112,8 @@ SUMMARY_COLUMNS = (
      "n_rejected_low_coverage", "n_rejected_other", "attempt_coverage_median",
      "attempt_coverage_min", "cam_tracked_fraction_median",
      "cam_tracked_fraction_min", "cam_reacquisitions_worst",
-     "n_strict_policy_takes", "n_keep_all_takes", "absdiff_median",
+     "n_strict_policy_takes", "n_keep_all_takes", "n_audit_stills",
+     "n_object_confirmations", "absdiff_median",
      "absdiff_largest", "paired_fraction_median", "paired_fraction_min",
      "cam_coverage_median", "cam_coverage_min", "cam_gaps_over_100ms_total",
      "cam_max_gap_ms_worst", "glove_coverage_median", "glove_coverage_min",
@@ -260,12 +265,29 @@ def attempt_rows(run_dir: Path, label: str) -> list:
     return rows
 
 
+def audit_rows(run_dir: Path, label: str) -> list:
+    """The object gate's record (second amendment of 2026-10-23), one row per
+    raw IR audit still <run>/audit/<grasp>_*_L.png and per line of
+    <run>/audit/confirmations.txt whose second field is the grasp."""
+    audit = run_dir / "audit"
+    rows = [{"run": label, "grasp": g, "kind": "still"}
+            for g in GRASPS for _ in audit.glob(f"{g}_*_L.png")]
+    path = audit / "confirmations.txt"
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            words = line.split()
+            if len(words) > 1 and words[1] in GRASPS:
+                rows.append({"run": label, "grasp": words[1],
+                             "kind": "confirmation"})
+    return rows
+
+
 # --- the summary --------------------------------------------------------------------
 def summarise(level: str, run: str, condition: str, grasp: str, takes: list,
-              expected: int, attempts: list) -> dict:
+              expected: int, attempts: list, audits=()) -> dict:
     """One row over `takes` (any status): every take counted, only the valid
-    ones measured; and every attempt of the group, kept or refused, whatever
-    its take's validity."""
+    ones measured; every attempt of the group, kept or refused, whatever
+    its take's validity; and its object gate's stills and confirmations."""
     valid = [t for t in takes if t["status"] == OK]
     invalid = sum(t["status"].startswith(INVALID) for t in takes)
     refused = [a["why"] for a in attempts if not a["accepted"]]
@@ -293,7 +315,10 @@ def summarise(level: str, run: str, condition: str, grasp: str, takes: list,
            "cam_tracked_fraction_min": min(tracked) if tracked else None,
            "cam_reacquisitions_worst": max(reacq) if reacq else None,
            "n_strict_policy_takes": policies.count(STRICT),
-           "n_keep_all_takes": policies.count(KEEP_ALL)}
+           "n_keep_all_takes": policies.count(KEEP_ALL),
+           "n_audit_stills": sum(a["kind"] == "still" for a in audits),
+           "n_object_confirmations": sum(a["kind"] == "confirmation"
+                                         for a in audits)}
     if not valid:
         return row
     per = [t[f"absdiff_med_{j}"] for t in valid for j in JOINTS]
@@ -354,13 +379,13 @@ def grid_grasps(rows: list) -> list:
     return GRASPS + sorted({t["grasp"] for t in rows} - set(GRASPS))
 
 
-def summary_rows(takes: list, attempts: list) -> list:
+def summary_rows(takes: list, attempts: list, audits=()) -> list:
     """Every run x grasp of the grid, recorded or not: every take counted,
-    only the valid ones measured, every attempt counted."""
+    only the valid ones measured, every attempt and audit row counted."""
     grasps = grid_grasps(takes + attempts)
 
-    def tried(runs, grasp=None):
-        return [t for t in attempts
+    def tried(runs, grasp=None, rows=attempts):
+        return [t for t in rows
                 if t["run"] in runs and grasp in (None, t["grasp"])]
 
     def pick(runs, grasp=None, valid=False):
@@ -376,11 +401,13 @@ def summary_rows(takes: list, attempts: list) -> list:
         factor = (len(GRASPS) if grasp == "all"
                   else 1 if grasp in GRASPS else 0)
         rows = [summarise(level, label, condition, grasp, pick({label}, one),
-                          EXPECTED[label] * factor, tried({label}, one))
+                          EXPECTED[label] * factor, tried({label}, one),
+                          tried({label}, one, audits))
                 for label, _, condition, _ in RUNS]
         rows.append(summarise(pooled_level, "B", "B", grasp,
                               pick({"B1", "B2"}, one), EXPECTED["B"] * factor,
-                              tried({"B1", "B2"}, one)))
+                              tried({"B1", "B2"}, one),
+                              tried({"B1", "B2"}, one, audits)))
         return rows
 
     per_grasp = {g: scope(g, "run_grasp", "run_grasp_pooledB")
@@ -476,6 +503,8 @@ def table(cols: list) -> list:
     lines.append(f"{label:<{LABEL_W}}" + "".join(
         f"{r['n_strict_policy_takes']}/{r['n_keep_all_takes']}".rjust(COL_W)
         for _, r in cols))
+    line("object audit stills (raw IR, per grasp)", "n_audit_stills", "{}")
+    line("object confirmations typed", "n_object_confirmations", "{}")
     lines.append("per joint: median over takes of the per-take median "
                  "|camera - glove|, deg")
     for j in JOINTS:
@@ -590,7 +619,7 @@ def main(argv=None) -> int:
     out = a.out or ((a.root if a.root is not None
                      else next(iter(given.values())).parent) / "comparison")
 
-    takes, attempts, run_lines, unkept = [], [], [], []
+    takes, attempts, audits, run_lines, unkept = [], [], [], [], []
     for label, folder, condition, expected in RUNS:
         if label in given:
             run_dir, name = given[label], str(given[label])
@@ -601,6 +630,8 @@ def main(argv=None) -> int:
         # counted even for a run with no take kept: its refusals are the data
         tried = attempt_rows(run_dir, label) if run_dir is not None else []
         attempts += tried
+        if run_dir is not None:
+            audits += audit_rows(run_dir, label)
         if not metas:
             # "absent" only when nothing was attempted: a run the camera lost
             # every time was recorded, and must not read as never recorded
@@ -640,7 +671,7 @@ def main(argv=None) -> int:
     for s in unkept:
         print(s)
 
-    summary = summary_rows(takes, attempts)
+    summary = summary_rows(takes, attempts, audits)
     out.mkdir(parents=True, exist_ok=True)
     write_csv(out / "takes.csv", TAKE_COLUMNS, takes)
     write_csv(out / "summary.csv", SUMMARY_COLUMNS, summary)

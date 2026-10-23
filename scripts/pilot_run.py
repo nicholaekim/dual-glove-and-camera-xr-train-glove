@@ -15,6 +15,14 @@ in its meta), the hint, the out-dir, and a --note naming the grasp's object
 and the glove setup. So no command is ever edited by hand, and a run that was cut short is
 topped up by running the same step again.
 
+The object gate (second amendment of 2026-10-23): in B1, C and B2 each
+grasp's takes start only after the operator, with the object held in the
+LEFT hand over the camera, has typed its ID (three tries, q stops; each
+confirmation appended to <run>\\audit\\confirmations.txt) and
+scripts\\leap\\ir_snapshot.py has left one raw infrared audit still of it in
+<run>\\audit. Either missing stops the run with nothing recorded for the
+grasp (exit 4 and 5).
+
 Before anything is recorded it checks, in this order: the glove setup, one
 for the whole pilot, kept in <root>\\glove_setup.txt (written by --gloves
 left|both); for the object runs B1, C and B2, <root>\\objects.txt with one
@@ -266,6 +274,59 @@ def run_command(cmd: list) -> int:
         return 130
 
 
+# --- the object gate (second amendment of 2026-10-23) ---------------------------
+def snapshot_cmd(root: Path, folder: str, grasp: str) -> list:
+    """One raw IR still, both eyes, into <run>\\audit, labelled with the
+    grasp, its object and the local time."""
+    label = f"{grasp}_{GRASP_OBJECT[grasp]}_{datetime.now():%H%M%S}"
+    return [sys.executable, r"scripts\leap\ir_snapshot.py",
+            "--out", str(root / folder / "audit"), "--label", label,
+            "--count", "1"]
+
+
+def object_gate(root: Path, root_dir: Path, folder: str, grasp: str) -> int:
+    """The typed ID, then the audit still: 0, or the exit code that stops
+    the run with nothing recorded for the grasp."""
+    ident = GRASP_OBJECT[grasp]
+    audit = root_dir / folder / "audit"
+    typed = None
+    for attempt in range(3):
+        if attempt:
+            print(f"that is not {ident}; type exactly {ident}, or q to stop")
+        try:
+            answer = input(f"With {ident} held in the LEFT hand over the "
+                           f"camera, type {ident} and press Enter to confirm "
+                           "(q to stop): ")
+        except (EOFError, KeyboardInterrupt):    # no keyboard, or Ctrl+C
+            print()
+            break
+        if answer.strip().lower() == "q":
+            break
+        if answer.strip().upper() == ident:
+            typed = answer
+            break
+    if typed is None:
+        print(f"stopped: {grasp} not confirmed with {ident} in the hand; "
+              "nothing recorded for it")
+        return 4
+    audit.mkdir(parents=True, exist_ok=True)
+    with open(audit / "confirmations.txt", "a", encoding="utf-8") as f:
+        f.write(f'{now()} {grasp} {ident} typed "{typed}"\n')
+
+    cmd = snapshot_cmd(root, folder, grasp)
+    label = cmd[cmd.index("--label") + 1]
+    before = set(audit.glob("*_L.png"))
+    run_command(cmd)
+    new = sorted(p for p in audit.glob(f"{label}*_L.png") if p not in before)
+    if not new:
+        print(f"stopped: no audit picture of {ident} in the hand was taken "
+              '(is "Allow images" on in the Ultraleap Control Panel?); '
+              f"nothing recorded for {grasp}")
+        return 5
+    print(f"audit still: {root / folder / 'audit' / new[0].name}")
+    return 0
+
+
 # --- step 9 and the close ------------------------------------------------------
 def compare_or_close(a, root: Path, root_dir: Path) -> int:
     _, a2_folder, a2_n = RUN["A2"][:3]
@@ -391,8 +452,13 @@ def main(argv=None) -> int:
         cmd += ["--out-dir", str(root / folder),
                 "--note", f"{note}; {middle}; {GLOVE_TEXT[gloves]}"]
         plan.append((i, grasp, missing, first, cmd))
-    for *_, cmd in plan:
+    for _, grasp, _, _, cmd in plan:
+        if objects:                  # the object gate comes before the takes
+            print(shell(snapshot_cmd(root, folder, grasp)))
         print(shell(cmd))
+        if objects:
+            print(f"typed confirmation of {GRASP_OBJECT[grasp]} required "
+                  "before this grasp")
     if new:
         print(f"glove setup kept in {root / 'glove_setup.txt'}: "
               f"{GLOVE_TEXT[gloves]}, for every run of this pilot")
@@ -428,6 +494,9 @@ def main(argv=None) -> int:
               f"numbered from {first})")
         if objects:
             print(f"USE {GRASP_OBJECT[grasp]}: {objects[i]}")
+            rc = object_gate(root, root_dir, folder, grasp)
+            if rc != 0:
+                return rc
         rc = run_command(cmd)
         if rc != 0:
             return rc

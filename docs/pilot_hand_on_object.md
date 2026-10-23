@@ -140,15 +140,27 @@ of a run, do not type it (it has no `--first-take`): double-click the same step'
 what is missing. In the commands below `<glove setup>` is `left glove only` or `both gloves connected`, as written in step 3; the
 launcher fills it in. Nothing is hidden: the printed commands are the ones that run.
 
+**Step 2c. Camera only, bare hand (next recording day, before the gloves go on).** A rehearsal of the object gate's
+camera part in a throwaway folder, never in the pilot's root: hold the can in the bare left hand over the camera and run
+
+    .venv\Scripts\python.exe scripts\leap\ir_snapshot.py --out recordings\pilot_hoo_gate_test\audit --label rehearsal_OBJ-CYL --count 1
+
+It must write `rehearsal_OBJ-CYL_000_L.png`, `_R.png` and `_000.json` (the sidecar naming the hands the tracker saw).
+Open the PNG: the can and the hand must be visible. If it says no image came, turn "Allow images" on in the Ultraleap
+Control Panel and run it again. The typed confirmation is pinned by tests and needs no rehearsal.
+
 **Step 3. Gloves on + camera.** Put the gloves on as the vendor advised (sleeve gussets to the webbing, wiggle and bend
 for a few seconds, then calibrate in XR Trainer; a closed hand in the calibration is closed, not squeezed). Right hand
 rests on the table for the whole pilot, outside the camera's view. Connect the LEFT glove only, if XR Trainer allows
 a single glove; an unused second glove adds nothing and the glove stream's timing has varied between sessions. If
 the software insists on both, connect both for every one of the five runs, never a mix, and say so in every
 `--note` ("both gloves connected"). XR Trainer streaming to port 9002, no other glove client running. Place the
-three measured objects within reach, and the paper's three pictures on screen. Then double-click
-`pilot_step3_gloves_left_only.cmd` (or `pilot_step3_gloves_both.cmd` if the software insisted on both): it writes the
-glove setup once (`pilot_run.py A --gloves left --print`) and shows the step 4 command without recording.
+three measured objects within reach, and the paper's three pictures on screen. In the Ultraleap Control Panel,
+"Allow images" must be ON (the object gate of steps 5 to 7 takes raw infrared pictures). Then double-click
+`pilot_step3_gloves_both.cmd` when both gloves are connected, which is what XR Trainer does on this machine (it
+streams both whether or not the right one is used; the record must say so), or `pilot_step3_gloves_left_only.cmd`
+only if the right glove is physically disconnected: it writes the glove setup once (`pilot_run.py A --gloves both
+--print`) and shows the step 4 command without recording.
 
 **Step 4. Gloves on + camera.** Condition A, mimed, 15 takes:
 
@@ -163,7 +175,9 @@ the 5 s, open. Nothing in the hand.
 
     .venv\Scripts\python.exe scripts\record_simultaneous.py --camera leap --hand left --poses cylindrical_object,spherical_object,tip_object --takes 3 --keep-all-tracking --out-dir recordings\pilot_hoo\B1_object --note "condition B1 object: OBJ-CYL, OBJ-BALL, OBJ-PEN as in objects.txt; <glove setup>"
 
-Launcher: `pilot_step5_B1_object.cmd` (`pilot_run.py B1`).
+Launcher: `pilot_step5_B1_object.cmd` (`pilot_run.py B1`). Before each grasp's takes the launcher asks you to type
+the object's ID with the object held in the left hand over the camera, then takes the raw infrared audit picture;
+only then does the recorder start (the second amendment below). The same in steps 6 and 7.
 
 Pick the object up with the right hand and place it into the open left hand after the tracker has acquired the open
 hand, then close on it at the beep and hold. Put it down between takes, keeping the right hand out of the camera's
@@ -303,6 +317,28 @@ calibration must not change between conditions, the five runs are recorded again
 takes, a few minutes). The first attempt's folder was renamed `recordings\pilot_hoo_2026-10-23_attempt1` (run A
 valid, the B1 deviations, the pre-amendment attempt, its own objects.txt and glove_setup.txt) and the launchers
 record the new session into a fresh `recordings\pilot_hoo`, so no launcher changes.
+
+## Amendment of 2026-10-23, second: the object gate
+
+On the first recording day the operator twice recorded the object runs without the objects (nine takes in the first
+attempt, then B1 and C of the second), and nothing in the record could show it: the recorder's still carries the
+skeleton drawing, the tracker cannot tell, and both sessions' object runs are set aside as deviations (manifests in
+`recordings\pilot_hoo_2026-10-23_attempt1` and `recordings\pilot_hoo`). The reviewer's requirement, applied before
+the next recording day: for B1, C and B2 the launcher does not start a grasp's takes until two things exist.
+
+1. The typed confirmation. After `USE OBJ-xxx: <line>`, the launcher asks the operator, with the object held in the
+   LEFT hand over the camera, to type that object's ID and press Enter. Three wrong answers, or `q`, stop the run with
+   nothing recorded for that grasp. Every confirmation is appended with its time to `<run>\audit\confirmations.txt`.
+2. The audit still. Right after the confirmation, `scripts\leap\ir_snapshot.py` takes one raw infrared picture of the
+   hand with the object, both eyes, no drawing on it, into `<run>\audit\` with a sidecar naming the hands the tracker
+   saw at that instant. No picture (for instance "Allow images" off in the Ultraleap Control Panel) stops the run.
+
+The recorder's own acquisition then starts as before (open hand, then the object placed, then the beep). The
+comparison counts the audit stills and the confirmations per run and grasp and prints them in the report, so an
+object run without them is visible as such. Mimed runs have no gate. Two settings for the next day's step 3: "Allow
+images" ON in the Ultraleap Control Panel (a setting, no hardware), and the both-gloves launcher
+(`pilot_step3_gloves_both.cmd`) because XR Trainer streams both gloves whether or not the right one is used; the
+record must say what was connected.
 
 ## What would make the pilot invalid
 
