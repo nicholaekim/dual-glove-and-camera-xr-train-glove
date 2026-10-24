@@ -603,7 +603,7 @@ only. They are not a threshold.
   intervals were cut on it. In p3_circular_precision_thumb_2_fingers take 4
   the declared 2 s interval covers 1.178 s of camera time. Replay uses the
   camera clock, so playback is not affected. Durations read from the
-  metadata are.
+  metadata are; section 10 gives them recomputed on the camera clock.
 - **The clock agreement check is internal.** It compares two clocks of one
   device pipeline. It does not test the camera clock against an external
   reference.
@@ -617,3 +617,54 @@ only. They are not a threshold.
   second at 1x on this machine (section 7), so full-speed play shows
   one source frame in about seven. The media clock and the frame shown
   at any instant stay correct; stepping shows every frame.
+
+## 10. Camera-clock erratum for the metadata's timing columns
+
+The metadata's durations for the static takes were cut on the writer clock
+(sections 5 and 9). `scripts/leap/camera_clock_erratum.py` recomputes them
+on the camera clock and writes the two side by side, with their difference
+and the largest writer stall inside each interval, under
+`results\replay_fidelity\camera_clock_erratum\`: `static_takes.csv` (one
+row per take), `transitions.csv` (one row per capture), `README.md` (the
+method, the three clocks and their roles, every column) and `summary.md`
+(the distributions and the takes over one frame period). It is a derived
+erratum, not a dataset change: the dataset is opened read-only, the script
+refuses an output folder inside it, the R9 rehash was run again after it
+(`DATASET UNCHANGED`), and the metadata keeps its writer-clock values.
+Tests: `tests/test_camera_clock_erratum.py` (a synthetic directory with a
+writer stall, plus two real-data tests that skip without the dataset);
+gates: `GATES_camera_clock_erratum.md`.
+
+```
+.venv\Scripts\python.exe scripts\leap\camera_clock_erratum.py --dataset "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized" --out results\replay_fidelity\camera_clock_erratum
+```
+
+```
+ERRATUM OK: static=115 transitions=52 static_interval_over_one_period=62
+```
+
+Measured on 2026-10-23 (the run took 17 s):
+
+- **Static takes.** The declared 2.000 s interval differs from the
+  camera-clock span of its frames by more than one frame period in 62 of
+  115 takes. In 42 of them only by convention: the declared end is an
+  instant up to one period after the last interval frame (median
+  difference -11.2 ms). In 20 the writer clock itself ran long over the
+  interval frames: camera span minus writer span of the same frames from
+  -12.0 to -33.0 ms, and -0.821 s in p3_circular_precision_thumb_2_fingers
+  take 4 (2.000 s declared, 1.999 s of writer time over frames
+  151749-151855, 1.178 s of camera time, one writer stall of 0.807 s
+  between frames 151852 and 151853). Whole-take durations: camera minus
+  metadata from -11.6 to +32.4 ms, median +8.4 ms; the metadata's own
+  `camera_clock_duration_s` agrees with the recomputed camera duration to
+  its 1 ms rounding (|difference| at most 0.49 ms).
+- **Transitions: a premise correction.** The metadata's cue, movement-start
+  and settled times are seconds from `first_frame_capture_time` on the
+  capture clock, not the writer clock (`leap_hand.transition.frame_time`
+  reads `capture_time`): each lands within 0.50 ms of a selected frame by
+  `capture_time` (the table's 1 ms rounding) and up to 20.6 ms from one by
+  `wall_time`. So each instant was mapped to the frame it was cut from by
+  `capture_time` and re-expressed on `timestamp_us`; the 42 timed
+  transitions change by at most 0.55 ms (durations by at most 0.49 ms).
+  Had the durations been cut on the writer clock, they would have been off
+  by -39 to +341 ms (the `wall_time` span of the same frames).
