@@ -7,8 +7,24 @@ set (or any camera JSONL file): the reconstructed skeleton in camera space or
 relative to the wrist or palm, the recorded abs26 positions as an overlay,
 per-joint axes, a timeline with the gaps, identity changes and dropped frames,
 a HUD with the clock, the raw stamps and the fidelity numbers of the shown
-frame, and a separate Paper 3 panel. Hold mode by default: only source
-frames are shown, never an interpolated pose unless `i` switches it on.
+frame, an angle panel, and a separate Paper 3 panel. Hold mode by default:
+only source frames are shown, never an interpolated pose unless `i` switches
+it on.
+
+The angle panel lists every angle of the shown pose that the coverage table
+names (leap_hand.angle_coverage), each with its column and status, with the
+finger MCP pairs labelled by order. Below it, apart, the "estimated" block:
+the thumb TMC pair relative to the recorded open hand
+(T_TMC_fe_est_openhand, T_TMC_aa_est_openhand, leap_hand.tmc_estimate), its
+twist and residual, and the calibration's provenance. These are estimates,
+not validated Paper 3 coordinates (docs/tmc_estimate.md). With --dataset the
+calibration is --tmc-calibration PATH (a calibration.json written by
+scripts/leap/tmc_estimate_report.py), by default
+results/replay_fidelity/tmc_estimate/calibration.json when it exists, else
+computed from the dataset's transitions (the time it took is printed).
+--no-tmc leaves the block "not computed"; so does --file without
+--tmc-calibration. A calibration of another session than the recording's is
+not applied (the block says so).
 
 Controls (keys and buttons): space play/pause   +/- speed (0.1 to 4)
 left/right step one frame   p/n previous/next event   r camera/wrist/palm
@@ -26,6 +42,8 @@ Usage:
   .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --dataset "<root>" --grasp p2_s03_power_grasp_finger_side --take 1 --mode interpolate --reference wrist --overlay --axes
   .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --dataset "<root>" --grasp p3_circular_power --take 1 --duration 5
   .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --dataset "<root>" --grasp p3_circular_power --take 1 --headless --screenshot out.png
+  .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --dataset "<root>" --grasp p3_circular_power --take 1 --no-tmc
+  .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --file recordings\\some_take.jsonl --hand left --tmc-calibration results\\replay_fidelity\\tmc_estimate\\calibration.json
   .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --dataset "<root>" --scenario-screenshots results\\replay_fidelity\\screens
 
 --scenario-screenshots replays four static takes headless (Agg) and writes a
@@ -34,10 +52,12 @@ metadata's representative frame; the HUD at the writer stall
 (p3_circular_precision_thumb_2_fingers take 4, frame_id 151853); interpolation
 at the identity change (p2_s03_power_grasp_finger_side take 1, between
 frame_id 88967 and 89008) and its timeline; then a 2 s headless playback whose
-timing log is written beside them. It ends with "SCREENSHOTS WRITTEN <n> files
-to <dir>" (n PNG files).
+timing log is written beside them, every one with the same estimated block
+as the window. It ends with "SCREENSHOTS WRITTEN <n> files to <dir>" (n PNG
+files).
 """
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -45,10 +65,13 @@ from pathlib import Path
 if __package__ in (None, ""):                    # run as a plain script
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
+from leap_hand import angle_coverage as ac
 from leap_hand import replay_core as rc
+from leap_hand import tmc_estimate as te
 
 REPO = Path(__file__).resolve().parents[2]
 RESULTS = REPO / "results" / "replay_fidelity"
+DEFAULT_TMC = RESULTS / "tmc_estimate" / "calibration.json"
 SCENARIOS = (("p3_circular_power", 1), ("p3_prismatic_precision", 1),
              ("p3_circular_precision_thumb_2_fingers", 4),
              ("p2_s03_power_grasp_finger_side", 1))
@@ -99,6 +122,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scenario-screenshots", type=Path, metavar="DIR",
                    help="headless: the four scenario recordings, one PNG per "
                         "state, and a timing log")
+    tmc = p.add_mutually_exclusive_group()
+    tmc.add_argument("--tmc-calibration", type=Path, metavar="PATH",
+                     help="calibration.json of tmc_estimate_report.py for the "
+                          "estimated thumb TMC block (default with --dataset: "
+                          "results/replay_fidelity/tmc_estimate/calibration.json "
+                          "if it exists, else computed from the dataset)")
+    tmc.add_argument("--no-tmc", action="store_true",
+                     help="no thumb TMC estimate (the block says not computed)")
     return p
 
 
@@ -143,6 +174,66 @@ def load(args) -> rc.Recording:
                              gap_threshold_s=args.gap_threshold, kind="file")
 
 
+def load_calibration(path) -> te.Calibration:
+    """A Calibration from a calibration.json (`Calibration.to_json`)."""
+    return te.Calibration.from_json(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def tmc_calibration(args):
+    """(Calibration or None, one line saying where it came from or why
+    there is none) for the estimated block (module docstring). A
+    --tmc-calibration that cannot be read raises."""
+    if args.no_tmc:
+        return None, "TMC estimate: off (--no-tmc)"
+    if args.tmc_calibration is not None:
+        return load_calibration(args.tmc_calibration), \
+            f"TMC calibration: {args.tmc_calibration}"
+    if args.dataset is None:
+        return None, "TMC estimate: not computed (no --dataset, no --tmc-calibration)"
+    if DEFAULT_TMC.is_file():
+        try:
+            return load_calibration(DEFAULT_TMC), f"TMC calibration: {DEFAULT_TMC}"
+        except (OSError, ValueError, KeyError, TypeError) as e:   # reported; replay opens
+            return None, (f"TMC estimate: not computed (cannot read {DEFAULT_TMC}: "
+                          f"{type(e).__name__}: {e})")
+    started = time.perf_counter()
+    try:
+        cal = te.calibrate(args.dataset)
+    except (ValueError, LookupError, OSError) as e:   # reported; the replay still opens
+        return None, (f"TMC estimate: not computed (calibration failed: "
+                      f"{type(e).__name__}: {e})")
+    return cal, (f"TMC calibration: computed from the dataset's transitions in "
+                 f"{time.perf_counter() - started:.1f} s (no {DEFAULT_TMC})")
+
+
+def provenance_text(cal: te.Calibration) -> str:
+    """One panel row (80 characters on this session): the block's title
+    already says open-hand calibration, not a validated Paper 3 coordinate;
+    the full provenance (frames, session) is printed when the calibration
+    loads. A 56-row (804 px) window has no row to spare in interpolate mode."""
+    a = cal.agreement
+    return (f"open hand, {cal.n_transitions} transitions; agreement median "
+            f"{a['median_deg']:.1f}/p90 {a['p90_deg']:.1f}/max {a['max_deg']:.1f} deg")
+
+
+def tmc_provider(cal: te.Calibration, rec: rc.Recording):
+    """The viewer's tmc_provider: tmc_estimate.estimate on the displayed pose,
+    with provenance_text. A calibration of another session than the
+    recording's (both named) is not applied: values None, the reason as
+    the provenance."""
+    session = str(rec.metadata.get("session") or "").strip()
+    if session and cal.session and session != cal.session:
+        note = (f"calibration of session {cal.session}, this recording is of "
+                f"session {session}: not applied")
+        return lambda pos, rot, hand_side: {**dict.fromkeys(ac.ESTIMATE_COLUMNS),
+                                            "provenance": note}
+    text = provenance_text(cal)
+
+    def provider(pos, rot, hand_side):
+        return {**te.estimate(pos, rot, hand_side, cal), "provenance": text}
+    return provider
+
+
 def default_timing_path(rec: rc.Recording) -> Path:
     take = f"_take{rec.take}" if rec.take is not None else ""
     return RESULTS / f"timing_{rec.name}{take}.json"
@@ -185,11 +276,14 @@ def headless_play(viewer, seconds: float, start_frame: int = 0) -> dict:
     return viewer.timing_summary()
 
 
-def scenario_screenshots(root: Path, out_dir: Path, gap_threshold: float) -> int:
-    """The four scenario takes, one PNG per state, plus the timing log.
-    Returns the number of PNG files written."""
+def scenario_screenshots(root: Path, out_dir: Path, gap_threshold: float,
+                         cal=None) -> int:
+    """The four scenario takes, one PNG per state, plus the timing log, the
+    estimated block from `cal` (None: not computed). Returns the number of
+    PNG files written."""
     from leap_hand.replay_viewer import ReplayViewer
 
+    provider = (lambda rec: None) if cal is None else (lambda rec: tmc_provider(cal, rec))
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     written = []
@@ -207,7 +301,8 @@ def scenario_screenshots(root: Path, out_dir: Path, gap_threshold: float) -> int
         print(f"{stem}: {len(rec.frames)} frames, clock {rec.timeline.source}, "
               f"{len(rec.events)} events, representative frame {rep} "
               f"(frame_id {rec.frames[rep].frame_id})")
-        viewer = ReplayViewer(rec, dpi=100, screenshot_dir=out_dir)
+        viewer = ReplayViewer(rec, dpi=100, screenshot_dir=out_dir,
+                              tmc_provider=provider(rec))
         viewer.seek_frame(rep)
         shot(viewer, stem, "camera")
         viewer.set_reference("wrist")
@@ -237,7 +332,8 @@ def scenario_screenshots(root: Path, out_dir: Path, gap_threshold: float) -> int
 
     name, take = SCENARIOS[0]
     rec = rc.find_static(root, name, take, gap_threshold_s=gap_threshold)
-    viewer = ReplayViewer(rec, dpi=100, timing_label=HEADLESS_LABEL)
+    viewer = ReplayViewer(rec, dpi=100, timing_label=HEADLESS_LABEL,
+                          tmc_provider=provider(rec))
     s = headless_play(viewer, HEADLESS_LOOP_S)
     log = viewer.write_timing_log(out_dir / "timing_headless_agg.json")
     viewer.close()
@@ -262,22 +358,35 @@ def main(argv=None) -> int:
         import matplotlib
         matplotlib.use("Agg")            # before the viewer imports pyplot
 
+    rec = None
+    if args.scenario_screenshots is None:
+        try:
+            rec = load(args)
+        except (LookupError, ValueError, OSError) as e:
+            print(f"cannot load the recording: {e}")
+            return 1
+    try:
+        cal, cal_line = tmc_calibration(args)
+    except (OSError, ValueError, KeyError, TypeError) as e:   # the --tmc-calibration file
+        print(f"cannot read the TMC calibration {args.tmc_calibration}: "
+              f"{type(e).__name__}: {e}")
+        return 1
+    print(cal_line)
+    if cal is not None:
+        print(f"  {cal.provenance}")
+
     if args.scenario_screenshots is not None:
         n = scenario_screenshots(args.dataset, args.scenario_screenshots,
-                                 args.gap_threshold)
+                                 args.gap_threshold, cal)
         print(f"SCREENSHOTS WRITTEN {n} files to {args.scenario_screenshots}")
         return 0
 
     from leap_hand.replay_viewer import ReplayViewer
-    try:
-        rec = load(args)
-    except (LookupError, ValueError, OSError) as e:
-        print(f"cannot load the recording: {e}")
-        return 1
     viewer = ReplayViewer(rec, mode=args.mode, reference=args.reference,
                           speed=args.speed, start_frame=args.start_frame,
                           overlay=args.overlay, axes=args.axes,
-                          screenshot_dir=RESULTS / "screens")
+                          screenshot_dir=RESULTS / "screens",
+                          tmc_provider=None if cal is None else tmc_provider(cal, rec))
     if args.headless:
         path = viewer.screenshot(args.screenshot)
         print(f"screenshot: {path}")

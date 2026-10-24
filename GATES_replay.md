@@ -7,32 +7,32 @@ Scope: every frame of the selected hand of any of the 167 recordings in `grasp s
 - [x] R1: replay core tests pass (rigid transforms and quaternion composition against an in-test Rodrigues reference, left/right synthetic hands, exact replay at source frames, timestamp-based playback and speed, repeated/nonmonotonic/missing clocks with visible fallback, gaps and identity changes never interpolated across)
   CHECK: .venv\Scripts\python.exe -m pytest tests/test_replay_core.py -q
   EXPECT: / passed/
-  EVIDENCE: automatic-evidence=v1; definition-sha256=2f893cb0006940d93509b6ff125bbf5cf31ec1c12c0e001a14d173326598375d; exit=0; EXPECT=matched; output-sha256=f7f3ce230d0f282b1edf876557352287a45920a672cefa7bda14fc87d5e44b92; output-bytes=101; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+  EVIDENCE: automatic-evidence=v1; definition-sha256=2f893cb0006940d93509b6ff125bbf5cf31ec1c12c0e001a14d173326598375d; exit=0; EXPECT=matched; output-sha256=bf2e2f69bc2530e8ccc312579d722803f653d57ff6efcf75f374d057f3420bef; output-bytes=101; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
 
 - [x] R2: Paper 3 layer tests pass (Table 6 and 7 coefficients 4/3, 3/2, 3/2, 2, 4/5, 6/5; class applicability; six unavailable coordinates; residual statistics on a synthetic series; the printed D-H matrix fails orthogonality and the corrected one passes; eq. 9-11 error is zero when the constraints hold exactly)
   CHECK: .venv\Scripts\python.exe -m pytest tests/test_paper3.py -q
   EXPECT: / passed/
-  EVIDENCE: automatic-evidence=v1; definition-sha256=291d2df76465927c7f0ff04292d5c5a17eb460f3a24b0cc8b345c77c8730a62c; exit=0; EXPECT=matched; output-sha256=ad5f4bcde50665dbd5f05cd09ded2c522c86cdae7dbb1845d27aa5cbee35fe00; output-bytes=101; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+  EVIDENCE: automatic-evidence=v1; definition-sha256=291d2df76465927c7f0ff04292d5c5a17eb460f3a24b0cc8b345c77c8730a62c; exit=0; EXPECT=matched; output-sha256=fcb679b7bc0f19523160ae946ede7e197d7087c99e4bd0bd7f9d600ceba09226; output-bytes=101; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
 
 - [x] R3: viewer tests pass on the Agg backend (play/pause, speed, scrub, frame step, source-frame mode, interpolation toggle, reference toggle, overlay toggle, event markers, HUD provenance text, screenshot and timing log written)
   CHECK: .venv\Scripts\python.exe -m pytest tests/test_replay_viewer.py -q
   EXPECT: / passed/
-  EVIDENCE: automatic-evidence=v1; definition-sha256=48b056431e2bef7295c0f7a9ad191e1b7215f4967bf5d0b8042740095d63db95; exit=0; EXPECT=matched; output-sha256=b7fe5ada83b2fe4275d0c9cd120329dbbc6ed0048aad1747a191edda8e31b657; output-bytes=112; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+  EVIDENCE: automatic-evidence=v1; definition-sha256=48b056431e2bef7295c0f7a9ad191e1b7215f4967bf5d0b8042740095d63db95; exit=0; EXPECT=matched; output-sha256=18d47d8788b6801f74322dc23b3d4631c76fe27a16d688a95dbe7316a4cda5e3; output-bytes=102; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
 
 - [x] R4: batch verification script tests pass on a synthetic dataset directory (CSV and JSON outputs with the expected rows, exclusions reported, scenario reports)
   CHECK: .venv\Scripts\python.exe -m pytest tests/test_replay_verify.py -q
   EXPECT: / passed/
-  EVIDENCE: automatic-evidence=v1; definition-sha256=97de6fbfa57adc58a8a8f12073998b0b2003259f20244fa02c8402caa6dac37c; exit=0; EXPECT=matched; output-sha256=37a6bb7b0aeef19a3d846574281c7776e60b07640376d37b75d33c2521db6738; output-bytes=102; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+  EVIDENCE: automatic-evidence=v1; definition-sha256=97de6fbfa57adc58a8a8f12073998b0b2003259f20244fa02c8402caa6dac37c; exit=0; EXPECT=matched; output-sha256=de864acbb8d3e035fa2c08f0ccd31171642d3be764e91effd6206daf02212dbf; output-bytes=102; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
 
 - [x] R5: the whole test suite still passes
   CHECK: .venv\Scripts\python.exe -m pytest tests -q -x
   EXPECT: / passed/
-  EVIDENCE: automatic-evidence=v1; definition-sha256=82d9daa730e6f68dcc71f03b8a43c11ff501ce9ad583b6a269b29ac693626b8b; exit=0; EXPECT=matched; output-sha256=8766cee6f8fa5507df9b10d7ead1e94069f80048b13bd1c1bdfe29a96e92281d; output-bytes=1585; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+  EVIDENCE: automatic-evidence=v1; definition-sha256=82d9daa730e6f68dcc71f03b8a43c11ff501ce9ad583b6a269b29ac693626b8b; exit=0; EXPECT=matched; output-sha256=3c8389ba81719d487474a75728896970147f8e908f02582e52566e78fbcf4026; output-bytes=1666; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
 
 - [x] R6: the batch run over the real dataset covers 115 static takes and 52 transitions, every recording within the declared tolerances (FK vs recorded abs26 at most 1e-6 m, matrix vs quaternion chain at most 1e-6 degrees), and writes results/replay_fidelity/fidelity.json, fidelity_per_recording.csv, events.csv, paper3_residuals.csv
   CHECK: .venv\Scripts\python.exe scripts\leap\replay_verify.py --dataset "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized" --out results\replay_fidelity --all --scenarios
   EXPECT: /FIDELITY OK: static=115 transitions=52 frames=71709 within_tolerance=167\/167/
-  EVIDENCE: automatic-evidence=v1; definition-sha256=35d2e71fd25078670cbe3b6433b384f91744433dfb0902f36e0cac1b86d5f07d; exit=0; EXPECT=matched; output-sha256=30e5e90520426fc2be87172e4319cc7869335810b977faac6a6b460c9cb7f312; output-bytes=733; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+  EVIDENCE: automatic-evidence=v1; definition-sha256=35d2e71fd25078670cbe3b6433b384f91744433dfb0902f36e0cac1b86d5f07d; exit=0; EXPECT=matched; output-sha256=2f3ff06aca284301eecd408103ecdbffed8d21d705149f10e28388ee5380d994; output-bytes=923; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
 
 - [x] R7: the four scenario reports hold the known facts: the timestamp anomaly (p3_circular_precision_thumb_2_fingers take 4, frames 151749-151855, writer span about 1.999 s, camera span about 1.178 s, clock source timestamp_us, no fallback), the identity change (p2_s03_power_grasp_finger_side take 1, hand id 573 to 574 between frames 88967 and 89008, camera gap about 0.455 s, two segments, no interpolation across), one circular grasp (p3_circular_power) and one prismatic grasp (p3_prismatic_precision) with Paper 3 residuals reported and the six unavailable coordinates marked
   CHECK: .venv\Scripts\python.exe scripts\leap\replay_verify.py --check-scenarios results\replay_fidelity
@@ -42,7 +42,7 @@ Scope: every frame of the selected hand of any of the 167 recordings in `grasp s
 - [x] R8: the viewer runs headless on the four scenario recordings and writes a screenshot per state (camera view, wrist view, overlay on, axes on, interpolation on at a gap, HUD at the writer stall) plus a timing log with scheduling statistics
   CHECK: .venv\Scripts\python.exe scripts\leap\replay_view.py --dataset "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized" --scenario-screenshots results\replay_fidelity\screens
   EXPECT: SCREENSHOTS WRITTEN
-  EVIDENCE: automatic-evidence=v1; definition-sha256=de5588dcf1ba43e565f47c9f6bdc7da00d280ed590b02486a2b2788cfb4c48de; exit=0; EXPECT=matched; output-sha256=d64a7793ed65f0965930ebaa12ab11d1d33db3aba15172443bc3555aba950213; output-bytes=1838; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+  EVIDENCE: automatic-evidence=v1; definition-sha256=de5588dcf1ba43e565f47c9f6bdc7da00d280ed590b02486a2b2788cfb4c48de; exit=0; EXPECT=matched; output-sha256=d75e66937f69acb58bd2876e49ff4e124b8893afe8d6fdf05e9aed7862a33d08; output-bytes=2401; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
 
 - [x] R9: the dataset is unchanged: every file of `grasp set 2026-10-08 organized` listed in the forensic baseline hashes to its baseline SHA-256
   CHECK: .venv\Scripts\python.exe scripts\leap\replay_verify.py --check-dataset-unchanged "C:\Users\nkim2\AppData\Local\Temp\hand-forensic-20261023-iqxo3s8o\baseline_sha256.json" "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized"

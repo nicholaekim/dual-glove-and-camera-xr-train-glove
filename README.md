@@ -271,12 +271,20 @@ gaps, hand-id changes and dropped frames marked on the timeline, exact
 source-frame stepping, optional interpolation that never crosses a declared
 discontinuity, the recorded `abs26` positions overlaid on the reconstructed
 skeleton with the residual in the HUD, joint axes, a camera / wrist / palm
-reference frame, and a separate Paper 3 panel (Cobos et al. 2009
+reference frame, an angle panel (every joint's flexion and abduction with
+its status, the finger MCP in both rotation orders, and a separate block for
+the open-hand-calibrated thumb TMC estimate, which is not a validated Paper
+3 coordinate), and a separate Paper 3 panel (Cobos et al. 2009
 relationships with page citations, no pass/fail). `scripts\leap\replay_verify.py`
 runs the same reconstruction over all 115 static takes and 52 transitions
-and writes the numbers to `results\replay_fidelity\`. Method, tolerances and
-measured errors: `docs/replay_fidelity.md`; plan: `docs/replay_plan.md`;
-handoff for the independent review: `docs/replay_handoff_codex.md`.
+and writes the numbers, the per-frame angles and the joint-by-movement
+coverage table to `results\replay_fidelity\`;
+`scripts\leap\tmc_estimate_report.py` writes the thumb TMC estimate with
+its calibration and assumption checks. Method, tolerances and measured
+errors: `docs/replay_fidelity.md`; angle coverage: `docs/angle_coverage.md`;
+the TMC estimate: `docs/tmc_estimate.md`; plans: `docs/replay_plan.md` and
+`docs/angle_coverage_plan.md`; handoff for the independent review:
+`docs/replay_handoff_codex.md`.
 
 ```powershell
 .venv\Scripts\python.exe scripts\leap\replay_view.py --dataset "..\xr trainer\grasp set 2026-10-08 organized" --grasp p3_circular_power --take 1

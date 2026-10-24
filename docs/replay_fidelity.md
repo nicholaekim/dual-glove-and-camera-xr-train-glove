@@ -30,10 +30,16 @@ need a reference measurement this dataset does not have.
 FIDELITY OK: static=115 transitions=52 frames=71709 within_tolerance=167/167
 ```
 
-The run took 116.6 s for all 167 recordings, in one process with no
-hardware attached. Each selected frame is reconstructed twice: once inside
-`replay_core.recording_fidelity` and once for the Paper 3 angles. The dataset
-is only read. The script refuses an `--out` folder inside the dataset.
+The run took 160.5 s for all 167 recordings (`wall_time_s` in
+`fidelity.json`; 164.5 s until the last output was written), measured on
+2026-10-23 with the same command plus `--check-angle-exports`
+(`GATES_angle_coverage.md` C4), in one process with no hardware attached. It
+now also writes the angle exports and the thumb TMC estimate; the first run,
+without them, took 116.6 s. Each selected frame is
+reconstructed twice: once inside `replay_core.recording_fidelity` and once
+for the Paper 3 angles, the angle exports and the estimate; the open-hand
+calibration (3.3 s) reconstructs its 4,379 frames once more. The dataset is
+only read. The script refuses an `--out` folder inside the dataset.
 
 | Check | Command | Result |
 |---|---|---|
@@ -55,6 +61,7 @@ baseline entry (`p2_s03_power_grasp_finger_side_left_take1.jsonl`).
 | `paper3_residuals.csv` / `.json` | 5,010 | 167 recordings x 30 relations, with status, reason, duplicate marker and statistics |
 | `paper3_pooled_by_class.csv` | 180 | 6 pools (static or transition x circular, prismatic or unmapped) x 30 relations |
 | `paper3_fingertip_error.csv` | 167 | eq. 9-11 per recording (unmapped grasps: `not_applied`) |
+| `angle_coverage.csv`, `angles_per_frame.csv`, `angles_per_recording.csv`, `tmc_calibration_used.json` | 43 / 71,709 / 167 / 1 calibration | the joint-by-movement coverage table, every angle per selected frame with the thumb TMC estimate columns (`*_est_openhand`, an estimate, not a Paper 3 coordinate), per-recording representative and hold-frame values, and the open-hand calibration the estimate used (`docs/angle_coverage.md`, `docs/tmc_estimate.md`) |
 | `summary.md` | | short human summary |
 | `scenarios\*.json` | 4 | the named scenarios (section 7) |
 

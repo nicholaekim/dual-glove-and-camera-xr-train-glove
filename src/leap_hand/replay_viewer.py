@@ -33,13 +33,25 @@ WHAT IS DRAWN
              camera +x right, +y up, +z toward the viewer, a proper rotation,
              so a left hand stays a left hand. The wrist is never re-anchored.
 
-TWO PANELS, KEPT APART
+THREE PANELS, KEPT APART
   HUD        replay fidelity: what is shown, from which line, on which clock,
              and how far the reconstruction is from the recording itself.
+  Angles     every angle of the displayed pose the coverage table names
+             (`angle_coverage.all_angles`), grouped by digit, each with its
+             column name and status (calculated, outside Paper 3); the finger
+             MCP pairs twice, flexion-first (xyz) and the paper's order; the
+             twist of each bone on its digit's line; the six coordinates the
+             camera does not measure named, never filled; and apart, the
+             "estimated" thumb TMC block, fed by an optional `tmc_provider`
+             (not computed without one): the two `_est_openhand` values, the
+             twist about the bone with its residual when the provider gives
+             them, and the calibration's provenance. The script
+             scripts/leap/replay_view.py builds the provider from an
+             open-hand calibration (`leap_hand.tmc_estimate`).
   Paper 3    the research comparison (`paper3.frame_relation_values`), with
              the class, the MCP-order disclosure and the six angles the
              camera does not give. Not a fidelity number.
-  Both are monospace text rasterised with Pillow (`_TextPanel`, why there).
+  All three are monospace text rasterised with Pillow (`_TextPanel`, why there).
 
 CONTROLS (buttons and keys)
   space play/pause   +/- speed 0.1 0.25 0.5 1 2 4   slider: scrub by source
@@ -79,8 +91,10 @@ from PIL import Image, ImageDraw, ImageFont
 from xr_hand.joints import BONES
 from xr_hand.viz3d import _HAND_COLORS, FINGERTIP_IDX, PALM_POLYGON_IDX
 
+from . import angle_coverage as ac
 from . import paper3 as p3
 from . import replay_core as rc
+from . import tmc_estimate as te
 
 SPEEDS = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0)
 TICK_MS = 15
@@ -107,6 +121,16 @@ FID_POSITION = "FK vs recorded abs26"
 FID_CHAIN = "matrix chain vs quaternion chain (same data, two code paths)"
 FID_BONE = "bone -z axis vs recorded bone vector"
 P3_TITLE = "Paper 3 agreement (research model, not fidelity)"
+ANG_TITLE = "Angles of the displayed source frame (degrees)"
+ANG_SIGNS = "flexion + toward the palm; abduction + toward the thumb side; both hands"
+ANG_TWIST = ("digit lines: twist of each bone, <DIGIT>_<BONE>_twist_tracker "
+             "(outside Paper 3)")
+ANG_UNAVAILABLE = ("unavailable: " + ", ".join(ac.UNAVAILABLE_COLUMNS)
+                   + " (not measured; see docs/angle_coverage.md)")
+EST_TITLE = "estimated (open-hand calibration; not a validated Paper 3 coordinate)"
+EST_NONE = "not computed (no calibration loaded)"
+MCP_ORDER_LABELS = {"": "(xyz, flexion first)",
+                    "_paper_order": "(paper order, abduction first)"}
 RECORDED_NA = "recorded: n/a between source frames"
 TIMING_DOC = (
     "One record per tick while playing. intended = the media time the tick "
@@ -132,8 +156,13 @@ C_WARN = "#ffb000"
 C_BAD = "#ff5050"
 C_P3_TITLE = "#c9a2ff"
 C_P3_EDGE = "#7a4fb0"
+C_ANG_PANEL = "#0b120e"
+C_ANG_TITLE = "#7fe0a0"
+C_ANG_EDGE = "#3d8a5c"
 STATUS_COLORS = {"applied": "#f0f0f0", "informational": C_CYAN,
                  "not_applied": "#7a7a85", "unavailable": "#5c5c6c"}
+ANGLE_COLORS = {"calculated": "#f0f0f0", "outside_paper3": "#9fb6cc",
+                "unavailable": "#6c6c7c", "estimated": C_WARN}
 EVENT_COLORS = {"gap": "#ff3b3b", "id_change": "#ff9f1a",
                 "dropped_frames": "#ffe14d", "invalid_status": "#9a9a9a",
                 "clock_defect": "#b36bff", "hold": "#2ecc71"}
@@ -141,17 +170,60 @@ TRIAD_COLORS = ("#ff4040", "#40e040", "#4080ff")
 OVERLAY_COLOR = "#ffe14d"
 RESIDUAL_COLOR = "#ff2020"
 
-HUD_FONT, P3_FONT, LINE_SPACING = 7.6, 6.8, 1.22
-# figure fractions: [left, bottom, width, height]
-RECT_3D = [0.005, 0.29, 0.36, 0.625]
-RECT_HUD = [0.37, 0.255, 0.325, 0.69]
-RECT_P3 = [0.70, 0.255, 0.295, 0.69]
+HUD_FONT, P3_FONT, ANG_FONT, LINE_SPACING, ANG_SPACING = 6.8, 6.8, 6.4, 1.22, 1.1
+NOTE_FONT = 7.0
+# figure fractions: [left, bottom, width, height]. At 100 dpi (this machine's
+# TkAgg window and the headless screenshots) every panel font is 9 px with a
+# 5 px advance: the angle panel holds 83 characters (its widest row is 81) and
+# about 56 rows at the window's 804 px height.
+RECT_3D = [0.005, 0.33, 0.225, 0.55]
+RECT_HUD = [0.235, 0.24, 0.22, 0.72]
+RECT_ANG = [0.46, 0.24, 0.28, 0.72]
+RECT_P3 = [0.745, 0.24, 0.25, 0.72]
 RECT_TIMELINE = [0.06, 0.155, 0.90, 0.045]
 RECT_SLIDER = [0.06, 0.112, 0.90, 0.025]
 
 
 def _fmt(v, spec: str, none: str = "n/a") -> str:
     return none if v is None else format(v, spec)
+
+
+def _deg(v) -> str:
+    """Signed degrees to 0.1 for the angle panel, 'n/a' for None, '0.0'
+    for a value that rounds to zero."""
+    if v is None:
+        return "n/a"
+    text = f"{v:+.1f}"
+    return "0.0" if float(text) == 0.0 else text
+
+
+def _angle_groups() -> List[Tuple[str, List[Tuple[str, str]]]]:
+    """(group, [(label, column)]) for the angle panel, from
+    angle_coverage.COVERAGE: the wrist, then each digit, every column of a
+    calculated or outside-Paper-3 entry (twist apart: it goes on the digit's
+    line). A finger MCP entry has two columns, each labelled with its order."""
+    groups: Dict[str, List[Tuple[str, str]]] = {"WRIST": []}
+    short = {"flexion/extension": "fe", "abduction/adduction": "aa",
+             "radial/ulnar deviation": "deviation"}
+    for e in ac.COVERAGE:
+        if (e.status not in ("calculated", "outside_paper3")
+                or e.movement not in short):
+            continue
+        digit, joint = (e.joint.split() + [""])[:2]
+        what = short[e.movement]
+        for column in e.output_columns:
+            if digit == "wrist":
+                label = f"wrist {what} (forearm to palm)"
+            elif len(e.output_columns) == 2:            # finger MCP: both orders
+                order = "_paper_order" if column.endswith("_paper_order") else ""
+                label = f"{joint} {what} {MCP_ORDER_LABELS[order]}"
+            else:
+                label = f"{joint} {what}"
+            groups.setdefault(digit.upper(), []).append((label, column))
+    return list(groups.items())
+
+
+ANGLE_GROUPS = _angle_groups()
 
 
 class _QuietSlider(Slider):
@@ -173,9 +245,11 @@ class _TextPanel(Artist):
     hi-dpi screen gets crisp text. The first line is drawn bold (the title).
     """
 
-    def __init__(self, ax, fontsize: float, bg: str, pad_px: int = 6):
+    def __init__(self, ax, fontsize: float, bg: str, pad_px: int = 6,
+                 spacing: float = LINE_SPACING):
         super().__init__()
         self._ax, self.fontsize, self.bg, self.pad = ax, fontsize, bg, pad_px
+        self.spacing = spacing
         self.lines: List[Tuple[str, str]] = []
         self._fonts: Dict[Tuple[int, bool], ImageFont.FreeTypeFont] = {}
         self._key = None
@@ -198,7 +272,7 @@ class _TextPanel(Artist):
 
     def _render(self, w: int, h: int, dpi: float) -> np.ndarray:
         px = max(6, int(round(self.fontsize * dpi / 72.0)))
-        step = int(round(px * LINE_SPACING))
+        step = int(round(px * self.spacing))
         width = max(20, int((w - 2 * self.pad) // self._font(px, False).getlength("M")))
         img = Image.new("RGBA", (w, h), self.bg)
         draw = ImageDraw.Draw(img)
@@ -240,6 +314,13 @@ class ReplayViewer:
     None when hidden). Methods that depend on time take an optional `now`
     (seconds on the clock given as `now=`, default time.perf_counter) so
     tests can drive them deterministically.
+
+    tmc_provider: optional callable (pos, rot, hand_side) -> dict with the two
+    `angle_coverage.ESTIMATE_COLUMNS` (degrees or None) and a `provenance`
+    string, optionally `tmc_estimate.TWIST` and `tmc_estimate.RESIDUAL`
+    (shown on one line when the twist is given), called on the displayed
+    pose; its numbers go to the angle panel's "estimated" block and nowhere
+    else. Without one that block says "not computed".
     """
 
     def __init__(self, rec: rc.Recording, *, mode: str = "hold",
@@ -248,7 +329,7 @@ class ReplayViewer:
                  axes: bool = False, figsize=(15.5, 8.6), dpi=None,
                  now=time.perf_counter,
                  screenshot_dir="results/replay_fidelity/screens",
-                 timing_label: Optional[str] = None):
+                 timing_label: Optional[str] = None, tmc_provider=None):
         if not rec.frames:
             raise ValueError("recording has no frames")
         if mode not in rc.MODES:
@@ -275,6 +356,8 @@ class ReplayViewer:
         self._limits = self._compute_limits()
         self._fid_cache: Dict[int, dict] = {}
         self._p3_cache: Dict[int, List[dict]] = {}
+        self.tmc_provider = tmc_provider
+        self._ang_cache: Dict[int, Tuple[dict, Optional[dict]]] = {}
         # scheduling: one record per tick; skipped frames counted per play run
         self.sched = rc.SchedulingLog()
         self._tick_run: List[int] = []       # play run of each tick
@@ -298,6 +381,7 @@ class ReplayViewer:
         self.frame_index = 0
         self._hud_lines: List[Tuple[str, str]] = []
         self._p3_lines: List[Tuple[str, str]] = []
+        self._ang_lines: List[Tuple[str, str]] = []
         self._build_figure(figsize, dpi)
         self.seek_frame(start_frame)
 
@@ -382,15 +466,19 @@ class ReplayViewer:
                                        color=C_CYAN, family="monospace",
                                        fontsize=7.5, va="bottom", ha="left")
         self._note_3d = self.fig.text(RECT_3D[0] + 0.005, RECT_3D[1] - 0.003, "",
-                                      color=C_DIM, family="monospace", fontsize=7.0,
-                                      va="top", ha="left")
+                                      color=C_DIM, family="monospace",
+                                      fontsize=NOTE_FONT, va="top", ha="left")
         w_in = self.fig.get_size_inches()[0]
         self._ref_width = int(RECT_3D[2] * w_in * 72 / (7.5 * 0.602)) - 2
+        self._note_width = int(RECT_3D[2] * w_in * 72 / (NOTE_FONT * 0.602)) - 2
 
-        # panels: HUD (fidelity) and Paper 3 (research), visibly apart
+        # panels: HUD (fidelity), angles, Paper 3 (research), visibly apart
         self.hud_ax = self._panel(RECT_HUD, "#2a2a35")
+        self.ang_ax = self._panel(RECT_ANG, C_ANG_EDGE)
         self.p3_ax = self._panel(RECT_P3, C_P3_EDGE)
         self.hud_panel = _TextPanel(self.hud_ax, HUD_FONT, C_PANEL)
+        self.ang_panel = _TextPanel(self.ang_ax, ANG_FONT, C_ANG_PANEL,
+                                    spacing=ANG_SPACING)
         self.p3_panel = _TextPanel(self.p3_ax, P3_FONT, C_P3_PANEL)
 
         # timeline markers above the slider, in source-frame-index coordinates
@@ -435,8 +523,8 @@ class ReplayViewer:
         # draw leaves it out; the draw_event handler keeps that full draw as
         # the background and draws the changing parts on top. A frame then
         # restores the background and redraws only those (_draw).
-        self._dynamic = [self.ax, self.hud_ax, self.p3_ax, self.slider_ax,
-                         self._cursor]
+        self._dynamic = [self.ax, self.hud_ax, self.ang_ax, self.p3_ax,
+                         self.slider_ax, self._cursor]
         for a in self._dynamic:
             a.set_animated(True)
         self._bg = None
@@ -529,6 +617,8 @@ class ReplayViewer:
         self.hud_panel.set_lines(self._hud_lines)
         self._p3_lines = self._compose_paper3()
         self.p3_panel.set_lines(self._p3_lines)
+        self._ang_lines = self._compose_angles()
+        self.ang_panel.set_lines(self._ang_lines)
         self._cursor.set_xdata([self.frame_index, self.frame_index])
         self._sync_widgets()
         canvas = self.fig.canvas
@@ -613,7 +703,8 @@ class ReplayViewer:
         size = hi - lo
         notes.append(f"view box x {size[0]:.3f}  y {size[1]:.3f}  z {size[2]:.3f} m "
                      f"(equal scale, set once per reference)")
-        self._note_3d.set_text("\n".join(notes))
+        self._note_3d.set_text("\n".join(piece for note in notes
+                                         for piece in textwrap.wrap(note, self._note_width)))
 
     def _segment_of(self, i: int) -> Tuple[int, rc.Segment]:
         for k, s in enumerate(self.rec.segments, start=1):
@@ -816,6 +907,72 @@ class ReplayViewer:
         out.append((f"MCP order: {first}", C_DIM))
         out.append(("unavailable (not given by the camera): "
                     + ", ".join(p3.UNAVAILABLE), C_DIM))
+        return out
+
+    def _angles_of_displayed(self) -> Tuple[dict, Optional[dict]]:
+        """(angle_coverage.all_angles, the tmc_provider's dict or None) of the
+        displayed pose; cached per source frame, an interpolated pose computed
+        each time."""
+        def compute(pos, rot):
+            est = (None if self.tmc_provider is None
+                   else self.tmc_provider(pos, rot, self.rec.hand_side))
+            return ac.all_angles(pos, rot, self.rec.hand_side), est
+        d = self.displayed
+        if d.source in ("recorded", "held"):
+            if d.i0 not in self._ang_cache:
+                r = self._recons[d.i0]
+                self._ang_cache[d.i0] = compute(r.pos, r.rot)
+            return self._ang_cache[d.i0]
+        return compute(d.pos, d.rot)
+
+    def _compose_angles(self) -> List[Tuple[str, str]]:
+        """The angle panel: wrist first, then one block per digit (its line
+        carries the twist of each of its bones), every column the coverage
+        table gives a value with that value and its status; the six
+        unavailable named; the estimate block apart (module docstring)."""
+        d = self.displayed
+        out = [(ANG_TITLE, C_ANG_TITLE), (ANG_SIGNS, C_TEXT), (ANG_TWIST, C_DIM)]
+        if d.pos is None:
+            out.append(("no pose at this media time", C_WARN))
+            return out
+        if d.source == "interpolated":
+            a, b = self.rec.frames[d.i0], self.rec.frames[d.i1]
+            out.append((f"interpolated between frame_id {a.frame_id} and "
+                        f"{b.frame_id} (not a recorded pose)", C_WARN))
+            where = "interpolated pose"
+        else:
+            where = f"source frame_id {d.frame.frame_id}"
+        angles, est = self._angles_of_displayed()
+
+        def row(label, column):
+            status = ac.status_of(column)
+            return (f"{label:<37} {column:<20} {_deg(angles[column]):>6} "
+                    f"{ac.STATUS_LABELS[status]}", ANGLE_COLORS[status])
+
+        out.append((f"{where:<37} {'column':<20} {'value':>6} status", C_DIM))
+        for group, rows in ANGLE_GROUPS:
+            if group != "WRIST":
+                twist = [(j.split("_", 1)[1][:4], angles[f"{j}_twist_tracker"])
+                         for j in ac.TWIST_JOINTS if j.startswith(group + "_")]
+                out.append((f"{group:<7}twist " + " ".join(
+                    f"{bone:<4} {_deg(v):>5}" for bone, v in twist), C_CYAN))
+            out.extend(row(label, column) for label, column in rows)
+        out.append((ANG_UNAVAILABLE, ANGLE_COLORS["unavailable"]))
+        out.append(("", C_TEXT))
+        out.append((EST_TITLE, C_WARN))
+        for column in ac.ESTIMATE_COLUMNS:
+            if est is None:
+                text = EST_NONE
+            elif est.get(column) is None:
+                text = "not computed (the provider gave no value)"
+            else:
+                text = f"{_deg(est[column])} deg (estimated)"
+            out.append((f"{column}: {text}", C_WARN))
+        if est is not None:
+            if est.get(te.TWIST) is not None:
+                out.append((f"{te.TWIST}: {_deg(est[te.TWIST])} deg (residual "
+                            f"{_fmt(est.get(te.RESIDUAL), '.1f')} deg)", C_WARN))
+            out.append((f"provenance: {est.get('provenance') or '(none given)'}", C_DIM))
         return out
 
     def _sync_widgets(self) -> None:
@@ -1050,6 +1207,15 @@ class ReplayViewer:
     def paper3_text(self) -> str:
         """The Paper 3 panel as shown (unwrapped lines)."""
         return "\n".join(text for text, _ in self._p3_lines)
+
+    def angles_text(self) -> str:
+        """The angle panel as shown (unwrapped lines)."""
+        return "\n".join(text for text, _ in self._ang_lines)
+
+    def panel_texts(self) -> Dict[str, str]:
+        """The three text panels as shown: hud, angles, paper3."""
+        return {"hud": self.hud_text(), "angles": self.angles_text(),
+                "paper3": self.paper3_text()}
 
     def screenshot(self, path=None) -> Path:
         """The whole figure as a PNG; without a path, a stamped file in

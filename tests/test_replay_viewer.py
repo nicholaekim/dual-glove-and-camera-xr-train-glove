@@ -24,10 +24,13 @@ matplotlib.use("Agg")
 import numpy as np
 import pytest
 
+from leap_hand import angle_coverage as ac
 from leap_hand import paper3
 from leap_hand import replay_core as rc
-from leap_hand.replay_viewer import (C_WARN, CLOCK_OK, P3_TITLE, RECORDED_NA,
-                                     ReplayViewer)
+from leap_hand import tmc_estimate as te
+from leap_hand.replay_viewer import (ANG_TITLE, ANG_UNAVAILABLE, C_WARN, CLOCK_OK,
+                                     EST_TITLE, P3_TITLE, RECORDED_NA, ReplayViewer)
+from xr_hand import joint_frames as jf
 from xr_hand.joints import JOINT_INDEX, JOINT_NAMES
 from xr_hand.kinematics import absolute_to_relative, mat3_to_quat
 
@@ -187,6 +190,7 @@ def test_builds_on_agg_paused_in_hold_mode_at_a_recorded_frame(viewer):
     assert v.displayed.source == "recorded" and v.displayed.i0 == 0
     assert v.hud_panel.rows > 15 and not v.hud_panel.truncated
     assert v.p3_panel.rows > 30 and not v.p3_panel.truncated
+    assert v.ang_panel.rows > 45 and not v.ang_panel.truncated
 
 
 def test_seek_and_step_land_on_exact_source_frames(viewer, rec):
@@ -493,6 +497,127 @@ def test_paper3_panel_is_separate_and_marks_the_unavailable_angles(viewer, rec):
     assert "fidelity" not in text.replace(P3_TITLE, "")   # numbers kept apart
 
 
+# --- the angle panel -------------------------------------------------------------------
+SIX = ("T_TMC_fe", "T_TMC_aa", "I_CMC", "M_CMC", "R_CMC", "L_CMC")
+DIGITS = ("THUMB", "INDEX", "MIDDLE", "RING", "LITTLE")
+
+
+def deg(v):
+    """How the angle panel prints a value (0.1 deg, signed, no '-0.0')."""
+    text = f"{v:+.1f}"
+    return "0.0" if float(text) == 0.0 else text
+
+
+def row_of(lines, column):
+    """The one panel line whose column field is `column`."""
+    hits = [ln for ln in lines if f" {column} " in ln]
+    assert len(hits) == 1, (column, hits)
+    return hits[0]
+
+
+def check_angle_rows(lines, angles):
+    for e in ac.COVERAGE:
+        if e.status not in ("calculated", "outside_paper3") or e.joint.startswith("every"):
+            continue
+        for column in e.output_columns:
+            line = row_of(lines, column)
+            assert line.endswith(ac.STATUS_LABELS[e.status]), line
+            assert f" {deg(angles[column])} " in line, (column, line)
+    for digit in DIGITS:                          # twist on the digit's own line
+        line = next(ln for ln in lines if ln.startswith(digit + " "))
+        assert " twist " in line
+        for joint in ac.TWIST_JOINTS:
+            if joint.startswith(digit + "_"):
+                bone = joint.split("_", 1)[1][:4]
+                value = deg(angles[f"{joint}_twist_tracker"])
+                assert f"{bone:<4} {value:>5}" in line, (joint, line)
+
+
+def test_angle_panel_lists_each_digits_angles_with_column_and_status(viewer, rec):
+    v = viewer
+    v.seek_frame(7)
+    lines = v.angles_text().splitlines()
+    assert lines[0] == ANG_TITLE == "Angles of the displayed source frame (degrees)"
+    assert lines.count("flexion + toward the palm; abduction + toward the thumb "
+                       "side; both hands") == 1
+    r = rc.reconstruct(rec.frames[7])
+    angles = ac.all_angles(r.pos, r.rot, "left")
+    check_angle_rows(lines, angles)
+    for letter in "IMRL":                         # the MCP twice, labelled by order
+        for k in ("fe", "aa"):
+            xyz = row_of(lines, f"{letter}_MCP_{k}")
+            paper = row_of(lines, f"{letter}_MCP_{k}_paper_order")
+            assert xyz.startswith(f"MCP {k} (xyz, flexion first) ")
+            assert paper.startswith(f"MCP {k} (paper order, abduction first) ")
+            assert xyz.endswith(" calculated") and paper.endswith(" calculated")
+    text = "\n".join(lines)
+    for label in (" calculated", " outside Paper 3"):
+        assert label in text
+    assert ANG_UNAVAILABLE == ("unavailable: T_TMC_fe, T_TMC_aa, I_CMC, M_CMC, R_CMC, "
+                               "L_CMC (not measured; see docs/angle_coverage.md)")
+    assert ANG_UNAVAILABLE in lines
+    for name in SIX:                              # named, never given a number
+        assert [ln for ln in lines if name in [w.strip(",") for w in ln.split()]
+                ] == [ANG_UNAVAILABLE], name
+    k = lines.index(EST_TITLE)                    # the estimate, apart and last
+    assert EST_TITLE == ("estimated (open-hand calibration; not a validated Paper 3 "
+                         "coordinate)")
+    assert k > lines.index(ANG_UNAVAILABLE) and lines[k - 1] == ""
+    assert lines[k + 1:] == ["T_TMC_fe_est_openhand: not computed (no calibration loaded)",
+                             "T_TMC_aa_est_openhand: not computed (no calibration loaded)"]
+    assert "fidelity" not in text
+    panels = v.panel_texts()
+    assert panels["angles"] == text and set(panels) == {"hud", "angles", "paper3"}
+    for other in (v.hud_text(), v.paper3_text()):
+        assert "_est_openhand" not in other and "_tracker" not in other
+
+
+def test_angle_panel_on_an_interpolated_pose(viewer, rec):
+    v, t = viewer, rec.timeline.t
+    v.set_mode("interpolate")
+    v.seek_time((t[2] + t[3]) / 2)
+    d = v.displayed
+    assert d.source == "interpolated"
+    lines = v.angles_text().splitlines()
+    assert (f"interpolated between frame_id {rec.frames[2].frame_id} and "
+            f"{rec.frames[3].frame_id} (not a recorded pose)") in lines
+    check_angle_rows(lines, ac.all_angles(d.pos, d.rot, "left"))
+    assert not v.ang_panel.truncated
+
+
+def test_a_tmc_provider_feeds_only_the_estimated_block(rec, tmp_path):
+    calls = []
+
+    def provider(pos, rot, hand_side):
+        calls.append((np.array(pos), np.array(rot), hand_side))
+        return {"T_TMC_fe_est_openhand": 12.345, "T_TMC_aa_est_openhand": None,
+                "provenance": "fake open-hand calibration, 3 transitions"}
+
+    v = ReplayViewer(rec, dpi=100, tmc_provider=provider,
+                     screenshot_dir=tmp_path / "screens")
+    try:
+        v.seek_frame(4)
+        lines = v.angles_text().splitlines()
+        k = lines.index(EST_TITLE)
+        assert lines[k + 1:] == [
+            "T_TMC_fe_est_openhand: +12.3 deg (estimated)",
+            "T_TMC_aa_est_openhand: not computed (the provider gave no value)",
+            "provenance: fake open-hand calibration, 3 transitions"]
+        pos, rot, side = calls[-1]
+        r = rc.reconstruct(rec.frames[4])
+        np.testing.assert_array_equal(pos, r.pos)
+        np.testing.assert_array_equal(rot, r.rot)
+        assert side == "left"
+        assert ANG_UNAVAILABLE in lines            # the validated pair stays unavailable
+        for other in (v.hud_text(), v.paper3_text()):
+            assert "fake open-hand" not in other and "_est_openhand" not in other
+        assert not v.ang_panel.truncated
+        png = v.screenshot(tmp_path / "with_estimate.png")
+        assert png.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    finally:
+        v.close()
+
+
 # --- output files ---------------------------------------------------------------------
 def test_screenshot_timeline_crop_and_timing_log(viewer, tmp_path):
     v = viewer
@@ -542,6 +667,132 @@ def test_script_headless_screenshot_and_argument_checks(jsonl, tmp_path, capsys)
                         "1", "--headless", "--screenshot", str(png)]) == 1
 
 
+# --- the estimated block from the script ------------------------------------------------
+EST_NONE_LINES = ["T_TMC_fe_est_openhand: not computed (no calibration loaded)",
+                  "T_TMC_aa_est_openhand: not computed (no calibration loaded)"]
+
+
+def write_calibration(path, rec, fe, aa, session="synthetic"):
+    """A hand-made Calibration (to_json) whose rest frame reads the fixture's
+    palm-to-metacarpal rotation (the same in every frame: the hand moves
+    rigidly) as (fe, aa) on this left hand: R_rest = R_pm (Ry(-aa) Rx(-fe))^T."""
+    pm = te.palm_to_metacarpal(rc.reconstruct(rec.frames[0]).rot)
+    cal = te.Calibration(R_rest=pm @ (jf.rot_y(-aa) @ jf.rot_x(-fe)).T, session=session,
+                         n_transitions=3, n_frames=75, per_transition=[],
+                         agreement={"median_deg": 4.4, "p90_deg": 7.8, "max_deg": 20.0,
+                                    "worst": {"name": "x", "take": 1}},
+                         provenance="hand-made test calibration")
+    path.write_text(json.dumps(cal.to_json()), encoding="utf-8")
+    return path
+
+
+def run_headless(jsonl, png, monkeypatch, *extra):
+    """(exit code, angle panel lines) of the script, headless at source frame
+    5 of the fixture file; the lines as the viewer had them when the script
+    closed it."""
+    seen = []
+    close = ReplayViewer.close
+
+    def capture(self):
+        seen.append(self.angles_text().splitlines())
+        close(self)
+    monkeypatch.setattr(ReplayViewer, "close", capture)
+    code = script.main(["--file", str(jsonl), "--hand", "left", "--hand-ids", "11 12",
+                        "--start-frame", "5", "--headless", "--screenshot", str(png),
+                        *map(str, extra)])
+    return code, (seen[-1] if seen else None)
+
+
+def test_script_builds_the_estimate_from_a_calibration_file(jsonl, rec, tmp_path,
+                                                            monkeypatch, capsys):
+    cal_path = write_calibration(tmp_path / "calibration.json", rec, 12.0, -7.0)
+    code, lines = run_headless(jsonl, tmp_path / "view.png", monkeypatch,
+                               "--tmc-calibration", cal_path)
+    assert code == 0
+    k = lines.index(EST_TITLE)
+    assert lines[k + 1:] == [
+        "T_TMC_fe_est_openhand: +12.0 deg (estimated)",
+        "T_TMC_aa_est_openhand: -7.0 deg (estimated)",
+        "T_TMC_twist_est_openhand: 0.0 deg (residual 0.0 deg)",
+        "provenance: open hand, 3 transitions; agreement median 4.4/p90 7.8/max 20.0 deg"]
+    assert ANG_UNAVAILABLE in lines              # the validated pair stays unavailable
+    out = capsys.readouterr().out
+    assert f"TMC calibration: {cal_path}" in out and "hand-made test calibration" in out
+    # the numbers are tmc_estimate's on the shown frame
+    r = rc.reconstruct(rec.frames[5])
+    e = te.estimate(r.pos, r.rot, "left", script.load_calibration(cal_path))
+    assert (deg(e["T_TMC_fe_est_openhand"]), deg(e["T_TMC_aa_est_openhand"])) == (
+        "+12.0", "-7.0")
+
+
+def test_script_without_a_calibration_says_not_computed(jsonl, rec, tmp_path,
+                                                        monkeypatch, capsys):
+    code, lines = run_headless(jsonl, tmp_path / "view.png", monkeypatch, "--no-tmc")
+    assert code == 0 and lines[lines.index(EST_TITLE) + 1:] == EST_NONE_LINES
+    assert "TMC estimate: off (--no-tmc)" in capsys.readouterr().out
+    code, lines = run_headless(jsonl, tmp_path / "view.png", monkeypatch)   # --file alone
+    assert code == 0 and lines[lines.index(EST_TITLE) + 1:] == EST_NONE_LINES
+    assert "no --dataset, no --tmc-calibration" in capsys.readouterr().out
+    code, lines = run_headless(jsonl, tmp_path / "view.png", monkeypatch,
+                               "--tmc-calibration", tmp_path / "missing.json")
+    assert code == 1 and lines is None
+    assert "cannot read the TMC calibration" in capsys.readouterr().out
+    cal_path = write_calibration(tmp_path / "calibration.json", rec, 1.0, 2.0)
+    with pytest.raises(SystemExit) as e:
+        script.main(["--file", str(jsonl), "--hand", "left", "--no-tmc",
+                     "--tmc-calibration", str(cal_path)])
+    assert e.value.code == 2
+
+
+def test_a_calibration_of_another_session_is_not_applied(jsonl, rec, tmp_path):
+    other = rc.load_recording(jsonl, "left", [11, 12], provenance=PROVENANCE,
+                              kind="static", name="p3_circular_power", take=1,
+                              metadata={**METADATA, "session": "S1"})
+    cal = script.load_calibration(
+        write_calibration(tmp_path / "calibration.json", rec, 12.0, -7.0, session="S0"))
+    v = ReplayViewer(other, dpi=100, tmc_provider=script.tmc_provider(cal, other),
+                     screenshot_dir=tmp_path / "screens")
+    try:
+        lines = v.angles_text().splitlines()
+        assert lines[lines.index(EST_TITLE) + 1:] == [
+            "T_TMC_fe_est_openhand: not computed (the provider gave no value)",
+            "T_TMC_aa_est_openhand: not computed (the provider gave no value)",
+            "provenance: calibration of session S0, this recording is of session S1: "
+            "not applied"]
+    finally:
+        v.close()
+
+
+def test_the_default_calibration_then_the_computed_one(rec, tmp_path, monkeypatch):
+    """With --dataset: the default calibration.json when it exists, else
+    tmc_estimate.calibrate over the dataset (timed), else not computed."""
+    args = script.build_parser().parse_args(
+        ["--dataset", str(tmp_path), "--grasp", "g", "--take", "1"])
+    path = write_calibration(tmp_path / "default.json", rec, 1.0, 2.0)
+    monkeypatch.setattr(script, "DEFAULT_TMC", path)
+    cal, line = script.tmc_calibration(args)
+    assert line == f"TMC calibration: {path}" and cal.provenance == "hand-made test calibration"
+    monkeypatch.setattr(script, "DEFAULT_TMC", tmp_path / "absent.json")
+    calls = []
+    monkeypatch.setattr(script.te, "calibrate", lambda root: calls.append(root) or cal)
+    computed, line = script.tmc_calibration(args)
+    assert computed is cal and calls == [tmp_path]
+    assert line.startswith("TMC calibration: computed from the dataset's transitions in ")
+    assert line.endswith(f"s (no {tmp_path / 'absent.json'})")
+
+    def fails(root):
+        raise ValueError("no usable transition")
+    monkeypatch.setattr(script.te, "calibrate", fails)
+    assert script.tmc_calibration(args) == (
+        None, "TMC estimate: not computed (calibration failed: ValueError: no usable "
+              "transition)")
+    broken = tmp_path / "broken.json"                # a default that cannot be read
+    broken.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(script, "DEFAULT_TMC", broken)
+    cal, line = script.tmc_calibration(args)
+    assert cal is None and line.startswith(f"TMC estimate: not computed (cannot read {broken}")
+
+
 @needs_dataset
 def test_scenario_screenshots_on_the_real_dataset(tmp_path, capsys):
     out_dir = tmp_path / "screens"
@@ -561,6 +812,7 @@ def test_scenario_screenshots_on_the_real_dataset(tmp_path, capsys):
     assert "p2_s03_power_grasp_finger_side_take1_interpolate_gap.png" in pngs
     assert "p2_s03_power_grasp_finger_side_take1_timeline.png" in pngs
     assert "interpolation at the gap: held (discontinuity (id_change, gap)" in out
+    assert "TMC calibration: " in out          # the screenshots carry the estimated block
     timing = json.loads((out_dir / "timing_headless_agg.json").read_text(encoding="utf-8"))
     # how many ticks fit in 2 s depends on the machine's load: at least one
     assert timing["label"] == "headless Agg draw loop" and timing["n"] >= 1

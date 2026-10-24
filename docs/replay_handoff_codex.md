@@ -396,3 +396,121 @@ timeline shows the orange id-change mark and the red gap at index 61; press
 ```bash
 .venv\Scripts\python.exe scripts\leap\replay_view.py --dataset DATASET --grasp p2_s03_power_grasp_finger_side --take 1 --start-frame 60 --mode interpolate
 ```
+
+## 10. Addendum of 2026-10-23: angle coverage audit, visible MCP angles, thumb TMC estimate
+
+Supervisor requirement received after section 1 to 9 were written. Plan:
+`docs/angle_coverage_plan.md`; ledger: `GATES_angle_coverage.md` (eight
+gates, C1 to C8).
+
+**New and changed files.** New: `src/leap_hand/angle_coverage.py`,
+`src/leap_hand/tmc_estimate.py`, `scripts/leap/tmc_estimate_report.py`,
+`tests/test_angle_coverage.py`, `tests/test_tmc_estimate.py`,
+`docs/angle_coverage.md`, `docs/tmc_estimate.md`,
+`docs/angle_coverage_plan.md`. Changed: `scripts/leap/replay_verify.py`
+(three angle exports, the calibration used, `--check-angle-exports`),
+`scripts/leap/replay_view.py` (loads a TMC calibration for the estimate
+block; `--tmc-calibration PATH`, `--no-tmc`), `src/leap_hand/replay_viewer.py`
+(a third text panel, "Angles of the displayed source frame", with a separate
+"estimated" block), `tests/test_replay_viewer.py`, `tests/test_replay_verify.py`,
+`docs/replay_fidelity.md` (output table and batch time).
+
+**The joint-by-movement table** (`angle_coverage.COVERAGE`, 43 entries; the
+table in `docs/angle_coverage.md` is rendered from the code and a test fails
+if they differ; `angle_coverage.csv` in every batch run): for every joint,
+flexion/extension and abduction/adduction, plus the wrist's two movements and
+the twist of every bone, with the output column, reference frame, zero, sign,
+method, note, requirement and the dataset's own column. Statuses:
+`calculated` (the 18 Paper 3 coordinates the camera gives plus the eight
+paper-order MCP values), `estimated` (the two thumb TMC estimate columns),
+`unavailable` (T_TMC_fe, T_TMC_aa, I/M/R/L_CMC flexion, and the four CMC
+abductions, each with the recording or calibration it needs), and
+`outside_paper3` (thumb MCP and IP abduction, finger PIP and DIP sideways
+components, wrist flexion and deviation, and 24 twists, all exported under
+`_tracker` names). No missing value is filled with zero or a Paper 3
+prediction: the six unavailable columns are present and empty in every
+exported row, and the export check fails on a single non-empty cell.
+
+**Finger MCP visibility.** `angles_per_frame.csv` (one row per selected
+frame, 71,709) carries `{I,M,R,L}_MCP_{fe,aa}` in both orders
+(`xyz`, flexion first, and `_paper_order`, abduction first) among its 68
+angle columns; `angles_per_recording.csv` gives each recording's
+representative-frame value and hold-frame mean/min/max; the viewer's angle
+panel lists each finger's MCP twice, labelled "MCP fe (xyz, flexion first)"
+and "MCP fe (paper order, abduction first)", with the status beside every
+value. At the 115 representative frames all 2,990 calculated values agree
+with the dataset's `joint_angles_24.csv` within 0.005 deg.
+
+**Thumb TMC estimate** (`leap_hand.tmc_estimate`, `docs/tmc_estimate.md`).
+Mapping: the thumb metacarpal's rotation against the PALM frame, referred to
+the session's open-hand rest orientation and split in the paper's order
+(abduction first about the rest frame's y, flexion about the new x, the
+thumb's hinge axis); the leftover turn about the bone is reported as twist.
+Calibration: the chordal mean over the pre-movement frames of the 42
+transitions that have a `movement_start_time_s` (4,379 frames; per
+transition first, then across transitions). Assumptions measured on the
+real data: hinge axes parallel (metacarpal vs proximal median 1.06 deg, max
+7.63; proximal vs distal median 1.24, max 7.48); rest orientation agreement
+across transitions median 4.4 deg, p90 7.8, max 20.0 (the estimate's floor
+uncertainty); the metacarpal moves against the palm (within-take spread up
+to 40.2 deg); the open-hand zero and the palm-as-carpus assumption are not
+measurable here and leave an unknown constant offset from Paper 3's zero.
+Signs pinned by synthetic tests for both hands. Everything about it stays in
+`*_est_openhand` columns, a separate viewer block and its own report
+(`results\replay_fidelity\tmc_estimate\`); `paper3.compare` keeps the Table
+6 TMC relation `unavailable`. Hold-frame means over the static takes:
+circular 20 takes fe 3.0 / 18.7 / 58.1 (min / median / max), aa -38.3 /
+3.8 / 17.4; prismatic 15 takes fe -13.5 / 3.5 / 18.9, aa -14.7 / -1.4 /
+10.2.
+
+**Commands** (repository root; `DATASET` as in section 9):
+
+```bash
+.venv\Scripts\python.exe -m pytest tests/test_angle_coverage.py tests/test_tmc_estimate.py tests/test_replay_viewer.py tests/test_replay_verify.py -q
+```
+
+```bash
+.venv\Scripts\python.exe scripts\leap\replay_verify.py --dataset DATASET --out results\replay_fidelity --all --scenarios --check-angle-exports
+```
+
+```bash
+.venv\Scripts\python.exe scripts\leap\tmc_estimate_report.py --dataset DATASET --out results\replay_fidelity\tmc_estimate
+```
+
+```bash
+node "%USERPROFILE%\.claude\skills\unlazy\scripts\gate-check.mjs" --reverify --timeout 1800 GATES_angle_coverage.md
+```
+
+**Results (2026-10-23).** Tests: `test_angle_coverage.py` 18,
+`test_tmc_estimate.py` 40, `test_replay_viewer.py` and `test_replay_verify.py`
+now 67 together (the four files 125). The batch run over the real dataset
+ends
+
+```
+FIDELITY OK: static=115 transitions=52 frames=71709 within_tolerance=167/167
+ANGLE EXPORTS OK: rows=71709 mcp_columns=16 est_columns=2 unavailable_empty=6 est_filled=71709
+```
+
+in 160.5 s (the calibration itself takes 3.3 s), and the TMC report ends
+`TMC ESTIMATE REPORT OK: transitions_used=42 recordings=167` in 44.9 s. The
+batch's per-frame estimates agree with the standalone report's within
+5e-5 deg on all 71,709 frames. New result files under
+`results\replay_fidelity\`: `angle_coverage.csv` (43 rows),
+`angles_per_frame.csv` (71,709 rows, 48 MB), `angles_per_recording.csv`
+(167 rows), `tmc_calibration_used.json`, and the folder `tmc_estimate\`
+(`calibration.json`, `assumption_checks.json`, `estimates_per_recording.csv`,
+`estimates_per_frame.csv`, `estimates_by_class.csv`). The viewer was launched
+on the real TkAgg window (1920 x 1080 display at 125 % scaling, 125 dpi,
+figure 15.4 x 8.0 in) with the calibration loaded: the angle panel fits
+without cut-off and the estimated block shows the values and provenance
+(`results\replay_fidelity\interactive_tk\12_tk_angle_panel_writer_stall.png`,
+`tk_geometry_check.json`). The gate ledgers' evidence lines
+(`GATES_angle_coverage.md`, and `GATES_replay.md` re-verified after these
+changes) record the checker's own runs.
+
+**Limits of the addendum.** The estimate's zero is the recorded open hand,
+not Paper 3's; its floor uncertainty is the rest-frame agreement (median
+4.4 deg, max 20.0 deg) and it carries an unknown constant offset from the
+paper's coordinate. The viewer's angle panel needs the 15.5 x 8.6 inch
+figure; at higher display scaling rows may wrap. Nothing is committed from
+the addendum yet.
