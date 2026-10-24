@@ -475,6 +475,13 @@ and `metadata/grasps_summary.csv` or `metadata/pose_transitions.csv`
 disagree, the metadata is the writer-clock number and the erratum is the
 camera-clock number; both are kept.
 
+**Reproduce.** From the repository root, with the dataset at the path above;
+the four files are rewritten in full on every run:
+
+```
+.venv\\Scripts\\python.exe scripts\\leap\\camera_clock_erratum.py --dataset "{root}" --out <folder>
+```
+
 **The three clocks on every JSONL line.**
 
 - `timestamp_us`: the camera's own acquisition clock (LeapC device clock),
