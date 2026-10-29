@@ -1,0 +1,30 @@
+# Gates: readable report of which joint angles the grasp set gives
+
+OWNS: scripts/leap/angle_coverage_report.py, tests/test_angle_coverage_report.py, GATES_angle_coverage_report.md
+
+Scope: `scripts/leap/angle_coverage_report.py` answers the professor's note ("some angles are not calculated for some joint like TMC and MCP. Also, some angles for abduction and adduction.") with a paper-style `report.html` (self-contained, figures as base64 PNG) and `report.pdf` (headless Edge or Chrome) plus `angle_coverage.csv`, written into a folder outside the dataset. Every count and every table row is read at run time from `leap_hand.angle_coverage.COVERAGE` and `docs/angle_coverage.md`; the agreement numbers are recomputed from the raw JSONL at each take's representative frame (`replay_core.find_static`, `reconstruct`, `angle_coverage.all_angles`) and compared with the dataset's own `metadata/joint_angles_24.csv`. The dataset is only read.
+
+Note on the count: the brief said 43 entries; `COVERAGE` holds 47 since the 2026-10-24 corrections (two neutral-posture estimates and two reference-evaluated `_mapped` entries were added for the thumb TMC). The report and its gates take the count from the code.
+
+- [x] A1: the report tests pass: angle_coverage.csv with one row per COVERAGE entry; report.html holds the title, author, every section heading, one Table 1 row per entry, two figures as base64 PNG, the agreement table with max |difference| below 1e-6 on the synthetic set and blank counts equal to the row count for the six unavailable; a dataset value moved by 1 deg shows up in that column's max (negative control); output inside the dataset refused; no browser prints PDF NOT MADE and exits 0; a PDF starting with %PDF when a browser exists
+  CHECK: .venv\Scripts\python.exe -m pytest tests/test_angle_coverage_report.py -q
+  EXPECT: / passed/
+  EVIDENCE: automatic-evidence=v1; definition-sha256=2562a885cab358d396c43ecba2b8b6a25c2e8626d2ab8d94b6a1b218e50b257a; exit=0; EXPECT=matched; output-sha256=802d20d370bbb8bc5c9980e21c1fdde08578c5aceb6be2d958c11f974d268435; output-bytes=100; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+
+- [x] A2: the coverage module's own tests and the sibling report's tests still pass (the report reuses the sibling's HTML helpers)
+  CHECK: .venv\Scripts\python.exe -m pytest tests/test_angle_coverage.py tests/test_camera_clock_erratum_report.py -q
+  EXPECT: / passed/
+  EVIDENCE: automatic-evidence=v1; definition-sha256=b9b3fdb7468def41ffd0308d59294f15bb5c2189d03995e84593cedc9496f663; exit=0; EXPECT=matched; output-sha256=ef2723aff744c91b01cc594cf1da1e5af4385d17e86fe6f6b4d79c4ef72b9048; output-bytes=101; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+
+- [x] A3: the real run writes angle_coverage.csv, report.html and report.pdf into the angle-coverage folder beside the dataset, the 26 compared columns agreeing with joint_angles_24.csv to within half of the dataset's 0.01 deg rounding step
+  CHECK: .venv\Scripts\python.exe scripts\leap\angle_coverage_report.py --dataset "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized" --out "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 angle coverage"
+  EXPECT: /COVERAGE REPORT OK: entries=47 given=18 unavailable=6 max_abs_diff_deg=(0|0\.00[0-4]\d*|0\.005) pdf=yes/
+  EVIDENCE: automatic-evidence=v1; definition-sha256=be15613c0f606d6d0c93b518ee6ffc032768e200562417e0222afbb9d5605d4e; exit=0; EXPECT=matched; output-sha256=d874895d9f7f518833fa7597b90ba37a6f2d4062bdd00ba83b44e08836c8d7d6; output-bytes=404; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
+
+- [x] A4: every page of the real report.pdf was looked at (pypdfium2 render, read page by page): nothing cut off or overlapping, no orphaned heading or group label, no table row split across pages, figure labels readable, the figures correct to the conventions of docs/angle_coverage.md section 2
+  EVIDENCE: 2026-10-29, final report.pdf (17 pages, A4) rendered at scale 1.5 and every page read; the final PDF's pages are pixel-identical to the inspected render. Fixed on the way: Figure 1 labels overlapping ("parent bone" over the x label, the abduction label over the zero label) and its key line cut at both ends; Table 1 caption orphaned under Figure 2 (Table 1 now starts its own page), Movement words broken mid-word, "outside Paper 3" wrapping its "3"; Table 2 caption orphaned at a page foot; a section 5 heading and a requirement term left at page feet; pages ending up to 110 mm early in headless Edge, traced by CSS-override probes to break-after: avoid on headings and break-inside: avoid on table groups (now: no break-after: avoid, heading + next block in one keep block). Figure 1 checked against the conventions: z toward the wrist, y dorsal, x = y cross z (out of the page in (a); toward the little finger of a right hand in (b)), flexion toward the palm, abduction toward the thumb. Numbers: a separate script compared Table 2's n, max |difference| and blank counts and Table 3's blank counts with the 2026-10-23 batch export results/replay_fidelity/angles_per_recording.csv (`<column>_rep`) against joint_angles_24.csv: NUMBERS AGREE, 26 columns and 6 blank columns.
+
+- [x] A5: the dataset is unchanged: every file of the forensic baseline hashes to its baseline SHA-256
+  CHECK: .venv\Scripts\python.exe scripts\leap\replay_verify.py --check-dataset-unchanged "C:\Users\nkim2\AppData\Local\Temp\hand-forensic-20261023-iqxo3s8o\baseline_sha256.json" "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized"
+  EXPECT: DATASET UNCHANGED
+  EVIDENCE: automatic-evidence=v1; definition-sha256=7759d2ddcdacea4fe89e5943974205eccc4f2ac759fc1fcdd0fa5abf2afb0744; exit=0; EXPECT=matched; output-sha256=d38204bbde96ec4916ca82f85f1b0410afb5c8aed343720ebd01558ce2ad3073; output-bytes=189; shell=C:\Windows\system32\cmd.exe; cwd=C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer; path=26dc5f0e5c3e/38 entries
