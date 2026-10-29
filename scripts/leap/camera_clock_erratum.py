@@ -595,10 +595,16 @@ line of the other hand or of a stray tracker id is never counted.
 **Rounding.** Seconds are rounded to 1e-6 (the clocks' resolution),
 milliseconds to 1e-3. Differences are camera minus metadata.
 
+**Report.** `report.pdf` (and `report.html`) beside these files is the
+human-readable version of the same tables, made by
+`scripts\\leap\\camera_clock_erratum_report.py --erratum <folder> --dataset "{root}"`;
+it is derived from them and adds nothing.
+
 **Files.** `static_takes.csv`, `transitions.csv`, this `README.md`, and
 `summary.md` (the run's verdict line, the distribution of every difference,
 the takes whose static interval differs by more than one frame period,
-and the clock evidence for the transitions).
+and the clock evidence for the transitions); optionally `report.pdf` and
+`report.html` (the report above).
 """
 
 

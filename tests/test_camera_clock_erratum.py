@@ -293,7 +293,12 @@ def test_summary_and_readme(batch):
     for phrase in ("timestamp_us", "capture_time", "wall_time", "unchanged",
                    "static_takes.csv", "transitions.csv", "--check-dataset-unchanged",
                    "nearest selected frame by `capture_time`", "**How to apply.**",
-                   "static_interval_camera_s", "in place of `static_interval_duration_s`"):
+                   "static_interval_camera_s", "in place of `static_interval_duration_s`",
+                   "**Report.** `report.pdf` (and `report.html`) beside these files is the",
+                   "human-readable version of the same tables, made by",
+                   "camera_clock_erratum_report.py --erratum <folder> --dataset",
+                   "it is derived from them and adds nothing.",
+                   "optionally `report.pdf` and\n`report.html`"):
         assert phrase in readme, phrase
 
 
