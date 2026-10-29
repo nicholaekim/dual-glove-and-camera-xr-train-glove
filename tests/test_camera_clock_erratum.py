@@ -292,7 +292,8 @@ def test_summary_and_readme(batch):
     readme = (out / "README.md").read_text(encoding="utf-8")
     for phrase in ("timestamp_us", "capture_time", "wall_time", "unchanged",
                    "static_takes.csv", "transitions.csv", "--check-dataset-unchanged",
-                   "nearest selected frame by `capture_time`"):
+                   "nearest selected frame by `capture_time`", "**How to apply.**",
+                   "static_interval_camera_s", "in place of `static_interval_duration_s`"):
         assert phrase in readme, phrase
 
 

@@ -482,6 +482,30 @@ the four files are rewritten in full on every run:
 .venv\\Scripts\\python.exe scripts\\leap\\camera_clock_erratum.py --dataset "{root}" --out <folder>
 ```
 
+**How to apply.** Keep the dataset's tables as they are and read this
+erratum beside them, joined on `grasp_name` + `take` (static takes) or
+`to_grasp` + `take` (transitions):
+
+1. For a static take's hold duration use `static_interval_camera_s` from
+   `static_takes.csv` in place of `static_interval_duration_s` in
+   `metadata/grasps_summary.csv`.
+2. For the hold's start and end as seconds into the take use
+   `static_interval_start_camera_s` and `static_interval_end_camera_s` in
+   place of `static_interval_start_s` and `static_interval_end_s`.
+3. For a take's length use `recording_duration_camera_s` in place of
+   `recording_duration_s`.
+4. The frames of the hold (`static_interval_first_frame_id` to
+   `static_interval_last_frame_id`), the representative frame, the joint
+   angles, the keypoints and the images are the same frames as before and
+   need no correction: only the durations and instants change.
+5. The transitions' `movement_start_time_s`, `settled_time_s` and
+   `transition_duration_s` already count on the capture clock and stand;
+   `transitions.csv` confirms them (the `*_difference_s` columns) and adds
+   the frame id each instant falls on.
+
+`static_interval_over_one_period` marks the takes where the correction is
+larger than one frame period; `summary.md` lists them, largest first.
+
 **The three clocks on every JSONL line.**
 
 - `timestamp_us`: the camera's own acquisition clock (LeapC device clock),
