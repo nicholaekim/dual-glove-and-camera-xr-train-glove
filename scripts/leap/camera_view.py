@@ -25,7 +25,10 @@ Other scripts start it for you and feed it a caption through --status-file.
 The still a recorder asks for there (`snap=<path>`) is cropped to the tracked
 hand, which reduces what it shows to the hand and a margin around it (a hand
 held near the face can still include part of it). With no hand tracked it
-writes a `<stem>.skipped.txt` note instead of the JPEG.
+writes a `<stem>.skipped.txt` note instead of the JPEG. Beside every still it
+writes `<still>.json`: when the IR image in it was captured (wall clock, from
+the image's LeapC timestamp), its LeapC timestamp and frame id, and when the
+file was saved.
 """
 import argparse, math, os, threading, time
 
@@ -36,7 +39,8 @@ from leap import enums
 from leapc_cffi import ffi, libleapc
 
 from leap_hand.protocol import (NO_TRACKED_HAND, QUIT, hand_crop_box, image_banner, parse_status,
-                                skipped_still_path, skipped_still_text)
+                                skipped_still_path, skipped_still_text, still_capture_record,
+                                write_still_capture)
 from leap_hand.tracking_quality import (HandState, LiveLossTracker, Sample, decode_device_status,
                                         image_stats)
 
@@ -67,7 +71,12 @@ lock = threading.Lock()
 # over a perfectly good picture of the hand.
 # `px` is the tracked hands' pixels in the unmirrored frame the last compose()
 # drew, and `px_t` the time of the tracking event they came from.
-state = {"img": None, "img_t": None, "images": 0,
+# `img_stamp` is (wall-clock capture time, LeapC timestamp in us, frame id)
+# of the image in `img`, each None when LeapC did not give it; `shown_stamp`
+# is that of the image the last compose() drew, which is the one a still is
+# cut from (see leap_hand.protocol.still_capture_record).
+state = {"img": None, "img_t": None, "images": 0, "img_stamp": (None, None, None),
+         "shown_stamp": (None, None, None),
          "hands": [], "hands_t": 0.0, "fps": 0.0, "frames": 0,
          "px": [], "px_t": 0.0}
 HANDS_FRESH_S = 0.25              # older tracking than this is drawn as no hand
@@ -99,11 +108,20 @@ class Listener(leap.Listener):
             img = image_to_numpy(e.image[0])
         except Exception:
             return
+        now = time.time()
+        # When the camera took this image, on the wall clock: the recorder's
+        # rule for tracking frames (leap_hand.stream), now minus the image's
+        # age on the LeapC clock, read here because only here are both held.
+        try:
+            ts = int(e.c_data.info.timestamp)
+            stamp = (now - (leap.get_now() - ts) / 1e6, ts, int(e.c_data.info.frame_id))
+        except Exception:
+            stamp = (None, None, None)
         with lock:
             state["img"] = img
-            state["img_t"] = time.time()       # a picture IS here, whatever
+            state["img_t"] = now               # a picture IS here, whatever
             state["images"] += 1               # the policy reply said
-        now = time.time()
+            state["img_stamp"] = stamp
         if now - tq["image_t"] >= 0.1:
             try:
                 tq["image"] = image_stats(img)
@@ -240,6 +258,7 @@ def compose():
     the plain one has no text and no border, for cropping a still from."""
     with lock:
         img = None if state["img"] is None else state["img"].copy()
+        state["shown_stamp"] = state["img_stamp"]
         hands_t = state["hands_t"]
         hands = list(state["hands"]) if time.time() - hands_t < HANDS_FRESH_S else []
         fps = state["fps"]; frames = state["frames"]; img_t = state["img_t"]
@@ -367,6 +386,11 @@ try:
                     print(f"still skipped, no hand tracked: {want_snap}")
                 else:
                     cv2.imwrite(want_snap, still)
+                    # `<still>.json`: when the image in this still was taken
+                    with lock:
+                        cap, ts, fid = state["shown_stamp"]
+                    write_still_capture(want_snap, still_capture_record(
+                        saved_at=time.time(), capture_time=cap, timestamp_us=ts, frame_id=fid))
             except Exception as ex:
                 print("could not write the snapshot:", ex)
         if not args.no_window:

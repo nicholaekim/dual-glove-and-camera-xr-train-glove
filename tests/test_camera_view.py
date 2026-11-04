@@ -7,7 +7,8 @@ from types import SimpleNamespace
 
 from leap_hand.protocol import (IMAGES_OFF, NO_TRACKED_HAND, STILL_UNKNOWN, CameraView,
                                 hand_crop_box, image_banner, move_still, skipped_still_path,
-                                skipped_still_text, still_status)
+                                skipped_still_text, still_capture_meta, still_capture_path,
+                                still_capture_record, still_status, write_still_capture)
 
 
 def test_viewer_script_exists_and_compiles():
@@ -186,3 +187,76 @@ def test_recorder_writes_why_a_still_is_missing(tmp_path):
     kept = meta(still="fist_left_take1_x.jpg")
     assert kept["still"] == str(Path("stills") / "fist_left_take1_x.jpg")
     assert kept["still_missing_reason"] is None
+
+
+# --- when the still was taken ---------------------------------------------------
+# The still is the photo a paired-pose comparison is timed by, so the viewer
+# writes `<still>.json` beside it with the image frame's own capture instant.
+
+NO_CAPTURE = {"still_capture_time": None, "still_timestamp_us": None,
+              "still_frame_id": None, "still_capture_time_source": None}
+
+
+def test_the_capture_record_comes_from_the_image_frame_or_says_it_does_not():
+    rec = still_capture_record(saved_at=1790000000.5, capture_time=1790000000.42,
+                               timestamp_us=194619959785, frame_id=3543)
+    assert rec == {"capture_time": 1790000000.42, "capture_time_source": "leapc_image_timestamp",
+                   "timestamp_us": 194619959785, "frame_id": 3543, "saved_at": 1790000000.5}
+    fallback = still_capture_record(saved_at=1790000000.5)
+    assert fallback["capture_time"] == 1790000000.5
+    assert fallback["capture_time_source"] == "saved_at"
+    assert fallback["timestamp_us"] is None and fallback["frame_id"] is None
+
+
+def test_the_capture_sidecar_is_written_beside_the_still_and_read_into_meta_keys(tmp_path):
+    still = tmp_path / "stills" / "fist_take1_x.jpg"
+    assert still_capture_path(still) == tmp_path / "stills" / "fist_take1_x.jpg.json"
+    assert still_capture_meta(still) == NO_CAPTURE               # nothing there: all null
+    write_still_capture(still, still_capture_record(saved_at=20.0, capture_time=19.96,
+                                                    timestamp_us=555, frame_id=9))
+    assert still_capture_meta(still) == {"still_capture_time": 19.96, "still_timestamp_us": 555,
+                                         "still_frame_id": 9,
+                                         "still_capture_time_source": "leapc_image_timestamp"}
+    still_capture_path(still).write_text("{torn", encoding="utf-8")
+    assert still_capture_meta(still) == NO_CAPTURE               # unreadable: null, not a crash
+
+
+def test_the_capture_sidecar_moves_with_the_still(tmp_path):
+    src = tmp_path / "stills" / "fist_take1_x.jpg"
+    dst = tmp_path / "rejected" / "stills" / "fist_left_take1_x_attempt1.jpg"
+    src.parent.mkdir(parents=True)
+    src.write_bytes(b"jpeg")
+    write_still_capture(src, still_capture_record(saved_at=5.0))
+    move_still(src, dst)
+    assert not still_capture_path(src).exists()
+    assert still_capture_meta(dst)["still_capture_time"] == 5.0
+
+
+def test_recorder_copies_the_still_capture_into_the_meta(tmp_path):
+    sync = _recorder()
+    session = sync.CoachedLeapSession
+    stills = tmp_path / "stills"
+    still = stills / "fist_take1_x.jpg"
+    still.parent.mkdir(parents=True)
+    still.write_bytes(b"jpeg")
+    write_still_capture(still, still_capture_record(saved_at=31.0, capture_time=30.95,
+                                                    timestamp_us=77, frame_id=12))
+    assert session._rename_still(still, "fist_left_take1_x") == ("fist_left_take1_x.jpg", "")
+    assert still_capture_path(stills / "fist_left_take1_x.jpg").is_file()
+
+    me = SimpleNamespace(hand="left", _pose="fist", _take=1, band=(18, 28), settle=1.5,
+                         stills_dir=stills, rejected_dir=tmp_path / "rejected")
+    def meta(accepted=True, **kw):
+        return session._meta_dict(me, sync.Attempt(**kw), accepted=accepted, file="f.jsonl",
+                                  still=kw.get("still", ""), attempts=1)
+    kept = meta(still="fist_left_take1_x.jpg")
+    assert (kept["still_capture_time"], kept["still_timestamp_us"], kept["still_frame_id"],
+            kept["still_capture_time_source"]) == (30.95, 77, 12, "leapc_image_timestamp")
+    # a rejected attempt's still lives under rejected/stills, and so does its sidecar
+    move_still(stills / "fist_left_take1_x.jpg",
+               tmp_path / "rejected" / "stills" / "fist_left_take1_x_attempt1.jpg")
+    refused = meta(accepted=False, still="fist_left_take1_x_attempt1.jpg")
+    assert refused["still_capture_time"] == 30.95
+    # no still, or an old session without sidecars: the keys are there and null
+    for got in (meta(), meta(still="fist_left_take2_y.jpg")):
+        assert {k: got[k] for k in NO_CAPTURE} == NO_CAPTURE

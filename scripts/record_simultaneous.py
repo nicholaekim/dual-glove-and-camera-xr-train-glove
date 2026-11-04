@@ -125,6 +125,8 @@ from leap_hand.protocol import (
     move_still,
     read_hand,
     skipped_still_path,
+    still_capture_meta,
+    still_capture_path,
     still_status,
     stream_health,
     view_caption,
@@ -863,6 +865,16 @@ class TakeResult:
     tries: List[Attempt] = field(default_factory=list)
 
 
+def _still_file(session, still: str, accepted: bool) -> Optional[Path]:
+    """Where an attempt's still named `still` is now: `stills/` for a kept
+    take, `rejected/stills/` for a refused one. None without a still, or for
+    a session object that has no folders (read with getattr, like the hint)."""
+    folder = getattr(session, "stills_dir" if accepted else "rejected_dir", None)
+    if not still or folder is None:
+        return None
+    return (folder if accepted else folder / STILLS) / still
+
+
 from leap_hand.protocol import CameraView  # noqa: E402  (the live camera window)
 
 
@@ -1300,6 +1312,7 @@ class CoachedLeapSession(LeapSyncSession):
             self._drop_settle(name)
             still.unlink(missing_ok=True)
             skipped_still_path(still).unlink(missing_ok=True)
+            still_capture_path(still).unlink(missing_ok=True)
             raise
         cam_rec.stop()
         glove_rec.stop()
@@ -1588,6 +1601,11 @@ class CoachedLeapSession(LeapSyncSession):
             # purpose, "unknown" when nothing says why (a crash, no viewer).
             "still_missing_reason": (None if still
                                      else got.still_missing or STILL_UNKNOWN),
+            # When the still's IR image was captured, from the viewer's
+            # `<still>.json` beside it (see `still_capture_record`): the
+            # moment a paired-pose comparison is timed by. All four None
+            # with no still or no sidecar.
+            **still_capture_meta(_still_file(self, still, accepted)),
             "file": file,
             # The REC hold as commanded (`Attempt.hold_start`), None when the
             # attempt never reached it: what a comparison's window ends on.

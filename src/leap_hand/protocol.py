@@ -41,6 +41,7 @@ Everything here is plain values and formatting with no I/O, so the live
 sessions can run it and `leap_hand.stats` can re-apply it to a recording
 months later.
 """
+import json
 import math
 import re
 from pathlib import Path
@@ -786,12 +787,77 @@ def still_status(still_path) -> Tuple[Optional[str], Optional[str]]:
     return None, STILL_UNKNOWN
 
 
+# When the still was taken. The viewer writes `<still>.json` beside the JPEG
+# (`fist_take1_x.jpg.json`) with the capture instant of the IR image the
+# still was cut from, so a comparison timed by the photo does not have to
+# read the time off the file's mtime, which is when the JPEG finished writing.
+# `capture_time` is on the wall clock, derived the way the recorder derives it
+# for tracking frames: time.time() when the image event arrived minus the
+# frame's age on the LeapC clock (LeapGetNow() - the image's timestamp).
+# Without a LeapC stamp it is `saved_at`, and `capture_time_source` says so.
+STILL_CAPTURE_SUFFIX = ".json"
+FROM_IMAGE = "leapc_image_timestamp"
+FROM_SAVED_AT = "saved_at"
+STILL_CAPTURE_KEYS = ("still_capture_time", "still_timestamp_us", "still_frame_id",
+                      "still_capture_time_source")
+
+
+def still_capture_path(still_path) -> Path:
+    """`<still>.json`: the capture record beside the still."""
+    p = Path(still_path)
+    return p.with_name(p.name + STILL_CAPTURE_SUFFIX)
+
+
+def still_capture_record(saved_at: float, capture_time: Optional[float] = None,
+                         timestamp_us: Optional[int] = None,
+                         frame_id: Optional[int] = None) -> dict:
+    """The sidecar's contents for a still saved at `saved_at` (time.time()).
+
+    `capture_time`, `timestamp_us` and `frame_id` are those of the IR image
+    the still was made from; with no capture_time it falls back to
+    `saved_at`, named as such."""
+    return {"capture_time": float(saved_at if capture_time is None else capture_time),
+            "capture_time_source": FROM_SAVED_AT if capture_time is None else FROM_IMAGE,
+            "timestamp_us": None if timestamp_us is None else int(timestamp_us),
+            "frame_id": None if frame_id is None else int(frame_id),
+            "saved_at": float(saved_at)}
+
+
+def write_still_capture(still_path, record: dict) -> Path:
+    path = still_capture_path(still_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def still_capture_meta(still_path) -> dict:
+    """The sidecar as the take meta's four `still_*` keys, all None when
+    there is no still, no sidecar (sessions made before it existed) or it
+    cannot be read."""
+    out = dict.fromkeys(STILL_CAPTURE_KEYS)
+    if not still_path:
+        return out
+    try:
+        rec = json.loads(still_capture_path(still_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return out
+    if not isinstance(rec, dict):
+        return out
+    out.update(still_capture_time=rec.get("capture_time"),
+               still_timestamp_us=rec.get("timestamp_us"),
+               still_frame_id=rec.get("frame_id"),
+               still_capture_time_source=rec.get("capture_time_source"))
+    return out
+
+
 def move_still(src, dst) -> None:
     """Move a take's still, and the viewer's note if it left one instead, to
-    the name `dst`. The note follows the same renaming rule as the JPEG so
-    `still_status(dst)` still finds it. Nothing to move, nothing created."""
+    the name `dst`. The note and the capture record follow the same renaming
+    rule as the JPEG so `still_status(dst)` and `still_capture_meta(dst)`
+    still find them. Nothing to move, nothing created."""
     src, dst = Path(src), Path(dst)
-    for a, b in ((src, dst), (skipped_still_path(src), skipped_still_path(dst))):
+    for a, b in ((src, dst), (skipped_still_path(src), skipped_still_path(dst)),
+                 (still_capture_path(src), still_capture_path(dst))):
         if a.is_file():
             b.parent.mkdir(parents=True, exist_ok=True)
             a.replace(b)
