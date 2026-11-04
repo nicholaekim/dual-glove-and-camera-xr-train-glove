@@ -685,7 +685,9 @@ python scripts\leap\stats.py --mock
 ```
 `--mock` images are obviously synthetic gradients and their sidecars say so;
 `convention_check.py` has no mock, because a convention can only be checked
-against a real device.
+against a real device. A mock `record_frame.py` run writes to
+`recordings\leap\prof_frames_mock\`, never into `prof_frames\`, so it cannot
+overwrite a real frame's keypoint file.
 
 **Exports — the existing tools, unchanged.** Leap recordings are JSONL with
 exactly the glove's keys plus camera-only extras, and `FrameRecorder.load`

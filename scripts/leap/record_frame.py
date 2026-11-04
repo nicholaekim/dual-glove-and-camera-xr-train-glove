@@ -34,6 +34,9 @@ this is the script that covers them one frame at a time.
   python scripts/leap/record_frame.py 128166 --hand left
   python scripts/leap/record_frame.py 128166 --mock --prep 0    # pipeline test
 
+`--mock` writes to recordings/leap/prof_frames_mock/ instead, so a pipeline
+test can never overwrite a real frame's keypoint file.
+
 Protocol (plan section 6): module flat on the table, lenses up, hand 20 to 50
 cm above it, palm roughly toward the camera. Ctrl+C before the beep costs you
 nothing; after it, whatever was recorded is still written.
@@ -72,6 +75,10 @@ from xr_hand.recorder import FrameRecorder, hand_tag, pose_filename
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_OUT = Path("recordings") / "leap" / "prof_frames"
+# A --mock run goes beside the real frames, never among them: the keypoint
+# file's name has no timestamp, so a mock run of a frame already recorded
+# would overwrite the real deliverable. Same rule as record_poses.py.
+MOCK_OUT = Path("recordings") / "leap" / "prof_frames_mock"
 DEFAULT_REFERENCE = Path("reference") / "frames"
 MIN_VISIBLE_TIME_US = 300_000     # plan section 6: a hand counts after 0.3 s
 MAX_DRAIN_ROUNDS = 8              # bound on the post-beep flush
@@ -325,8 +332,9 @@ def main() -> None:
     p.add_argument("--hand", choices=("left", "right"), default=None,
                    help="keep only frames with this label (default: the label "
                         "with the most frames, since labels are unreliable)")
-    p.add_argument("--out-dir", type=Path, default=DEFAULT_OUT,
-                   help=f"output root (default: {DEFAULT_OUT})")
+    p.add_argument("--out-dir", type=Path, default=None,
+                   help=f"output root (default: {DEFAULT_OUT}, or {MOCK_OUT} "
+                        "with --mock)")
     p.add_argument("--reference", type=Path, default=DEFAULT_REFERENCE,
                    help=f"the professor's frames (default: {DEFAULT_REFERENCE})")
     p.add_argument("--no-open", action="store_true",
@@ -336,6 +344,8 @@ def main() -> None:
     p.add_argument("--mode", default="desktop",
                    choices=("desktop", "hmd", "screentop"))
     args = p.parse_args()
+    if args.out_dir is None:
+        args.out_dir = MOCK_OUT if args.mock else DEFAULT_OUT
 
     name = frame_name(args.frame)
     image = find_reference(name, args.reference)

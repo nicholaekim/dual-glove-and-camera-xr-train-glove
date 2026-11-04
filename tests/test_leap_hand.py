@@ -2883,6 +2883,31 @@ def test_record_frame_writes_the_professor_format_on_the_mock(tmp_path: Path,
     assert len(analyse_file(takes[0])) == 2       # both hands recorded
 
 
+def test_record_frame_mock_never_writes_into_the_real_frames_folder(
+        tmp_path: Path, monkeypatch):
+    """A --mock run with no --out-dir goes beside the real frames, never among
+    them: the keypoint file has no timestamp, so a mock run of a frame already
+    recorded would overwrite the real deliverable."""
+    import sys
+
+    record_frame = _load_script("record_frame")
+    monkeypatch.setattr(record_frame, "beep", lambda *a, **k: None)
+    monkeypatch.chdir(tmp_path)
+    real = Path("recordings") / "leap" / "prof_frames"
+    real.mkdir(parents=True)
+    (real / "frame_128166_keypoints.txt").write_text("real take\n")
+    monkeypatch.setattr(sys, "argv", [
+        "record_frame.py", "128166", "--mock", "--prep", "0", "--seconds", "1",
+    ])
+    record_frame.main()
+
+    mock_dir = Path("recordings") / "leap" / "prof_frames_mock"
+    assert (mock_dir / "frame_128166_keypoints.txt").is_file()
+    assert len(list((mock_dir / "frame_128166").glob("*.jsonl"))) == 1
+    assert (real / "frame_128166_keypoints.txt").read_text() == "real take\n"
+    assert sorted(p.name for p in real.iterdir()) == ["frame_128166_keypoints.txt"]
+
+
 def test_record_frame_keeps_only_the_hand_you_asked_for(tmp_path: Path,
                                                         monkeypatch):
     import sys
