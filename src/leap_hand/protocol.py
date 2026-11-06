@@ -740,6 +740,16 @@ def hand_crop_box(points: Sequence[Sequence[float]], size: int,
     return int(x0), int(y0), int(x1), int(y1)
 
 
+def crop_hand(plain, px):
+    """(crop, box): `plain` cut to `hand_crop_box(px, width)`, a copy with
+    nothing drawn on it, or (None, None) when there is no hand to crop to."""
+    box = hand_crop_box(px, plain.shape[1])
+    if box is None:
+        return None, None
+    x0, y0, x1, y1 = box
+    return plain[y0:y1, x0:x1].copy(), box
+
+
 # Why a take has no still. Written into its meta.json as
 # `still_missing_reason`, so a still the viewer skipped on purpose can be told
 # apart from one that is missing because something failed.
@@ -810,17 +820,55 @@ def still_capture_path(still_path) -> Path:
 
 def still_capture_record(saved_at: float, capture_time: Optional[float] = None,
                          timestamp_us: Optional[int] = None,
-                         frame_id: Optional[int] = None) -> dict:
+                         frame_id: Optional[int] = None,
+                         full: Optional[str] = None) -> dict:
     """The sidecar's contents for a still saved at `saved_at` (time.time()).
 
     `capture_time`, `timestamp_us` and `frame_id` are those of the IR image
     the still was made from; with no capture_time it falls back to
-    `saved_at`, named as such."""
+    `saved_at`, named as such. `full` is the file name of the uncropped
+    frame the still was cut from (`full_still_path`), None when there is
+    none: the record describes both pictures, which are one frame."""
     return {"capture_time": float(saved_at if capture_time is None else capture_time),
             "capture_time_source": FROM_SAVED_AT if capture_time is None else FROM_IMAGE,
             "timestamp_us": None if timestamp_us is None else int(timestamp_us),
             "frame_id": None if frame_id is None else int(frame_id),
-            "saved_at": float(saved_at)}
+            "saved_at": float(saved_at),
+            "full": None if full is None else str(full)}
+
+
+# The uncropped frame a hand still was cut from, `<stem>.full.jpg` beside
+# `<stem>.jpg`. It shows the whole camera view, the operator included, so it
+# stays in the session folder: it never goes into a professor's folder.
+FULL_SUFFIX = ".full.jpg"
+
+
+def full_still_path(still_path) -> Path:
+    """`<stem>.full.jpg`: the whole frame the still `<stem>.jpg` was cut from."""
+    p = Path(still_path)
+    return p.with_name(p.stem + FULL_SUFFIX)
+
+
+def save_still(still_path, still, stamp, saved_at: float, imwrite,
+               full=None, cut_from=None) -> Path:
+    """Write the still, the uncropped frame it was cut from (when `full` is
+    given) and the sidecar describing both; returns the sidecar's path.
+
+    `stamp` is (capture_time, timestamp_us, frame_id) of the one image both
+    pictures show. `cut_from` is the array the crop was taken from, and it
+    must BE `full` (the same object, not an equal copy): cropping can then
+    neither move the timestamp nor take its picture from another frame.
+    `imwrite(path, array)` is cv2.imwrite in the viewer."""
+    if full is not None and cut_from is not full:
+        raise ValueError("the still was not cut from the full frame saved with it")
+    full_name = None
+    if full is not None:
+        imwrite(str(full_still_path(still_path)), full)
+        full_name = full_still_path(still_path).name
+    imwrite(str(still_path), still)
+    cap, ts, fid = stamp
+    return write_still_capture(still_path, still_capture_record(
+        saved_at=saved_at, capture_time=cap, timestamp_us=ts, frame_id=fid, full=full_name))
 
 
 def write_still_capture(still_path, record: dict) -> Path:
@@ -852,15 +900,28 @@ def still_capture_meta(still_path) -> dict:
 
 def move_still(src, dst) -> None:
     """Move a take's still, and the viewer's note if it left one instead, to
-    the name `dst`. The note and the capture record follow the same renaming
-    rule as the JPEG so `still_status(dst)` and `still_capture_meta(dst)`
-    still find them. Nothing to move, nothing created."""
+    the name `dst`. The note, the uncropped frame and the capture record
+    follow the same renaming rule as the JPEG so `still_status(dst)` and
+    `still_capture_meta(dst)` still find them. The record's `full` names the
+    uncropped frame, so it is rewritten to the frame's new name when that
+    frame moved with it (the only field touched). Nothing to move, nothing
+    created."""
     src, dst = Path(src), Path(dst)
     for a, b in ((src, dst), (skipped_still_path(src), skipped_still_path(dst)),
+                 (full_still_path(src), full_still_path(dst)),
                  (still_capture_path(src), still_capture_path(dst))):
         if a.is_file():
             b.parent.mkdir(parents=True, exist_ok=True)
             a.replace(b)
+    rec_path = still_capture_path(dst)
+    if rec_path.is_file() and full_still_path(dst).is_file():
+        try:
+            rec = json.loads(rec_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(rec, dict) and rec.get("full") != full_still_path(dst).name:
+            rec["full"] = full_still_path(dst).name
+            rec_path.write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
 
 
 # --- stream health -----------------------------------------------------------

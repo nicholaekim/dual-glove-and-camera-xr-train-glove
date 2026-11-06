@@ -6,7 +6,9 @@ import importlib.util
 from types import SimpleNamespace
 
 from leap_hand.protocol import (IMAGES_OFF, NO_TRACKED_HAND, STILL_UNKNOWN, CameraView,
-                                hand_crop_box, image_banner, move_still, skipped_still_path,
+                                crop_hand, full_still_path, hand_crop_box, image_banner,
+                                move_still,
+                                save_still, skipped_still_path,
                                 skipped_still_text, still_capture_meta, still_capture_path,
                                 still_capture_record, still_status, write_still_capture)
 
@@ -126,6 +128,32 @@ def test_no_hand_in_the_picture_means_no_crop():
     assert hand_crop_box([(-5, 3), (800, 10)], 768) is None
 
 
+# The still is a photo: the crop is the frame's own pixels in hand_crop_box's
+# box, with nothing drawn on it (no skeleton, no ring, no caption).
+
+def test_crop_hand_is_the_frame_region_untouched():
+    import numpy as np
+    rng = np.random.default_rng(0)
+    plain = rng.integers(0, 256, (768, 768, 3), dtype=np.uint8)
+    source = plain.copy()
+    pts = [(300, 300), (400, 300), (300, 450), (400, 450)]
+    crop, box = crop_hand(plain, pts)
+    assert box == hand_crop_box(pts, 768)
+    x0, y0, x1, y1 = box
+    assert np.array_equal(crop, source[y0:y1, x0:x1])
+    assert int(np.count_nonzero(crop != source[y0:y1, x0:x1])) == 0
+    assert np.array_equal(plain, source)               # the frame is not drawn on either
+    crop[:] = 0                                        # a copy, not a view into the frame
+    assert np.array_equal(plain, source)
+
+
+def test_crop_hand_with_no_hand_in_the_picture_is_none():
+    import numpy as np
+    plain = np.zeros((768, 768, 3), np.uint8)
+    assert crop_hand(plain, []) == (None, None)
+    assert crop_hand(plain, [(-5, 3), (800, 10)]) == (None, None)
+
+
 # --- a still that is missing, and why ----------------------------------------
 # A still skipped because no hand was tracked leaves `<stem>.skipped.txt`
 # behind; no JPEG and no note is a failure nobody recorded. The meta.json says
@@ -201,7 +229,8 @@ def test_the_capture_record_comes_from_the_image_frame_or_says_it_does_not():
     rec = still_capture_record(saved_at=1790000000.5, capture_time=1790000000.42,
                                timestamp_us=194619959785, frame_id=3543)
     assert rec == {"capture_time": 1790000000.42, "capture_time_source": "leapc_image_timestamp",
-                   "timestamp_us": 194619959785, "frame_id": 3543, "saved_at": 1790000000.5}
+                   "timestamp_us": 194619959785, "frame_id": 3543, "saved_at": 1790000000.5,
+                   "full": None}
     fallback = still_capture_record(saved_at=1790000000.5)
     assert fallback["capture_time"] == 1790000000.5
     assert fallback["capture_time_source"] == "saved_at"
@@ -260,3 +289,116 @@ def test_recorder_copies_the_still_capture_into_the_meta(tmp_path):
     # no still, or an old session without sidecars: the keys are there and null
     for got in (meta(), meta(still="fist_left_take2_y.jpg")):
         assert {k: got[k] for k in NO_CAPTURE} == NO_CAPTURE
+
+
+# --- the uncropped frame kept beside the cropped still ------------------------------
+# The viewer crops the still to the hand; the whole frame it was cut from is
+# kept too, `<stem>.full.jpg`, from the same frame object and so the same moment.
+
+def _fake_imwrite(written):
+    def imwrite(path, array):
+        written.append((path, array))
+        Path(path).write_bytes(b"jpeg")
+        return True
+    return imwrite
+
+
+def test_save_still_writes_crop_full_frame_and_one_sidecar_for_both(tmp_path):
+    import numpy as np
+    plain = np.arange(768 * 768 * 3, dtype=np.uint32).reshape(768, 768, 3).astype(np.uint8)
+    crop = plain[100:300, 200:400].copy()
+    still = tmp_path / "stills" / "fist_take1_x.jpg"
+    still.parent.mkdir(parents=True)
+    written = []
+    save_still(still, crop, (19.96, 555, 9), 20.0, _fake_imwrite(written),
+               full=plain, cut_from=plain)
+    assert full_still_path(still) == tmp_path / "stills" / "fist_take1_x.full.jpg"
+    # the full frame is the very array the crop came from, written uncropped
+    assert [Path(p).name for p, _ in written] == ["fist_take1_x.full.jpg", "fist_take1_x.jpg"]
+    assert written[0][1] is plain and written[1][1] is crop
+    rec = still_capture_meta(still)
+    assert rec["still_capture_time"] == 19.96 and rec["still_frame_id"] == 9
+    import json
+    side = json.loads(still_capture_path(still).read_text(encoding="utf-8"))
+    assert side["full"] == "fist_take1_x.full.jpg" and side["capture_time"] == 19.96
+
+
+def test_save_still_refuses_a_crop_from_another_frame_object(tmp_path):
+    import numpy as np
+    import pytest
+    plain = np.zeros((768, 768, 3), np.uint8)
+    other = plain.copy()                         # equal pixels, another frame object
+    still = tmp_path / "fist_take1_x.jpg"
+    written = []
+    with pytest.raises(ValueError):
+        save_still(still, plain[:10, :10].copy(), (1.0, 2, 3), 4.0, _fake_imwrite(written),
+                   full=plain, cut_from=other)
+    assert written == [] and not still_capture_path(still).exists()
+    # the whole-frame still (--still full) has no separate full frame: `full` null
+    save_still(still, plain, (1.0, 2, 3), 4.0, _fake_imwrite(written))
+    import json
+    assert json.loads(still_capture_path(still).read_text(encoding="utf-8"))["full"] is None
+    assert not full_still_path(still).exists()
+
+
+def test_the_full_frame_moves_with_the_still_and_the_sidecar_names_it(tmp_path):
+    import json
+    src = tmp_path / "stills" / "fist_take1_x.jpg"
+    src.parent.mkdir(parents=True)
+    written = []
+    save_still(src, b"crop", (5.0, 1, 2), 6.0, _fake_imwrite(written), full=b"f", cut_from=b"f")
+    # accepted: renamed in place, the full frame and the sidecar with it
+    kept = tmp_path / "stills" / "fist_left_take1_x.jpg"
+    move_still(src, kept)
+    assert full_still_path(kept).is_file() and not full_still_path(src).exists()
+    side = json.loads(still_capture_path(kept).read_text(encoding="utf-8"))
+    assert side["full"] == "fist_left_take1_x.full.jpg" and side["capture_time"] == 5.0
+    # rejected: moved under rejected/stills, again together
+    rej = tmp_path / "rejected" / "stills" / "fist_left_take1_x_attempt1.jpg"
+    move_still(kept, rej)
+    assert full_still_path(rej).is_file() and not full_still_path(kept).exists()
+    assert json.loads(still_capture_path(rej).read_text(encoding="utf-8"))["full"] == \
+        "fist_left_take1_x_attempt1.full.jpg"
+
+
+def test_recorder_meta_names_the_full_frame_or_null(tmp_path):
+    sync = _recorder()
+    session = sync.CoachedLeapSession
+    stills = tmp_path / "stills"
+    stills.mkdir()
+    save_still(stills / "fist_take1_x.jpg", b"crop", (30.95, 77, 12), 31.0,
+               _fake_imwrite([]), full=b"f", cut_from=b"f")
+    assert session._rename_still(stills / "fist_take1_x.jpg", "fist_left_take1_x") == \
+        ("fist_left_take1_x.jpg", "")
+    me = SimpleNamespace(hand="left", _pose="fist", _take=1, band=(18, 28), settle=1.5,
+                         stills_dir=stills, rejected_dir=tmp_path / "rejected")
+
+    def meta(accepted=True, **kw):
+        return session._meta_dict(me, sync.Attempt(**kw), accepted=accepted, file="f.jsonl",
+                                  still=kw.get("still", ""), attempts=1)
+    assert meta(still="fist_left_take1_x.jpg")["still_full"] == \
+        str(Path("stills") / "fist_left_take1_x.full.jpg")
+    move_still(stills / "fist_left_take1_x.jpg",
+               tmp_path / "rejected" / "stills" / "fist_left_take1_x_attempt1.jpg")
+    assert meta(accepted=False, still="fist_left_take1_x_attempt1.jpg")["still_full"] == \
+        str(Path("rejected") / "stills" / "fist_left_take1_x_attempt1.full.jpg")
+    assert meta()["still_full"] is None                      # no still, no full frame
+    (stills / "fist_left_take2_y.jpg").write_bytes(b"jpeg")  # a still without a full frame
+    assert meta(still="fist_left_take2_y.jpg")["still_full"] is None
+
+
+def test_first_take_auto_continues_after_every_take_on_disk(tmp_path):
+    sync = _recorder()
+    assert sync.next_take(tmp_path, "open_palm", "left") == 1
+    (tmp_path / "leap").mkdir()
+    (tmp_path / "leap" / "open_palm_left_take1_20261104_100000.meta.json").write_text("{}")
+    (tmp_path / "leap" / "open_palm_right_take7_20261104_100000.meta.json").write_text("{}")
+    (tmp_path / "leap" / "fist_left_take9_20261104_100000.meta.json").write_text("{}")
+    assert sync.next_take(tmp_path, "open_palm", "left") == 2
+    # a take whose every attempt was rejected still holds its number
+    (tmp_path / "rejected" / "glove").mkdir(parents=True)
+    (tmp_path / "rejected" / "glove" /
+     "open_palm_left_take2_20261104_100100_attempt3.jsonl").write_text("")
+    assert sync.next_take(tmp_path, "open_palm", "left") == 3
+    assert sync.next_take(tmp_path, "fist", "left") == 10
+    assert sync.next_take(tmp_path, "pinch", "left") == 1

@@ -19,12 +19,31 @@ and for every accepted take writes, under `--out` (default
 The moment is the photo's (`leap_hand.paired_pose.take_moment`); each
 sensor's frame is the one nearest it on the capture clock, within
 `--max-dt-ms`. No lag correction, no scaling, no fit. Coordinates only.
+When `docs/sessions/<results folder name>.md` exists, README.md includes its text
+verbatim under "Operator's session notes" (`session_notes_path`).
 
 Usage:
   python scripts/paired_pose_compare.py recordings/sync_day2
   python scripts/paired_pose_compare.py <session> --takes fist_left_take1_<stamp> ...
   python scripts/paired_pose_compare.py <session> --include-rejected --out somewhere
   python scripts/paired_pose_compare.py --check-outputs results/paired_pose/<session>
+  python scripts/paired_pose_compare.py --select results/paired_pose/<session>
+  python scripts/paired_pose_compare.py --gate-fail results/paired_pose/<session> --newest-of open_palm --reason "<text>"
+
+Take selection (`--select`): the normal run writes `visual_checks.csv` (take,
+pose, intended_pose_seen, note) when it is absent, and adds a blank row for
+every take it does not list yet; the operator writes yes or no in
+intended_pose_seen after looking at the take's figure.png. `--select` then
+applies one predefined rule, in take order (take 1 first, then take 2, ...):
+a take is accepted when ALL of its checks hold (SELECTION_RULE below); the
+first take that passes is accepted and later takes of that pose are never
+considered. NOTHING is chosen by disagreement magnitude: median_mm and
+max_mm are read only to see that they are finite numbers. A pose with no
+accepted take is listed with accepted_take empty and "re-record". Nothing is
+deleted; every rejected take keeps its reason in `selection.csv`. Every take
+of a pose is walked in ascending take number, however many there are.
+`--gate-fail` appends a failed setup gate to `setup_gate.csv`; such a take is
+ineligible until the operator revalidates it there (yes + a reason).
 """
 import argparse
 import csv
@@ -44,6 +63,7 @@ from matplotlib.backends.backend_pdf import PdfPages               # noqa: E402
 import numpy as np                                                 # noqa: E402
 
 from cam_hand.prof_format import parse_text                        # noqa: E402
+from leap_hand.pose_check import EXPECTED_FINGERS                  # noqa: E402
 from leap_hand.paired_pose import (BONES, CAPTURE_CLOCK, CHAINS, HANDEDNESS_MARGIN_MM,  # noqa: E402
                                    INDETERMINATE, LABEL, OPPOSITE, SAME, SIMULTANEITY,
                                    TIMING_LABEL,
@@ -69,6 +89,53 @@ POINT_COLUMNS = ["index", "name", "glove_x_mm", "glove_y_mm", "glove_z_mm",
 LETTERS = {"thumb": "T", "index": "I", "middle": "M", "ring": "R", "pinky": "L"}
 # Measured 5 October 2026 on closing movements (glove against camera); not corrected here.
 GLOVE_LAG = {"left": "about 0.47 s", "right": "about 0 s"}
+
+# bent_wrist is in the professor's approved list, and is a CONTROL here.
+CONTROL_POSE = "bent_wrist"
+BENT_WRIST_CONTROL = (
+    "bent_wrist is a CONTROL: the wrist-centred, independently palm-aligned frame removes "
+    "the hand's orientation, so a bent wrist with an unchanged hand shape cannot show as a "
+    "landmark distance; it is recorded to demonstrate what this comparison cannot measure, "
+    "kept because the professor approved the list, and its distances must not be read as "
+    "wrist-angle disagreement.")
+
+# --- take selection (--select) ---------------------------------------------------------
+SELECT_MAX_DT_MS = 50.0
+VISUAL_FILE, SELECTION_FILE = "visual_checks.csv", "selection.csv"
+# Keyed by the take stem, which already names pose, hand, take number and timestamp.
+VISUAL_COLUMNS = ["take", "pose", "figure", "intended_pose_seen", "decided_at", "note"]
+SELECTION_COLUMNS = ["pose", "hand", "accepted_take", "rejected_takes", "rejected_reasons",
+                     "auto_checks", "visual_check", "setup_gate", "pose_classifier", "action",
+                     "note"]
+# The operator's record of a failed setup gate (part 1's five checks), one row per
+# declaration; appended by --gate-fail, edited only by the operator, never by a run.
+GATE_FILE = "setup_gate.csv"
+GATE_COLUMNS = ["take", "declared_at", "reason", "revalidated", "revalidation_reason",
+                "revalidated_at"]
+INVESTIGATE = "investigate before re-recording"
+RE_RECORD = "re-record"
+SELECTION_MARK = "<!-- selection table: written by --select -->"
+POSE_ORDER = ("open_palm", "fist", "index_point", "thumbs_up", "peace", "pinch",
+              "finger_spread", "thumb_opposition", "crossed_fingers", "bent_wrist")
+SELECTION_RULE = (
+    "A take is accepted for its pose when ALL of these hold: `moment_source` is "
+    f"\"{STILL_CAPTURE}\"; |`cam_dt_ms`| and |`glove_dt_ms`| are both "
+    f"{SELECT_MAX_DT_MS:g} ms or less; `stillness` is \"still\"; `handedness` is \"{SAME}\" "
+    f"(\"opposite\" and \"indeterminate\" reject the take with \"{INVESTIGATE}\"); `status` "
+    "is \"ok\" with finite landmark distances (palm frames valid, landmarks finite); and "
+    f"`{VISUAL_FILE}` says yes for it (the operator looked at its figure.png and saw the "
+    "intended pose); and the take is not listed in "
+    f"`{GATE_FILE}` as a failed setup gate, unless the operator revalidated it there "
+    "(`revalidated` yes with a `revalidation_reason`). Every take of a pose present in "
+    "`comparison.csv` is considered, in ascending take number (take 1 first, then take 2, "
+    "3, ...; a session with repeated setup-gate attempts holds more than two); the first "
+    "take that passes is accepted and later takes of that pose are never considered. Nothing is chosen by disagreement magnitude: `median_mm` and "
+    "`max_mm` are read only to see that they are finite numbers. A pose with no accepted "
+    f"take is listed with `accepted_take` empty and \"{RE_RECORD}\". Nothing is deleted: "
+    f"rejected takes stay on disk and in `comparison.csv`, each with its reason in "
+    f"`{SELECTION_FILE}`. The recorder's own rejected attempts (`_attemptN`) are not "
+    "candidates. The same checks apply to every take and every pose; for the four poses "
+    "without a pose classifier (`pose_classifier` \"none\") only the classifier is missing.")
 
 
 def glove_exporter():
@@ -228,6 +295,7 @@ def take_notes(i: dict) -> str:
         "landmarks, so a difference in the hand's orientation between the sensors is removed, "
         "not measured; the two sensors are not physically registered.",
         SIMULTANEITY,
+    ] + ([BENT_WRIST_CONTROL] if meta.get("pose") == CONTROL_POSE else []) + [
         "",
         f"moment: {local_iso(moment.t)} local time ({moment.t:.3f} s since 1970)",
         f"  source: {moment.source}",
@@ -241,7 +309,11 @@ def take_notes(i: dict) -> str:
                      "captured; that write delay is unknown (not recorded in this take) and adds "
                      "to every dt below")
     lines.append(f"  still: {moment.still if moment.still else 'not on disk'}"
-                 + (f" ({i['still_px'][0]} x {i['still_px'][1]} px, shown as saved)"
+                 + (f" ({i['still_px'][0]} x {i['still_px'][1]} px, shown as saved: the camera "
+                    "window's IR frame, brightness lifted for the eye (x2.2 + 8), mirrored as the "
+                    "window shows it, cropped to the tracked hand; what the window draws on a "
+                    "still is stated in README.md: nothing since the window change of "
+                    "2026-11-05, the skeleton, ring and caption before it)"
                     if i["still_px"] else ""))
     lines += [
         "",
@@ -364,7 +436,7 @@ def draw_figure(img, g_local, c_local, hand, meta, stem, moment, cam, glv, cam_l
         titled.append((palm, side, title, colour, label))
     fig.canvas.draw()                    # applies the equal aspect: the boxes' real places
     b = ax.get_position()
-    fig.text((b.x0 + b.x1) / 2, 0.835, "Photo: raw IR image", ha="center", fontsize=13,
+    fig.text((b.x0 + b.x1) / 2, 0.835, "Photo: IR still (brightness lifted, nothing drawn)", ha="center", fontsize=13,
              fontweight="bold", color="#222222")
     for palm, side, title, colour, label in titled:
         b0, b1 = palm.get_position(), side.get_position()
@@ -453,7 +525,25 @@ def run_summary(rows: list) -> str:
             f"largest |dt| {dt:.1f} ms.")
 
 
-def readme_text(session: Path, rows: list, max_dt_s: float, include_rejected: bool) -> str:
+def session_notes_path(results_dir: Path, repo_root: Path = None) -> Path:
+    """The operator's notes for a results folder: docs/sessions/<folder name>.md."""
+    return Path(repo_root or REPO) / "docs" / "sessions" / f"{Path(results_dir).name}.md"
+
+
+def session_notes(path: Path) -> str:
+    """The README section carrying the notes file verbatim, or "" when it is absent."""
+    if path is None or not path.is_file():
+        return ""
+    try:
+        shown = path.resolve().relative_to(REPO).as_posix()
+    except ValueError:
+        shown = path.as_posix()
+    return (f"\n## Operator's session notes\n\nIncluded verbatim from `{shown}`.\n\n"
+            f"{path.read_text(encoding='utf-8').rstrip()}\n")
+
+
+def readme_text(session: Path, rows: list, max_dt_s: float, include_rejected: bool,
+                notes: Path = None) -> str:
     done = sum(r["status"] == OK for r in rows)
     whole = sum(r.get("_still_px") == WHOLE_FRAME_PX for r in rows)
     warn = (f"\n**{whole} of the stills here are the whole {WHOLE_FRAME_PX[0]} x "
@@ -487,13 +577,20 @@ the July 2026 glove JSONL, and re-checked 2026-11-03 on all 14,838 glove lines o
 produced.
 
 {run_summary(rows)}
-
+{session_notes(notes)}
 ## What each file is
 
 Per take, in `<take>/`:
 
-- `figure.png`: three panels. "Photo: raw IR image" is the still the camera window saved
-  during the take, shown as it was saved. "Leap hand model (reconstructed)" and "Glove hand
+- `figure.png`: three panels. "Photo: IR still (brightness lifted, nothing drawn)" is the
+  still the camera window saved during the take, shown as it was saved: the window's IR
+  frame with its brightness lifted for the eye (x2.2 + 8), mirrored as the window shows it,
+  cropped to the tracked hand, with nothing drawn on it. Stills recorded before the window
+  change of 2026-11-05 (every take in results/paired_pose/sync_day2, and
+  recordings/sidecar_dry_run take 1, recorded earlier that day)
+  carry the tracker's skeleton overlay, the aiming ring and the recorder's caption,
+  because the window used to draw before copying; their figures were made from those
+  files as they are. "Leap hand model (reconstructed)" and "Glove hand
   model (reconstructed)" are the
   21 points and 20 bones of each sensor's frame nearest the photo's moment, both drawn in the
   common frame below with the same limits and the same scale: a palm view (up = x, the
@@ -522,6 +619,10 @@ Session level: `comparison.csv` (one row per take: `moment_source`, `cam_dt_ms`,
 `glove_speed_mm_s`, `camera_speed_mm_s`, `stillness`, `median_mm` and `max_mm` ({STAT_BASIS}),
 `max_point`, `n_points`, `status`), `figures.pdf` (every figure, one page per processed
 take), this file.
+
+- Session notes: when `docs/sessions/<this folder's name>.md` exists in the repo, its text
+  is included above, verbatim, under its own heading after the run summary (no such section
+  otherwise).
 
 ## What each landmark is on each sensor
 
@@ -612,7 +713,40 @@ nor its PALM point is among the 21.)
   point, a disagreement; neither sensor is treated as the reference. A sensor that does
   not measure something leaves it empty, it is never filled in from the other.
 - Coordinates only: no joint angles are computed.
+- bent_wrist: {BENT_WRIST_CONTROL}
+- Stills: `<take>.jpg` is cropped to the hand. Takes recorded after 2026-11-04 also keep
+  the uncropped frame it was cut from, `<take>.full.jpg` (the same frame, so the same
+  moment; the meta's `still_full`). The uncropped frame shows the operator: it stays in
+  the session folder and never goes into a professor's folder.
+{control_rows(rows)}
+## Take selection
+
+{SELECTION_RULE}
+
+`{VISUAL_FILE}` (in this folder) is the operator's sheet: one row per take, `intended_pose_seen`
+blank until the operator writes yes or no after looking at that take's figure.png. Yes means:
+the photo shows the intended pose being held (not a transition, not another pose), and each
+model shows that same hand as far as its sensor can represent it. A sensor's known inability is
+the disagreement under study, not a no: the glove reads finger flexion only, with a template
+spread and no wrist, so its model cannot show a pinch closing, a true spread or crossed fingers;
+and no model shows the wrist angle of bent_wrist (the control). No means the photo shows a
+different pose or a hand in transition, or a model contradicts the photo beyond its sensor's
+limits (for example a glove reading an open hand while the photo shows a fist). Then:
+`python scripts/paired_pose_compare.py --select <this folder>` writes `{SELECTION_FILE}` and
+the table below.
+
+{SELECTION_MARK}
+The selection table appears here after `--select`.
 """
+
+
+def control_rows(rows: list) -> str:
+    """The README lines that put the control sentence on every bent_wrist take."""
+    takes = [r["take"] for r in rows if r.get("pose") == CONTROL_POSE]
+    if not takes:
+        return ""
+    return ("\n### bent_wrist takes in this run\n\n"
+            + "".join(f"- `{t}`: {BENT_WRIST_CONTROL}\n" for t in takes))
 
 
 def main(argv=None) -> int:
@@ -627,9 +761,28 @@ def main(argv=None) -> int:
                     help="also process accepted:false takes and rejected/ attempts")
     ap.add_argument("--check-outputs", type=Path, default=None, metavar="DIR",
                     help="re-read an output folder and check it is complete")
+    ap.add_argument("--select", type=Path, default=None, metavar="DIR",
+                    help="apply the take selection rule to a results folder (comparison.csv "
+                         "+ the operator's visual_checks.csv) and write selection.csv")
+    ap.add_argument("--gate-fail", type=Path, default=None, metavar="DIR",
+                    help="record a failed setup gate for one take in DIR/setup_gate.csv "
+                         "(with --take STEM or --newest-of POSE, and --reason)")
+    ap.add_argument("--take", default=None, help="with --gate-fail: the take stem")
+    ap.add_argument("--newest-of", default=None, metavar="POSE",
+                    help="with --gate-fail: the take of POSE with the highest take number "
+                         "in comparison.csv")
+    ap.add_argument("--reason", default=None, help="with --gate-fail: what failed")
     args = ap.parse_args(argv)
     if args.check_outputs is not None:
         return check_outputs(args.check_outputs)
+    if args.select is not None:
+        return run_select(args.select)
+    if args.gate_fail is not None:
+        if bool(args.take) == bool(args.newest_of):
+            print("--gate-fail needs exactly one of --take STEM or --newest-of POSE",
+                  file=sys.stderr)
+            return 2
+        return run_gate_fail(args.gate_fail, args.take, args.newest_of, args.reason)
     if args.session is None or not (args.session / "leap").is_dir():
         print(f"not a session folder (no leap/ inside): {args.session}", file=sys.stderr)
         return 2
@@ -667,12 +820,14 @@ def main(argv=None) -> int:
             else:
                 print(f"{stem}: refused: {row['status']}")
     write_comparison(out / "comparison.csv", rows)
-    (out / "README.md").write_text(readme_text(session, rows, max_dt_s, args.include_rejected),
-                                   encoding="utf-8")
+    (out / "README.md").write_text(readme_text(session, rows, max_dt_s, args.include_rejected,
+                                               session_notes_path(out)), encoding="utf-8")
     if not args.include_rejected and not args.takes:
         n = len(list((session / "rejected" / "leap").glob("*.meta.json")))
         if n:
             print(f"{n} rejected attempt(s) under rejected/ not processed (--include-rejected)")
+    added = write_visual_template(out, rows)
+    print(f"{VISUAL_FILE}: {added} blank row(s) added for the operator -> {out / VISUAL_FILE}")
     done = sum(r["status"] == OK for r in rows)
     print(f"PAIRED POSE DONE: takes={len(rows)} processed={done} refused={len(rows) - done} "
           f"-> {out}")
@@ -685,7 +840,8 @@ README_MUST = ("millimetres", "wrist", "middle-finger knuckle", "PINKY_MCP", "IN
                STILL_MTIME, LABEL, TIMING_LABEL, SIMULTANEITY, "not physically registered", "WRIST and PALM",
                "x = (M - W) / |M - W|", "degenerate palm frame", "ARRIVAL",
                "What each landmark is on each sensor", "POSE_SETTLE_SPEED_MM_S",
-               "no scaled table", SAME, OPPOSITE, INDETERMINATE)
+               "no scaled table", SAME, OPPOSITE, INDETERMINATE, BENT_WRIST_CONTROL,
+               SELECTION_RULE, SELECTION_MARK, ".full.jpg")
 NOTES_MUST = (LABEL, TIMING_LABEL, SIMULTANEITY, "timing uncertainty", "stillness:", "transformation:", "handedness:",
               STAT_BASIS)
 
@@ -724,6 +880,8 @@ def check_outputs(out: Path) -> int:
             text = path.read_text(encoding="utf-8")
             bad += [f"{r['take']}: notes.txt does not say {s!r}" for s in NOTES_MUST
                     if s not in text]
+            if r["pose"] == CONTROL_POSE and BENT_WRIST_CONTROL not in text:
+                bad.append(f"{r['take']}: notes.txt lacks the bent_wrist control sentence")
         if r["handedness"] not in (SAME, OPPOSITE, INDETERMINATE):
             bad.append(f"{r['take']}: handedness {r['handedness']!r}")
         if not (r["stillness"] == "still" or r["stillness"].startswith(("moving (", "speed not"))):
@@ -736,6 +894,266 @@ def check_outputs(out: Path) -> int:
         print("OUTPUTS NOT OK:\n  " + "\n  ".join(bad))
         return 1
     print(f"OUTPUTS OK: takes={len(rows)} processed={len(done)} pages={pages}")
+    return 0
+
+
+# --- take selection ------------------------------------------------------------------
+STEM_RE = re.compile(r"^(?P<pose>.+)_(?P<hand>left|right)_take(?P<n>\d+)_")
+
+
+def stem_parts(stem: str):
+    """(pose, hand, take number) read from a take's name, None where it does not say."""
+    m = STEM_RE.match(stem)
+    return (m["pose"], m["hand"], int(m["n"])) if m else (None, None, None)
+
+
+def _num(v):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+def auto_failures(row: dict) -> list:
+    """The automatic checks this comparison.csv row fails, [] when it passes all.
+    Nothing here compares one take's distances with another's."""
+    if row.get("status") != OK:
+        # refused by the tool: the other checks were never computed for it
+        return [f"status: {row.get('status') or 'empty'}"]
+    fails = []
+    if row.get("moment_source") != STILL_CAPTURE:
+        fails.append(f"moment_source is {row.get('moment_source') or 'empty'!r}, "
+                     f"not {STILL_CAPTURE!r}")
+    for col in ("cam_dt_ms", "glove_dt_ms"):
+        v = _num(row.get(col))
+        if v is None or abs(v) > SELECT_MAX_DT_MS:
+            fails.append(f"|{col}| {'missing' if v is None else f'{abs(v):g} ms'} "
+                         f"(limit {SELECT_MAX_DT_MS:g} ms)")
+    if row.get("stillness") != "still":
+        fails.append(f"stillness {row.get('stillness') or 'empty'!r}")
+    if row.get("handedness") != SAME:
+        fails.append(f"handedness {row.get('handedness') or 'empty'!r}: {INVESTIGATE}")
+    if _num(row.get("median_mm")) is None or _num(row.get("max_mm")) is None:
+        fails.append("landmark distances not finite")
+    return fails
+
+
+def _visual_value(cell) -> str:
+    return (cell or "").strip().lower()
+
+
+def gate_state(rows: list):
+    """({take: ("failed", reason) or ("revalidated", reason)}, problems) from
+    setup_gate.csv rows. A take with any declaration not revalidated is
+    "failed"; a "yes" without a revalidation_reason is a problem (refused)."""
+    state, problems = {}, []
+    for r in rows:
+        take, reason = (r.get("take") or "").strip(), (r.get("reason") or "").strip()
+        if not take:
+            continue
+        if _visual_value(r.get("revalidated")) == "yes":
+            why = (r.get("revalidation_reason") or "").strip()
+            if not why:
+                problems.append(f"{take}: revalidated is yes but revalidation_reason is empty")
+            elif state.get(take, ("",))[0] != "failed":
+                state[take] = ("revalidated", why)
+        else:
+            state[take] = ("failed", reason or "no reason given")
+    return state, problems
+
+
+def select_takes(rows: list, visual: dict, gate: dict = None):
+    """(selection rows, problems). `rows` are comparison.csv rows, `visual`
+    {take: intended_pose_seen as written}, `gate` the `gate_state` of
+    setup_gate.csv. `problems` lists every take the rule needs a yes or no
+    for and has none (blank, absent or another word); when it is not empty
+    nothing is selected. A take refused by the tool (status not ok, so no
+    figure.png to look at) or blocked by a failed setup gate needs no visual
+    check: it is rejected anyway, and its visual_check is "not filled" if
+    blank. Every take of a pose is walked in ascending take number, however
+    many there are."""
+    gate = gate or {}
+    groups = {}
+    for r in rows:
+        stem = r.get("take") or ""
+        if re.search(r"_attempt\d+$", stem):
+            continue                                   # the recorder's rejected attempts
+        s_pose, s_hand, n = stem_parts(stem)
+        key = (r.get("pose") or s_pose or "unknown", r.get("hand") or s_hand or "unknown")
+        groups.setdefault(key, []).append((n if n is not None else 10 ** 9, stem, r))
+    order = {p: i for i, p in enumerate(POSE_ORDER)}
+    out, problems = [], []
+    for (pose, hand) in sorted(groups, key=lambda k: (k[1], order.get(k[0], 99), k[0])):
+        accepted, rejected, reasons, autos, visuals, gates = "", [], [], [], [], []
+        investigate = False
+        for n, stem, r in sorted(groups[(pose, hand)], key=lambda t: (t[0], t[1])):
+            label = f"take{n}" if n != 10 ** 9 else stem
+            fails = auto_failures(r)
+            g_kind, g_why = gate.get(stem, ("", ""))
+            if g_kind:
+                gates.append(f"{label}: {'setup gate failed' if g_kind == 'failed' else 'revalidated'}"
+                             f": {g_why}")
+            blocked = [f"setup gate failed: {g_why}"] if g_kind == "failed" else []
+            seen = _visual_value(visual.get(stem))
+            if seen not in ("yes", "no"):
+                if r.get("status") == OK and not blocked:
+                    problems.append(f"{stem}: intended_pose_seen is "
+                                    f"{'blank' if not seen else repr(seen)} (write yes or no)")
+                    if not fails:
+                        break                          # it may be the accepted take
+                    continue
+                seen = "not filled"
+            autos.append(f"{label}: {'passed' if not fails else '; '.join(fails)}")
+            visuals.append(f"{label}: {seen}")
+            if not fails and not blocked and seen == "yes":
+                accepted = stem
+                break                                  # later takes are never considered
+            investigate = investigate or any(INVESTIGATE in f for f in fails)
+            rejected.append(stem)
+            reasons.append(f"{stem}: " + "; ".join(
+                blocked + fails
+                + (["visual check: intended pose not seen"] if seen == "no" else [])
+                + (["visual check not filled"] if seen == "not filled" else [])))
+        action = "" if accepted else (f"{INVESTIGATE}, then {RE_RECORD}" if investigate
+                                      else RE_RECORD)
+        out.append({"pose": pose, "hand": hand, "accepted_take": accepted,
+                    "rejected_takes": " | ".join(rejected),
+                    "rejected_reasons": " | ".join(reasons),
+                    "auto_checks": " | ".join(autos), "visual_check": " | ".join(visuals),
+                    "setup_gate": " | ".join(gates),
+                    "pose_classifier": "checked" if pose in EXPECTED_FINGERS else "none",
+                    "action": action,
+                    "note": BENT_WRIST_CONTROL if pose == CONTROL_POSE else ""})
+    return out, problems
+
+
+def _read_csv(path: Path) -> list:
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def write_visual_template(out: Path, rows: list) -> int:
+    """`visual_checks.csv` with a blank intended_pose_seen for every take not
+    listed in it yet; rows already there are never changed (a sheet written
+    before the `figure` and `decided_at` columns existed gets them empty).
+    `figure` is the figure.png the operator must look at, relative to this
+    folder. Returns how many rows were added."""
+    path = out / VISUAL_FILE
+    have = _read_csv(path) if path.is_file() else []
+    listed = {r.get("take") for r in have}
+    new = [{"take": r["take"], "pose": r.get("pose") or "",
+            "figure": (f"{r['take']}/figure.png" if r.get("status") == OK
+                       else "none (refused by the tool, see comparison.csv status)"),
+            "intended_pose_seen": "", "decided_at": "", "note": ""} for r in rows
+           if r.get("take") not in listed and not re.search(r"_attempt\d+$", r.get("take", ""))]
+    new_cols = bool(have) and list(have[0]) != VISUAL_COLUMNS   # add columns, values untouched
+    if new or new_cols or not path.is_file():
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            extra = [k for k in (have[0] if have else {}) if k and k not in VISUAL_COLUMNS]
+            cols = VISUAL_COLUMNS + extra                    # an operator's own columns kept
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            for r in have + new:
+                w.writerow({k: r.get(k) or "" for k in cols})
+    return len(new)
+
+
+def selection_table(sel: list) -> str:
+    def cell(v):
+        return str(v or "").replace("|", "/").replace("\n", " ") or "-"
+    cols = ["pose", "hand", "accepted_take", "rejected_reasons", "auto_checks",
+            "visual_check", "setup_gate", "pose_classifier", "action", "note"]
+    lines =["| " + " | ".join(cols) + " |", "|" + "---|" * len(cols)]
+    lines += ["| " + " | ".join(cell(r[c]) for c in cols) + " |" for r in sel]
+    return "\n".join(lines)
+
+
+def run_select(out: Path) -> int:
+    """`--select`: selection.csv and the README's selection table, or a refusal."""
+    comp, vis = out / "comparison.csv", out / VISUAL_FILE
+    if not comp.is_file():
+        print(f"SELECT REFUSED: no comparison.csv in {out} (run the tool on the session first)",
+              file=sys.stderr)
+        return 2
+    if not vis.is_file():
+        print(f"SELECT REFUSED: no {VISUAL_FILE} in {out}. The normal run writes it; "
+              "fill intended_pose_seen with yes or no for every take, then run --select again.",
+              file=sys.stderr)
+        return 2
+    visual = {r.get("take"): r.get("intended_pose_seen") for r in _read_csv(vis)}
+    gate, gate_problems = gate_state(_read_csv(out / GATE_FILE)
+                                     if (out / GATE_FILE).is_file() else [])
+    if gate_problems:
+        print(f"SELECT REFUSED: {GATE_FILE} has a revalidation without a reason (write why the "
+              f"take is valid after all in revalidation_reason of {out / GATE_FILE}, or set "
+              "revalidated back to empty):\n  " + "\n  ".join(gate_problems), file=sys.stderr)
+        return 2
+    sel, problems = select_takes(_read_csv(comp), visual, gate)
+    if problems:
+        print(f"SELECT REFUSED: {VISUAL_FILE} has no yes/no for {len(problems)} take(s) the "
+              "selection rule needs (look at each take's figure.png, write yes or no in "
+              f"intended_pose_seen of {vis}, then run --select again):\n  "
+              + "\n  ".join(problems), file=sys.stderr)
+        return 2
+    with open(out / SELECTION_FILE, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=SELECTION_COLUMNS)
+        w.writeheader()
+        w.writerows(sel)
+    readme = out / "README.md"
+    if readme.is_file():
+        text = readme.read_text(encoding="utf-8")
+        head = text.split(SELECTION_MARK)[0].rstrip("\n")
+        readme.write_text(
+            f"{head}\n\n{SELECTION_MARK}\n### Selection ({datetime.date.today().isoformat()}, "
+            f"from `{SELECTION_FILE}`)\n\n{selection_table(sel)}\n", encoding="utf-8")
+    for r in sel:
+        print(f"{r['pose']} ({r['hand']}): "
+              + (f"accepted {r['accepted_take']}" if r["accepted_take"] else r["action"])
+              + (f"; rejected {r['rejected_takes']}" if r["rejected_takes"] else ""))
+    n_acc = sum(bool(r["accepted_take"]) for r in sel)
+    print(f"SELECTION DONE: poses={len(sel)} accepted={n_acc} re-record={len(sel) - n_acc} "
+          f"-> {out / SELECTION_FILE}")
+    return 0
+
+
+def newest_take(rows: list, pose: str):
+    """The stem of `pose`'s row with the highest take number in comparison.csv, or None."""
+    found = [(n, stem) for stem in (r.get("take") or "" for r in rows)
+             if not re.search(r"_attempt\d+$", stem)
+             for p, _, n in [stem_parts(stem)] if p == pose and n is not None]
+    return max(found)[1] if found else None
+
+
+def run_gate_fail(out: Path, take, newest_of, reason: str) -> int:
+    """`--gate-fail`: append one row to setup_gate.csv, revalidated empty.
+    Existing rows are copied unchanged; nothing is ever removed."""
+    reason = (reason or "").strip()
+    comp = out / "comparison.csv"
+    rows = _read_csv(comp) if comp.is_file() else []
+    if not reason:
+        print("GATE-FAIL REFUSED: --reason is empty; say what failed", file=sys.stderr)
+        return 2
+    if newest_of:
+        take = newest_take(rows, newest_of)
+        if take is None:
+            print(f"GATE-FAIL REFUSED: no {newest_of} take in {comp}", file=sys.stderr)
+            return 2
+    if not take or take not in {r.get("take") for r in rows}:
+        print(f"GATE-FAIL REFUSED: take {take!r} is not in {comp}", file=sys.stderr)
+        return 2
+    path = out / GATE_FILE
+    new = not path.is_file()
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=GATE_COLUMNS)
+        if new:
+            w.writeheader()
+        w.writerow({"take": take, "declared_at": datetime.datetime.now().isoformat(
+                    timespec="seconds"), "reason": reason, "revalidated": "",
+                    "revalidation_reason": "", "revalidated_at": ""})
+    print(f"SETUP GATE FAILED recorded: take={take} reason={reason!r} -> {path}")
+    print("  --select will not accept this take unless revalidated is set to yes with a "
+          "revalidation_reason in that file.")
     return 0
 
 

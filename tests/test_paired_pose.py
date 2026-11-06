@@ -300,6 +300,244 @@ def test_a_take_asked_for_by_name_that_is_not_there_is_listed(tmp_path):
     assert status == {"fist_left_take1_a": "ok", "nope": "no meta.json for this take"}
 
 
+# --- take selection (--select) ------------------------------------------------------
+def _crow(take, **kw):
+    """A comparison.csv row that passes every automatic check unless told otherwise."""
+    pose = kw.pop("pose", take.split("_left_")[0])
+    row = {"take": take, "pose": pose, "hand": "left", "moment_source": STILL_CAPTURE,
+           "cam_dt_ms": "3.0", "glove_dt_ms": "-8.0", "handedness": SAME,
+           "stillness": "still", "median_mm": "20.0", "max_mm": "40.0", "status": "ok"}
+    row.update(kw)
+    return row
+
+
+def _write_csv(path, columns, rows):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+
+
+def test_selection_accepts_take1_and_never_by_magnitude():
+    s = _script()
+    rows = [_crow("fist_left_take1_a", median_mm="35.0", max_mm="90.0"),
+            _crow("fist_left_take2_b", median_mm="5.0", max_mm="9.0")]   # smaller, later
+    sel, problems = s.select_takes(rows, {"fist_left_take1_a": "yes", "fist_left_take2_b": "yes"})
+    assert problems == []
+    (fist,) = sel
+    assert fist["accepted_take"] == "fist_left_take1_a"
+    assert fist["rejected_takes"] == ""                  # take 2 is never considered
+    assert fist["auto_checks"] == "take1: passed" and fist["visual_check"] == "take1: yes"
+    assert fist["pose_classifier"] == "checked" and fist["action"] == ""
+    # the rule is the same whatever the distances are: swapping them changes nothing
+    swapped = [dict(rows[0], median_mm="5.0", max_mm="9.0"),
+               dict(rows[1], median_mm="35.0", max_mm="90.0")]
+    assert s.select_takes(swapped, {"fist_left_take1_a": "yes",
+                                    "fist_left_take2_b": "yes"})[0][0]["accepted_take"] \
+        == "fist_left_take1_a"
+
+
+def test_selection_falls_through_to_take2_with_take1s_reasons():
+    s = _script()
+    rows = [_crow("pinch_left_take2_b"), _crow("pinch_left_take1_a", stillness="moving (glove)",
+                                               glove_dt_ms="-62.5")]
+    sel, problems = s.select_takes(rows, {"pinch_left_take1_a": "yes",
+                                          "pinch_left_take2_b": "yes"})
+    assert problems == []
+    (pinch,) = sel
+    assert pinch["accepted_take"] == "pinch_left_take2_b"
+    assert pinch["rejected_takes"] == "pinch_left_take1_a"
+    assert "stillness 'moving (glove)'" in pinch["rejected_reasons"]
+    assert "|glove_dt_ms| 62.5 ms" in pinch["rejected_reasons"]
+    assert pinch["auto_checks"].startswith("take1: ") and pinch["auto_checks"].endswith(
+        "take2: passed")
+    # a visual "no" on a take that passes every automatic check also rejects it
+    sel, _ = s.select_takes([_crow("peace_left_take1_a"), _crow("peace_left_take2_b")],
+                            {"peace_left_take1_a": "no", "peace_left_take2_b": "yes"})
+    assert sel[0]["accepted_take"] == "peace_left_take2_b"
+    assert "intended pose not seen" in sel[0]["rejected_reasons"]
+
+
+def test_selection_with_no_accepted_take_says_re_record_and_investigate():
+    s = _script()
+    rows = [_crow("crossed_fingers_left_take1_a", handedness=OPPOSITE),
+            _crow("crossed_fingers_left_take2_b", moment_source=STILL_MTIME),
+            _crow("bent_wrist_left_take1_c", status="no glove file (x.jsonl)", handedness="",
+                  stillness="", cam_dt_ms="", glove_dt_ms="", median_mm="", max_mm="")]
+    sel, problems = s.select_takes(rows, {"crossed_fingers_left_take1_a": "yes",
+                                          "crossed_fingers_left_take2_b": "yes"})
+    assert problems == []                    # the refused bent_wrist take needs no visual cell
+    by = {r["pose"]: r for r in sel}
+    cf, bw = by["crossed_fingers"], by["bent_wrist"]
+    assert cf["accepted_take"] == "" and bw["accepted_take"] == ""
+    assert cf["action"] == "investigate before re-recording, then re-record"
+    assert "investigate before re-recording" in cf["rejected_reasons"]
+    assert bw["action"] == "re-record" and bw["visual_check"] == "take1: not filled"
+    assert cf["pose_classifier"] == "none" and bw["pose_classifier"] == "none"
+    assert bw["note"] == s.BENT_WRIST_CONTROL and cf["note"] == ""
+    assert [r["pose"] for r in sel] == ["crossed_fingers", "bent_wrist"]   # protocol order
+
+
+def test_select_refuses_a_blank_visual_cell_and_writes_the_table_when_filled(tmp_path, capsys):
+    s = _script()
+    rows = [_crow("open_palm_left_take1_a"), _crow("fist_left_take1_b"),
+            _crow("fist_left_take2_c")]
+    _write_csv(tmp_path / "comparison.csv", s.COLUMNS, rows)
+    (tmp_path / "README.md").write_text("# x\n\n" + s.SELECTION_MARK + "\nplaceholder\n",
+                                        encoding="utf-8")
+    assert s.main(["--select", str(tmp_path)]) == 2           # no visual_checks.csv at all
+    assert s.write_visual_template(tmp_path, rows) == 3
+    assert s.write_visual_template(tmp_path, rows) == 0       # existing rows never rewritten
+    _write_csv(tmp_path / "visual_checks.csv", s.VISUAL_COLUMNS,
+               [{"take": "open_palm_left_take1_a", "intended_pose_seen": "yes"},
+                {"take": "fist_left_take1_b", "intended_pose_seen": ""},
+                {"take": "fist_left_take2_c", "intended_pose_seen": ""}])
+    capsys.readouterr()
+    assert s.main(["--select", str(tmp_path)]) == 2
+    err = capsys.readouterr().err
+    assert "SELECT REFUSED" in err and "fist_left_take1_b: intended_pose_seen is blank" in err
+    assert "fist_left_take2_c" not in err        # not needed: take 1 may still be accepted
+    assert not (tmp_path / "selection.csv").exists()
+    _write_csv(tmp_path / "visual_checks.csv", s.VISUAL_COLUMNS,
+               [{"take": "open_palm_left_take1_a", "intended_pose_seen": "yes"},
+                {"take": "fist_left_take1_b", "intended_pose_seen": "Yes "},
+                {"take": "fist_left_take2_c", "intended_pose_seen": ""}])
+    assert s.main(["--select", str(tmp_path)]) == 0
+    sel = _rows(tmp_path / "selection.csv")
+    assert list(sel[0]) == s.SELECTION_COLUMNS
+    assert [(r["pose"], r["accepted_take"]) for r in sel] == [
+        ("open_palm", "open_palm_left_take1_a"), ("fist", "fist_left_take1_b")]
+    readme = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "placeholder" not in readme and "| open_palm | left | open_palm_left_take1_a" in readme
+
+
+def test_selection_walks_every_take_in_ascending_number_beyond_two():
+    """A session with repeated setup-gate attempts holds open_palm take 3 and beyond."""
+    s = _script()
+    rows = [_crow("open_palm_left_take3_c"),                       # listed first on purpose
+            _crow("open_palm_left_take1_a", stillness="moving (camera)"),
+            _crow("open_palm_left_take2_b", handedness=INDETERMINATE)]
+    vis = {r["take"]: "yes" for r in rows}
+    (op,), problems = s.select_takes(rows, vis)
+    assert problems == []
+    assert op["accepted_take"] == "open_palm_left_take3_c"
+    assert op["rejected_takes"] == "open_palm_left_take1_a | open_palm_left_take2_b"
+    assert op["auto_checks"].split(" | ")[2] == "take3: passed"
+
+
+def _gate_rows(*rows):
+    cols = ["take", "declared_at", "reason", "revalidated", "revalidation_reason",
+            "revalidated_at"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def test_a_failed_setup_gate_blocks_a_take_and_revalidation_unblocks_it():
+    s = _script()
+    rows = [_crow("open_palm_left_take1_a"), _crow("open_palm_left_take2_b")]
+    vis = {"open_palm_left_take1_a": "yes", "open_palm_left_take2_b": "yes"}
+    gate, problems = s.gate_state(_gate_rows(
+        ("open_palm_left_take1_a", "2026-11-04T17:00:00", "glove slipped", "", "", "")))
+    assert problems == []
+    (op,), _ = s.select_takes(rows, vis, gate)          # take 1 passes everything else
+    assert op["accepted_take"] == "open_palm_left_take2_b"
+    assert "setup gate failed: glove slipped" in op["rejected_reasons"]
+    # blocked takes need no visual cell
+    (op,), problems = s.select_takes(rows, {"open_palm_left_take2_b": "yes"}, gate)
+    assert problems == [] and op["accepted_take"] == "open_palm_left_take2_b"
+    gate, problems = s.gate_state(_gate_rows(
+        ("open_palm_left_take1_a", "2026-11-04T17:00:00", "glove slipped", "yes",
+         "glove re-seated, checked the figure again", "")))
+    assert problems == []
+    (op,), _ = s.select_takes(rows, vis, gate)
+    assert op["accepted_take"] == "open_palm_left_take1_a"
+    assert op["setup_gate"] == "take1: revalidated: glove re-seated, checked the figure again"
+    _, problems = s.gate_state(_gate_rows(
+        ("open_palm_left_take1_a", "2026-11-04T17:00:00", "glove slipped", "yes", "", "")))
+    assert problems and "revalidation_reason is empty" in problems[0]
+
+
+def test_gate_fail_appends_and_select_refuses_a_revalidation_without_reason(tmp_path, capsys):
+    s = _script()
+    rows = [_crow("open_palm_left_take1_a"), _crow("open_palm_left_take2_b"),
+            _crow("fist_left_take1_c")]
+    _write_csv(tmp_path / "comparison.csv", s.COLUMNS, rows)
+    s.write_visual_template(tmp_path, rows)
+    assert s.main(["--gate-fail", str(tmp_path), "--newest-of", "open_palm",
+                   "--reason", "camera tilted"]) == 0
+    assert s.main(["--gate-fail", str(tmp_path), "--take", "nope", "--reason", "x"]) == 2
+    assert s.main(["--gate-fail", str(tmp_path), "--take", "fist_left_take1_c",
+                   "--reason", " "]) == 2
+    (g,) = _rows(tmp_path / "setup_gate.csv")
+    assert list(g) == s.GATE_COLUMNS
+    assert (g["take"], g["reason"], g["revalidated"]) == ("open_palm_left_take2_b",
+                                                          "camera tilted", "")
+    # the normal run never rewrites it; the operator's sheet keeps its filled rows
+    _write_csv(tmp_path / "visual_checks.csv", s.VISUAL_COLUMNS,
+               [dict(r, intended_pose_seen="yes", decided_at="2026-11-04T18:00")
+                for r in _rows(tmp_path / "visual_checks.csv")])
+    before = (tmp_path / "visual_checks.csv").read_text(encoding="utf-8")
+    rows.append(_crow("pinch_left_take1_d"))
+    _write_csv(tmp_path / "comparison.csv", s.COLUMNS, rows)
+    assert s.write_visual_template(tmp_path, rows) == 1
+    after = (tmp_path / "visual_checks.csv").read_text(encoding="utf-8")
+    assert after.startswith(before.rstrip("\r\n"))
+    vis = {r["take"]: r for r in _rows(tmp_path / "visual_checks.csv")}
+    assert vis["pinch_left_take1_d"]["figure"] == "pinch_left_take1_d/figure.png"
+    assert vis["pinch_left_take1_d"]["intended_pose_seen"] == ""
+    assert s.main(["--select", str(tmp_path)]) == 2          # pinch not looked at yet
+    _write_csv(tmp_path / "visual_checks.csv", s.VISUAL_COLUMNS,
+               [dict(r, intended_pose_seen="yes") for r in vis.values()])
+    assert s.main(["--select", str(tmp_path)]) == 0
+    sel = {r["pose"]: r for r in _rows(tmp_path / "selection.csv")}
+    assert sel["open_palm"]["accepted_take"] == "open_palm_left_take1_a"   # take 1 first
+    _write_csv(tmp_path / "setup_gate.csv", s.GATE_COLUMNS, [dict(g, revalidated="yes")])
+    capsys.readouterr()
+    assert s.main(["--select", str(tmp_path)]) == 2
+    assert "revalidation_reason is empty" in capsys.readouterr().err
+
+
+def test_bent_wrist_is_marked_as_a_control_in_notes_and_readme(tmp_path):
+    s = _script()
+    session, out = tmp_path / "session", tmp_path / "out"
+    _synthetic_take(session, "bent_wrist_left_take1_x")
+    path = session / "leap" / "bent_wrist_left_take1_x.meta.json"
+    path.write_text(json.dumps(dict(json.loads(path.read_text(encoding="utf-8")),
+                                    pose="bent_wrist")), encoding="utf-8")
+    _synthetic_take(session, "fist_left_take1_y")
+    assert s.main([str(session), "--out", str(out)]) == 0
+    assert s.BENT_WRIST_CONTROL in (out / "bent_wrist_left_take1_x" / "notes.txt").read_text(
+        encoding="utf-8")
+    assert s.BENT_WRIST_CONTROL not in (out / "fist_left_take1_y" / "notes.txt").read_text(
+        encoding="utf-8")
+    readme = (out / "README.md").read_text(encoding="utf-8")
+    assert f"- `bent_wrist_left_take1_x`: {s.BENT_WRIST_CONTROL}" in readme
+    assert [r["take"] for r in _rows(out / "visual_checks.csv")] == [
+        "bent_wrist_left_take1_x", "fist_left_take1_y"]
+    assert s.check_outputs(out) == 0
+
+
+def test_readme_includes_the_session_notes_verbatim_when_the_file_exists(tmp_path):
+    s = _script()
+    repo, out = tmp_path / "repo", tmp_path / "results" / "my_session"
+    path = s.session_notes_path(out, repo)
+    assert path == repo / "docs" / "sessions" / "my_session.md"
+    path.parent.mkdir(parents=True)
+    notes = "## Camera orientation\n\nTilted toward the operator.\n"
+    path.write_text(notes, encoding="utf-8")
+    readme = s.readme_text(tmp_path / "session", [], 0.05, False, path)
+    assert "## Operator's session notes" in readme and notes.rstrip() in readme
+    assert path.as_posix() in readme                                # names its source
+    assert (readme.index("No take was processed in this run.") <readme.index("## Operator's session notes")
+            < readme.index("## What each file is"))
+
+
+def test_readme_has_no_session_notes_heading_when_the_file_is_absent(tmp_path):
+    s = _script()
+    path = s.session_notes_path(tmp_path / "results" / "my_session", tmp_path / "repo")
+    readme = s.readme_text(tmp_path / "session", [], 0.05, False, path)
+    assert not path.exists() and "## Operator's session notes" not in readme
+
+
 # --- the real day-2 take ----------------------------------------------------------
 def test_real_day2_take_runs_end_to_end(tmp_path):
     need = [DAY2 / "leap" / f"{DAY2_TAKE}.jsonl", DAY2 / "glove" / f"{DAY2_TAKE}.jsonl",

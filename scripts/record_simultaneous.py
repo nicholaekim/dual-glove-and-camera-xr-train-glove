@@ -87,6 +87,7 @@ Usage:
 """
 import argparse
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -122,6 +123,7 @@ from leap_hand.protocol import (
     median,
     parse_band,
     pose_label,
+    full_still_path,
     move_still,
     read_hand,
     skipped_still_path,
@@ -875,6 +877,30 @@ def _still_file(session, still: str, accepted: bool) -> Optional[Path]:
     return (folder if accepted else folder / STILLS) / still
 
 
+def _full_still(session, still: str, accepted: bool) -> Optional[str]:
+    """The meta's `still_full`: the uncropped frame beside the still,
+    relative to the session folder like `still`, None when it is not there."""
+    path = _still_file(session, still, accepted)
+    if path is None or not full_still_path(path).is_file():
+        return None
+    return str((Path(STILLS) if accepted else Path(REJECTED) / STILLS)
+               / full_still_path(path).name)
+
+
+def next_take(out_dir: Path, pose: str, hand: str) -> int:
+    """1 + the highest take number of `pose` for `hand` anywhere in `out_dir`,
+    kept or rejected (1 when there is none): what `--first-take auto` gives.
+
+    Counted from every file name `<pose>_<hand>_take<N>_...` under the
+    folder, so a re-run never reuses a number, never overwrites and never
+    deletes: an earlier take that failed a later check stays on disk under
+    its own number, for the take selection to reject with its reason."""
+    pattern = re.compile(rf"^{re.escape(pose)}_{re.escape(hand)}_take(\d+)_")
+    numbers = [int(m.group(1)) for p in Path(out_dir).rglob("*")
+               for m in [pattern.match(p.name)] if m]
+    return max(numbers, default=0) + 1
+
+
 from leap_hand.protocol import CameraView  # noqa: E402  (the live camera window)
 
 
@@ -1313,6 +1339,7 @@ class CoachedLeapSession(LeapSyncSession):
             still.unlink(missing_ok=True)
             skipped_still_path(still).unlink(missing_ok=True)
             still_capture_path(still).unlink(missing_ok=True)
+            full_still_path(still).unlink(missing_ok=True)
             raise
         cam_rec.stop()
         glove_rec.stop()
@@ -1606,6 +1633,10 @@ class CoachedLeapSession(LeapSyncSession):
             # moment a paired-pose comparison is timed by. All four None
             # with no still or no sidecar.
             **still_capture_meta(_still_file(self, still, accepted)),
+            # The uncropped frame the still was cut from, `<stem>.full.jpg`
+            # beside it (same folder, same moment; it shows the operator, so
+            # it stays in the session folder). None when there is none.
+            "still_full": _full_still(self, still, accepted),
             "file": file,
             # The REC hold as commanded (`Attempt.hold_start`), None when the
             # attempt never reached it: what a comparison's window ends on.
@@ -1746,9 +1777,12 @@ def main() -> None:
         description="Guided pose session recording glove and camera together.")
     p.add_argument("--poses", default=",".join(DEFAULT_POSES))
     p.add_argument("--takes", type=int, default=3)
-    p.add_argument("--first-take", type=int, default=1,
+    p.add_argument("--first-take", default="1",
                    help="number of the first take (default 1); a top-up of a "
-                        "folder that already holds takes 1..N gives N+1")
+                        "folder that already holds takes 1..N gives N+1. "
+                        "'auto' (--camera leap --hand left|right): each pose "
+                        "starts after the highest take number of that pose "
+                        "already in --out-dir, kept or rejected")
     p.add_argument("--duration", type=float, default=5.0)
     p.add_argument("--prep", type=float, default=5.0)
     p.add_argument("--hz", type=float, default=None,
@@ -1834,8 +1868,14 @@ def main() -> None:
     poses = [slugify(x) for x in args.poses.split(",") if slugify(x)]
     if not poses:
         raise SystemExit("no poses given")
-    if args.first_take < 1:
-        raise SystemExit("--first-take must be 1 or more")
+    auto_take = str(args.first_take).strip().lower() == "auto"
+    if not auto_take:
+        try:
+            args.first_take = int(args.first_take)
+        except ValueError:
+            raise SystemExit(f"--first-take takes a number or 'auto', not {args.first_take!r}")
+        if args.first_take < 1:
+            raise SystemExit("--first-take must be 1 or more")
 
     backend = str(args.camera).strip().lower()
     if backend != LEAP:
@@ -1865,6 +1905,9 @@ def main() -> None:
     except ValueError as e:
         raise SystemExit(str(e))
     coached = backend == LEAP and args.hand in ("left", "right")
+    if auto_take and not coached:
+        raise SystemExit("--first-take auto needs --camera leap --hand left|right: "
+                         "it reads the take numbers from that session's file names")
     hints = tuple(dict.fromkeys(args.hint or ()))   # each --hint once, in order
     # Both go into each take's meta.json, which only the coached session
     # writes: anywhere else they would be dropped without a trace, and a take
@@ -1998,8 +2041,12 @@ def main() -> None:
         try:
             session.wait_for_both()
             for i, pose in enumerate(poses, 1):
-                last = args.first_take + args.takes - 1    # "take 4/5"
-                for take in range(args.first_take, last + 1):
+                first = (next_take(args.out_dir, pose, args.hand) if auto_take
+                         else args.first_take)
+                if auto_take:
+                    print(f"{pose}: --first-take auto -> take {first}")
+                last = first + args.takes - 1              # "take 4/5"
+                for take in range(first, last + 1):
                     session.run_take(pose, take, last, i, len(poses),
                                      args.duration, args.prep)
         except (KeyboardInterrupt, QuitSession):
