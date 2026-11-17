@@ -25,7 +25,10 @@ FINGER_CMC = tuple(n for n in CAMERA_NOT_GIVEN if n.endswith("_CMC"))
 
 
 def _rows(path: Path) -> list[dict]:
-    assert path.is_file(), f"{path} missing: run scripts/leap/myosuite_hand_limits.py in .venv-myo"
+    # results/ is not in the repository: a fresh checkout has no tables to check
+    if not path.is_file():
+        pytest.skip(f"{path.name} is not here: run scripts/leap/myosuite_hand_limits.py "
+                    "in .venv-myo")
     with path.open(newline="", encoding="utf-8") as fh:
         return list(csv.DictReader(fh))
 

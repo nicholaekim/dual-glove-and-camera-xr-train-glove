@@ -316,6 +316,13 @@ def test_no_camera_in_the_launcher():
     assert "no camera" in lowered
     for needle in ("above the module", "lenses up", "ultraleap", "gloves on + camera"):
         assert needle not in lowered, needle
+
+
+def test_the_desktop_copy_of_the_launcher_is_the_same_file():
+    """The operator starts the recording from a copy of the launcher beside the
+    repository folder, on the Desktop. A checkout elsewhere has no such copy."""
     desktop = REPO.parent / "record_glove_poses.cmd"
-    assert desktop.is_file(), "the launcher's copy on the Desktop"
+    if not desktop.is_file():
+        pytest.skip("no copy of the launcher beside this checkout")
+    launcher = (REPO / "launchers" / "record_glove_poses.cmd").read_text(encoding="utf-8")
     assert desktop.read_text(encoding="utf-8") == launcher, "the Desktop copy is the same file"

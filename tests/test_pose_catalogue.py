@@ -7,6 +7,8 @@ import re
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 CSV_PATH = REPO / "protocols" / "pose_catalogue_100.csv"
 DOC_PATH = REPO / "docs" / "pose_catalogue_100.md"
@@ -124,4 +126,7 @@ def test_the_both_hands_protocol_has_every_pose_and_its_picture():
     proto = json.loads(path.read_text(encoding="utf-8"))
     assert [i["id"] for i in proto["items"]] == [r["id"] for r in _rows()]
     folder = (path.parent / proto["images_dir"]).resolve()
+    if not folder.is_dir():
+        # the pictures are rendered into results/, which is not in the repository
+        pytest.skip("the pose pictures are not here: run scripts/leap/pose_catalogue_render.py")
     assert all((folder / i["image"]).is_file() for i in proto["items"])
