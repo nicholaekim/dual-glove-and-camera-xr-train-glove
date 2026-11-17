@@ -14,17 +14,38 @@ it on.
 The angle panel lists every angle of the shown pose that the coverage table
 names (leap_hand.angle_coverage), each with its column and status, with the
 finger MCP pairs labelled by order. Below it, apart, the "estimated" block:
-the thumb TMC pair relative to the recorded open hand
-(T_TMC_fe_est_openhand, T_TMC_aa_est_openhand, leap_hand.tmc_estimate), its
-twist and residual, and the calibration's provenance. These are estimates,
-not validated Paper 3 coordinates (docs/tmc_estimate.md). With --dataset the
-calibration is --tmc-calibration PATH (a calibration.json written by
-scripts/leap/tmc_estimate_report.py), by default
-results/replay_fidelity/tmc_estimate/calibration.json when it exists, else
-computed from the dataset's transitions (the time it took is printed).
---no-tmc leaves the block "not computed"; so does --file without
---tmc-calibration. A calibration of another session than the recording's is
-not applied (the block says so).
+the thumb TMC pair relative to the calibration's reference, named by the
+calibration's kind (T_TMC_fe_est_openhand / T_TMC_aa_est_openhand for the
+session's recorded open hand, T_TMC_fe_est_neutral / T_TMC_aa_est_neutral for
+a tmc_neutral calibration take; leap_hand.tmc_estimate,
+leap_hand.tmc_calibration_take), its twist and residual, and the
+calibration's provenance; the block's title says which kind. These are
+tracker-relative estimates, not validated Paper 3 coordinates
+(docs/tmc_estimate.md). The calibration is --tmc-calibration PATH (a
+calibration.json of either writer: scripts/leap/tmc_estimate_report.py, or
+record_poses.py --calibration tmc_neutral; a file without a "kind" is read
+by its provenance's first words or refused with the fix spelled out); with
+--dataset and no path, results/replay_fidelity/tmc_estimate/calibration.json
+when it exists, else one computed from the dataset's transitions (the time it
+took is printed). --no-tmc leaves the block "not computed"; so does --file
+without --tmc-calibration. A calibration of another session or another hand
+than the recording's is not applied (the block says why), and neither is one
+whose hand is not known: a file written before the hand field existed is
+applied only with --tmc-calibration-hand left|right (refused when the file
+records another hand) or when --dataset's metadata/pose_transitions.csv
+names its transitions and their hand (the console says which); never is the
+hand taken from the recording or from a file name.
+
+Above the estimate, the two "mapped (...)" rows: with --tmc-mapping PATH (a
+mapping.json from scripts/leap/reference_validation.py compare, i.e. a
+mapping fitted and held-out-tested against an independent reference device;
+leap_hand.reference_validation), T_TMC_fe_mapped / T_TMC_aa_mapped of the
+shown pose, but only when the recording is of the mapping's participant, hand
+and tracker session (the dataset's metadata, or a loose file's .meta.json
+sidecar from record_validation.py) and inside its tested range; else the
+rows say why it is empty. The first row's tag says what the reference was:
+reference-evaluated, SYNTHETIC (not measured), or a cross-check only. Without
+--tmc-mapping there are no such rows.
 
 Controls (keys and buttons): space play/pause   +/- speed (0.1 to 4)
 left/right step one frame   p/n previous/next event   r camera/wrist/palm
@@ -45,6 +66,7 @@ Usage:
   .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --dataset "<root>" --grasp p3_circular_power --take 1 --no-tmc
   .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --file recordings\\some_take.jsonl --hand left --tmc-calibration results\\replay_fidelity\\tmc_estimate\\calibration.json
   .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --dataset "<root>" --scenario-screenshots results\\replay_fidelity\\screens
+  .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --file <validation take>.jsonl --hand left --tmc-mapping <comparison folder>\\mapping.json
 
 --scenario-screenshots replays four static takes headless (Agg) and writes a
 PNG per state: camera view, wrist view, overlay on and axes on at the
@@ -60,12 +82,14 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 if __package__ in (None, ""):                    # run as a plain script
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from leap_hand import angle_coverage as ac
+from leap_hand import reference_validation as rv
 from leap_hand import replay_core as rc
 from leap_hand import tmc_estimate as te
 
@@ -124,12 +148,24 @@ def build_parser() -> argparse.ArgumentParser:
                         "state, and a timing log")
     tmc = p.add_mutually_exclusive_group()
     tmc.add_argument("--tmc-calibration", type=Path, metavar="PATH",
-                     help="calibration.json of tmc_estimate_report.py for the "
-                          "estimated thumb TMC block (default with --dataset: "
+                     help="calibration.json for the estimated thumb TMC block: of "
+                          "tmc_estimate_report.py (open hand, *_est_openhand) or of "
+                          "record_poses.py --calibration tmc_neutral (neutral posture "
+                          "take, *_est_neutral) (default with --dataset: "
                           "results/replay_fidelity/tmc_estimate/calibration.json "
                           "if it exists, else computed from the dataset)")
     tmc.add_argument("--no-tmc", action="store_true",
                      help="no thumb TMC estimate (the block says not computed)")
+    p.add_argument("--tmc-mapping", type=Path, metavar="PATH",
+                   help="a mapping.json of scripts/leap/reference_validation.py compare: "
+                        "the reference-mapped thumb TMC pair, shown only inside the "
+                        "mapping's participant, hand, session and tested range")
+    p.add_argument("--tmc-calibration-hand", choices=rc.SIDES, metavar="HAND",
+                   help="the hand (left|right) of a calibration file written before the "
+                        "hand field existed; refused when the file records another hand. "
+                        "Without it such a file is applied only when --dataset's "
+                        "metadata/pose_transitions.csv names its transitions and their "
+                        "hand, else the estimate is not applied")
     return p
 
 
@@ -174,25 +210,52 @@ def load(args) -> rc.Recording:
                              gap_threshold_s=args.gap_threshold, kind="file")
 
 
-def load_calibration(path) -> te.Calibration:
-    """A Calibration from a calibration.json (`Calibration.to_json`)."""
-    return te.Calibration.from_json(json.loads(Path(path).read_text(encoding="utf-8")))
+def load_calibration(path, hand=None) -> te.Calibration:
+    """A Calibration from a calibration.json (`Calibration.to_json`); `hand`
+    declares the hand of a file that records none (refused when it
+    contradicts a recorded hand)."""
+    return te.Calibration.from_json(json.loads(Path(path).read_text(encoding="utf-8")),
+                                    hand=hand)
+
+
+def resolve_hand(cal: te.Calibration, declared, dataset):
+    """(the calibration with its hand known where it can be, one phrase saying
+    how). The file's own hand first; else the user's declaration (already
+    applied by load_calibration); else, with a dataset, the hand of the
+    transitions the calibration names in metadata/pose_transitions.csv
+    (tmc_estimate.hand_from_transitions); else unknown, and the estimate is
+    not applied (tmc_estimate.mismatch says so in the block)."""
+    if cal.hand is not None:
+        how = ("declared with --tmc-calibration-hand" if declared else "recorded in the file")
+        return cal, f"hand {cal.hand} ({how})"
+    why = "no --dataset to recover it from"
+    if dataset is not None:
+        hand, why = te.hand_from_transitions(cal, dataset)
+        if hand is not None:
+            return replace(cal, hand=hand), f"hand {hand} ({why})"
+    return cal, (f"hand not recorded in the file ({why}): the estimate is not applied; "
+                 f"declare it with --tmc-calibration-hand left|right or regenerate the file")
 
 
 def tmc_calibration(args):
-    """(Calibration or None, one line saying where it came from or why
-    there is none) for the estimated block (module docstring). A
-    --tmc-calibration that cannot be read raises."""
+    """(Calibration or None, one line saying where it came from, how its hand
+    is known, or why there is none) for the estimated block (module
+    docstring). A --tmc-calibration that cannot be read, or whose recorded
+    hand contradicts --tmc-calibration-hand, raises."""
     if args.no_tmc:
         return None, "TMC estimate: off (--no-tmc)"
+    declared = args.tmc_calibration_hand
     if args.tmc_calibration is not None:
-        return load_calibration(args.tmc_calibration), \
-            f"TMC calibration: {args.tmc_calibration}"
+        cal, how = resolve_hand(load_calibration(args.tmc_calibration, declared), declared,
+                                args.dataset)
+        return cal, f"TMC calibration: {args.tmc_calibration}; {how}"
     if args.dataset is None:
         return None, "TMC estimate: not computed (no --dataset, no --tmc-calibration)"
     if DEFAULT_TMC.is_file():
         try:
-            return load_calibration(DEFAULT_TMC), f"TMC calibration: {DEFAULT_TMC}"
+            cal, how = resolve_hand(load_calibration(DEFAULT_TMC, declared), declared,
+                                    args.dataset)
+            return cal, f"TMC calibration: {DEFAULT_TMC}; {how}"
         except (OSError, ValueError, KeyError, TypeError) as e:   # reported; replay opens
             return None, (f"TMC estimate: not computed (cannot read {DEFAULT_TMC}: "
                           f"{type(e).__name__}: {e})")
@@ -208,30 +271,54 @@ def tmc_calibration(args):
 
 def provenance_text(cal: te.Calibration) -> str:
     """One panel row (80 characters on this session): the block's title
-    already says open-hand calibration, not a validated Paper 3 coordinate;
-    the full provenance (frames, session) is printed when the calibration
-    loads. A 56-row (804 px) window has no row to spare in interpolate mode."""
+    already says the calibration kind and that it is not a validated Paper 3
+    coordinate; the full provenance (frames, session) is printed when the
+    calibration loads. The 804 px window holds about 57 rows: the worst case
+    (interpolated pose, an estimate and a mapping) fills them."""
     a = cal.agreement
-    return (f"open hand, {cal.n_transitions} transitions; agreement median "
+    what, unit = (("open hand", "transitions") if cal.kind == "openhand"
+                  else ("neutral posture take", "takes"))
+    return (f"{what}, {cal.n_transitions} {unit}; agreement median "
             f"{a['median_deg']:.1f}/p90 {a['p90_deg']:.1f}/max {a['max_deg']:.1f} deg")
 
 
 def tmc_provider(cal: te.Calibration, rec: rc.Recording):
-    """The viewer's tmc_provider: tmc_estimate.estimate on the displayed pose,
-    with provenance_text. A calibration of another session than the
-    recording's (both named) is not applied: values None, the reason as
-    the provenance."""
-    session = str(rec.metadata.get("session") or "").strip()
-    if session and cal.session and session != cal.session:
-        note = (f"calibration of session {cal.session}, this recording is of "
-                f"session {session}: not applied")
-        return lambda pos, rot, hand_side: {**dict.fromkeys(ac.ESTIMATE_COLUMNS),
-                                            "provenance": note}
+    """The viewer's tmc_provider: tmc_estimate.estimate on the displayed pose
+    (its outputs named by the calibration's kind), with provenance_text and
+    the kind. A calibration of another hand, or of another session than the
+    recording's (both named), is not applied: that kind's values None, the
+    reason as the provenance (tmc_estimate.mismatch)."""
+    reason = te.mismatch(cal, rec.hand_side, rec.metadata.get("session"))
+    columns = ac.ESTIMATE_COLUMNS_BY_KIND[cal.kind]
+    if reason:
+        return lambda pos, rot, hand_side: {**dict.fromkeys(columns), "kind": cal.kind,
+                                            "provenance": f"{reason}: not applied"}
     text = provenance_text(cal)
 
     def provider(pos, rot, hand_side):
         return {**te.estimate(pos, rot, hand_side, cal), "provenance": text}
     return provider
+
+
+def mapping_provider(mapping: rv.TmcMapping, rec: rc.Recording):
+    """(the viewer's mapping_provider, one console line). Outside the mapping's
+    scope (another hand, session or participant, or a recording that names
+    none) every value is None and the reason is the note
+    (reference_validation.scope_mismatch); inside it, apply_mapping on the
+    shown pose, which leaves values outside the tested range empty too."""
+    scope = rv.recording_scope(rec)
+    reason = rv.scope_mismatch(mapping, rec.hand_side, scope["session"],
+                               scope["participant"])
+    base = {"mapping_status": mapping.status, "scope": mapping.scope_text(),
+            "scope_row": mapping.scope_row()}
+    if reason:
+        empty = {**dict.fromkeys(ac.MAPPED_COLUMNS), "status": "not_applied",
+                 "note": reason, **base}
+        return (lambda pos, rot, hand_side: empty), f"not applied to this recording: {reason}"
+
+    def provider(pos, rot, hand_side):
+        return {**rv.apply_mapping(mapping, rot), **base}
+    return provider, "applied to this recording (inside its tested range only)"
 
 
 def default_timing_path(rec: rc.Recording) -> Path:
@@ -372,7 +459,20 @@ def main(argv=None) -> int:
               f"{type(e).__name__}: {e}")
         return 1
     print(cal_line)
+    mapping = None
+    if args.tmc_mapping is not None:
+        try:
+            mapping = rv.load_mapping(args.tmc_mapping)
+        except rv.ReferenceError as e:
+            print(f"cannot read the TMC mapping: {e}")
+            return 1
+        print(f"TMC mapping: {args.tmc_mapping}; {mapping.id}; "
+              f"{rv.STATUS_TEXT[mapping.status]}")
+        print(f"  scope: {mapping.scope_text()}")
     if cal is not None:
+        print(f"  kind: {cal.kind} ({te.KIND_LABELS[cal.kind]}); hand "
+              f"{cal.hand or 'not recorded in the file'}; outputs "
+              f"{', '.join(ac.ESTIMATE_COLUMNS_BY_KIND[cal.kind])}")
         print(f"  {cal.provenance}")
 
     if args.scenario_screenshots is not None:
@@ -382,11 +482,16 @@ def main(argv=None) -> int:
         return 0
 
     from leap_hand.replay_viewer import ReplayViewer
+    mprov = None
+    if mapping is not None:
+        mprov, how = mapping_provider(mapping, rec)
+        print(f"  {how}")
     viewer = ReplayViewer(rec, mode=args.mode, reference=args.reference,
                           speed=args.speed, start_frame=args.start_frame,
                           overlay=args.overlay, axes=args.axes,
                           screenshot_dir=RESULTS / "screens",
-                          tmc_provider=None if cal is None else tmc_provider(cal, rec))
+                          tmc_provider=None if cal is None else tmc_provider(cal, rec),
+                          mapping_provider=mprov)
     if args.headless:
         path = viewer.screenshot(args.screenshot)
         print(f"screenshot: {path}")

@@ -606,18 +606,25 @@ def view_caption(phase: str, pose: str, extra: str = "",
 QUIT = "__quit__"
 
 
-def status_text(caption: str, band=None, snap=None) -> str:
-    """The status file's contents, as the viewer parses them back."""
+def status_text(caption: str, band=None, snap=None, ref=None) -> str:
+    """The status file's contents, as the viewer parses them back.
+
+    `ref` is the path of the reference picture of the pose being asked for
+    (`reference_poses/<pose>.png`, see `reference_path`); the window draws it
+    in its top-right corner so the operator can copy it."""
     body = (caption or "").strip()
     if band:
         body += f"\nband={band[0]:g},{band[1]:g}"
     if snap:
         body += f"\nsnap={snap}"
+    if ref:
+        body += f"\nref={ref}"
     return body
 
 
 def parse_status(text: str):
-    """`status_text` backwards: (caption, band or None, snap or None).
+    """`status_text` backwards: (caption, band or None, snap or None,
+    ref or None).
 
     Unknown keys and malformed values are ignored rather than raising: the
     viewer is a child process watching a file that the parent may be halfway
@@ -628,6 +635,7 @@ def parse_status(text: str):
     caption = lines[0].strip() if lines else ""
     band = None
     snap = None
+    ref = None
     for line in lines[1:]:
         line = line.strip()
         if line.startswith("band="):
@@ -639,7 +647,63 @@ def parse_status(text: str):
                 band = (low, high)
         elif line.startswith("snap="):
             snap = line[5:].strip() or None
-    return caption, band, snap
+        elif line.startswith("ref="):
+            ref = line[4:].strip() or None
+    return caption, band, snap, ref
+
+
+# --- the reference picture of the pose being asked for --------------------------
+# The operator does not always know what a pose should look like. The pictures
+# in `reference_poses/` are the professor's own tracker frames (she defined the
+# pose list; `reference_poses/sources.txt` names each frame), and the window
+# shows the one for the pose being recorded in its top-right corner. Only on
+# the annotated window frame: the still is cut from the clean frame and never
+# carries it.
+REFERENCE_PHASES = ("ACQUIRE", "SETTLE", "REC")   # the phases that name a pose
+REFERENCE_WIDTH = 240                               # px, in the 768 px window
+REFERENCE_TOP = 124                                 # below the caption and two hand lines
+REFERENCE_MARGIN = 10
+
+
+def reference_path(ref_dir, phase: str, pose: str) -> Optional[str]:
+    """`<ref_dir>/<pose>.png` while `phase` asks for `pose`, else None.
+    None too when the picture is not on disk: the window then shows none."""
+    if str(phase or "").upper() not in REFERENCE_PHASES or not pose:
+        return None
+    path = Path(ref_dir) / f"{pose}.png"
+    return str(path) if path.is_file() else None
+
+
+def reference_label(ref) -> str:
+    """`.../crossed_fingers.png` -> `TARGET: CROSSED FINGERS`."""
+    return f"TARGET: {Path(ref).stem.replace('_', ' ').upper()}"
+
+
+def paste_reference(frame, ref_img, label: str, put,
+                    top: int = REFERENCE_TOP, margin: int = REFERENCE_MARGIN,
+                    char_px: int = 17):
+    """Draw `ref_img` (already scaled) into the top-right corner of `frame`,
+    in place, with `label` on one line above it, written by `put(frame, text,
+    org)`. Returns the picture's (x0, y0, x1, y1), or None if it does not fit.
+
+    Draws on `frame` and nothing else: the caller passes the annotated window
+    frame, never the clean one a still is cut from. The label starts at the
+    picture's left edge, or further left so a long one still ends at the
+    picture's right edge; `char_px` is the
+    caption font's width per character (Hershey simplex, scale 0.75)."""
+    height, width = frame.shape[:2]
+    h, w = ref_img.shape[:2]
+    x1 = width - margin
+    x0 = x1 - w
+    y0 = top
+    y1 = min(height, y0 + h)
+    if x0 < 0 or y1 <= y0:
+        return None
+    frame[y0:y1, x0:x1] = ref_img[:y1 - y0]
+    if label:
+        lx = max(margin, min(x0, x1 - char_px * len(label)))
+        put(frame, label, (lx, y0 - 10))
+    return x0, y0, x1, y1
 
 
 # --- the viewer's "no picture" banner ----------------------------------------
@@ -1063,6 +1127,7 @@ class CameraView:
         # moment the still is taken.
         self._caption = ""
         self._snap = None
+        self._ref = None
 
     def start(self):
         if not self.enabled or self._proc is not None:
@@ -1086,10 +1151,13 @@ class CameraView:
         atexit.register(self.close)
         return self
 
-    def caption(self, text, band=None):
-        """Set the window's caption (and optionally its height band). Cheap to
-        call every HUD refresh: the file is only rewritten when it changes."""
+    def caption(self, text, band=None, ref=None):
+        """Set the window's caption (and optionally its height band and the
+        reference picture `ref` of the pose being asked for; None shows no
+        picture). Cheap to call every HUD refresh: the file is only rewritten
+        when it changes."""
         self._caption = (text or "").strip()
+        self._ref = str(ref) if ref else None
         self._write_status(band)
 
     def snapshot(self, path):
@@ -1123,7 +1191,7 @@ class CameraView:
     def _write_status(self, band=None):
         if not self.enabled or self._status is None:
             return
-        body = status_text(self._caption, band, self._snap)
+        body = status_text(self._caption, band, self._snap, self._ref)
         if body == self._last:
             return
         self._last = body

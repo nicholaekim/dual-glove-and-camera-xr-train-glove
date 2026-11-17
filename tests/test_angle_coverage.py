@@ -83,11 +83,16 @@ def short(movement):
 # --- the table -----------------------------------------------------------------------
 def test_coverage_holds_every_joint_movement_pair_of_the_plan():
     """thumb 3 joints x 2 + four fingers x 4 joints x 2 + wrist 2 + twist 1 =
-    41 pairs, plus the two estimated thumb TMC entries: 43."""
+    41 pairs, plus the four estimated thumb TMC entries (two kinds) and the
+    two reference-evaluated ones (the mapped pair): 47."""
     expected = [("thumb TMC", "fe", "unavailable", ()),
                 ("thumb TMC", "fe", "estimated", ("T_TMC_fe_est_openhand",)),
+                ("thumb TMC", "fe", "estimated", ("T_TMC_fe_est_neutral",)),
+                ("thumb TMC", "fe", "evaluated", ("T_TMC_fe_mapped",)),
                 ("thumb TMC", "aa", "unavailable", ()),
                 ("thumb TMC", "aa", "estimated", ("T_TMC_aa_est_openhand",)),
+                ("thumb TMC", "aa", "estimated", ("T_TMC_aa_est_neutral",)),
+                ("thumb TMC", "aa", "evaluated", ("T_TMC_aa_mapped",)),
                 ("thumb MCP", "fe", "calculated", ("T_MCP_fe",)),
                 ("thumb MCP", "aa", "outside_paper3", ("T_MCP_aa_tracker",)),
                 ("thumb IP", "fe", "calculated", ("T_IP",)),
@@ -115,7 +120,7 @@ def test_coverage_holds_every_joint_movement_pair_of_the_plan():
     assert twist.output_columns == tuple(f"{n}_twist_tracker" for n in NON_ROOT)
     assert len(twist.output_columns) == 24 and twist.method == (
         "xyz third angle (joint_frames.joint_angles twist_deg)")
-    assert len(ac.COVERAGE) == 43 == len(expected) + 1
+    assert len(ac.COVERAGE) == 47 == len(expected) + 1
     assert all(e.status in ac.STATUS for e in ac.COVERAGE)
 
 
@@ -151,18 +156,33 @@ def test_unavailable_paper3_names_carry_the_plans_requirements():
         assert e.note == "outside Paper 3's model and not measured: rigid palm"
 
 
-def test_the_estimate_is_kept_apart_from_the_validated_coordinates():
+def test_the_estimates_are_kept_apart_from_the_validated_coordinates_and_each_other():
+    """One estimated entry per calibration kind and movement (2026-10-24):
+    open-hand-relative and neutral-posture-relative, never one column."""
     est = [e for e in ac.COVERAGE if e.status == "estimated"]
-    assert [e.output_columns for e in est] == [("T_TMC_fe_est_openhand",),
-                                               ("T_TMC_aa_est_openhand",)]
-    assert ac.ESTIMATE_COLUMNS == ("T_TMC_fe_est_openhand", "T_TMC_aa_est_openhand")
+    assert [e.output_columns for e in est] == [
+        ("T_TMC_fe_est_openhand",), ("T_TMC_fe_est_neutral",),
+        ("T_TMC_aa_est_openhand",), ("T_TMC_aa_est_neutral",)]
+    assert ac.ESTIMATE_COLUMNS_BY_KIND == {
+        "openhand": ("T_TMC_fe_est_openhand", "T_TMC_aa_est_openhand"),
+        "neutral": ("T_TMC_fe_est_neutral", "T_TMC_aa_est_neutral")}
+    assert ac.ESTIMATE_COLUMNS == ("T_TMC_fe_est_openhand", "T_TMC_aa_est_openhand",
+                                   "T_TMC_fe_est_neutral", "T_TMC_aa_est_neutral")
     for e in est:
         assert e.paper3_name is None and e.dataset_column is None
-        assert e.reference_frame == "palm frame via the session's open-hand rest frame"
-        assert e.zero_position == "the session's open-hand pose"
         assert e.method.startswith("paper_order on R_rest^T (R_palm^T R_metacarpal)")
         assert "NOT a validated Paper 3 coordinate" in e.note
-        assert "unknown constant" in e.note
+        assert "cross-talk" in e.note and "unknown constant" not in e.note
+        if e.output_columns[0].endswith("_openhand"):
+            assert e.reference_frame == "palm frame via the session's open-hand rest frame"
+            assert e.zero_position == "the session's open-hand pose"
+            assert e.requirement.startswith("the session's open-hand frames")
+        else:
+            assert e.reference_frame == ("palm frame via the rest frame of a tmc_neutral "
+                                         "calibration take")
+            assert e.zero_position.startswith("the tmc_neutral posture held in a calibration take")
+            assert "record_poses.py --calibration tmc_neutral" in e.requirement
+            assert "none recorded yet" in e.requirement
     assert not set(ac.ESTIMATE_COLUMNS) & set(ac.ALL_ANGLE_COLUMNS)
 
 
@@ -266,7 +286,7 @@ def test_write_coverage_csv_has_one_row_per_entry(tmp_path):
         "joint", "movement", "paper3_name", "status", "output_columns",
         "reference_frame", "zero_position", "sign_convention", "method", "note",
         "requirement", "dataset_column"]
-    assert len(rows) == 43 == len(ac.coverage_rows())
+    assert len(rows) == 47 == len(ac.coverage_rows())
     by = [dict(zip(header, r)) for r in rows]
     mcp = next(r for r in by if r["paper3_name"] == "I_MCP_fe")
     assert mcp["output_columns"] == "I_MCP_fe; I_MCP_fe_paper_order"
@@ -284,6 +304,8 @@ def test_status_of_maps_every_column():
         assert ac.status_of(c) == expected, c
     for c in ac.ESTIMATE_COLUMNS:
         assert ac.status_of(c) == "estimated"
+    for c in ac.MAPPED_COLUMNS:
+        assert ac.status_of(c) == "evaluated"
     assert ac.status_of("I_MCP_aa_paper_order") == "calculated"
     with pytest.raises(KeyError):
         ac.status_of("I_MCP_twist")
@@ -292,4 +314,26 @@ def test_status_of_maps_every_column():
 def test_the_doc_holds_the_table_the_code_renders():
     doc = (REPO / "docs" / "angle_coverage.md").read_text(encoding="utf-8")
     assert ac.coverage_markdown() in doc
-    assert ac.coverage_markdown().count("\n") == 43 + 1         # header, rule, 43 rows
+    assert ac.coverage_markdown().count("\n") == 47 + 1         # header, rule, 47 rows
+
+
+
+def test_status_vocabulary_names_the_four_kinds_of_value():
+    """calculated tracker coordinate, unvalidated estimate, reference-evaluated
+    measurement with its scope, unavailable (outside Paper 3 is a calculated
+    tracker coordinate that is not one of the 24)."""
+    assert ac.STATUS == ("calculated", "estimated", "evaluated", "unavailable",
+                         "outside_paper3")
+    assert ac.STATUS_LABELS["estimated"] == "unvalidated estimate"
+    assert ac.STATUS_LABELS["evaluated"] == "reference-evaluated"
+    assert "tracker coordinate" in ac.STATUS_MEANINGS["calculated"]
+    assert "scope" in ac.STATUS_MEANINGS["evaluated"]
+    from leap_hand import reference_validation as rvl
+    assert ac.MAPPED_COLUMNS == rvl.MAPPED_COLUMNS
+    for e in ac.COVERAGE:
+        if e.status == "evaluated":
+            assert e.paper3_name is None              # never under a Paper 3 name
+            assert "No mapping evaluated against a measured anatomical reference" in e.note
+            assert e.dataset_column is None
+    six = [e for e in ac.COVERAGE if e.paper3_name in ac.UNAVAILABLE_COLUMNS]
+    assert {e.status for e in six} == {"unavailable"}

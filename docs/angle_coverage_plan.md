@@ -137,7 +137,9 @@ Assumptions, each tested or measured and written in `docs/tmc_estimate.md`:
 - A3 the open-hand pose is the zero. Paper 3 gives its zero only as a
   drawing (Figure 1, p.3) and Table 5's ranges fix no zero, so the estimate
   is "relative to the recorded open hand" and differs from the paper's by
-  an unknown constant per coordinate; it is never used as a validated
+  a change of reference (corrected 2026-10-24 after Codex's review: not a
+  fixed amount per angle but a pose-dependent mix of the two,
+  `docs/tmc_estimate.md`, "What a change of reference does"); it is never used as a validated
   Paper 3 coordinate and the Table 6 relation T_TMC_fe ~ 11/10 T_MCP_fe
   stays `unavailable`;
 - A4 the tracker's thumb metacarpal is a tracked bone, not a rigid part of

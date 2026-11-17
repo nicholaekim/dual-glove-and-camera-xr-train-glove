@@ -570,6 +570,85 @@ def test_dropped_frames_inside_a_segment_are_shown_and_interpolated(tmp_path):
     np.testing.assert_allclose(shown.pos, (a.pos + b.pos) / 2.0, atol=1e-15)
 
 
+# --- invalid tracking is a discontinuity (Codex finding 2, 2026-10-24) -----------------
+def test_invalid_tracking_between_two_frames_is_never_interpolated_across(tmp_path):
+    """Codex's case: three frames of one hand id at 0, 11 and 22 ms, the
+    middle one status 0. The two valid frames are not one continuous motion:
+    the tracker said it had no hand in between."""
+    lines = clock_lines(3)
+    lines[1]["status"] = 0
+    rec = load(tmp_path, lines)
+    t = rec.timeline.t
+    assert [f.frame_id for f in rec.frames] == [1000, 1002]
+    assert rec.frames[0].hand_id == rec.frames[1].hand_id == 7       # same id both sides
+    assert rec.lines_excluded["invalid_status"] == 1
+    # the invalid line keeps its event and provenance; no "still interpolated" event
+    assert [(e.kind, e.index, e.frame_id_after) for e in rec.events] == [
+        ("invalid_status", 1, 1001)]
+    assert rec.events[0].detail.startswith("line 2: status 0 (frame_id 1001, hand_id 7)")
+    assert [(s.start, s.end, s.hand_id) for s in rec.segments] == [(0, 0, 7), (1, 1, 7)]
+    t_mid = (t[0] + t[1]) / 2.0
+    shown = rc.pose_at(rec, t_mid, "interpolate")
+    assert shown.source == "held" and shown.i0 == 0 and shown.i1 == 0
+    assert "discontinuity" in shown.note and "invalid_status" in shown.note
+    assert "frame_id 1000 and 1002" in shown.note
+    np.testing.assert_array_equal(shown.pos, rc.reconstruct(rec.frames[0]).pos)
+    assert rc.pose_at(rec, t_mid, "hold").source == "held"
+    assert rc.pose_at(rec, t[1], "interpolate").source == "recorded"   # the next valid frame
+    assert rc.pose_at(rec, t[1] + 0.001, "interpolate").source == "held"  # after the last
+
+
+def test_consecutive_invalid_lines_cut_once_and_keep_every_event(tmp_path):
+    lines = clock_lines(6)
+    lines[2]["status"] = lines[3]["status"] = 0
+    rec = load(tmp_path, lines)
+    t = rec.timeline.t
+    assert [f.frame_id for f in rec.frames] == [1000, 1001, 1004, 1005]
+    assert [(e.kind, e.index, e.frame_id_after) for e in rec.events] == [
+        ("invalid_status", 2, 1002), ("invalid_status", 2, 1003)]
+    assert [(s.start, s.end) for s in rec.segments] == [(0, 1), (2, 3)]
+    inside = rc.pose_at(rec, (t[0] + t[1]) / 2.0, "interpolate")   # valid data: still interpolated
+    assert inside.source == "interpolated" and inside.alpha == pytest.approx(0.5)
+    across = rc.pose_at(rec, (t[1] + t[2]) / 2.0, "interpolate")
+    assert across.source == "held" and across.i0 == 1 and "invalid_status" in across.note
+    after = rc.pose_at(rec, (t[2] + t[3]) / 2.0, "interpolate")
+    assert after.source == "interpolated" and after.i0 == 2
+
+
+def test_invalid_lines_before_the_first_and_after_the_last_frame_cut_nothing(tmp_path):
+    lines = clock_lines(5)
+    lines[0]["status"] = lines[4]["status"] = 0
+    rec = load(tmp_path, lines)
+    t = rec.timeline.t
+    assert [f.frame_id for f in rec.frames] == [1001, 1002, 1003]
+    first, last = rec.events
+    assert (first.kind, first.index, first.frame_id_after) == ("invalid_status", 0, 1000)
+    assert "before the first selected frame" in first.detail
+    assert (last.kind, last.index, last.frame_id_after) == ("invalid_status", 2, 1004)
+    assert "after the last selected frame" in last.detail
+    assert [(s.start, s.end) for s in rec.segments] == [(0, 2)]       # one segment
+    assert rc.pose_at(rec, t[0] - 0.005, "interpolate").source == "unavailable"
+    mid = rc.pose_at(rec, (t[0] + t[1]) / 2.0, "interpolate")
+    assert mid.source == "interpolated" and mid.alpha == pytest.approx(0.5)
+    assert rc.pose_at(rec, t[2] + 0.005, "interpolate").source == "held"
+
+
+def test_an_invalid_line_at_an_id_change_names_the_id_change(tmp_path):
+    """Both at once: the cut is one, the id_change event is written, the
+    invalid event keeps its own line, and the hold reason names both."""
+    lines = clock_lines(6, hand_ids=[7, 7, 7, 8, 8, 8])
+    lines[3]["status"] = 0
+    rec = load(tmp_path, lines, ids=(7, 8))
+    assert [f.frame_id for f in rec.frames] == [1000, 1001, 1002, 1004, 1005]
+    assert sorted((e.kind, e.index) for e in rec.events) == [("id_change", 3),
+                                                             ("invalid_status", 3)]
+    assert [(s.start, s.end, s.hand_id) for s in rec.segments] == [(0, 2, 7), (3, 4, 8)]
+    t = rec.timeline.t
+    shown = rc.pose_at(rec, (t[2] + t[3]) / 2.0, "interpolate")
+    assert shown.source == "held" and "id_change" in shown.note
+    assert "invalid_status" in shown.note
+
+
 # --- hand selection and exclusions --------------------------------------------------
 def test_selection_counts_every_excluded_line(tmp_path):
     right = clock_lines(4)

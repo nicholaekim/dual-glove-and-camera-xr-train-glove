@@ -71,7 +71,7 @@ suite runs without the camera and the gloves.
 
 ## Runbook
 
-Run from the repo root; the launchers are in `launchers\`.
+Run from the repo root; the launchers are in `launchers\`. While a pose is asked for, the camera window shows the professor's reference picture of that pose in its top-right corner (`reference_poses\<pose>.png`, frames named in `reference_poses\sources.txt`), so the operator copies her pose; the saved still never carries it.
 
 1. Camera only, bare left hand, no gloves: double-click `sidecar_dry_run.cmd` (on the
    Desktop). Its scope: it validates the camera's timestamp-sidecar path only, not

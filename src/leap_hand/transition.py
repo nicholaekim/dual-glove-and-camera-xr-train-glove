@@ -576,9 +576,11 @@ def pose_distance_mm(pos, ref, index: Optional[Sequence[int]] = None
 
 def pose_speeds(t: np.ndarray, pos: Sequence[np.ndarray],
                 step_s: float = SPEED_STEP_S,
-                index: Optional[Sequence[int]] = None) -> np.ndarray:
+                index: Optional[Sequence[int]] = None,
+                tips: bool = False) -> np.ndarray:
     """The mean joint speed in mm/s of every frame with the whole hand's
-    movement taken out.
+    movement taken out. With `tips`, the fastest fingertip's speed instead
+    of the mean over the joints: what one finger did (`TIP_MOVE_SPEED_MM_S`).
 
     As `centred_speeds`: the two frames are the earliest and the latest
     within half a step of the frame (at an end of the recording, the frames
@@ -595,10 +597,48 @@ def pose_speeds(t: np.ndarray, pos: Sequence[np.ndarray],
         if (b <= a or t[b] - t[a] <= 0 or pos[a].shape != (26, 3)
                 or pos[b].shape != (26, 3)):
             continue
-        step = float(np.linalg.norm(laid_on(pos[b], pos[a], index) - pos[a],
-                                    axis=1).mean())
+        left = np.linalg.norm(laid_on(pos[b], pos[a], index) - pos[a], axis=1)
+        step = float(left[TIP_INDEX].max() if tips else left.mean())
         speeds[k] = step / (t[b] - t[a]) * 1000.0
     return speeds
+
+
+# One finger bending moves the mean of 26 joints very little: on 2026-11-12
+# the pose B01 of the catalogue (only the index half curls) was sent back
+# three times as "no close after the cue". The fastest fingertip against the
+# palm (`pose_speeds(tips=True)`) sees it. Read that day from the 51 takes
+# kept in three sessions of the pose catalogue (left hand): making a pose
+# peaked at 120 to 1140 mm/s (5th percentile 195); an open hand in the 0.15 s
+# after the cue read 2 to 47 (one take, already moving, 197); a held pose
+# inside its static interval 4 to 175 (95th percentile 115). Not tried on
+# recordings other than those. The recorder uses it only with --finger-poses.
+TIP_MOVE_SPEED_MM_S = 150.0
+TIP_INDEX = [i for n, i in JOINT_INDEX.items() if n.endswith("_TIP")]
+TIP_THRESHOLDS_READ_ON = "2026-11-12"
+
+
+def fingertip_peak_mm_s(rows: Sequence[dict], t0: float, t_end: float,
+                        follow=None, require_label: Optional[str] = None,
+                        prefer: Optional[str] = None) -> Optional[float]:
+    """The fastest fingertip speed against the palm, mm/s, between the cue
+    `t0` and `t_end`, on the lines `summarise_forming` measures (the followed
+    hand's, or the most seen label's, that carry `require_label`). None
+    without two such lines."""
+    if follow is not None:
+        start_id, others, palm = follow
+        mine = follow_hand(rows, start_id, others or (), palm, prefer=prefer).rows
+    else:
+        label = operator_label(rows, prefer)
+        mine = [] if label is None else hand_rows(rows, label)
+    after = sorted((r for _i, r in mine
+                    if (require_label is None
+                        or str(r.get("hand_side")) == require_label)
+                    and t0 <= frame_time(r) <= t_end), key=frame_time)
+    if len(after) < 2:
+        return None
+    speeds = pose_speeds(np.array([frame_time(r) for r in after]),
+                         [joint_positions(r) for r in after], tips=True)
+    return None if np.all(np.isnan(speeds)) else float(np.nanmax(speeds))
 
 
 @dataclass

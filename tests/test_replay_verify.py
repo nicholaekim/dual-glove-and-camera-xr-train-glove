@@ -356,8 +356,9 @@ def test_fingertip_error_rows(batch):
 ANGLE_OUTPUTS = ("angle_coverage.csv", "angles_per_frame.csv", "angles_per_recording.csv")
 MCP16 = [f"{f}_MCP_{k}{o}" for f in "IMRL" for k in ("fe", "aa") for o in ("", "_paper_order")]
 EST = ("T_TMC_fe_est_openhand", "T_TMC_aa_est_openhand")
-ANGLES_OK = ("ANGLE EXPORTS OK: rows=42 mcp_columns=16 est_columns=2 unavailable_empty=6 "
-             "est_filled=0")
+NEUTRAL = ("T_TMC_fe_est_neutral", "T_TMC_aa_est_neutral")
+ANGLES_OK = ("ANGLE EXPORTS OK: rows=42 mcp_columns=16 est_columns=4 unavailable_empty=6 "
+             "est_filled=0 mapped_columns=2 mapped_filled=0")
 
 
 def test_angle_exports_have_one_row_per_selected_frame(batch):
@@ -368,7 +369,9 @@ def test_angle_exports_have_one_row_per_selected_frame(batch):
         header = next(csv.reader(f))
     assert header[:9] == ["kind", "name", "take", "hand_side", "hand_id",
                           "frame_index", "frame_id", "t_s", "hold"]
-    assert header[-3:] == list(EST) + ["T_TMC_est_calibration"]
+    assert header[-9:] == (list(EST) + list(NEUTRAL) + ["T_TMC_est_calibration"]
+                           + ["T_TMC_fe_mapped", "T_TMC_aa_mapped", "T_TMC_mapped_status",
+                              "T_TMC_mapping"])
     for name in MCP16 + list(SIX):
         assert name in header, name
     rows = read_csv(out / "angles_per_frame.csv")
@@ -383,7 +386,9 @@ def test_angle_exports_have_one_row_per_selected_frame(batch):
                    ("transition", "p3_circular_power", "1"): 12}
     for r in rows:
         assert all(r[c] == "" for c in SIX), r["frame_id"]          # never 0
-        assert all(r[c] == "" for c in EST + ("T_TMC_est_calibration",))
+        assert all(r[c] == "" for c in EST + NEUTRAL + ("T_TMC_est_calibration",))
+        assert all(r[c] == "" for c in ("T_TMC_fe_mapped", "T_TMC_aa_mapped",
+                                        "T_TMC_mapped_status", "T_TMC_mapping"))
         assert all(math.isfinite(float(r[c])) for c in MCP16), r["frame_id"]
     circ = [r for r in rows if (r["name"], r["take"]) == ("p3_circular_power", "1")
             and r["kind"] == "static"]
@@ -433,9 +438,9 @@ def test_angles_per_recording_representative_and_hold_frames(batch):
         for s in ("rep", "hold_mean", "hold_min", "hold_max"):
             assert circ[f"{c}_{s}"] != "", (c, s)
             assert trans[f"{c}_{s}"] == "", (c, s)           # a transition has neither
-    assert not any(k.startswith(SIX) and "_est_openhand" not in k
+    assert not any(k.startswith(SIX) and "_est_" not in k
                    for k in rows[0])                          # nothing for the six
-    for c in EST:                              # the estimate's own columns, empty here
+    for c in EST + NEUTRAL:                    # the estimates' own columns, empty here
         for s in ("rep", "hold_mean", "hold_min", "hold_max"):
             assert circ[f"{c}_{s}"] == "" and trans[f"{c}_{s}"] == "", (c, s)
     assert circ["T_TMC_est_calibration"] == ""
@@ -455,8 +460,8 @@ def test_check_angle_exports_alone_and_after_a_run(batch, tmp_path):
     assert code == 0, text
     last = text.strip().splitlines()
     assert last[-2].startswith("FIDELITY OK: static=1 transitions=0 frames=10")
-    assert last[-1] == ("ANGLE EXPORTS OK: rows=10 mcp_columns=16 est_columns=2 "
-                        "unavailable_empty=6 est_filled=0")
+    assert last[-1] == ("ANGLE EXPORTS OK: rows=10 mcp_columns=16 est_columns=4 "
+                        "unavailable_empty=6 est_filled=0 mapped_columns=2 mapped_filled=0")
     with pytest.raises(SystemExit) as e:
         rv.main(["--check-angle-exports", "--check-scenarios", str(out)])
     assert e.value.code == 2
@@ -504,16 +509,19 @@ REST_FRAMES = 24
 MOVEMENT_START_S = 0.35     # open-hand window t < 0.25 s: frames 0-22 of the 24 at rest
 
 
-def write_calibration(path, fe, aa, session="synthetic"):
+def write_calibration(path, fe, aa, session="synthetic", kind="openhand", hand=None,
+                      provenance="hand-made test calibration", drop=()):
     """A hand-made Calibration (to_json) whose rest frame reads the fixture's
     palm-to-metacarpal rotation (I in every frame: hand_pose never turns a
-    metacarpal) as (fe, aa) on a right hand: R_rest = (Ry(aa) Rx(-fe))^T."""
+    metacarpal) as (fe, aa) on a right hand: R_rest = (Ry(aa) Rx(-fe))^T.
+    `drop` removes keys from the written JSON (a file of an older format)."""
     cal = te.Calibration(R_rest=(jf.rot_y(aa) @ jf.rot_x(-fe)).T, session=session,
                          n_transitions=5, n_frames=100, per_transition=[],
                          agreement={"median_deg": 1.0, "p90_deg": 2.0, "max_deg": 3.0,
                                     "worst": {"name": "x", "take": 1}},
-                         provenance="hand-made test calibration")
-    path.write_text(json.dumps(cal.to_json()), encoding="utf-8")
+                         provenance=provenance, kind=kind, hand=hand)
+    doc = {k: v for k, v in cal.to_json().items() if k not in drop}
+    path.write_text(json.dumps(doc), encoding="utf-8")
     return path
 
 
@@ -533,11 +541,12 @@ def test_without_a_calibration_the_estimate_stays_empty_and_the_summary_says_why
     assert "tmc_calibration_used.json records this" in summary
 
 
-def test_the_open_hand_calibration_fills_every_row(tmp_path):
+def test_the_open_hand_calibration_fills_every_row_of_its_hand(tmp_path):
     """24 frames at rest before the transition, movement start 0.35 s: the
-    window holds 23 frames, the one transition calibrates, and every frame of
-    every recording gets an estimate, 0 here (R_palm^T R_metacarpal = I in
-    every frame, so R_rest = I)."""
+    window holds 23 frames, the one (right-hand) transition calibrates, and
+    every frame of every right-hand recording gets an estimate, 0 here
+    (R_palm^T R_metacarpal = I in every frame, so R_rest = I). The left-hand
+    prismatic take (10 frames) gets none: a rest frame is not mirrored."""
     root = make_dataset(tmp_path / "dataset", rest_frames=REST_FRAMES,
                         movement_start_s=MOVEMENT_START_S, session="S1")
     out = tmp_path / "out"
@@ -545,34 +554,179 @@ def test_the_open_hand_calibration_fills_every_row(tmp_path):
     assert code == 0, text
     last = text.strip().splitlines()
     assert last[-2] == "FIDELITY OK: static=3 transitions=1 frames=66 within_tolerance=4/4"
-    assert last[-1] == ("ANGLE EXPORTS OK: rows=66 mcp_columns=16 est_columns=2 "
-                        "unavailable_empty=6 est_filled=66")
+    assert last[-1] == ("ANGLE EXPORTS OK: rows=66 mcp_columns=16 est_columns=4 "
+                        "unavailable_empty=6 est_filled=56 mapped_columns=2 mapped_filled=0")
     assert "TMC calibration openhand:S1:1t/23f, computed by" in text
     rows = read_csv(out / "angles_per_frame.csv")
     assert len(rows) == 66
     for r in rows:
-        assert r["T_TMC_est_calibration"] == "openhand:S1:1t/23f"
-        for c in EST:
-            assert float(r[c]) == pytest.approx(0.0, abs=1e-3), (c, r["frame_id"])
+        if r["hand_side"] == "right":
+            assert r["T_TMC_est_calibration"] == "openhand:S1:1t/23f"
+            for c in EST:
+                assert float(r[c]) == pytest.approx(0.0, abs=1e-3), (c, r["frame_id"])
+        else:
+            assert all(r[c] == "" for c in EST + ("T_TMC_est_calibration",))
+        assert all(r[c] == "" for c in NEUTRAL)             # the other kind's columns
         assert all(r[c] == "" for c in SIX)                  # the validated pair stays empty
+    assert sum(r["hand_side"] == "right" for r in rows) == 56
     used = json.loads((out / "tmc_calibration_used.json").read_text(encoding="utf-8"))
     assert (used["provenance_id"], used["session"], used["n_transitions"],
-            used["n_frames"]) == ("openhand:S1:1t/23f", "S1", 1, 23)
-    assert used["rows_estimated"] == used["rows"] == 66 and used["not_estimated"] == []
+            used["n_frames"], used["kind"], used["hand"]) == (
+        "openhand:S1:1t/23f", "S1", 1, 23, "openhand", "right")
+    assert (used["rows_estimated"], used["rows"]) == (56, 66)
+    assert used["not_estimated"] == [
+        "static p3_prismatic_precision take 1: calibration of the right hand, this "
+        "recording is of the left hand"]
     np.testing.assert_allclose(te.Calibration.from_json(used).R_rest, np.eye(3), atol=1e-5)
     per = read_csv(out / "angles_per_recording.csv")
-    circ, trans = per[0], per[3]
+    circ, pris, trans = per[0], per[2], per[3]
     for c in EST:
         for s in ("rep", "hold_mean", "hold_min", "hold_max"):
             assert float(circ[f"{c}_{s}"]) == pytest.approx(0.0, abs=1e-3), (c, s)
+            assert pris[f"{c}_{s}"] == ""
         assert trans[f"{c}_rep"] == "" and trans[f"{c}_hold_mean"] == ""
     assert circ["T_TMC_est_calibration"] == trans["T_TMC_est_calibration"] == (
         "openhand:S1:1t/23f")
+    assert pris["T_TMC_est_calibration"] == ""
     summary = (out / "summary.md").read_text(encoding="utf-8")
-    assert "is in 66 of 66 rows of angles_per_frame.csv" in summary
+    assert "is in 56 of 66 rows of angles_per_frame.csv" in summary
+    assert "calibration kind `openhand`, hand right" in summary
     assert "Calibration: tmc_calibration_used.json (computed by" in summary
     assert "`T_TMC_est_calibration` = `openhand:S1:1t/23f`" in summary
     assert "not a validated Paper 3 coordinate" in summary
+    assert ("Not estimated (the calibration is of another session or hand, or its hand is "
+            "not known):") in summary
+    assert "calibration of the right hand, this recording is of the left hand" in summary
+
+
+def test_a_neutral_calibration_file_fills_the_neutral_columns_only(tmp_path):
+    """--tmc-calibration with a tmc_neutral calibration.json: the estimate
+    goes to *_est_neutral, *_est_openhand stays empty, the calibration id
+    says neutral, and the checker accepts the file (est_columns=4)."""
+    root = make_dataset(tmp_path / "dataset")
+    cal = write_calibration(tmp_path / "neutral.json", 12.0, -7.0, kind="neutral", hand="right",
+                            provenance="tmc_neutral calibration of session synthetic")
+    out = tmp_path / "out"
+    code, text = run(["--dataset", root, "--out", out, "--all", "--tmc-calibration", cal,
+                      "--check-angle-exports"])
+    assert code == 0, text
+    assert (f"TMC calibration neutral:synthetic:5t/100f, read from {cal}; hand right "
+            "(recorded in the file)") in text
+    assert text.strip().splitlines()[-1] == ANGLES_OK.replace("est_filled=0", "est_filled=32")
+    for r in read_csv(out / "angles_per_frame.csv"):
+        if r["hand_side"] == "right":
+            assert r["T_TMC_est_calibration"] == "neutral:synthetic:5t/100f"
+            assert float(r["T_TMC_fe_est_neutral"]) == pytest.approx(12.0, abs=1e-4)
+            assert float(r["T_TMC_aa_est_neutral"]) == pytest.approx(-7.0, abs=1e-4)
+        else:                                  # the left-hand take: a right-hand calibration
+            assert all(r[c] == "" for c in NEUTRAL + ("T_TMC_est_calibration",))
+        assert all(r[c] == "" for c in EST)
+    per = read_csv(out / "angles_per_recording.csv")
+    assert float(per[0]["T_TMC_fe_est_neutral_rep"]) == pytest.approx(12.0, abs=1e-4)
+    assert per[0]["T_TMC_fe_est_openhand_rep"] == "" and per[2]["T_TMC_fe_est_neutral_rep"] == ""
+    used = json.loads((out / "tmc_calibration_used.json").read_text(encoding="utf-8"))
+    assert used["kind"] == "neutral" and used["provenance_id"] == "neutral:synthetic:5t/100f"
+    assert used["hand"] == "right"
+    summary = (out / "summary.md").read_text(encoding="utf-8")
+    assert "`T_TMC_fe_est_neutral`, `T_TMC_aa_est_neutral`; calibration kind `neutral`" in summary
+    assert "the tmc_neutral posture of 5 take(s)" in summary
+    assert "a held reference posture (not the ISB neutral)" in summary
+    # an older file whose kind cannot be told is refused with the fix
+    old = write_calibration(tmp_path / "old.json", 1.0, 2.0, drop=("kind", "hand"))
+    code, text = run(["--dataset", root, "--out", tmp_path / "out2", "--all",
+                      "--tmc-calibration", old])
+    assert code == 2 and "cannot read the TMC calibration" in text
+    assert 'no "kind"' in text and '"kind": "neutral"' in text
+    # one whose provenance says the kind is read, but its hand is not known: the
+    # table cannot name its transitions (the hand-made file lists none), so no
+    # row gets an estimate until the hand is declared
+    older = write_calibration(tmp_path / "older.json", 12.0, -7.0,
+                              provenance="open-hand calibration of session synthetic",
+                              drop=("kind", "hand"))
+    code, text = run(["--dataset", root, "--out", tmp_path / "out3", "--all",
+                      "--tmc-calibration", older, "--check-angle-exports"])
+    assert code == 0, text
+    assert (f"TMC calibration openhand:synthetic:5t/100f, read from {older}; hand unknown "
+            "(not recorded in the file (the calibration lists no transitions to match); the "
+            "estimate is not applied: declare it with --tmc-calibration-hand left|right or "
+            "regenerate the file)") in text
+    assert text.strip().splitlines()[-1] == ANGLES_OK                 # est_filled=0
+    used = json.loads((tmp_path / "out3" / "tmc_calibration_used.json").read_text(encoding="utf-8"))
+    assert used["hand"] is None and used["rows_estimated"] == 0
+    assert len(used["not_estimated"]) == 4
+    assert all(x.endswith(f"{te.HAND_UNKNOWN}") for x in used["not_estimated"])
+    summary = (tmp_path / "out3" / "summary.md").read_text(encoding="utf-8")
+    assert "or its hand is not known):" in summary and "calibration hand not recorded" in summary
+    code, text = run(["--dataset", root, "--out", tmp_path / "out4", "--all",
+                      "--tmc-calibration", older, "--tmc-calibration-hand", "right",
+                      "--check-angle-exports"])
+    assert code == 0 and "hand right (declared with --tmc-calibration-hand)" in text
+    assert text.strip().splitlines()[-1] == ANGLES_OK.replace("est_filled=0", "est_filled=32")
+    # a declaration that contradicts a recorded hand is refused
+    code, text = run(["--dataset", root, "--out", tmp_path / "out5", "--all",
+                      "--tmc-calibration", cal, "--tmc-calibration-hand", "left"])
+    assert code == 2 and "records the right hand; the declared left hand contradicts it" in text
+
+
+def test_the_hand_of_an_older_file_is_recovered_from_the_transition_table(tmp_path):
+    """An older open-hand file made from this dataset names its transitions;
+    the table records their hand, so the batch applies it to that hand."""
+    root = make_dataset(tmp_path / "dataset", rest_frames=REST_FRAMES,
+                        movement_start_s=MOVEMENT_START_S, session="S1")
+    cal = te.calibrate(root)
+    assert cal.hand == "right"
+    older = tmp_path / "older.json"
+    older.write_text(json.dumps({k: v for k, v in cal.to_json().items() if k != "hand"}),
+                     encoding="utf-8")
+    out = tmp_path / "out"
+    code, text = run(["--dataset", root, "--out", out, "--all", "--tmc-calibration", older,
+                      "--check-angle-exports"])
+    assert code == 0, text
+    assert (f"read from {older}; hand right (recovered from metadata/pose_transitions.csv: "
+            "1 of 1 transitions of session S1 are right-hand recordings)") in text
+    assert text.strip().splitlines()[-1] == ("ANGLE EXPORTS OK: rows=66 mcp_columns=16 "
+                                             "est_columns=4 unavailable_empty=6 est_filled=56 "
+                                             "mapped_columns=2 mapped_filled=0")
+    used = json.loads((out / "tmc_calibration_used.json").read_text(encoding="utf-8"))
+    assert used["hand"] == "right" and used["rows_estimated"] == 56
+
+
+def test_check_angle_exports_refuses_mixed_kinds(tmp_path):
+    """Negative controls on an open-hand run: a row carrying both kinds, a
+    calibration id naming the other kind, and a file with valid rows of two
+    kinds all fail the checker."""
+    root = make_dataset(tmp_path / "dataset")
+    cal = write_calibration(tmp_path / "cal.json", 12.0, -7.0, hand="right")
+    out = tmp_path / "out"
+    code, _ = run(["--dataset", root, "--out", out, "--all", "--tmc-calibration", cal])
+    assert code == 0                                  # 32 right-hand rows estimated
+
+    def both_kinds(rows):
+        for row in rows[1:3]:
+            row[rows[0].index("T_TMC_fe_est_neutral")] = "1.0"
+            row[rows[0].index("T_TMC_aa_est_neutral")] = "2.0"
+    code, text = run(["--out", _copy_exports(out, tmp_path / "both", both_kinds),
+                      "--check-angle-exports"])
+    assert code == 1 and "2 rows with a thumb TMC estimate missing a value" in text
+    assert "est_filled=30" in text
+
+    def other_name(rows):
+        rows[4][rows[0].index("T_TMC_est_calibration")] = "neutral:synthetic:5t/100f"
+    code, text = run(["--out", _copy_exports(out, tmp_path / "name", other_name),
+                      "--check-angle-exports"])
+    assert code == 1 and "1 rows with a thumb TMC estimate missing a value" in text
+
+    def two_kinds(rows):
+        h = rows[0]
+        for row in rows[1:3]:
+            row[h.index("T_TMC_fe_est_neutral")] = row[h.index("T_TMC_fe_est_openhand")]
+            row[h.index("T_TMC_aa_est_neutral")] = row[h.index("T_TMC_aa_est_openhand")]
+            row[h.index("T_TMC_fe_est_openhand")] = row[h.index("T_TMC_aa_est_openhand")] = ""
+            row[h.index("T_TMC_est_calibration")] = "neutral:synthetic:5t/100f"
+    code, text = run(["--out", _copy_exports(out, tmp_path / "two", two_kinds),
+                      "--check-angle-exports"])
+    assert code == 1 and "estimates of two kinds in one file: neutral in 2 rows, " \
+                         "openhand in 30 rows" in text
 
 
 def test_an_explicit_calibration_file_is_used(tmp_path):
@@ -580,21 +734,29 @@ def test_an_explicit_calibration_file_is_used(tmp_path):
     calibrate itself). (fe, aa) = (12, -7) on the right hand reads (12, +7)
     on the left: abduction is signed toward each hand's thumb side."""
     root = make_dataset(tmp_path / "dataset")
-    cal = write_calibration(tmp_path / "cal.json", 12.0, -7.0)
+    cal = write_calibration(tmp_path / "cal.json", 12.0, -7.0, hand="right")
     out = tmp_path / "out"
     code, text = run(["--dataset", root, "--out", out, "--all", "--tmc-calibration", cal,
                       "--check-angle-exports"])
     assert code == 0, text
-    assert f"TMC calibration openhand:synthetic:5t/100f, read from {cal}" in text
-    assert text.strip().splitlines()[-1] == ANGLES_OK.replace("est_filled=0", "est_filled=42")
-    for r in read_csv(out / "angles_per_frame.csv"):
-        assert r["T_TMC_est_calibration"] == "openhand:synthetic:5t/100f"
-        assert float(r["T_TMC_fe_est_openhand"]) == pytest.approx(12.0, abs=1e-4)
-        aa = -7.0 if r["hand_side"] == "right" else 7.0
-        assert float(r["T_TMC_aa_est_openhand"]) == pytest.approx(aa, abs=1e-4)
+    assert (f"TMC calibration openhand:synthetic:5t/100f, read from {cal}; hand right "
+            "(recorded in the file)") in text
+    assert text.strip().splitlines()[-1] == ANGLES_OK.replace("est_filled=0", "est_filled=32")
+    rows = read_csv(out / "angles_per_frame.csv")
+    assert sum(r["hand_side"] == "right" for r in rows) == 32
+    for r in rows:
+        if r["hand_side"] == "right":
+            assert r["T_TMC_est_calibration"] == "openhand:synthetic:5t/100f"
+            assert float(r["T_TMC_fe_est_openhand"]) == pytest.approx(12.0, abs=1e-4)
+            assert float(r["T_TMC_aa_est_openhand"]) == pytest.approx(-7.0, abs=1e-4)
+        else:                                  # the left-hand take gets a right-hand calibration: no
+            assert all(r[c] == "" for c in EST + ("T_TMC_est_calibration",))
     used = json.loads((out / "tmc_calibration_used.json").read_text(encoding="utf-8"))
     assert used["provenance"] == "hand-made test calibration"
-    assert used["source"] == f"read from {cal}" and used["rows_estimated"] == 42
+    assert used["source"].startswith(f"read from {cal}") and used["rows_estimated"] == 32
+    assert used["not_estimated"] == [
+        "static p3_prismatic_precision take 1: calibration of the right hand, this "
+        "recording is of the left hand"]
     code, text = run(["--dataset", root, "--out", tmp_path / "out2", "--all",
                       "--tmc-calibration", tmp_path / "missing.json"])
     assert code == 2 and "cannot read the TMC calibration" in text
@@ -603,7 +765,7 @@ def test_an_explicit_calibration_file_is_used(tmp_path):
 
 def test_a_calibration_of_another_session_is_not_applied(tmp_path):
     root = make_dataset(tmp_path / "dataset", session="S1")
-    cal = write_calibration(tmp_path / "cal.json", 12.0, -7.0, session="S0")
+    cal = write_calibration(tmp_path / "cal.json", 12.0, -7.0, session="S0", hand="right")
     out = tmp_path / "out"
     code, text = run(["--dataset", root, "--out", out, "--all", "--tmc-calibration", cal,
                       "--check-angle-exports"])
@@ -612,9 +774,10 @@ def test_a_calibration_of_another_session_is_not_applied(tmp_path):
     used = json.loads((out / "tmc_calibration_used.json").read_text(encoding="utf-8"))
     assert used["rows_estimated"] == 0 and len(used["not_estimated"]) == 4
     summary = (out / "summary.md").read_text(encoding="utf-8")
-    assert "Not estimated (the calibration is of another session):" in summary
-    assert ("- static p3_circular_power take 1: recording of session S1, calibration "
-            "of session S0") in summary
+    assert ("Not estimated (the calibration is of another session or hand, or its hand is "
+            "not known):") in summary
+    assert ("- static p3_circular_power take 1: calibration of session S0, this recording "
+            "is of session S1") in summary
 
 
 def test_a_residual_over_tolerance_fails_the_run(tmp_path):
@@ -817,3 +980,122 @@ def test_real_scenarios_hold_the_known_facts(tmp_path):
     assert jump["writer_s"] > 0.8
     code, text = run(["--check-scenarios", tmp_path])
     assert code == 0 and text.strip() == "SCENARIOS OK"
+
+
+
+# --- the reference-mapped columns (leap_hand.reference_validation) -----------------------
+from leap_hand import reference_validation as rvl   # noqa: E402
+from leap_hand import replay_core as rc             # noqa: E402
+
+MAPPED = ["T_TMC_fe_mapped", "T_TMC_aa_mapped", "T_TMC_mapped_status", "T_TMC_mapping"]
+
+
+def rot_between(v, u):
+    """The rotation taking unit vector v onto unit vector u (Rodrigues)."""
+    v, u = np.asarray(v, float) / np.linalg.norm(v), np.asarray(u, float) / np.linalg.norm(u)
+    axis = np.cross(v, u)
+    s, c = np.linalg.norm(axis), float(v @ u)
+    k = axis / s
+    K = np.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
+    return np.eye(3) + s * K + (1.0 - c) * (K @ K)
+
+
+def write_mapping(path, root, fe=20.0, aa=10.0, *, session="S9", participant="P01",
+                  hand="right", tested=((-90.0, 90.0), (-90.0, 90.0)),
+                  status="synthetic_demonstration"):
+    """A hand-made mapping that reads the transition's first frame as (fe, aa):
+    A turns its thumb head direction R_pm (0, 0, -1) onto the canonical
+    direction written out for a right hand (s = +1) in the abduction-then-
+    flexion order, u = (sin fe, sin aa cos fe, cos aa cos fe)."""
+    rec = rc.find_transition(root, "p3_circular_power", 1)
+    pm = te.palm_to_metacarpal(rc.reconstruct(rec.frames[0]).rot)
+    f, a = math.radians(fe), math.radians(aa)
+    u = (math.sin(f), math.sin(a) * math.cos(f), math.cos(a) * math.cos(f))
+    A = rot_between(pm @ np.array([0.0, 0.0, -1.0]), u)
+    path.write_text(json.dumps({
+        "format": rvl.MAPPING_FORMAT, "id": "tmcmap-batchtest", "status": status,
+        "participant": participant, "hand": hand, "session": session,
+        "rotation_order": "abduction_then_flexion", "A": A.tolist(), "b": [0.0, 0.0, -1.0],
+        "tested_range_deg": {"fe": list(tested[0]), "aa": list(tested[1])},
+        "heldout": {"fe": {"n": 50, "mae_deg": 1.0}, "aa": {"n": 50, "mae_deg": 1.0}}}),
+        encoding="utf-8")
+    return path
+
+
+def test_mapped_columns_fill_only_the_recording_inside_the_mapping_scope(tmp_path):
+    root = make_dataset(tmp_path / "dataset", session="S9")
+    m = write_mapping(tmp_path / "mapping.json", root)
+    out = tmp_path / "out"
+    code, text = run(["--dataset", root, "--out", out, "--all", "--check-angle-exports",
+                      "--tmc-mapping", m])
+    assert code == 0, text
+    assert text.strip().splitlines()[-1] == ANGLES_OK.replace("mapped_filled=0",
+                                                              "mapped_filled=12")
+    assert "TMC mapping tmcmap-batchtest: SYNTHETIC demonstration" in text
+    rows = read_csv(out / "angles_per_frame.csv")
+    trans = [r for r in rows if r["kind"] == "transition"]
+    static = [r for r in rows if r["kind"] == "static"]
+    assert len(trans) == 12 and len(static) == 30
+    assert all(r["T_TMC_mapped_status"] == "synthetic_demonstration"
+               and r["T_TMC_mapping"] == "tmcmap-batchtest" for r in trans)
+    assert (float(trans[0]["T_TMC_fe_mapped"]), float(trans[0]["T_TMC_aa_mapped"])) == \
+        pytest.approx((20.0, 10.0), abs=1e-6)
+    assert all(r[c] == "" for r in static for c in MAPPED)      # no participant: not applied
+    used = json.loads((out / "tmc_mapping_used.json").read_text(encoding="utf-8"))
+    assert used["rows_filled"] == 12 and used["mapping"]["id"] == "tmcmap-batchtest"
+    reasons = sorted(x.split(": ", 1)[1] for x in used["not_applied"])
+    assert reasons == [
+        "this recording is of the left hand, the mapping of the right hand",
+        "this recording names no participant (the mapping is of participant P01, session S9)",
+        "this recording names no participant (the mapping is of participant P01, session S9)"]
+    summary = (out / "summary.md").read_text(encoding="utf-8")
+    assert "## Reference-mapped thumb TMC" in summary and "It filled 12 of 42 rows" in summary
+
+
+def test_mapped_values_outside_the_tested_range_stay_empty_with_their_status(tmp_path):
+    root = make_dataset(tmp_path / "dataset", session="S9")
+    # the fixture's thumb metacarpal does not move against the palm: every
+    # transition frame reads (20, 10), outside a range that stops at fe 15
+    m = write_mapping(tmp_path / "mapping.json", root, tested=((-15.0, 15.0), (0.0, 30.0)))
+    out = tmp_path / "out"
+    code, text = run(["--dataset", root, "--out", out, "--all", "--check-angle-exports",
+                      "--tmc-mapping", m])
+    assert code == 0, text
+    trans = [r for r in read_csv(out / "angles_per_frame.csv") if r["kind"] == "transition"]
+    assert len(trans) == 12
+    assert all(r["T_TMC_mapped_status"] == "outside_tested_range" and r["T_TMC_fe_mapped"] == ""
+               and r["T_TMC_aa_mapped"] == "" and r["T_TMC_mapping"] == "tmcmap-batchtest"
+               for r in trans)
+    assert text.strip().splitlines()[-1] == ANGLES_OK
+
+
+def test_a_mapping_of_another_session_fills_nothing_and_says_why(tmp_path):
+    root = make_dataset(tmp_path / "dataset", session="S9")
+    m = write_mapping(tmp_path / "mapping.json", root, session="S1")
+    out = tmp_path / "out"
+    code, text = run(["--dataset", root, "--out", out, "--all", "--check-angle-exports",
+                      "--tmc-mapping", m])
+    assert code == 0 and text.strip().splitlines()[-1] == ANGLES_OK
+    used = json.loads((out / "tmc_mapping_used.json").read_text(encoding="utf-8"))
+    assert used["rows_filled"] == 0
+    assert any("this recording is of session S9, the mapping of session S1" in x
+               for x in used["not_applied"])
+    bad = tmp_path / "bad.json"
+    bad.write_text("{}", encoding="utf-8")
+    code, text = run(["--dataset", root, "--out", tmp_path / "o2", "--all",
+                      "--tmc-mapping", bad])
+    assert code == 2 and "cannot read the TMC mapping: a mapping file has format" in text
+
+
+@pytest.mark.parametrize("edit", [
+    lambda rows, h: rows[3].__setitem__(h.index("T_TMC_fe_mapped"), "1.5"),
+    lambda rows, h: rows[3].__setitem__(h.index("T_TMC_mapped_status"), "evaluated_in_range"),
+    lambda rows, h: rows[3].__setitem__(h.index("T_TMC_mapping"), "tmcmap-x"),
+    lambda rows, h: rows[3].__setitem__(h.index("T_TMC_mapped_status"), "validated"),
+])
+def test_check_angle_exports_refuses_mapped_cells_that_disagree_with_their_status(
+        batch, tmp_path, edit):
+    _, out, _, _ = batch
+    broken = _copy_exports(out, tmp_path / "broken", lambda rows: edit(rows, rows[0]))
+    code, text = run(["--out", broken, "--check-angle-exports"])
+    assert code == 1 and "1 rows whose mapped cells disagree with their status" in text

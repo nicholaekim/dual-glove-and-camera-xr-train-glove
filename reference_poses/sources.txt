@@ -1,0 +1,11 @@
+Eight of these are the professor's own frames from her tracker dataset (xr trainer\xr trainer poses\frame_<n>_DONE|NA\frame_<n>.png), shown to the operator in the camera window as the target pose, copied byte-for-byte as delivered (overlay included as delivered: no 21-point overlay is visible in these PNGs). Hand label from frame_<n>.txt. crossed_fingers.png and thumb_opposition.png are text cards (PIL, 640x480) stating the redo launcher's definition, not photos.
+open_palm: frame_251307 (right), professor's tracker dataset, DONE
+fist: frame_235829 (right), professor's tracker dataset, DONE
+index_point: frame_165027 (left), professor's tracker dataset, DONE
+thumbs_up: frame_196440 (right), professor's tracker dataset, DONE
+peace: frame_160031 (left), professor's tracker dataset, DONE
+pinch: frame_129041 (left), professor's tracker dataset, DONE
+finger_spread: frame_190629 (right), professor's tracker dataset, DONE
+thumb_opposition: text card (definition); the professor's set has no frame showing this pose; nearest frames 224007 / 204909 show a V and were not used
+crossed_fingers: text card (definition); the professor's set has no frame showing this pose; nearest frames 224007 / 204909 show a V and were not used
+bent_wrist: frame_197760 (left), professor's tracker dataset, NA

@@ -1,0 +1,362 @@
+{
+ "name": "glove_planar_poses_50",
+ "version": 1,
+ "description": "Set D: 50 static single-plane poses for the XR glove, gloves on, no camera, each held still; written by scripts/leap/glove_planar_poses.py, ranges and exclusions in protocols/glove_planar_poses_50.csv. Record with scripts/glove/record_poses.py --pose-list this file.",
+ "setup": "gloves on, no camera: XR Train open and streaming, the hand held still in the pose for the 5 s of the take",
+ "plane": "each digit moves only in its own flexion-extension plane: fingers side by side (spread together), wrist neutral, thumb bent or straight in its own plane",
+ "takes_per_item": 3,
+ "duration_s": 5.0,
+ "prep_s": 5.0,
+ "items": [
+  {
+   "id": "ps01",
+   "label": "middle tip curl, others straight",
+   "group": "single finger",
+   "shape": "only the middle finger with PIP and DIP half bent and its MCP straight; the other three straight and together, thumb straight in the palm plane",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "ps02",
+   "label": "ring tip curl, others straight",
+   "group": "single finger",
+   "shape": "only the ring finger with PIP and DIP half bent and its MCP straight; the other three straight and together, thumb straight in the palm plane",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pd01",
+   "label": "middle and ring tabletop",
+   "group": "pair",
+   "shape": "middle and ring bent 90 at the MCP only, index and little straight, thumb up in plane",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pd02",
+   "label": "middle and ring half curled",
+   "group": "pair",
+   "shape": "middle and ring half curled, index and little straight, thumb up in plane",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pd03",
+   "label": "middle and ring tip curl",
+   "group": "pair",
+   "shape": "middle and ring with PIP and DIP half bent and MCP straight, index and little straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pd04",
+   "label": "index and ring tabletop",
+   "group": "pair",
+   "shape": "index and ring bent 90 at the MCP only, middle and little straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pd05",
+   "label": "index and little tabletop",
+   "group": "pair",
+   "shape": "index and little bent 90 at the MCP only, middle and ring straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pd06",
+   "label": "middle and little tabletop",
+   "group": "pair",
+   "shape": "middle and little bent 90 at the MCP only, index and ring straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pd07",
+   "label": "index and middle tip curl, others straight",
+   "group": "pair",
+   "shape": "index and middle with PIP and DIP half bent, ring and little straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pd08",
+   "label": "ring and little tip curl",
+   "group": "pair",
+   "shape": "ring and little with PIP and DIP half bent, index and middle straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pd09",
+   "label": "index and ring half curled",
+   "group": "pair",
+   "shape": "index and ring half curled, middle and little straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pd10",
+   "label": "middle and little half curled",
+   "group": "pair",
+   "shape": "middle and little half curled, index and ring straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pd11",
+   "label": "middle and ring quarter curled",
+   "group": "pair",
+   "shape": "middle and ring a quarter curled, index and little straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pd12",
+   "label": "index and little quarter curled",
+   "group": "pair",
+   "shape": "index and little a quarter curled, middle and ring straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pf01",
+   "label": "index straight, three tabletop",
+   "group": "three fingers",
+   "shape": "middle, ring and little bent 90 at the MCP with PIP and DIP straight, index straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pf02",
+   "label": "little straight, three tabletop",
+   "group": "three fingers",
+   "shape": "index, middle and ring bent 90 at the MCP with PIP and DIP straight, little straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pf03",
+   "label": "index straight, three tip curl",
+   "group": "three fingers",
+   "shape": "middle, ring and little with PIP and DIP half bent and MCP straight, index straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pf04",
+   "label": "little straight, three tip curl",
+   "group": "three fingers",
+   "shape": "index, middle and ring with PIP and DIP half bent and MCP straight, little straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pf05",
+   "label": "index straight, three quarter curled",
+   "group": "three fingers",
+   "shape": "middle, ring and little a quarter curled, index straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pf06",
+   "label": "little straight, three quarter curled",
+   "group": "three fingers",
+   "shape": "index, middle and ring a quarter curled, little straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pf07",
+   "label": "little straight, three hooked",
+   "group": "three fingers",
+   "shape": "index, middle and ring bent at PIP and DIP with MCP straight, little straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pr01",
+   "label": "ring and little quarter curled",
+   "group": "split",
+   "shape": "ring and little a quarter curled, index and middle straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pr02",
+   "label": "radial tabletop, ulnar quarter",
+   "group": "split",
+   "shape": "index and middle bent 90 at the MCP only, ring and little a quarter curled",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pr03",
+   "label": "radial quarter, ulnar tabletop",
+   "group": "split",
+   "shape": "index and middle a quarter curled, ring and little bent 90 at the MCP only",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pr04",
+   "label": "radial half, ulnar tabletop",
+   "group": "split",
+   "shape": "index and middle half curled, ring and little bent 90 at the MCP only",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pr05",
+   "label": "radial hook, ulnar half",
+   "group": "split",
+   "shape": "index and middle hooked at PIP and DIP, ring and little half curled",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pr06",
+   "label": "radial half, ulnar hook",
+   "group": "split",
+   "shape": "index and middle half curled, ring and little hooked at PIP and DIP",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pr07",
+   "label": "radial quarter, ulnar full",
+   "group": "split",
+   "shape": "index and middle a quarter curled, ring and little fully curled",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pr08",
+   "label": "radial full, ulnar quarter",
+   "group": "split",
+   "shape": "index and middle fully curled, ring and little a quarter curled",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pr09",
+   "label": "radial tabletop, ulnar full",
+   "group": "split",
+   "shape": "index and middle bent 90 at the MCP only, ring and little fully curled",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pc01",
+   "label": "index full, middle half",
+   "group": "coupling",
+   "shape": "index fully curled, middle held half curled, ring and little straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pc02",
+   "label": "middle full, index half",
+   "group": "coupling",
+   "shape": "middle fully curled, index held half curled, ring and little straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pc03",
+   "label": "middle full, ring half",
+   "group": "coupling",
+   "shape": "middle fully curled, ring held half curled, index and little straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pc04",
+   "label": "ring full, middle half",
+   "group": "coupling",
+   "shape": "ring fully curled, middle held half curled, index and little straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pc05",
+   "label": "ring full, little half",
+   "group": "coupling",
+   "shape": "ring fully curled, little held half curled, index and middle straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pc06",
+   "label": "little full, ring half",
+   "group": "coupling",
+   "shape": "little fully curled, ring held half curled, index and middle straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pc07",
+   "label": "index full, middle quarter",
+   "group": "coupling",
+   "shape": "index fully curled, middle held a quarter curled, ring and little straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pc08",
+   "label": "little full, ring quarter",
+   "group": "coupling",
+   "shape": "little fully curled, ring held a quarter curled, index and middle straight",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pm01",
+   "label": "radial quarter, ulnar half",
+   "group": "mixed depth",
+   "shape": "index and middle a quarter curled, ring and little half curled",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pm02",
+   "label": "radial half, ulnar quarter",
+   "group": "mixed depth",
+   "shape": "index and middle half curled, ring and little a quarter curled",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pm03",
+   "label": "inner fingers half, outer quarter",
+   "group": "mixed depth",
+   "shape": "middle and ring half curled, index and little a quarter curled",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pm04",
+   "label": "outer fingers half, inner quarter",
+   "group": "mixed depth",
+   "shape": "index and little half curled, middle and ring a quarter curled",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pm05",
+   "label": "radial tabletop, ulnar half",
+   "group": "mixed depth",
+   "shape": "index and middle bent 90 at the MCP only, ring and little half curled",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pm06",
+   "label": "radial hook, ulnar full",
+   "group": "mixed depth",
+   "shape": "index and middle hooked at PIP and DIP, ring and little fully curled",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pt01",
+   "label": "radial tip curl, ulnar half, thumb tip bent",
+   "group": "thumb",
+   "shape": "index and middle with PIP and DIP half bent, ring and little half curled, thumb straight at its MCP with only the tip joint bent",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pt02",
+   "label": "radial half, ulnar tip curl, thumb MCP bent",
+   "group": "thumb",
+   "shape": "index and middle half curled, ring and little with PIP and DIP half bent, thumb bent at its MCP only",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pt03",
+   "label": "radial full, ulnar tabletop, thumb across",
+   "group": "thumb",
+   "shape": "index and middle fully curled, ring and little bent 90 at the MCP only, thumb half flexed across the palm",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pt04",
+   "label": "radial full, ulnar hook, thumb MCP bent",
+   "group": "thumb",
+   "shape": "index and middle fully curled, ring and little hooked at PIP and DIP, thumb bent at its MCP only",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pt05",
+   "label": "ring quarter, little half, thumb tip bent",
+   "group": "thumb",
+   "shape": "index and middle straight, ring a quarter curled, little half curled, only the thumb's tip joint bent",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  },
+  {
+   "id": "pt06",
+   "label": "index half, middle quarter, thumb along",
+   "group": "thumb",
+   "shape": "index half curled, middle a quarter curled, ring and little straight, thumb adducted along the index",
+   "orientation": "gloves on, no camera; move each digit only in its own bending plane, fingers side by side, wrist straight"
+  }
+ ]
+}

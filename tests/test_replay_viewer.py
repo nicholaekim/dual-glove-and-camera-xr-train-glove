@@ -27,9 +27,12 @@ import pytest
 from leap_hand import angle_coverage as ac
 from leap_hand import paper3
 from leap_hand import replay_core as rc
+from leap_hand import tmc_calibration_take as tct
 from leap_hand import tmc_estimate as te
 from leap_hand.replay_viewer import (ANG_TITLE, ANG_UNAVAILABLE, C_WARN, CLOCK_OK,
-                                     EST_TITLE, P3_TITLE, RECORDED_NA, ReplayViewer)
+                                     EST_TITLE, EST_TITLES, P3_TITLE, RECORDED_NA,
+                                     RECT_3D, RECT_HUD, TICK_MS, ReplayViewer)
+from PIL import Image
 from xr_hand import joint_frames as jf
 from xr_hand.joints import JOINT_INDEX, JOINT_NAMES
 from xr_hand.kinematics import absolute_to_relative, mat3_to_quat
@@ -262,13 +265,14 @@ def test_playing_to_the_end_pauses_on_the_last_frame_and_play_restarts(viewer, r
 def test_lateness_and_skipped_frames_are_logged_per_tick(viewer, rec):
     v, t = viewer, rec.timeline.t
     v.toggle_play(now=10.0)                # frame 0 on screen
-    v.tick(now=10.1)                       # due at 0.015 s of media time, came at 0.1
+    v.tick(now=10.1)                       # due at TICK_MS of media time, came at 0.1
     a = v.frame_index
-    v.tick(now=10.2)                       # due at 0.115, came at 0.2
+    v.tick(now=10.2)                       # due at 0.1 + TICK_MS, came at 0.2
     b = v.frame_index
     s = v.timing_summary()
     assert s["n"] == 2 and 1 < a < b
-    assert s["mean_ms"] == pytest.approx(85.0) and s["max_ms"] == pytest.approx(85.0)
+    late = 100.0 - TICK_MS
+    assert s["mean_ms"] == pytest.approx(late) and s["max_ms"] == pytest.approx(late)
     skipped = (a - 1) + (b - a - 1)        # frames never on screen since frame 0
     assert s["frames_skipped"] == skipped
     v.seek_frame(25, now=10.2)             # a jump while playing: a new run
@@ -537,7 +541,8 @@ def test_angle_panel_lists_each_digits_angles_with_column_and_status(viewer, rec
     v = viewer
     v.seek_frame(7)
     lines = v.angles_text().splitlines()
-    assert lines[0] == ANG_TITLE == "Angles of the displayed source frame (degrees)"
+    assert lines[0] == ANG_TITLE == ("Angles of the displayed source frame (degrees; "
+                                     "calculated = tracker coordinate)")
     assert lines.count("flexion + toward the palm; abduction + toward the thumb "
                        "side; both hands") == 1
     r = rc.reconstruct(rec.frames[7])
@@ -554,7 +559,8 @@ def test_angle_panel_lists_each_digits_angles_with_column_and_status(viewer, rec
     for label in (" calculated", " outside Paper 3"):
         assert label in text
     assert ANG_UNAVAILABLE == ("unavailable: T_TMC_fe, T_TMC_aa, I_CMC, M_CMC, R_CMC, "
-                               "L_CMC (not measured; see docs/angle_coverage.md)")
+                               "L_CMC (not measured)")
+    assert not [ln for ln in lines if "mapped" in ln]    # no mapping: no mapped block
     assert ANG_UNAVAILABLE in lines
     for name in SIX:                              # named, never given a number
         assert [ln for ln in lines if name in [w.strip(",") for w in ln.split()]
@@ -600,7 +606,7 @@ def test_a_tmc_provider_feeds_only_the_estimated_block(rec, tmp_path):
         lines = v.angles_text().splitlines()
         k = lines.index(EST_TITLE)
         assert lines[k + 1:] == [
-            "T_TMC_fe_est_openhand: +12.3 deg (estimated)",
+            "T_TMC_fe_est_openhand: +12.3 deg (unvalidated estimate)",
             "T_TMC_aa_est_openhand: not computed (the provider gave no value)",
             "provenance: fake open-hand calibration, 3 transitions"]
         pos, rot, side = calls[-1]
@@ -638,7 +644,73 @@ def test_screenshot_timeline_crop_and_timing_log(viewer, tmp_path):
     assert data["backend"].lower() == "agg" and data["label"] == "unit test"
     assert data["n"] == 2 == len(data["ticks"])
     assert data["recording"]["name"] == "p3_circular_power"
-    assert data["ticks"][0]["lateness_ms"] == pytest.approx(35.0)
+    assert data["ticks"][0]["lateness_ms"] == pytest.approx(50.0 - TICK_MS)
+    for k in ("rendered_updates", "frames_shown", "wall_duration_s", "rendered_per_s",
+              "frames_shown_per_s", "runs_detail"):
+        assert k in data, k
+
+
+# --- rendering counts and the drawn pixels (Codex finding 1, 2026-10-24) ---------------
+def test_timing_summary_counts_rendered_updates_and_frames_shown_per_run(viewer, rec):
+    v, t = viewer, rec.timeline.t
+    v.fig.canvas.draw()                              # a full draw: the background exists
+    assert v._bg is not None
+    before = v.timing_summary()["rendered_updates"]
+    v.toggle_play(now=20.0)                          # run 1 from frame 0
+    for k in range(1, 6):
+        v.tick(now=20.0 + 0.02 * k)                  # a new frame every 20 ms of wall time
+    s = v.timing_summary()
+    (run,) = s["runs_detail"]
+    assert run["run"] == 1 and run["ticks"] == 5 and run["speed"] == 1.0
+    assert run["rendered_updates"] == 5              # one blit per tick, counted
+    assert run["frames_shown"] == 5                  # every tick landed on a new frame
+    assert run["frames_skipped"] == s["frames_skipped"] > 0   # 20 ms steps over 11 ms frames
+    assert run["wall_duration_s"] == pytest.approx(0.1)
+    assert run["rendered_per_s"] == pytest.approx(50.0) == run["frames_shown_per_s"]
+    assert s["wall_duration_s"] == pytest.approx(0.1) and s["frames_shown"] == 5
+    assert s["rendered_updates"] >= before + 5       # play's own draw also counts
+    # a tick that lands on the frame already shown renders but shows nothing new
+    v.tick(now=20.1001)
+    (run,) = v.timing_summary()["runs_detail"]
+    assert run["ticks"] == 6 and run["rendered_updates"] == 6 and run["frames_shown"] == 5
+    # a seek starts a second run; the first run's record is kept
+    v.seek_frame(25, now=20.2)
+    v.tick(now=20.21)
+    runs = v.timing_summary()["runs_detail"]
+    assert [r["run"] for r in runs] == [1, 2] and runs[1]["ticks"] == 1
+    assert runs[0]["ticks"] == 6                     # unchanged
+    v.toggle_play(now=20.3)                          # pause: the run is closed
+    v.tick(now=20.4)                                 # paused: no tick is recorded
+    assert v.timing_summary()["runs_detail"][1]["ticks"] == 1
+
+
+def test_screenshot_shows_the_hand_and_the_atlas_rendered_text(viewer, tmp_path):
+    """The hand's artists are animated and drawn on top of the background;
+    the panels are composed from the glyph atlas. Both must reach the pixels
+    of a saved figure (and of the blitted window, which uses the same code)."""
+    v = viewer
+    png = v.screenshot(tmp_path / "shot.png")
+    img = np.asarray(Image.open(png).convert("RGB")).astype(int)
+    H, W = img.shape[:2]
+
+    def region(rect):
+        x0, x1 = int(rect[0] * W), int((rect[0] + rect[2]) * W)
+        y1, y0 = int((1 - rect[1]) * H), int((1 - rect[1] - rect[3]) * H)
+        return img[y0:y1, x0:x1]
+    hand = region(RECT_3D)
+    pane = np.array([10, 10, 18])                   # the 3D pane colour (0.04, 0.04, 0.07)
+    bright = (np.abs(hand - pane).sum(axis=2) > 60).sum()
+    assert bright > 500, bright                      # bones, joints and tips are drawn
+    hud = region(RECT_HUD)
+    text_px = (hud.max(axis=2) > 120).sum()          # light glyphs on the dark panel
+    assert text_px > 2000, text_px
+    assert v.hud_panel.rows > 20 and not v.hud_panel.truncated
+    assert v.ang_panel.rows > 40 and v.p3_panel.rows > 10
+    # the glyph atlas holds what the panels used: digits, letters, the degree-ish signs
+    atlas = next(iter(v.hud_panel._atlases.values()))
+    assert {"0", "9", "a", "e", ".", "µ"} <= set(atlas.ids)
+    assert atlas.strip("ab").shape == (atlas.h, 2 * atlas.adv)
+    assert atlas.strip("").shape == (atlas.h, 0)
 
 
 # --- the script ---------------------------------------------------------------------
@@ -672,17 +744,20 @@ EST_NONE_LINES = ["T_TMC_fe_est_openhand: not computed (no calibration loaded)",
                   "T_TMC_aa_est_openhand: not computed (no calibration loaded)"]
 
 
-def write_calibration(path, rec, fe, aa, session="synthetic"):
+def write_calibration(path, rec, fe, aa, session="synthetic", kind="openhand", hand=None,
+                      provenance="hand-made test calibration", drop=()):
     """A hand-made Calibration (to_json) whose rest frame reads the fixture's
     palm-to-metacarpal rotation (the same in every frame: the hand moves
-    rigidly) as (fe, aa) on this left hand: R_rest = R_pm (Ry(-aa) Rx(-fe))^T."""
+    rigidly) as (fe, aa) on this left hand: R_rest = R_pm (Ry(-aa) Rx(-fe))^T.
+    `drop` removes keys from the written JSON (a file of an older format)."""
     pm = te.palm_to_metacarpal(rc.reconstruct(rec.frames[0]).rot)
     cal = te.Calibration(R_rest=pm @ (jf.rot_y(-aa) @ jf.rot_x(-fe)).T, session=session,
                          n_transitions=3, n_frames=75, per_transition=[],
                          agreement={"median_deg": 4.4, "p90_deg": 7.8, "max_deg": 20.0,
                                     "worst": {"name": "x", "take": 1}},
-                         provenance="hand-made test calibration")
-    path.write_text(json.dumps(cal.to_json()), encoding="utf-8")
+                         provenance=provenance, kind=kind, hand=hand)
+    doc = {k: v for k, v in cal.to_json().items() if k not in drop}
+    path.write_text(json.dumps(doc), encoding="utf-8")
     return path
 
 
@@ -705,14 +780,14 @@ def run_headless(jsonl, png, monkeypatch, *extra):
 
 def test_script_builds_the_estimate_from_a_calibration_file(jsonl, rec, tmp_path,
                                                             monkeypatch, capsys):
-    cal_path = write_calibration(tmp_path / "calibration.json", rec, 12.0, -7.0)
+    cal_path = write_calibration(tmp_path / "calibration.json", rec, 12.0, -7.0, hand="left")
     code, lines = run_headless(jsonl, tmp_path / "view.png", monkeypatch,
                                "--tmc-calibration", cal_path)
     assert code == 0
     k = lines.index(EST_TITLE)
     assert lines[k + 1:] == [
-        "T_TMC_fe_est_openhand: +12.0 deg (estimated)",
-        "T_TMC_aa_est_openhand: -7.0 deg (estimated)",
+        "T_TMC_fe_est_openhand: +12.0 deg (unvalidated estimate)",
+        "T_TMC_aa_est_openhand: -7.0 deg (unvalidated estimate)",
         "T_TMC_twist_est_openhand: 0.0 deg (residual 0.0 deg)",
         "provenance: open hand, 3 transitions; agreement median 4.4/p90 7.8/max 20.0 deg"]
     assert ANG_UNAVAILABLE in lines              # the validated pair stays unavailable
@@ -749,7 +824,8 @@ def test_a_calibration_of_another_session_is_not_applied(jsonl, rec, tmp_path):
                               kind="static", name="p3_circular_power", take=1,
                               metadata={**METADATA, "session": "S1"})
     cal = script.load_calibration(
-        write_calibration(tmp_path / "calibration.json", rec, 12.0, -7.0, session="S0"))
+        write_calibration(tmp_path / "calibration.json", rec, 12.0, -7.0, session="S0",
+                          hand="left"))
     v = ReplayViewer(other, dpi=100, tmc_provider=script.tmc_provider(cal, other),
                      screenshot_dir=tmp_path / "screens")
     try:
@@ -763,6 +839,215 @@ def test_a_calibration_of_another_session_is_not_applied(jsonl, rec, tmp_path):
         v.close()
 
 
+# --- the calibration kind through the real CLI path (Codex finding 4, 2026-10-24) -------
+NEUTRAL_BLOCK = [
+    EST_TITLES["neutral"],
+    "T_TMC_fe_est_neutral: +12.0 deg (unvalidated estimate)",
+    "T_TMC_aa_est_neutral: -7.0 deg (unvalidated estimate)",
+    "T_TMC_twist_est_neutral: 0.0 deg (residual 0.0 deg)",
+    "provenance: neutral posture take, 3 takes; agreement median 4.4/p90 7.8/max 20.0 deg"]
+
+
+def test_script_routes_a_neutral_calibration_to_the_neutral_block(jsonl, rec, tmp_path,
+                                                                 monkeypatch, capsys):
+    cal_path = write_calibration(tmp_path / "neutral.json", rec, 12.0, -7.0,
+                                 kind="neutral", hand="left",
+                                 provenance="tmc_neutral calibration of session X (left hand)")
+    code, lines = run_headless(jsonl, tmp_path / "view.png", monkeypatch,
+                               "--tmc-calibration", cal_path)
+    assert code == 0
+    assert lines[lines.index(EST_TITLES["neutral"]):] == NEUTRAL_BLOCK
+    assert EST_TITLE not in lines and not any("_est_openhand" in l for l in lines)
+    assert ANG_UNAVAILABLE in lines                 # the validated pair stays unavailable
+    out = capsys.readouterr().out
+    assert "kind: neutral (tmc_neutral calibration take" in out
+    assert "hand left; outputs T_TMC_fe_est_neutral, T_TMC_aa_est_neutral" in out
+
+
+def test_script_shows_a_real_calibration_take_under_the_neutral_names(tmp_path, monkeypatch,
+                                                                      capsys):
+    """End to end with the real writer: synthetic tmc_neutral takes written the
+    way the recorder writes them, read by tmc_calibration_take.calibrate, saved
+    as calibration.json, loaded by the script, applied to a loose camera file
+    whose thumb sits at (20, 10) from the same rest frame."""
+    from test_tmc_calibration_take import N_HOLD, write_take
+    from test_tmc_estimate import hand_pose, line as est_line
+    from test_tmc_estimate import write_jsonl as est_write_jsonl
+    folder = tmp_path / "20990101_000000_left"
+    write_take(folder, 1, N_HOLD)
+    write_take(folder, 2, N_HOLD)
+    cal = tct.calibrate(folder)
+    cal_path = folder / "calibration.json"
+    cal_path.write_text(json.dumps(cal.to_json()), encoding="utf-8")
+    assert json.loads(cal_path.read_text(encoding="utf-8"))["kind"] == "neutral"
+    loose = tmp_path / "loose_left.jsonl"
+    pose = hand_pose("left", 20.0, 10.0)
+    est_write_jsonl(loose, [est_line("left", 5, 100 + k, 5_000_000_000 + k * 11_111, pose)
+                            for k in range(30)])
+    seen = []
+    close = ReplayViewer.close
+
+    def capture(self):
+        seen.append(self.angles_text().splitlines())
+        close(self)
+    monkeypatch.setattr(ReplayViewer, "close", capture)
+    code = script.main(["--file", str(loose), "--hand", "left", "--headless",
+                        "--screenshot", str(tmp_path / "view.png"),
+                        "--tmc-calibration", str(cal_path)])
+    assert code == 0
+    lines = seen[-1]
+    k = lines.index(EST_TITLES["neutral"])
+    assert lines[k + 1:k + 4] == ["T_TMC_fe_est_neutral: +20.0 deg (unvalidated estimate)",
+                                  "T_TMC_aa_est_neutral: +10.0 deg (unvalidated estimate)",
+                                  "T_TMC_twist_est_neutral: 0.0 deg (residual 0.0 deg)"]
+    assert lines[k + 4].startswith("provenance: neutral posture take, 2 takes; agreement")
+    assert not any("_est_openhand" in l or "open hand" in l for l in lines)
+    out = capsys.readouterr().out
+    assert "kind: neutral" in out and tct.PROVENANCE_PREFIX in out
+    # the standalone neutral estimator agrees with what the window shows
+    e = tct.estimate(*pose, "left", script.load_calibration(cal_path))
+    assert (deg(e[tct.FE]), deg(e[tct.AA])) == ("+20.0", "+10.0")
+    # and the other hand's recording does not get it
+    right = rc.load_recording(loose, "left", None, kind="file")
+    right.hand_side = "right"
+    prov = script.tmc_provider(script.load_calibration(cal_path), right)
+    got = prov(*pose, "right")
+    assert got["kind"] == "neutral" and got["T_TMC_fe_est_neutral"] is None
+    assert got["provenance"] == ("calibration of the left hand, this recording is of the "
+                                 "right hand: not applied")
+
+
+def test_older_calibration_files_are_read_by_their_provenance_or_refused(jsonl, rec, tmp_path,
+                                                                        monkeypatch, capsys):
+    """A calibration.json written before `kind` existed: the first words of
+    the provenance say which writer made it; anything else is refused with
+    the fix spelled out, never guessed."""
+    open_hand = write_calibration(tmp_path / "old_openhand.json", rec, 12.0, -7.0,
+                                  provenance="open-hand calibration of session X: ...",
+                                  drop=("kind", "hand"))
+    code, lines = run_headless(jsonl, tmp_path / "view.png", monkeypatch,
+                               "--tmc-calibration", open_hand)
+    k = lines.index(EST_TITLE)                       # the kind is read; the hand is not known
+    assert code == 0 and lines[k + 1] == ("T_TMC_fe_est_openhand: not computed (the provider "
+                                          "gave no value)")
+    assert lines[k + 3] == f"provenance: {te.HAND_UNKNOWN}: not applied"
+    out = capsys.readouterr().out
+    assert "hand not recorded in the file (no --dataset to recover it from)" in out
+    assert "declare it with --tmc-calibration-hand left|right" in out
+    code, lines = run_headless(jsonl, tmp_path / "view.png", monkeypatch,
+                               "--tmc-calibration", open_hand, "--tmc-calibration-hand", "left")
+    assert code == 0 and lines[lines.index(EST_TITLE) + 1].startswith(
+        "T_TMC_fe_est_openhand: +12.0 deg")
+    assert "hand left (declared with --tmc-calibration-hand)" in capsys.readouterr().out
+    neutral = write_calibration(tmp_path / "old_neutral.json", rec, 12.0, -7.0,
+                                provenance="tmc_neutral calibration of session X (left hand)",
+                                drop=("kind", "hand"))
+    code, lines = run_headless(jsonl, tmp_path / "view.png", monkeypatch,
+                               "--tmc-calibration", neutral)
+    k = lines.index(EST_TITLES["neutral"])
+    assert code == 0 and lines[k + 1].endswith("not computed (the provider gave no value)")
+    code, lines = run_headless(jsonl, tmp_path / "view.png", monkeypatch,
+                               "--tmc-calibration", neutral, "--tmc-calibration-hand", "left")
+    assert code == 0 and lines[lines.index(EST_TITLES["neutral"]) + 1].startswith(
+        "T_TMC_fe_est_neutral: +12.0 deg")
+    unknown = write_calibration(tmp_path / "old_unknown.json", rec, 12.0, -7.0,
+                                drop=("kind", "hand"))
+    code, lines = run_headless(jsonl, tmp_path / "view.png", monkeypatch,
+                               "--tmc-calibration", unknown)
+    out = capsys.readouterr().out
+    assert code == 1 and lines is None
+    assert "cannot read the TMC calibration" in out and 'no "kind"' in out
+    assert '"kind": "openhand"' in out and '"kind": "neutral"' in out
+
+
+def right_handed(jsonl):
+    """The fixture's frames read back as a right-hand recording (the data is
+    left-hand; only the label matters for the routing checks)."""
+    rec = rc.load_recording(jsonl, "left", [11, 12], kind="file")
+    rec.hand_side = "right"
+    return rec
+
+
+@pytest.mark.parametrize("kind", te.KINDS)
+def test_an_older_file_without_a_hand_is_applied_to_no_hand_unless_declared(
+        jsonl, rec, tmp_path, monkeypatch, capsys, kind):
+    """Codex's recheck of 2026-10-24: the default calibration file predates
+    the hand field. Such a file is never applied to a right-hand recording,
+    never assumed to fit a left one, and applies only once its hand is
+    declared (or recovered from the dataset's table); a declaration that
+    contradicts a recorded hand is refused."""
+    fe, aa = ac.ESTIMATE_COLUMNS_BY_KIND[kind]
+    title = EST_TITLES[kind]
+    path = write_calibration(tmp_path / f"old_{kind}.json", rec, 12.0, -7.0, kind=kind,
+                             provenance=f"{te.PROVENANCE_PREFIXES[kind]} of session X",
+                             drop=("hand",))
+    cal = script.load_calibration(path)
+    assert cal.kind == kind and cal.hand is None
+    for recording in (rec, right_handed(jsonl)):
+        r = rc.reconstruct(recording.frames[0])
+        got = script.tmc_provider(cal, recording)(r.pos, r.rot, recording.hand_side)
+        assert got[fe] is None and got[aa] is None and got["kind"] == kind
+        assert got["provenance"] == f"{te.HAND_UNKNOWN}: not applied"
+    code, lines = run_headless(jsonl, tmp_path / "v.png", monkeypatch, "--tmc-calibration", path)
+    k = lines.index(title)
+    assert code == 0 and lines[k + 1] == f"{fe}: not computed (the provider gave no value)"
+    assert lines[k + 2] == f"{aa}: not computed (the provider gave no value)"
+    assert lines[k + 3] == f"provenance: {te.HAND_UNKNOWN}: not applied"
+    out = capsys.readouterr().out
+    assert "hand not recorded in the file" in out and "--tmc-calibration-hand" in out
+    code, lines = run_headless(jsonl, tmp_path / "v.png", monkeypatch, "--tmc-calibration", path,
+                               "--tmc-calibration-hand", "left")
+    assert code == 0 and lines[lines.index(title) + 1] == f"{fe}: +12.0 deg (unvalidated estimate)"
+    assert "hand left (declared with --tmc-calibration-hand)" in capsys.readouterr().out
+    code, lines = run_headless(jsonl, tmp_path / "v.png", monkeypatch, "--tmc-calibration", path,
+                               "--tmc-calibration-hand", "right")
+    assert code == 0 and lines[lines.index(title) + 3] == (
+        "provenance: calibration of the right hand, this recording is of the left hand: "
+        "not applied")
+    typed = write_calibration(tmp_path / f"typed_{kind}.json", rec, 12.0, -7.0, kind=kind,
+                              hand="left")
+    code, lines = run_headless(jsonl, tmp_path / "v.png", monkeypatch, "--tmc-calibration",
+                               typed, "--tmc-calibration-hand", "right")
+    assert code == 1 and lines is None
+    assert "records the left hand; the declared right hand contradicts it" in (
+        capsys.readouterr().out)
+
+
+@pytest.mark.parametrize("kind", te.KINDS)
+def test_a_known_hand_applies_only_to_recordings_of_that_hand(jsonl, rec, tmp_path, kind):
+    fe = ac.ESTIMATE_COLUMNS_BY_KIND[kind][0]
+    recordings = {"left": rec, "right": right_handed(jsonl)}
+    for cal_hand in ("left", "right"):
+        cal = script.load_calibration(write_calibration(
+            tmp_path / f"{kind}_{cal_hand}.json", rec, 12.0, -7.0, kind=kind, hand=cal_hand))
+        for rec_hand, recording in recordings.items():
+            r = rc.reconstruct(recording.frames[0])
+            got = script.tmc_provider(cal, recording)(r.pos, r.rot, rec_hand)
+            assert got["kind"] == kind
+            if rec_hand == cal_hand:
+                assert got[fe] is not None and "not applied" not in got["provenance"]
+            else:
+                assert got[fe] is None
+                assert got["provenance"] == (f"calibration of the {cal_hand} hand, this "
+                                             f"recording is of the {rec_hand} hand: not applied")
+
+
+def test_a_calibration_of_another_hand_is_not_applied(jsonl, rec, tmp_path):
+    cal = script.load_calibration(
+        write_calibration(tmp_path / "right.json", rec, 12.0, -7.0, hand="right"))
+    v = ReplayViewer(rec, dpi=100, tmc_provider=script.tmc_provider(cal, rec),
+                     screenshot_dir=tmp_path / "screens")
+    try:
+        lines = v.angles_text().splitlines()
+        assert lines[lines.index(EST_TITLE) + 1:] == [
+            "T_TMC_fe_est_openhand: not computed (the provider gave no value)",
+            "T_TMC_aa_est_openhand: not computed (the provider gave no value)",
+            "provenance: calibration of the right hand, this recording is of the left "
+            "hand: not applied"]
+    finally:
+        v.close()
+
+
 def test_the_default_calibration_then_the_computed_one(rec, tmp_path, monkeypatch):
     """With --dataset: the default calibration.json when it exists, else
     tmc_estimate.calibrate over the dataset (timed), else not computed."""
@@ -771,7 +1056,44 @@ def test_the_default_calibration_then_the_computed_one(rec, tmp_path, monkeypatc
     path = write_calibration(tmp_path / "default.json", rec, 1.0, 2.0)
     monkeypatch.setattr(script, "DEFAULT_TMC", path)
     cal, line = script.tmc_calibration(args)
-    assert line == f"TMC calibration: {path}" and cal.provenance == "hand-made test calibration"
+    assert line.startswith(f"TMC calibration: {path}; hand not recorded in the file (the "
+                           "calibration lists no transitions to match): the estimate is not "
+                           "applied; declare it with --tmc-calibration-hand")
+    assert cal.hand is None and cal.provenance == "hand-made test calibration"
+    # an older default file whose transitions the dataset's table names: the hand
+    # comes from the table, the one place it is recorded
+    from test_tmc_estimate import write_table
+    write_table(tmp_path / "metadata" / "pose_transitions.csv", [
+        {"participant_id": "P01", "hand": "left", "from_grasp": "open_hand", "to_grasp": "g",
+         "take": 1, "recording_file": "x.jsonl", "validity": "valid", "frames": 10,
+         "hand_ids": "1", "session": "S"}])
+    older = te.Calibration(R_rest=np.eye(3), session="S", n_transitions=1, n_frames=10,
+                           per_transition=[{"name": "g", "take": 1, "n_frames": 10}],
+                           agreement={"median_deg": 0.0, "p90_deg": 0.0, "max_deg": 0.0,
+                                      "worst": {"name": "g", "take": 1}},
+                           provenance="open-hand calibration of session S", kind="openhand")
+    (tmp_path / "older.json").write_text(
+        json.dumps({k: v for k, v in older.to_json().items() if k != "hand"}),
+        encoding="utf-8")
+    monkeypatch.setattr(script, "DEFAULT_TMC", tmp_path / "older.json")
+    cal, line = script.tmc_calibration(args)
+    assert cal.hand == "left"
+    assert line.endswith("hand left (recovered from metadata/pose_transitions.csv: 1 of 1 "
+                         "transitions of session S are left-hand recordings)")
+    args_declared = script.build_parser().parse_args(
+        ["--dataset", str(tmp_path), "--grasp", "g", "--take", "1",
+         "--tmc-calibration-hand", "right"])
+    cal, line = script.tmc_calibration(args_declared)          # the declaration wins
+    assert cal.hand == "right" and line.endswith("hand right (declared with --tmc-calibration-hand)")
+    monkeypatch.setattr(script, "DEFAULT_TMC", path)            # a typed file: agrees or raises
+    assert script.tmc_calibration(args_declared)[0].hand == "right"
+    typed = write_calibration(tmp_path / "typed.json", rec, 1.0, 2.0, hand="left")
+    monkeypatch.setattr(script, "DEFAULT_TMC", typed)
+    cal, line = script.tmc_calibration(args_declared)   # the default file: reported, replay opens
+    assert cal is None and "records the left hand; the declared right hand contradicts it" in line
+    assert script.tmc_calibration(args)[0].hand == "left"
+    cal, line = script.tmc_calibration(args)
+    assert line.endswith("hand left (recorded in the file)")
     monkeypatch.setattr(script, "DEFAULT_TMC", tmp_path / "absent.json")
     calls = []
     monkeypatch.setattr(script.te, "calibrate", lambda root: calls.append(root) or cal)
@@ -817,3 +1139,131 @@ def test_scenario_screenshots_on_the_real_dataset(tmp_path, capsys):
     # how many ticks fit in 2 s depends on the machine's load: at least one
     assert timing["label"] == "headless Agg draw loop" and timing["n"] >= 1
     assert timing["backend"].lower() == "agg" and len(timing["ticks"]) == timing["n"]
+
+
+# --- the reference-mapped block (leap_hand.reference_validation) --------------------
+from leap_hand import reference_validation as rvl   # noqa: E402
+
+
+def write_mapping(path, rec, fe, aa, *, status="synthetic_demonstration", hand="left",
+                  session="S1", participant="P01", order="abduction_then_flexion",
+                  tested=((-10.0, 40.0), (0.0, 30.0))):
+    """A hand-made mapping whose A turns the fixture's thumb metacarpal head
+    direction (R_pm (0, 0, -1), the same in every frame) onto the canonical
+    direction of (fe, aa) written out here for a left hand (s = -1): in the
+    abduction-then-flexion order u = (sin(-fe), sin aa cos fe, cos aa cos fe).
+    So the block must read (fe, aa) exactly."""
+    pm = te.palm_to_metacarpal(rc.reconstruct(rec.frames[0]).rot)
+    v = pm @ np.array([0.0, 0.0, -1.0])
+    f, a = math.radians(fe), math.radians(aa)
+    u = np.array([math.sin(-f), math.sin(a) * math.cos(f), math.cos(a) * math.cos(f)])
+    axis = np.cross(v, u)
+    A = rodrigues(axis, math.degrees(math.atan2(np.linalg.norm(axis), float(v @ u))))
+    doc = {"format": rvl.MAPPING_FORMAT, "id": "tmcmap-test", "status": status,
+           "participant": participant, "hand": hand, "session": session,
+           "rotation_order": order, "A": A.tolist(), "b": [0.0, 0.0, -1.0],
+           "tested_range_deg": {"fe": list(tested[0]), "aa": list(tested[1])},
+           "heldout": {"fe": {"n": 120, "mae_deg": 1.25}, "aa": {"n": 120, "mae_deg": 0.75}}}
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
+def sidecar(jsonl, **fields):
+    jsonl.with_suffix(rvl.META_SUFFIX).write_text(json.dumps(fields), encoding="utf-8")
+
+
+def mapped_rows(lines):
+    k = next(i for i, ln in enumerate(lines) if ln.startswith("mapped ("))
+    return lines[k], lines[k + 1], k
+
+
+@pytest.mark.parametrize("status,tag", [
+    ("synthetic_demonstration", "SYNTHETIC, not measured"),
+    ("evaluated", "reference-evaluated"),
+    ("cross_check", "cross-check only")])
+def test_mapping_block_shows_values_in_scope_with_what_the_reference_was(
+        jsonl, rec, tmp_path, monkeypatch, capsys, status, tag):
+    sidecar(jsonl, participant="P01", session="S1")
+    m = write_mapping(tmp_path / "mapping.json", rec, 20.0, 10.0, status=status)
+    code, lines = run_headless(jsonl, tmp_path / "v.png", monkeypatch, "--tmc-mapping", m)
+    assert code == 0
+    first, second, k = mapped_rows(lines)
+    assert first == f"mapped ({tag}): T_TMC_fe_mapped +20.0 T_TMC_aa_mapped +10.0"
+    assert second == ("tested fe -10..40, aa 0..30 deg; P01, left hand, session S1; "
+                      "tmcmap-test")
+    assert lines[k - 1] == ANG_UNAVAILABLE                  # right under the unavailable six
+    assert lines[k + 2] == "" and lines[k + 3] == EST_TITLE   # the estimate apart, last
+    out = capsys.readouterr().out
+    assert "TMC mapping:" in out and "tmcmap-test" in out
+    assert "applied to this recording (inside its tested range only)" in out
+    assert ANG_UNAVAILABLE in lines                         # the Paper 3 pair stays unavailable
+
+
+def test_mapping_is_not_applied_outside_its_scope(jsonl, rec, tmp_path, monkeypatch, capsys):
+    m = write_mapping(tmp_path / "mapping.json", rec, 20.0, 10.0)
+    cases = [({"participant": "P01", "session": "S2"},
+              "this recording is of session S2, the mapping of session S1"),
+             ({"participant": "P02", "session": "S1"},
+              "this recording is of participant P02, the mapping of participant P01"),
+             (None, "this recording names no session and no participant")]
+    for fields, reason in cases:
+        side = jsonl.with_suffix(rvl.META_SUFFIX)
+        side.unlink(missing_ok=True)
+        if fields is not None:
+            sidecar(jsonl, **fields)
+        code, lines = run_headless(jsonl, tmp_path / "v.png", monkeypatch, "--tmc-mapping", m)
+        first, second, _k = mapped_rows(lines)
+        assert code == 0
+        assert first == "mapped (SYNTHETIC, not measured): not applied to this recording"
+        assert second.startswith(reason), second
+        assert not [ln for ln in lines if "T_TMC_fe_mapped" in ln]
+        assert f"not applied to this recording: {reason}" in capsys.readouterr().out
+    sidecar(jsonl, participant="P01", session="S1")
+    m = write_mapping(tmp_path / "right.json", rec, 20.0, 10.0, hand="right")
+    code, lines = run_headless(jsonl, tmp_path / "v.png", monkeypatch, "--tmc-mapping", m)
+    assert mapped_rows(lines)[1] == ("this recording is of the left hand, the mapping "
+                                     "of the right hand")
+
+
+def test_mapping_values_outside_the_tested_range_stay_empty(jsonl, rec, tmp_path,
+                                                            monkeypatch):
+    sidecar(jsonl, participant="P01", session="S1")
+    m = write_mapping(tmp_path / "mapping.json", rec, 20.0, 10.0,
+                      tested=((-10.0, 15.0), (0.0, 30.0)))
+    code, lines = run_headless(jsonl, tmp_path / "v.png", monkeypatch, "--tmc-mapping", m)
+    first, second, _k = mapped_rows(lines)
+    assert first == "mapped (SYNTHETIC, not measured): empty here"
+    assert second.startswith("fe 20.0, aa 10.0 deg outside the tested range fe -10.0..15.0")
+
+
+def test_mapping_file_that_is_not_a_mapping_is_refused(jsonl, tmp_path, monkeypatch, capsys):
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"format": "something else"}), encoding="utf-8")
+    code, _lines = run_headless(jsonl, tmp_path / "v.png", monkeypatch, "--tmc-mapping", bad)
+    assert code == 1
+    assert "cannot read the TMC mapping: a mapping file has format" in capsys.readouterr().out
+
+
+def test_status_rows_fit_the_real_window_in_the_worst_case(rec, jsonl, tmp_path):
+    """Interpolated pose, an estimate with its twist and provenance, and the
+    mapped block, on the TkAgg window's 804 px height at 100 dpi: nothing cut."""
+    sidecar(jsonl, participant="P01", session="S1")
+    cal = script.load_calibration(write_calibration(tmp_path / "c.json", rec, 12.0, -7.0,
+                                                    hand="left"))
+    mapping = rvl.load_mapping(write_mapping(tmp_path / "m.json", rec, 20.0, 10.0))
+    mprov, how = script.mapping_provider(mapping, rec)
+    assert how.startswith("applied")
+    v = ReplayViewer(rec, mode="interpolate", figsize=(15.5, 8.04), dpi=100,
+                     tmc_provider=script.tmc_provider(cal, rec), mapping_provider=mprov,
+                     screenshot_dir=tmp_path / "s")
+    try:
+        t = rec.timeline.t
+        v.seek_time((t[2] + t[3]) / 2)
+        assert v.displayed.source == "interpolated"
+        v.screenshot(tmp_path / "worst.png")
+        lines = v.angles_text().splitlines()
+        assert any(ln.startswith("mapped (SYNTHETIC") for ln in lines)
+        assert lines[-1].startswith("provenance: ")
+        assert not v.ang_panel.truncated, v.ang_panel.rows
+    finally:
+        v.close()

@@ -389,3 +389,46 @@ def test_keep_all_tracking_is_refused_where_hint_is(argv, tmp_path,
     assert "--keep-all-tracking needs --camera leap --hand left|right" in str(
         e.value)
     assert not out.exists(), "refused before anything was recorded"
+
+
+class SpyView:
+    """Stands in for the CameraView: keeps every caption and its ref."""
+
+    def __init__(self):
+        self.calls = []
+
+    def caption(self, text, band=None, ref=None):
+        self.calls.append((text, ref))
+
+    def snapshot(self, path):
+        return None
+
+
+def test_a_pose_phase_sends_the_reference_picture_of_that_pose(tmp_path,
+                                                                monkeypatch):
+    """G27: while FIST is asked for, the window is sent the reference folder's
+    fist.png; with the file gone it is sent nothing. The folder here is a
+    stand-in: the professor's photographs are not in the repository
+    (.gitignore), and the recorder passes the path on without opening it."""
+    sync = load_sync()
+    ref_dir = tmp_path / "reference"
+    ref_dir.mkdir()
+    picture = ref_dir / "fist.png"
+    picture.write_bytes(b"stand-in")
+    monkeypatch.setattr(sync, "REFERENCE_DIR", ref_dir)
+    session = posed_session(sync, tmp_path, monkeypatch, leap_pose="fist",
+                            glove_curl=1.0, retries=0)
+    session.view = SpyView()
+    session.run_take("fist", 1, 1, 1, 1, duration=0.3, prep=0)
+    session.finish()
+    calls = session.view.calls
+    held = [ref for text, ref in calls if text.startswith("HOLD: FIST")]
+    acquiring = [ref for text, ref in calls if text.startswith("OPEN PALM first")]
+    assert held and set(held) == {str(picture)}
+    assert acquiring and set(acquiring) == {str(picture)}
+    # no file on disk: the recorder passes nothing
+    monkeypatch.setattr(sync, "REFERENCE_DIR", tmp_path / "none")
+    session.view.calls.clear()
+    session._phase, session._pose = "REC", "fist"
+    session._show_hud(0.0)
+    assert session.view.calls[-1][1] is None

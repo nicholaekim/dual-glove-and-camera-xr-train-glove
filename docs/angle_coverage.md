@@ -1,12 +1,27 @@
 # Angle coverage: every joint and movement, its column and its status
 
 Written 2026-10-23 (coverage leaf of `docs/angle_coverage_plan.md`; gates C1,
-C3, C4 and C8 of `GATES_angle_coverage.md`). For every joint of the hand,
+C3, C4 and C8 of `GATES_angle_coverage.md`); corrected 2026-10-24 after
+Codex's independent review (`GATES_codex_corrections.md`): the neutral-posture
+estimate entries, the calibration kind in the exports and the viewer, and the
+wording of the estimate's relation to the paper's coordinates; extended
+2026-10-24 (later, `GATES_reference_validation.md`) with the `evaluated` status
+and the reference-mapped pair (`docs/reference_validation.md`). For every joint of the hand,
 flexion/extension and abduction/adduction, plus the wrist and the twist of
 every bone, this page says which number the camera recording gives, under
 which column name, measured from which frame, from which zero, with which
-sign and by which method, and with one of four statuses. Where the recording
+sign and by which method, and with one of five statuses. Where the recording
 gives no number it says what recording or calibration would.
+
+Every value is one of four kinds, and each output says which:
+**a calculated tracker coordinate** (`calculated`, and `outside_paper3` for
+the tracker's movements that are not among Paper 3's 24), **an unvalidated
+estimate** (`estimated`), **a measurement evaluated against an independent
+reference, with its validation scope** (`evaluated`), or **unavailable**.
+The viewer's angle panel labels each row (`calculated`, `outside Paper 3`,
+`unvalidated estimate`, and the `mapped (reference-evaluated)` rows with their
+scope); the per-frame export has the status of the mapped values in
+`T_TMC_mapped_status`.
 
 Code: `src/leap_hand/angle_coverage.py` (`COVERAGE`, `all_angles`,
 `write_coverage_csv`, `coverage_markdown`). Tests:
@@ -18,7 +33,8 @@ Viewer: the angle panel of `src/leap_hand/replay_viewer.py`.
 | Status | Meaning |
 |---|---|
 | `calculated` | read off the tracker's bone orientations by a stated decomposition: the 18 Paper 3 coordinates the camera gives, plus the paper-order MCP pairs |
-| `estimated` | calculated against a calibration the dataset itself supplies, with stated assumptions; kept in separate columns suffixed `_est_<calibration>` and in a separate viewer block, never merged with the validated coordinates (the thumb TMC pair, `docs/tmc_estimate.md`) |
+| `estimated` | an unvalidated estimate: a tracker-relative coordinate referred to a calibration posture (the thumb TMC pair, `docs/tmc_estimate.md`), with stated assumptions; one entry per calibration kind, in separate columns `_est_openhand` (the session's recorded open hand) and `_est_neutral` (a `tmc_neutral` calibration take) and in a separate viewer block titled by the kind, never merged with each other or with the reference-evaluated values; it differs from the anatomical coordinate by a pose-dependent reference change, not by a fixed offset |
+| `evaluated` | a measurement evaluated against an independent reference, with its validation scope: the thumb TMC pair through a mapping fitted on calibration trials and tested on held-out trials against a reference device (`docs/reference_validation.md`), in `T_TMC_fe_mapped` / `T_TMC_aa_mapped`, filled only for the participant, hand and tracker session the mapping was evaluated on and inside its tested range, with `T_TMC_mapped_status` per row (`evaluated_in_range`; `synthetic_demonstration` or `cross_check` when the reference was synthetic or not an anatomical reference; `outside_tested_range` with the values empty). No mapping evaluated against a measured anatomical reference exists yet (2026-10-24), so these columns are empty in every real export |
 | `unavailable` | a coordinate the tracker does not measure; the cell is empty; the entry's `requirement` says what recording or calibration would give it |
 | `outside_paper3` | a movement the tracker reports but Paper 3's 24-DoF model does not have (thumb MCP and IP abduction, finger PIP and DIP sideways components, twist about the bone axis, wrist flexion and deviation); exported under a `_tracker` name so it is never mistaken for a Paper 3 coordinate (shown as "outside Paper 3" in the viewer) |
 
@@ -31,8 +47,9 @@ Viewer: the angle panel of `src/leap_hand/replay_viewer.py`.
   the PALM joint's frame (the tracker's rigid hand).
 - **Zero**: "bone in line with the parent" for a phalanx; "metacarpal along
   the reference frame's -z" for a metacarpal against the wrist or palm; "the
-  session's open-hand pose" for the estimate; for the wrist, the PALM axes
-  aligned with the WRIST (forearm) axes.
+  session's open-hand pose" for the open-hand estimate and "the tmc_neutral
+  posture held in a calibration take" for the neutral-posture estimate; for
+  the wrist, the PALM axes aligned with the WRIST (forearm) axes.
 - **Signs, both hands**: flexion positive toward the palm; abduction positive
   toward the thumb side (radial); twist positive with the back of the bone
   turning toward the little finger; wrist flexion positive toward the palm
@@ -58,17 +75,26 @@ To regenerate it after a change to `COVERAGE`:
 .venv\Scripts\python.exe -c "from leap_hand.angle_coverage import coverage_markdown; print(coverage_markdown())"
 ```
 
-43 entries: the thumb's 3 joints x 2 movements, the four fingers' 4 joints x
-2, the wrist's 2 and one twist entry (41 joint-movement pairs), plus the two
-`estimated` thumb TMC entries beside the two `unavailable` ones. The same
-rows, with the same columns, are `angle_coverage.csv` of every batch run.
+47 entries: the thumb's 3 joints x 2 movements, the four fingers' 4 joints x
+2, the wrist's 2 and one twist entry (41 joint-movement pairs), plus the four
+`estimated` thumb TMC entries (open-hand-relative and neutral-posture-relative,
+for flexion and for abduction) and the two `evaluated` ones (the
+reference-mapped pair) beside the two `unavailable` ones. So the table tells
+apart calculated tracker coordinates, open-hand-relative estimates,
+neutral-posture-relative estimates, reference-evaluated values (scope-bound,
+none yet) and unavailable anatomical coordinates. The same rows, with the same columns, are `angle_coverage.csv`
+of every batch run.
 
 | Joint | Movement | Paper 3 name | Status | Output column(s) | Reference frame | Zero | Sign | Method | Note | Requirement | Dataset column |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | thumb TMC | flexion/extension | `T_TMC_fe` | unavailable |  | Paper 3's thumb frame: TMC flexion axis parallel to the MCP and IP flexion axes (Table 3, p.5) | Paper 3's thumb zero, given only as a drawing (Figure 1, p.3) | flexion positive toward the palm (both hands) | none: not measured | not measured as the paper defines it: the wrist-frame XYZ pair of the thumb metacarpal is about the hand's axes (the thumb's own flexion axis is about 81 deg from the palm's x), not the paper's TMC pair, and cannot be converted because the paper's thumb frame is a drawing (Figure 1, p.3); the dataset's cell is blank | a calibration recording with the thumb in an anatomically defined neutral (ISB-style TMC frame from the trapezium and first metacarpal landmarks, Cheze et al. 2008 as cited by Paper 3) or a goniometer reading at a recorded reference pose, so the estimate's zero can be tied to the paper's; plus an independent sensor (the paper used a Cyberglove) to validate the mapping | `T_TMC_fe` |
-| thumb TMC | flexion/extension |  | estimated | `T_TMC_fe_est_openhand` | palm frame via the session's open-hand rest frame | the session's open-hand pose | flexion positive toward the palm (both hands) | paper_order on R_rest^T (R_palm^T R_metacarpal); see leap_hand.tmc_estimate | NOT a validated Paper 3 coordinate: relative to the recorded open hand, it differs from the paper's zero by an unknown constant per coordinate (Paper 3 gives its zero only as a drawing, Figure 1 p.3); the Table 6 relation T_TMC_fe ~ 11/10 T_MCP_fe stays unavailable | the session's open-hand frames: transitions with a movement_start_time_s, frames before movement_start_time_s - 0.1 s (leap_hand.tmc_estimate) |  |
+| thumb TMC | flexion/extension |  | unvalidated estimate | `T_TMC_fe_est_openhand` | palm frame via the session's open-hand rest frame | the session's open-hand pose | flexion positive toward the palm (both hands) | paper_order on R_rest^T (R_palm^T R_metacarpal); see leap_hand.tmc_estimate | NOT a validated Paper 3 coordinate: a tracker-relative coordinate, the thumb metacarpal against the tracker's palm referred to the recorded open hand; a change of reference (to the paper's zero, a drawing in Figure 1 p.3, or to an anatomical frame) turns both components by pose-dependent amounts (cross-talk), not by a constant per angle, so no zero offset ties it to the paper's (docs/tmc_estimate.md); the Table 6 relation T_TMC_fe ~ 11/10 T_MCP_fe stays unavailable | the session's open-hand frames: transitions with a movement_start_time_s, frames before movement_start_time_s - 0.1 s (leap_hand.tmc_estimate) |  |
+| thumb TMC | flexion/extension |  | unvalidated estimate | `T_TMC_fe_est_neutral` | palm frame via the rest frame of a tmc_neutral calibration take | the tmc_neutral posture held in a calibration take (thumb beside the index, in the plane of the palm; docs/tmc_calibration_protocol.md) | flexion positive toward the palm (both hands) | paper_order on R_rest^T (R_palm^T R_metacarpal); see leap_hand.tmc_estimate | NOT a validated Paper 3 coordinate: the same tracker-relative coordinate referred to a held reference posture instead of the incidental open hand; the posture stands in for the ISB first-CMC neutral and is not that neutral, and the cross-talk caveat is the same (docs/tmc_estimate.md) | a tmc_neutral calibration take of the same session and hand (scripts/leap/record_poses.py --calibration tmc_neutral, docs/tmc_calibration_protocol.md; leap_hand.tmc_calibration_take), its calibration.json given as --tmc-calibration; none recorded yet (2026-10-24) |  |
+| thumb TMC | flexion/extension |  | reference-evaluated | `T_TMC_fe_mapped` | the reference device's trapezium (proximal) frame, through the rotation fitted from the tracker's palm frame (leap_hand.reference_validation) | the reference capture's declared zero (e.g. the ISB neutral) | flexion positive with the metacarpal head moving across the palm toward the little finger, in the plane of the palm (both hands) | the reference's declared rotation order on A R_pm b, with A and b fitted on calibration trials only and the errors measured on held-out trials (leap_hand.reference_validation) | reference-evaluated only inside the scope of the mapping that produced it: the participant, hand and tracker session it was evaluated on, inside its tested range, with the row status T_TMC_mapped_status (evaluated_in_range; synthetic_demonstration or cross_check when the reference was synthetic or not an anatomical reference); empty elsewhere, and empty in every row of the 2026-10-08 dataset. No mapping evaluated against a measured anatomical reference exists yet (2026-10-24) | a validation session recorded with scripts/leap/record_validation.py while an anatomical reference device records the same hand (docs/validation_capture_protocol.md), compared with scripts/leap/reference_validation.py compare |  |
 | thumb TMC | abduction/adduction | `T_TMC_aa` | unavailable |  | Paper 3's thumb frame: TMC flexion axis parallel to the MCP and IP flexion axes (Table 3, p.5) | Paper 3's thumb zero, given only as a drawing (Figure 1, p.3) | abduction positive toward the thumb side, radial (both hands) | none: not measured | not measured as the paper defines it: the wrist-frame XYZ pair of the thumb metacarpal is about the hand's axes (the thumb's own flexion axis is about 81 deg from the palm's x), not the paper's TMC pair, and cannot be converted because the paper's thumb frame is a drawing (Figure 1, p.3); the dataset's cell is blank | a calibration recording with the thumb in an anatomically defined neutral (ISB-style TMC frame from the trapezium and first metacarpal landmarks, Cheze et al. 2008 as cited by Paper 3) or a goniometer reading at a recorded reference pose, so the estimate's zero can be tied to the paper's; plus an independent sensor (the paper used a Cyberglove) to validate the mapping | `T_TMC_aa` |
-| thumb TMC | abduction/adduction |  | estimated | `T_TMC_aa_est_openhand` | palm frame via the session's open-hand rest frame | the session's open-hand pose | abduction positive toward the thumb side, radial (both hands) | paper_order on R_rest^T (R_palm^T R_metacarpal); see leap_hand.tmc_estimate | NOT a validated Paper 3 coordinate: relative to the recorded open hand, it differs from the paper's zero by an unknown constant per coordinate (Paper 3 gives its zero only as a drawing, Figure 1 p.3); the Table 6 relation T_TMC_fe ~ 11/10 T_MCP_fe stays unavailable | the session's open-hand frames: transitions with a movement_start_time_s, frames before movement_start_time_s - 0.1 s (leap_hand.tmc_estimate) |  |
+| thumb TMC | abduction/adduction |  | unvalidated estimate | `T_TMC_aa_est_openhand` | palm frame via the session's open-hand rest frame | the session's open-hand pose | abduction positive toward the thumb side, radial (both hands) | paper_order on R_rest^T (R_palm^T R_metacarpal); see leap_hand.tmc_estimate | NOT a validated Paper 3 coordinate: a tracker-relative coordinate, the thumb metacarpal against the tracker's palm referred to the recorded open hand; a change of reference (to the paper's zero, a drawing in Figure 1 p.3, or to an anatomical frame) turns both components by pose-dependent amounts (cross-talk), not by a constant per angle, so no zero offset ties it to the paper's (docs/tmc_estimate.md); the Table 6 relation T_TMC_fe ~ 11/10 T_MCP_fe stays unavailable | the session's open-hand frames: transitions with a movement_start_time_s, frames before movement_start_time_s - 0.1 s (leap_hand.tmc_estimate) |  |
+| thumb TMC | abduction/adduction |  | unvalidated estimate | `T_TMC_aa_est_neutral` | palm frame via the rest frame of a tmc_neutral calibration take | the tmc_neutral posture held in a calibration take (thumb beside the index, in the plane of the palm; docs/tmc_calibration_protocol.md) | abduction positive toward the thumb side, radial (both hands) | paper_order on R_rest^T (R_palm^T R_metacarpal); see leap_hand.tmc_estimate | NOT a validated Paper 3 coordinate: the same tracker-relative coordinate referred to a held reference posture instead of the incidental open hand; the posture stands in for the ISB first-CMC neutral and is not that neutral, and the cross-talk caveat is the same (docs/tmc_estimate.md) | a tmc_neutral calibration take of the same session and hand (scripts/leap/record_poses.py --calibration tmc_neutral, docs/tmc_calibration_protocol.md; leap_hand.tmc_calibration_take), its calibration.json given as --tmc-calibration; none recorded yet (2026-10-24) |  |
+| thumb TMC | abduction/adduction |  | reference-evaluated | `T_TMC_aa_mapped` | the reference device's trapezium (proximal) frame, through the rotation fitted from the tracker's palm frame (leap_hand.reference_validation) | the reference capture's declared zero (e.g. the ISB neutral) | abduction positive with the metacarpal head moving palmarly, out of the plane of the palm (palmar abduction; both hands) | the reference's declared rotation order on A R_pm b, with A and b fitted on calibration trials only and the errors measured on held-out trials (leap_hand.reference_validation) | reference-evaluated only inside the scope of the mapping that produced it: the participant, hand and tracker session it was evaluated on, inside its tested range, with the row status T_TMC_mapped_status (evaluated_in_range; synthetic_demonstration or cross_check when the reference was synthetic or not an anatomical reference); empty elsewhere, and empty in every row of the 2026-10-08 dataset. No mapping evaluated against a measured anatomical reference exists yet (2026-10-24) | a validation session recorded with scripts/leap/record_validation.py while an anatomical reference device records the same hand (docs/validation_capture_protocol.md), compared with scripts/leap/reference_validation.py compare |  |
 | thumb MCP | flexion/extension | `T_MCP_fe` | calculated | `T_MCP_fe` | parent bone frame (THUMB_METACARPAL) | bone in line with the parent | flexion positive toward the palm (both hands) | xyz: R = Rx(a) Ry(b) Rz(c), flexion first (joint_frames.joint_angles) |  |  | `T_MCP_fe` |
 | thumb MCP | abduction/adduction |  | outside Paper 3 | `T_MCP_aa_tracker` | parent bone frame (THUMB_METACARPAL) | bone in line with the parent | abduction positive toward the thumb side, radial (both hands) | xyz second angle (joint_frames.joint_angles abd_deg) | the paper's thumb MCP has 1 DoF (Table 3, p.5) |  | `THUMB_PROXIMAL.abd_deg` |
 | thumb IP | flexion/extension | `T_IP` | calculated | `T_IP` | parent bone frame (THUMB_PROXIMAL) | bone in line with the parent | flexion positive toward the palm (both hands) | xyz: R = Rx(a) Ry(b) Rz(c), flexion first (joint_frames.joint_angles) |  |  | `T_IP` |
@@ -129,35 +155,55 @@ assumption of that experiment, stated in `paper3`'s module docstring ("EQ.
 9-11 HERE") and in its `ERROR_NOTE`: the palm-arc part of the paper's error is
 not in those numbers.
 
-The thumb TMC estimate (`T_TMC_fe_est_openhand`, `T_TMC_aa_est_openhand`) is
-not a fill either: it is a different coordinate (relative to the recorded
-open hand, with an unknown offset from the paper's zero), in its own columns,
-with its own status, computed by `leap_hand.tmc_estimate`
-(`docs/tmc_estimate.md`); where it appears is in section 6, "Where the
-estimate appears".
+The thumb TMC estimates (`T_TMC_fe_est_openhand`, `T_TMC_aa_est_openhand`;
+`T_TMC_fe_est_neutral`, `T_TMC_aa_est_neutral`) are not a fill either: each
+is a different coordinate, tracker-relative and referred to its own reference
+(the recorded open hand, or a held `tmc_neutral` posture), whose difference
+from the paper's anatomical coordinate is a pose-dependent reference change
+and not an offset that a zero could remove (`docs/tmc_estimate.md`, "What a
+change of reference does"); they sit in their own columns, with their own
+status, computed by `leap_hand.tmc_estimate`; where they appear is in
+section 6, "Where the estimate appears". Validated thumb TMC flexion and
+abduction, and the four finger CMC flexions, remain unavailable: they are
+never filled with zero, with a tracker-frame value under an anatomical name,
+or with a prediction from Paper 3's relationships.
 
 ## 5. What each unavailable coordinate would need
 
+The full specification of each of the six, with what this dataset supports
+kept apart from Paper 3's assumptions, is `docs/measurement_specification.md`;
+the path for real reference measurements is `docs/reference_validation.md`,
+and the live procedure `docs/validation_capture_protocol.md`.
+
 - **Finger CMC (I, M, R, L; the palm arc)**: a sensor that measures each
-  metacarpal against the carpus. LeapC fits a rigid palm; the StretchSense
-  glove has no palm-arc sensor either. Options: optical markers on the four
-  metacarpal heads and the wrist with a marker-based fit, or a tracker whose
-  hand model has palm-arc joints. Without one, no recording of this setup can
-  give it. (The wrist-frame metacarpal flexion is the forearm-to-palm bend,
-  not the palm arc; against the palm it is a constant of the tracker's rigid
-  hand.)
+  metacarpal against the carpus. LeapC fits a rigid palm: measured on every
+  frame of the dataset on 2026-10-24, its four finger metacarpals never leave
+  their mean orientation in the palm frame by more than 0.000024 deg
+  (`docs/measurement_specification.md`, "Observability"), so the motion is
+  unobservable by this tracker and no calibration can recover it. The
+  StretchSense glove has no palm-arc sensor either. Options: optical markers
+  on the four metacarpals and a carpal cluster, or electromagnetic sensors;
+  the values are then that device's measurements. (The wrist-frame
+  metacarpal flexion is the forearm-to-palm bend, not the palm arc; against
+  the palm it is a constant of the tracker's rigid hand.)
 - **Finger CMC abduction**: not in Paper 3's model at all, and not measured
   (rigid palm). The same sensor as for the CMC flexion would measure it; it
   would still be a tracker-only value outside the 24.
-- **Validated thumb TMC (`T_TMC_fe`, `T_TMC_aa`)**: a calibration recording
-  with the thumb in an anatomically defined neutral (ISB-style TMC frame from
-  the trapezium and first metacarpal landmarks, Cheze et al. 2008 as cited by
-  Paper 3) or a goniometer reading at a recorded reference pose, so the
-  estimate's zero can be tied to the paper's; plus an independent sensor (the
-  paper used a Cyberglove) to validate the mapping. The wrist-frame XYZ pair
-  of the thumb metacarpal is about the hand's axes (the thumb's own flexion
+- **Validated thumb TMC (`T_TMC_fe`, `T_TMC_aa`)**: an anatomical reference
+  frame on the same hand (an ISB-style TMC frame from the trapezium and first
+  metacarpal landmarks, Cheze et al. 2008 as cited by Paper 3), because a
+  change of reference mixes the two angles pose-dependently and a zero
+  posture alone (a goniometer reading at a recorded reference pose, or the
+  `tmc_neutral` calibration take of `docs/tmc_calibration_protocol.md`, none
+  recorded yet) fixes the zero's repeatability but not that mixing; plus an
+  independent sensor (the paper used a Cyberglove) to validate the mapping's
+  scale and cross-talk over the postures used. The wrist-frame XYZ pair of
+  the thumb metacarpal is about the hand's axes (the thumb's own flexion
   axis is about 81 degrees from the palm's x) and cannot be converted,
   because the paper's thumb frame is given only as a drawing (Figure 1, p.3).
+  The import and comparison path for that reference, with the mapping fitted
+  on calibration trials and tested on held-out ones, exists
+  (`leap_hand.reference_validation`); no reference capture does yet.
 
 ## 6. Where the numbers go
 
@@ -178,66 +224,101 @@ from the same reconstructed poses as the Paper 3 comparison:
 
 | File | Rows | Columns |
 |---|---|---|
-| `angle_coverage.csv` | one per entry (43) | the table above (`coverage_rows()`) |
-| `angles_per_frame.csv` | one per selected frame (71,709 over the dataset) | `kind, name, take, hand_side, hand_id, frame_index, frame_id, t_s, hold` (1/0 inside/outside the metadata's static interval, blank for transitions), the 68 columns of `ALL_ANGLE_COLUMNS` in table order (degrees, 6 decimals; the six unavailable empty), `T_TMC_fe_est_openhand`, `T_TMC_aa_est_openhand`, `T_TMC_est_calibration` (below, "Where the estimate appears") |
-| `angles_per_recording.csv` | one per recording (167) | the representative frame's value (static takes: the frame whose `frame_id` is the metadata's `representative_frame_id`; transitions blank) and the hold-frame mean, min and max of each of the 26 `calculated` columns, the finger MCP in both orders |
+| `angle_coverage.csv` | one per entry (47) | the table above (`coverage_rows()`) |
+| `angles_per_frame.csv` | one per selected frame (71,709 over the dataset) | `kind, name, take, hand_side, hand_id, frame_index, frame_id, t_s, hold` (1/0 inside/outside the metadata's static interval, blank for transitions), the 68 columns of `ALL_ANGLE_COLUMNS` in table order (degrees, 6 decimals; the six unavailable empty), `T_TMC_fe_est_openhand`, `T_TMC_aa_est_openhand`, `T_TMC_fe_est_neutral`, `T_TMC_aa_est_neutral`, `T_TMC_est_calibration` (below, "Where the estimate appears"), then `T_TMC_fe_mapped`, `T_TMC_aa_mapped`, `T_TMC_mapped_status`, `T_TMC_mapping` (filled only with `--tmc-mapping`, inside the mapping's scope; `docs/reference_validation.md`) |
+| `angles_per_recording.csv` | one per recording (167) | the representative frame's value (static takes: the frame whose `frame_id` is the metadata's `representative_frame_id`; transitions blank) and the hold-frame mean, min and max of each of the 26 `calculated` columns, the finger MCP in both orders, and of the four estimate columns (the run's kind filled, the other kind blank) |
 
 `--check-angle-exports` (after the run, or alone with `--out`) checks the
 per-frame file against `fidelity.json`: one row per selected frame, the 16
 finger MCP columns (`{I,M,R,L}_MCP_{fe,aa}` and their `_paper_order` twins)
-numeric in every row, the two estimate columns present, the six unavailable
-columns empty in every row, and `angle_coverage.csv` with 43 rows.
+numeric in every row, the four estimate columns present, every row with an
+estimate carrying both values of exactly one kind and a calibration naming
+that kind, the six unavailable columns empty in every row, the mapped
+columns present with every filled pair carrying a value status and its
+mapping and no value status without values, and `angle_coverage.csv` with 47
+rows. Its line ends `mapped_columns=2 mapped_filled=<rows>`.
 
 **The viewer** (`scripts/leap/replay_view.py`) has a third text panel between
 the HUD and the Paper 3 panel, "Angles of the displayed source frame
-(degrees)": the sign line once; the wrist rows; per digit a line carrying the
+(degrees; calculated = tracker coordinate)": the sign line once; the wrist rows; per digit a line carrying the
 twist of each of its bones, then each column with its value and status
 (`calculated`, `outside Paper 3`); every finger MCP twice, labelled "MCP fe
 (xyz, flexion first)" and "MCP fe (paper order, abduction first)", and the
-same for aa; one line naming the six unavailable coordinates; and, apart, the
+same for aa; one line naming the six unavailable coordinates; with
+`--tmc-mapping`, two rows right under it, `mapped (reference-evaluated |
+SYNTHETIC, not measured | cross-check only): T_TMC_fe_mapped ...
+T_TMC_aa_mapped ...` and the tested range and scope, or why the mapping is
+not applied or the values are empty; and, apart, the
 block "estimated (open-hand calibration; not a validated Paper 3
-coordinate)", which says "not computed (no calibration loaded)" unless the
-viewer is given a `tmc_provider`.
+coordinate)" or "estimated (tmc_neutral calibration take; not a validated
+Paper 3 coordinate)", titled by the loaded calibration's kind, which says
+"not computed (no calibration loaded)" unless the viewer is given a
+`tmc_provider`.
 
 ### Where the estimate appears
 
 The thumb TMC estimate (`leap_hand.tmc_estimate`; mapping, calibration,
-assumptions A1 to A5 and uncertainty in `docs/tmc_estimate.md`) is relative
-to the recorded open hand, never a validated Paper 3 coordinate:
-`T_TMC_fe` and `T_TMC_aa` stay empty everywhere.
+assumptions A1 to A5 and uncertainty in `docs/tmc_estimate.md`) is a
+tracker-relative coordinate referred to its calibration's reference (the
+recorded open hand, kind `openhand`, or a held `tmc_neutral` posture, kind
+`neutral`; `Calibration.kind`, with the hand in `Calibration.hand`), never a
+validated Paper 3 coordinate: `T_TMC_fe` and `T_TMC_aa` stay empty
+everywhere. The kind is carried from the calibration file through loading,
+estimation, export and display (2026-10-24, after Codex's review):
 
-- **`angles_per_frame.csv`**: `T_TMC_fe_est_openhand` and
-  `T_TMC_aa_est_openhand` in every row the batch could estimate, and
+- **`angles_per_frame.csv`**: the two columns of the run's kind
+  (`T_TMC_fe_est_openhand` and `T_TMC_aa_est_openhand`, or
+  `T_TMC_fe_est_neutral` and `T_TMC_aa_est_neutral`) in every row the batch
+  could estimate, the other kind's two columns empty, and
   `T_TMC_est_calibration` naming the calibration as
-  `openhand:<session>:<transitions>t/<frames>f`. The batch calibrates once
-  per run (`tmc_estimate.calibrate` over the dataset's transitions, or
-  `--tmc-calibration PATH`) and computes the estimate from the poses it has
-  already reconstructed. 2026-10-23 run: all 71,709 rows,
+  `<kind>:<session>:<transitions or takes>t/<frames>f`. The batch calibrates
+  once per run (`tmc_estimate.calibrate` over the dataset's transitions, or
+  `--tmc-calibration PATH`, a `calibration.json` of either writer) and
+  computes the estimate from the poses it has already reconstructed.
+  2026-10-23 run: all 71,709 rows,
   `openhand:20261001_101621_left:42t/4379f`; the values agree with
   `tmc_estimate_report.py`'s `estimates_per_frame.csv` to 5e-5 deg (that
   file's 4-decimal rounding) on every frame. Without a calibration (no
-  transition with a movement start and 20 open-hand frames) the three
-  columns are empty and `summary.md` says why; a recording whose metadata
-  names another session than the calibration's is left empty too.
-- **`angles_per_recording.csv`**: `T_TMC_fe_est_openhand_rep`, `_hold_mean`,
-  `_hold_min`, `_hold_max`, the same for `T_TMC_aa_est_openhand`, and
-  `T_TMC_est_calibration`.
+  transition with a movement start and 20 open-hand frames) the five columns
+  are empty and `summary.md` says why; a recording whose metadata names
+  another session than the calibration's, or whose hand is not the
+  calibration's, is left empty too, with the reason in `summary.md` and
+  `tmc_calibration_used.json`.
+- **`angles_per_recording.csv`**: `_rep`, `_hold_mean`, `_hold_min` and
+  `_hold_max` of each of the four estimate columns (the run's kind filled,
+  the other blank), and `T_TMC_est_calibration`.
 - **`tmc_calibration_used.json`** (beside them): the calibration the run used
-  (`Calibration.to_json`, plus `provenance_id`, `source`, `rows_estimated`),
-  readable again with `--tmc-calibration`; or `"calibration": null` with the
-  reason.
-- **`--check-angle-exports`** appends `est_filled=<rows with both values>` to
-  its OK line (`est_filled=71709` on the dataset) and fails on a row with one
-  estimate value, or with values but no `T_TMC_est_calibration`.
-- **The viewer's "estimated" block**: the two values, the twist about the
-  bone with its residual, and one provenance row (transitions and the
-  rest-frame agreement median/p90/max; the full provenance is printed when
-  the calibration loads). `replay_view.py` with `--dataset` takes
-  `--tmc-calibration PATH`, else
+  (`Calibration.to_json` with `kind` and `hand`, plus `provenance_id`,
+  `source`, `rows_estimated`, `not_estimated`), readable again with
+  `--tmc-calibration`; or `"calibration": null` with the reason. A
+  `calibration.json` written before the `kind` field existed is read by the
+  first words of its provenance (`open-hand calibration` /
+  `tmc_neutral calibration`), anything else is refused with the fix spelled
+  out. One written before the `hand` field existed is applied only once its
+  hand is known: declared with `--tmc-calibration-hand left|right`, or, for
+  an open-hand file, recovered from `metadata/pose_transitions.csv` when the
+  table names every transition the file lists and they record one hand;
+  otherwise every row's estimate stays empty and `summary.md` and
+  `tmc_calibration_used.json` say "calibration hand not recorded" (Codex's
+  recheck, 2026-10-24). The hand is never taken from the recording.
+- **`--check-angle-exports`** appends `est_filled=<rows with one complete
+  pair>` to its OK line (`est_columns=4`; `est_filled=71709` on the dataset)
+  and fails on a row with one estimate value, with both kinds, with values
+  but no `T_TMC_est_calibration`, with a calibration naming the other kind,
+  or on a file whose rows carry two kinds.
+- **The viewer's "estimated" block**, titled by the kind: that kind's two
+  values, the twist about the bone with its residual, and one provenance row
+  ("open hand, N transitions" or "neutral posture take, N takes", with the
+  rest-frame agreement median/p90/max; the full provenance, the kind and the
+  hand are printed when the calibration loads). `replay_view.py` takes
+  `--tmc-calibration PATH` (either kind); with `--dataset` and no path,
   `results\replay_fidelity\tmc_estimate\calibration.json` when it exists,
-  else computes one (and prints how long it took); `--no-tmc`, or `--file`
-  without `--tmc-calibration`, leaves it "not computed". The headless
-  screenshots carry the same block.
+  else it computes an open-hand one (and prints how long it took);
+  `--no-tmc`, or `--file` without `--tmc-calibration`, leaves it "not
+  computed"; a calibration of another session or hand, or of no known hand,
+  shows "not applied" with the reason (`--tmc-calibration-hand left|right`
+  declares the hand of an older file). The headless screenshots carry the
+  same block.
 
 ## 7. The dataset's own columns, mapped
 

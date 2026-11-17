@@ -73,10 +73,13 @@ A2_TEXT = (
     "uncertainty. spread_*: the frames of one window about that window's mean.")
 A3_TEXT = (
     "The open hand is the zero. Paper 3 gives its zero only as a drawing "
-    "(Figure 1, p.3) and Table 5's ranges fix no zero, so the estimate is "
-    "relative to the recorded open hand and differs from the paper's T_TMC_fe "
-    "and T_TMC_aa by an unknown constant per coordinate. It is never used as "
-    "a validated Paper 3 coordinate: it is written only under *_est_openhand "
+    "(Figure 1, p.3) and Table 5's ranges fix no zero, so the estimate is a "
+    "tracker-relative coordinate referred to the recorded open hand. Its "
+    "difference from the paper's T_TMC_fe and T_TMC_aa is a change of reference "
+    "rotation, which after the abduction-then-flexion decomposition shifts both "
+    "angles by pose-dependent amounts (cross-talk), not by a fixed amount per "
+    "angle (tmc_estimate, 'WHAT A CHANGE OF REFERENCE DOES'). It is never used "
+    "as a validated Paper 3 coordinate: it is written only under *_est_openhand "
     "names, and paper3.compare keeps the Table 6 relation T_TMC_fe ~ 11/10 "
     "T_MCP_fe 'unavailable'. Not measurable with this dataset.")
 A4_TEXT = (
@@ -88,8 +91,9 @@ A5_TEXT = (
     "The palm frame stands for the carpus. The trapezium is not tracked and "
     "LeapC fits a rigid palm, so the TMC is measured against the PALM joint's "
     "frame. How far that frame is from an anatomical trapezium frame is not "
-    "measured by this dataset; it is part of A3's unknown constant (and of a "
-    "possible scale or cross-talk error a validation would have to measure).")
+    "measured by this dataset; it is part of the pose-dependent reference "
+    "difference of A3 (and of a possible scale or cross-talk error a validation "
+    "would have to measure).")
 ORIGIN_TEXT = (
     "rec.timeline.t counts from the first selected frame on the camera clock "
     "(timestamp_us); movement_start_time_s counts from first_frame_capture_time "

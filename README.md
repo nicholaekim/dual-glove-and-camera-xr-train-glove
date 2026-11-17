@@ -267,24 +267,42 @@ reject reasons and in each take's `gate.losses`.
 **Replay a recorded take and check it against itself (no hardware).**
 `scripts\leap\replay_view.py` plays every selected-hand frame of a take from
 the organized grasp dataset on the camera's own clock, with the tracking
-gaps, hand-id changes and dropped frames marked on the timeline, exact
-source-frame stepping, optional interpolation that never crosses a declared
-discontinuity, the recorded `abs26` positions overlaid on the reconstructed
-skeleton with the residual in the HUD, joint axes, a camera / wrist / palm
-reference frame, an angle panel (every joint's flexion and abduction with
-its status, the finger MCP in both rotation orders, and a separate block for
-the open-hand-calibrated thumb TMC estimate, which is not a validated Paper
-3 coordinate), and a separate Paper 3 panel (Cobos et al. 2009
-relationships with page citations, no pass/fail). `scripts\leap\replay_verify.py`
-runs the same reconstruction over all 115 static takes and 52 transitions
-and writes the numbers, the per-frame angles and the joint-by-movement
-coverage table to `results\replay_fidelity\`;
+gaps, hand-id changes, invalid-tracking lines and dropped frames marked on
+the timeline, exact source-frame stepping, optional interpolation that never
+crosses a declared discontinuity (a hand-id change, a clock gap or an
+invalid-tracking line), the recorded `abs26` positions overlaid on the
+reconstructed skeleton with the residual in the HUD, joint axes, a camera /
+wrist / palm reference frame, an angle panel (every joint's flexion and
+abduction with its status, the finger MCP in both rotation orders, and a
+separate block for the thumb TMC estimate, a tracker-relative coordinate
+referred to the loaded calibration's reference, open hand or `tmc_neutral`
+take, which is not a validated Paper 3 coordinate), and a separate Paper 3
+panel (Cobos et al. 2009 relationships with page citations, no pass/fail).
+`scripts\leap\replay_verify.py` runs the same reconstruction over all 115
+static takes and 52 transitions and writes the numbers, the per-frame angles
+and the joint-by-movement coverage table to `results\replay_fidelity\`;
 `scripts\leap\tmc_estimate_report.py` writes the thumb TMC estimate with
-its calibration and assumption checks. Method, tolerances and measured
-errors: `docs/replay_fidelity.md`; angle coverage: `docs/angle_coverage.md`;
-the TMC estimate: `docs/tmc_estimate.md`; plans: `docs/replay_plan.md` and
-`docs/angle_coverage_plan.md`; handoff for the independent review:
+its calibration and assumption checks; `scripts\leap\replay_playback_check.py`
+measures the real window's rendering rate over repeated playback trials.
+Method, tolerances and measured errors: `docs/replay_fidelity.md`; angle
+coverage: `docs/angle_coverage.md`; the TMC estimate: `docs/tmc_estimate.md`;
+plans: `docs/replay_plan.md`, `docs/angle_coverage_plan.md` and
+`docs/codex_corrections_plan.md`; handoff for the independent review:
 `docs/replay_handoff_codex.md`.
+
+The six Paper 3 coordinates the tracker does not give (the thumb TMC pair and
+the four finger CMC) need an independent reference device; nothing in this
+repository can manufacture them. `docs/measurement_specification.md` says
+what each needs (the finger CMC are unobservable by this tracker: its
+metacarpals never move against its palm, measured on every frame of the
+dataset); `scripts\leap\record_validation.py` records the tracker side of a
+validation session while the reference device records the same hand;
+`scripts\leap\reference_validation.py` imports the reference
+(`docs/reference_validation.md`, format `hand_reference_v1`), fits the
+palm-to-trapezium mapping on calibration trials and reports bias, MAE, RMSE,
+gain, cross-talk and repeatability on held-out trials, and runs a synthetic
+end-to-end example; the live procedure is `docs/validation_capture_protocol.md`.
+No reference capture exists yet; handoff: `docs/validation_handoff_codex.md`.
 
 ```powershell
 .venv\Scripts\python.exe scripts\leap\replay_view.py --dataset "..\xr trainer\grasp set 2026-10-08 organized" --grasp p3_circular_power --take 1
@@ -1728,6 +1746,16 @@ src/xr_hand/joint_frames.py  26 joint frames: wrist-frame positions, local axes,
                              24 named angles (docs/joint_frames.md)
 scripts/joint_frames_view.py live axes on the camera image; --take / --session
                              export CSV, PNG and one PDF for the hand-in
+scripts/leap/pose_catalogue.py  100 new static poses for the Leap with reference joint
+                             ranges from the constraint tables (docs/pose_catalogue_100.md,
+                             protocols/pose_catalogue_100.csv)
+scripts/leap/myosuite_hand_limits.py  MyoSuite's MyoHand joint ranges beside Paper 3's
+                             Table 5 and the glove's spans (docs/myosuite_constraints.md;
+                             runs in .venv-myo: mujoco, myosuite, myo_sim)
+scripts/leap/glove_planar_poses.py  50 single-plane poses for the XR glove, not in the
+                             database or the camera catalogue, with reference ranges and
+                             the constraint each tests (docs/glove_planar_poses_50.md,
+                             protocols/glove_planar_poses_50.csv and .json)
 archive/summer-xr-trainer/   July glove-only repo, merged with history: the
                              42-take July dataset, REPORT.txt, technical PDF,
                              record_frame.ps1 (frozen, see archive/README.md)

@@ -91,6 +91,36 @@ def slugify(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
 
 
+def load_pose_list(path) -> tuple[list, dict]:
+    """(pose ids in order, {id: (label, shape)}) from a pose-list JSON: an
+    object with `items`, each with an `id` that is already a file-name safe
+    pose name, and optionally a `label` and a `shape`. ValueError says what is
+    wrong with the file.
+
+    shortcut: scripts/record_simultaneous.py keeps its own copy of this (it
+    exits instead of raising); fold the two when that script is next touched.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as e:
+        raise ValueError(f"cannot read {path}: {e}")
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list) or not items:
+        raise ValueError(f"{path} has no items")
+    ids: list = []
+    text: dict = {}
+    for n, item in enumerate(items, 1):
+        pid = str(item.get("id") or "") if isinstance(item, dict) else ""
+        if not pid or slugify(pid) != pid:
+            raise ValueError(f"item {n} of {path} needs an id made of "
+                             "lower-case letters, digits and _")
+        if pid in text:
+            raise ValueError(f"id {pid!r} appears twice in {path}")
+        ids.append(pid)
+        text[pid] = (str(item.get("label") or pid), str(item.get("shape") or ""))
+    return ids, text
+
+
 def pose_filename(pose: str, take: int) -> str:
     """fist, 2 -> 'fist_take2_20260701_154212.jsonl' (hand added on finalize)."""
     stamp = time.strftime("%Y%m%d_%H%M%S")

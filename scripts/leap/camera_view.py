@@ -22,6 +22,9 @@ It is fed from the SDK's callback at a few microseconds a frame, so the
 window does not lag for it.
 
 Other scripts start it for you and feed it a caption through --status-file.
+With `ref=<path>` there the window also shows that picture (the professor's
+frame of the pose being recorded, `reference_poses/`), 240 px wide in its
+top-right corner under "TARGET: <POSE>", on the annotated window frame only.
 The still a recorder asks for there (`snap=<path>`) is cropped to the tracked
 hand, which reduces what it shows to the hand and a margin around it (a hand
 held near the face can still include part of it). The still has nothing drawn
@@ -44,8 +47,9 @@ import leap
 from leap import enums
 from leapc_cffi import ffi, libleapc
 
-from leap_hand.protocol import (NO_TRACKED_HAND, QUIT, crop_hand, image_banner, parse_status,
-                                save_still, skipped_still_path, skipped_still_text)
+from leap_hand.protocol import (NO_TRACKED_HAND, QUIT, REFERENCE_WIDTH, crop_hand, image_banner,
+                                parse_status, paste_reference, reference_label, save_still,
+                                skipped_still_path, skipped_still_text)
 from leap_hand.tracking_quality import (HandState, LiveLossTracker, Sample, decode_device_status,
                                         image_stats)
 
@@ -234,28 +238,46 @@ def parent_alive():
 
 
 def read_status():
-    """The status file: (caption, snapshot path or None), band applied as a side effect.
+    """The status file: (caption, snapshot path or None, reference picture path
+    or None), band applied as a side effect.
 
     Line 1 is the caption; the rest are `key=value` in any order — `band=LOW,HIGH`
-    (cm) moves the height target, `snap=<path>` asks for one still. The format
-    lives in leap_hand.protocol so the recorder that writes it and this viewer
-    cannot drift apart."""
+    (cm) moves the height target, `snap=<path>` asks for one still, `ref=<path>`
+    is the reference picture of the pose being asked for. The format lives in
+    leap_hand.protocol so the recorder that writes it and this viewer cannot
+    drift apart."""
     global LOW, HIGH
     if not args.status_file:
-        return "", None
+        return "", None, None
     try:
         with open(args.status_file, encoding="utf-8") as fh:
             text = fh.read()
     except OSError:
-        return "", None
-    caption, band, snap = parse_status(text)
+        return "", None, None
+    caption, band, snap, ref = parse_status(text)
     if band:
         LOW, HIGH = band
-    return caption, snap
+    return caption, snap, ref
 
 
-def read_caption():
-    return read_status()[0]
+_refs = {}                        # reference picture path -> image scaled to REFERENCE_WIDTH
+
+
+def reference_image(path):
+    """The reference picture at `path`, scaled to REFERENCE_WIDTH px wide, or None.
+    Loaded once per path; a missing or unreadable file is retried, not cached."""
+    if path in _refs:
+        return _refs[path]
+    if not os.path.isfile(path):
+        return None
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    img = cv2.resize(img, (REFERENCE_WIDTH, max(1, round(h * REFERENCE_WIDTH / w))),
+                     interpolation=cv2.INTER_AREA)
+    _refs[path] = img
+    return img
 
 
 def compose():
@@ -307,9 +329,15 @@ def compose():
     wanted = [args.hand] if args.hand != "both" else ["left", "right"]
     seen = {h["side"]: h for h in hands}
     y = 30
-    caption = read_caption()
+    caption, _snap, ref = read_status()
     if caption and caption != QUIT:
         put(frame, caption, (14, y), 0.75, (0, 255, 255), 2); y += 34
+    # the professor's picture of the pose being asked for, on `frame` only:
+    # `plain`, which every still is cut from, never carries it
+    ref_img = reference_image(ref) if ref else None
+    if ref_img is not None:
+        paste_reference(frame, ref_img, reference_label(ref),
+                        lambda f, t, o: put(f, t, o, 0.75, (0, 255, 255), 2))
     ok_all = True
     for side in wanted:
         h = seen.get(side)
@@ -373,7 +401,7 @@ try:
         # is written, only a note saying so, which the recorder copies into
         # the take's meta.json: a still skipped on purpose is then not
         # mistaken for one lost to a crash.
-        caption_now, want_snap = read_status()
+        caption_now, want_snap, _ref = read_status()
         if want_snap and want_snap != snapped:
             snapped = want_snap
             # ONE frame for everything this still says: `source` is the plain

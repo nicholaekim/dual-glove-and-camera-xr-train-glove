@@ -21,18 +21,41 @@ Every recording is read and measured with the replay viewer's own code
             paper3.frame_angles, the ones the comparison uses), the six
             unavailable Paper 3 coordinates empty, never 0.
   estimate  leap_hand.tmc_estimate.estimate on the same poses: the thumb TMC
-            pair relative to the recorded open hand (T_TMC_fe_est_openhand,
-            T_TMC_aa_est_openhand), with T_TMC_est_calibration naming the
-            calibration (openhand:<session>:<transitions>t/<frames>f). An
-            ESTIMATE, not a validated Paper 3 coordinate (docs/tmc_estimate.md).
-            The calibration is made once per run, tmc_estimate.calibrate over
-            the dataset's transitions, or read from --tmc-calibration PATH (a
-            calibration.json of tmc_estimate_report.py, or a
-            tmc_calibration_used.json of an earlier run). Without one (no
+            pair relative to the calibration's reference, in the columns of
+            the calibration's kind (T_TMC_fe_est_openhand / T_TMC_aa_est_openhand
+            for the session's recorded open hand, T_TMC_fe_est_neutral /
+            T_TMC_aa_est_neutral for a tmc_neutral calibration take; the other
+            kind's two columns stay empty), with T_TMC_est_calibration naming
+            the calibration (<kind>:<session>:<transitions or takes>t/<frames>f).
+            A tracker-relative ESTIMATE, not a validated Paper 3 coordinate
+            (docs/tmc_estimate.md). The calibration is made once per run,
+            tmc_estimate.calibrate over the dataset's transitions, or read
+            from --tmc-calibration PATH (a calibration.json of
+            tmc_estimate_report.py or of record_poses.py --calibration
+            tmc_neutral, or a tmc_calibration_used.json of an earlier run; a
+            file without a "kind" is read by its provenance's first words or
+            refused; a file without a "hand" is applied only when
+            --tmc-calibration-hand declares it or the dataset's
+            metadata/pose_transitions.csv names its transitions and their
+            hand, never from the recording or a file name). Without one (no
             transition with a movement start and enough open-hand frames) the
-            three columns stay empty and summary.md says why; a recording
-            whose metadata names another session than the calibration's gets
-            none either.
+            five columns stay empty and summary.md says why; a recording
+            whose metadata names another session, or whose hand differs from
+            the calibration's or is not known to it, gets none either.
+  mapped    with --tmc-mapping PATH (a mapping.json of
+            scripts/leap/reference_validation.py compare: a mapping fitted and
+            held-out-tested against an independent reference device), the
+            thumb TMC pair through it, T_TMC_fe_mapped / T_TMC_aa_mapped, with
+            T_TMC_mapped_status per row (evaluated_in_range, or
+            synthetic_demonstration / cross_check when the reference was
+            synthetic or not an anatomical reference; outside_tested_range with
+            the values empty) and T_TMC_mapping naming the mapping. Only for a
+            recording of the mapping's participant, hand and session
+            (leap_hand.reference_validation.scope_mismatch); every other row
+            leaves the four cells empty and summary.md and
+            tmc_mapping_used.json say why. The dataset of 2026-10-08 has no
+            participant column and another session than any validation
+            capture, so no mapping applies to it.
 
 Each frame is reconstructed twice: inside recording_fidelity, and once here
 for the Paper 3 angles, the angle exports and the estimate (the calibration
@@ -44,19 +67,25 @@ Run (combinable): --all, --static GRASP TAKE, --transition TO_GRASP TAKE
     paper3_residuals.csv and .json, paper3_pooled_by_class.csv,
     paper3_fingertip_error.csv, angle_coverage.csv, angles_per_frame.csv,
     angles_per_recording.csv, tmc_calibration_used.json (the calibration the
-    estimate used, or why there is none), summary.md, and end with one line
+    estimate used, or why there is none), tmc_mapping_used.json (the mapping,
+    the rows it filled and why the others are empty), summary.md, and end with
+    one line
       FIDELITY OK: static=<n> transitions=<m> frames=<f> within_tolerance=<k>/<total>
     or FIDELITY FAIL: ... and exit 1 when a recording is outside the declared
     tolerances or cannot be loaded.
   --scenarios   also writes OUT/scenarios/<name>.json for the four SCENARIOS.
   --check-angle-exports   after the run, or alone on an existing --out: the
     per-frame angle file against fidelity.json (one row per selected frame,
-    the 16 finger MCP columns numeric in every row, the two estimate columns
-    and their calibration column present, every row with an estimate having
-    both values and its calibration, the six unavailable columns empty in
-    every row); prints
-      ANGLE EXPORTS OK: rows=<n> mcp_columns=16 est_columns=2 unavailable_empty=6 est_filled=<e>
-    (e = rows with both estimate values) or ANGLE EXPORTS FAIL: ... and exits 1.
+    the 16 finger MCP columns numeric in every row, the four estimate columns
+    (two per kind) and their calibration column present, every row with an
+    estimate having both values of one kind and a calibration naming that
+    kind, the six unavailable columns empty in every row, the two mapped
+    columns with their status and mapping columns present, a row with mapped
+    values having both numeric, a value-bearing status and its mapping named,
+    a row without values having no value-bearing status); prints
+      ANGLE EXPORTS OK: rows=<n> mcp_columns=16 est_columns=4 unavailable_empty=6 est_filled=<e> mapped_columns=2 mapped_filled=<m>
+    (e = rows with one complete estimate pair, m = rows with both mapped values)
+    or ANGLE EXPORTS FAIL: ... and exits 1.
 Checks (alone):
   --check-scenarios DIR                     SCENARIOS OK | SCENARIOS FAIL: <which>
   --check-dataset-unchanged BASELINE ROOT   DATASET UNCHANGED | DATASET CHANGED
@@ -76,6 +105,7 @@ import math
 import os
 import time
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -83,6 +113,7 @@ import numpy as np
 
 from leap_hand import angle_coverage as ac
 from leap_hand import paper3 as p3
+from leap_hand import reference_validation as rvl
 from leap_hand import replay_core as rc
 from leap_hand import tmc_estimate as te
 from xr_hand.joint_frames import fmt_num
@@ -156,8 +187,11 @@ QUIRKS = [
 ANGLE_META_COLUMNS = ["kind", "name", "take", "hand_side", "hand_id", "frame_index",
                       "frame_id", "t_s", "hold"]
 EST_CALIBRATION_COLUMN = "T_TMC_est_calibration"
+MAPPED_TAIL = list(ac.MAPPED_COLUMNS) + [rvl.MAPPED_STATUS_COLUMN, rvl.MAPPING_ID_COLUMN]
 ANGLE_FRAME_COLUMNS = (ANGLE_META_COLUMNS + list(ac.ALL_ANGLE_COLUMNS)
-                       + list(ac.ESTIMATE_COLUMNS) + [EST_CALIBRATION_COLUMN])
+                       + list(ac.ESTIMATE_COLUMNS) + [EST_CALIBRATION_COLUMN] + MAPPED_TAIL)
+VALUE_STATUSES = ("evaluated_in_range", "synthetic_demonstration", "cross_check")
+TMC_MAPPING_USED = "tmc_mapping_used.json"
 MCP_COLUMNS = [f"{f}_MCP_{k}{order}" for f in p3.FINGERS for k in ("fe", "aa")
                for order in ("", "_paper_order")]
 CALCULATED_COLUMNS = [c for c in ac.ALL_ANGLE_COLUMNS
@@ -291,17 +325,15 @@ def duplicates(rows) -> dict:
 
 
 def provenance_id(cal: te.Calibration) -> str:
-    """The short calibration name written beside every estimated value."""
-    return f"openhand:{cal.session}:{cal.n_transitions}t/{cal.n_frames}f"
+    """The short calibration name written beside every estimated value:
+    <kind>:<session>:<transitions or takes>t/<frames>f."""
+    return f"{cal.kind}:{cal.session}:{cal.n_transitions}t/{cal.n_frames}f"
 
 
-def session_mismatch(rec: rc.Recording, cal: te.Calibration):
-    """Why the calibration does not apply to this recording (its metadata
-    names another session than the calibration's), or None."""
-    session = str(rec.metadata.get("session") or "").strip()
-    if session and cal.session and session != cal.session:
-        return f"recording of session {session}, calibration of session {cal.session}"
-    return None
+def calibration_mismatch(rec: rc.Recording, cal: te.Calibration):
+    """Why the calibration does not apply to this recording (another hand, or
+    its metadata names another session than the calibration's), or None."""
+    return te.mismatch(cal, rec.hand_side, rec.metadata.get("session"))
 
 
 def _start_counts(root) -> str:
@@ -316,14 +348,28 @@ def _start_counts(root) -> str:
 
 
 def tmc_calibration(args, root) -> dict:
-    """The run's open-hand calibration: {'cal': Calibration or None,
-    'source': where it came from, 'reason': why there is none}. A
-    --tmc-calibration file that cannot be read raises; a failed calibrate
-    is reported, never raised: the estimate columns then stay empty."""
+    """The run's calibration: {'cal': Calibration or None, 'source': where it
+    came from, 'reason': why there is none}. --tmc-calibration PATH is read
+    as either kind (Calibration.from_json); a file that cannot be read or
+    whose kind cannot be told raises; a failed open-hand calibrate is
+    reported, never raised: the estimate columns then stay empty."""
     if args.tmc_calibration is not None:
         doc = json.loads(Path(args.tmc_calibration).read_text(encoding="utf-8"))
-        return {"cal": te.Calibration.from_json(doc), "reason": None,
-                "source": f"read from {args.tmc_calibration}"}
+        declared = args.tmc_calibration_hand
+        cal = te.Calibration.from_json(doc, hand=declared)
+        if cal.hand is not None:
+            how = "declared with --tmc-calibration-hand" if declared else "recorded in the file"
+        else:                      # an older file: the source metadata, or nothing
+            hand, how = te.hand_from_transitions(cal, root)
+            if hand is not None:
+                cal = replace(cal, hand=hand)
+            else:
+                how = (f"not recorded in the file ({how}); the estimate is not applied: "
+                       "declare it with --tmc-calibration-hand left|right or regenerate "
+                       "the file")
+        return {"cal": cal, "reason": None,
+                "source": f"read from {args.tmc_calibration}; hand {cal.hand or 'unknown'} "
+                          f"({how})"}
     started = time.perf_counter()
     try:
         cal = te.calibrate(root)
@@ -335,10 +381,14 @@ def tmc_calibration(args, root) -> dict:
                        f"transitions in {time.perf_counter() - started:.1f} s")}
 
 
-def analyse(rec: rc.Recording, cal: te.Calibration = None) -> dict:
+def analyse(rec: rc.Recording, cal: te.Calibration = None,
+            mapping: "rvl.TmcMapping" = None) -> dict:
     """Everything the outputs need from one recording (no Recording kept).
-    With `cal`, the thumb TMC estimate of every frame (unless the session
-    differs: est None and est_note says why)."""
+    With `cal`, the thumb TMC estimate of every frame in the two columns of
+    the calibration's kind (unless the hand or the session differs: est None
+    and est_note says why). With `mapping`, the reference-mapped pair of every
+    frame with its row status, when the recording is inside the mapping's
+    scope (else mapped None and mapped_note says why)."""
     fid = rc.recording_fidelity(rec)                        # reconstructs each frame
     poses = [(r.pos, r.rot) for r in map(rc.reconstruct, rec.frames)]   # once more
     # every column of the coverage table per frame (NaN where None); its Paper 3
@@ -349,13 +399,28 @@ def analyse(rec: rc.Recording, cal: te.Calibration = None) -> dict:
             full[c][k] = np.nan if v is None else v
     est, est_note = None, "no calibration"
     if cal is not None:
-        est_note = session_mismatch(rec, cal)
+        est_note = calibration_mismatch(rec, cal)
     if cal is not None and est_note is None:
-        est = {c: np.empty(len(poses)) for c in ac.ESTIMATE_COLUMNS}
+        columns = ac.ESTIMATE_COLUMNS_BY_KIND[cal.kind]
+        est = {c: np.empty(len(poses)) for c in columns}
         for k, (pos, rot) in enumerate(poses):
             e = te.estimate(pos, rot, rec.hand_side, cal)
-            for c in ac.ESTIMATE_COLUMNS:
+            for c in columns:
                 est[c][k] = e[c]
+    mapped, mapped_status, mapped_note = None, None, "no mapping"
+    if mapping is not None:
+        scope = rvl.recording_scope(rec)
+        mapped_note = rvl.scope_mismatch(mapping, rec.hand_side, scope["session"],
+                                         scope["participant"])
+        if mapped_note is None:
+            mapped = {c: np.full(len(poses), np.nan) for c in ac.MAPPED_COLUMNS}
+            mapped_status = []
+            for k, (_pos, rot) in enumerate(poses):
+                v = rvl.apply_mapping(mapping, rot)
+                for c in ac.MAPPED_COLUMNS:
+                    if v[c] is not None:
+                        mapped[c][k] = v[c]
+                mapped_status.append(v["status"])
     angles = {n: full[n] for n in p3.ANGLE_NAMES}
     cls, cls_reason = p3.grasp_class(rec.name)
     hold = rc.hold_mask(rec)
@@ -391,6 +456,8 @@ def analyse(rec: rc.Recording, cal: te.Calibration = None) -> dict:
         "angles": angles, "all_angles": full, "hold": hold, "longest_gap": gap,
         "est": est, "est_note": est_note,
         "est_calibration": None if est is None else provenance_id(cal),
+        "mapped": mapped, "mapped_status": mapped_status, "mapped_note": mapped_note,
+        "mapping_id": None if mapped is None else mapping.id,
         "frame_ids": [f.frame_id for f in rec.frames],
         "hand_id_per_frame": [f.hand_id for f in rec.frames],
         "t_s": np.asarray(rec.timeline.t, dtype=float),
@@ -489,21 +556,28 @@ def write_angles_per_frame(path: Path, results) -> int:
     hold 1/0 inside/outside the metadata's static interval (blank without
     one: transitions), t_s on the recording's clock from its first selected
     frame, then every column of the coverage table. The six unavailable Paper
-    3 coordinates are empty in every row. The two thumb TMC estimate columns
-    and T_TMC_est_calibration are filled where the recording has an estimate
-    (`analyse` with a calibration), empty otherwise. Returns the number of
-    rows."""
+    3 coordinates are empty in every row. Of the four thumb TMC estimate
+    columns, the two of the calibration's kind and T_TMC_est_calibration are
+    filled where the recording has an estimate (`analyse` with a
+    calibration); the other kind's two, and every column without an
+    estimate, are empty. The two mapped columns, their status and the mapping
+    are filled only where the recording is inside a mapping's scope (`analyse`
+    with a mapping); outside the tested range the status is filled and the
+    values are empty. Returns the number of rows."""
     n = 0
     with open(path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(ANGLE_FRAME_COLUMNS)
         for a in results:
             cols = [a["all_angles"][c] for c in ac.ALL_ANGLE_COLUMNS]
-            hold, est = a["hold"], a["est"]
+            hold, est, mapped = a["hold"], a["est"], a.get("mapped")
             for k, frame_id in enumerate(a["frame_ids"]):
                 tail = ([""] * (len(ac.ESTIMATE_COLUMNS) + 1) if est is None else
-                        [_deg(est[c][k]) for c in ac.ESTIMATE_COLUMNS]
+                        [_deg(est[c][k]) if c in est else "" for c in ac.ESTIMATE_COLUMNS]
                         + [a["est_calibration"]])
+                tail += ([""] * len(MAPPED_TAIL) if mapped is None else
+                         [_deg(mapped[c][k]) for c in ac.MAPPED_COLUMNS]
+                         + [a["mapped_status"][k], a["mapping_id"]])
                 w.writerow([a["kind"], a["name"], _cell(a["take"]), a["hand_side"],
                             _cell(a["hand_id_per_frame"][k]), k, frame_id,
                             fmt_num(float(a["t_s"][k]), 6),
@@ -530,9 +604,9 @@ def _representative_index(a):
 def angle_recording_row(a) -> dict:
     """The representative frame's value and the hold-frame mean, min and max of
     every calculated column (the finger MCP in both orders) and of the two
-    thumb TMC estimate columns, with the estimate's calibration; blank where
-    a recording has no representative frame, no hold frames or no
-    estimate."""
+    thumb TMC estimate columns of the calibration's kind, with the estimate's
+    calibration; blank where a recording has no representative frame, no hold
+    frames or no estimate, and in the other kind's columns."""
     idx, note = _representative_index(a)
     hold = a["hold"]
     row = {"kind": a["kind"], "name": a["name"], "take": a["take"],
@@ -564,12 +638,12 @@ def _is_number(text) -> bool:
 def check_angle_exports(out):
     """(ok, lines): OUT/angles_per_frame.csv against OUT/fidelity.json. One
     row per selected frame (frames_selected), the 16 finger MCP columns (xyz
-    and paper order) numeric in every row, the two estimate columns and
-    T_TMC_est_calibration present, a row with any of those three filled
-    having both values numeric and its calibration (est_filled counts those
-    rows; 0 is not a failure: no calibration), the six unavailable Paper 3
-    coordinates empty in every row, and angle_coverage.csv with one row per
-    entry."""
+    and paper order) numeric in every row, the four estimate columns (two per
+    kind) and T_TMC_est_calibration present, a row with any of those five
+    filled having both values of exactly one kind numeric and a calibration
+    naming that kind (`<kind>:...`; est_filled counts those rows; 0 is not a
+    failure: no calibration), the six unavailable Paper 3 coordinates empty
+    in every row, and angle_coverage.csv with one row per entry."""
     out = Path(out)
     problems = []
     try:
@@ -580,15 +654,21 @@ def check_angle_exports(out):
         problems.append(f"cannot read frames_selected from {out / 'fidelity.json'} "
                         f"({type(e).__name__})")
     header, rows, malformed, est_filled, est_bad = [], 0, 0, 0, 0
-    mcp_bad, six_filled = Counter(), Counter()
+    mapped_filled, mapped_bad = 0, 0
+    mcp_bad, six_filled, est_by_kind = Counter(), Counter(), Counter()
     try:
         with open(out / "angles_per_frame.csv", encoding="utf-8", newline="") as f:
             reader = csv.reader(f)
             header = next(reader, [])
             mcp = [(c, header.index(c)) for c in MCP_COLUMNS if c in header]
             six = [(c, header.index(c)) for c in ac.UNAVAILABLE_COLUMNS if c in header]
-            est = [header.index(c) for c in ac.ESTIMATE_COLUMNS + (EST_CALIBRATION_COLUMN,)
-                   if c in header]
+            pairs = {kind: [header.index(c) for c in cols if c in header]
+                     for kind, cols in ac.ESTIMATE_COLUMNS_BY_KIND.items()}
+            pairs = {k: v for k, v in pairs.items() if len(v) == 2}
+            cal_i = (header.index(EST_CALIBRATION_COLUMN)
+                     if EST_CALIBRATION_COLUMN in header else None)
+            m_i = ([header.index(c) for c in MAPPED_TAIL]
+                   if all(c in header for c in MAPPED_TAIL) else None)
             for row in reader:
                 rows += 1
                 if len(row) != len(header):
@@ -600,15 +680,32 @@ def check_angle_exports(out):
                 for c, i in six:
                     if row[i] != "":
                         six_filled[c] += 1
-                if len(est) == 3 and any(row[i] != "" for i in est):
-                    if _is_number(row[est[0]]) and _is_number(row[est[1]]) and row[est[2]]:
+                filled = [k for k, (i, j) in pairs.items() if row[i] != "" or row[j] != ""]
+                if cal_i is not None and (filled or row[cal_i] != ""):
+                    kind = filled[0] if len(filled) == 1 else None
+                    if (kind is not None and all(_is_number(row[i]) for i in pairs[kind])
+                            and row[cal_i].startswith(kind + ":")):
                         est_filled += 1
+                        est_by_kind[kind] += 1
                     else:
                         est_bad += 1
+                if m_i is not None:
+                    fe, aa, status, mid = (row[i] for i in m_i)
+                    if fe or aa:
+                        if (_is_number(fe) and _is_number(aa) and status in VALUE_STATUSES
+                                and mid):
+                            mapped_filled += 1
+                        else:
+                            mapped_bad += 1
+                    elif status in VALUE_STATUSES or (status and not mid) or \
+                            (status not in ("", "outside_tested_range")) or \
+                            (mid and not status):
+                        mapped_bad += 1
     except OSError as e:
         problems.append(f"cannot read {out / 'angles_per_frame.csv'} ({type(e).__name__})")
     missing = [c for c in MCP_COLUMNS + list(ac.ESTIMATE_COLUMNS)
-               + [EST_CALIBRATION_COLUMN] + list(ac.UNAVAILABLE_COLUMNS) if c not in header]
+               + [EST_CALIBRATION_COLUMN] + list(ac.UNAVAILABLE_COLUMNS) + MAPPED_TAIL
+               if c not in header]
     if missing:
         problems.append(f"columns missing: {', '.join(missing)}")
     if expected is not None and rows != expected:
@@ -623,7 +720,15 @@ def check_angle_exports(out):
                  for c, n in six_filled.items()]
     if est_bad:
         problems.append(f"{est_bad} rows with a thumb TMC estimate missing a value or "
-                        f"its {EST_CALIBRATION_COLUMN}")
+                        f"its {EST_CALIBRATION_COLUMN} (one kind per row, both values "
+                        f"numeric, the calibration naming that kind)")
+    if mapped_bad:
+        problems.append(f"{mapped_bad} rows whose mapped cells disagree with their status "
+                        f"(values need both numbers, a status of {VALUE_STATUSES} and the "
+                        f"mapping named; a row without values has no such status)")
+    if len(est_by_kind) > 1:
+        problems.append("estimates of two kinds in one file: "
+                        + ", ".join(f"{k} in {n} rows" for k, n in sorted(est_by_kind.items())))
     try:
         with open(out / "angle_coverage.csv", encoding="utf-8", newline="") as f:
             n_cov = len(list(csv.DictReader(f)))
@@ -637,7 +742,9 @@ def check_angle_exports(out):
               f"est_columns={sum(c in header for c in ac.ESTIMATE_COLUMNS)} "
               f"unavailable_empty="
               f"{sum(c in header and not six_filled[c] for c in ac.UNAVAILABLE_COLUMNS)} "
-              f"est_filled={est_filled}")
+              f"est_filled={est_filled} "
+              f"mapped_columns={sum(c in header for c in ac.MAPPED_COLUMNS)} "
+              f"mapped_filled={mapped_filled}")
     if problems:
         return False, [f"ANGLE EXPORTS FAIL: {counts}"] + [f"  {p}" for p in problems]
     return True, [f"ANGLE EXPORTS OK: {counts}"]
@@ -1032,23 +1139,51 @@ def tmc_summary(tmc) -> list:
                 f"with a `movement_start_time_s` and at least {te.MIN_FRAMES} open-hand "
                 f"frames before it (docs/tmc_estimate.md). {TMC_USED} records this."]
     a = cal.agreement
-    out = [f"The thumb TMC estimate (`{'`, `'.join(ac.ESTIMATE_COLUMNS)}`; "
-           "leap_hand.tmc_estimate, docs/tmc_estimate.md) is in "
-           f"{tmc['filled_rows']} of {tmc['rows']} rows of angles_per_frame.csv and in "
-           "the `*_est_openhand_rep` / `_hold_mean` / `_hold_min` / `_hold_max` columns "
-           f"of angles_per_recording.csv. Calibration: {TMC_USED} ({tmc['source']}), "
-           f"`{EST_CALIBRATION_COLUMN}` = `{provenance_id(cal)}`: the open hand of "
-           f"{cal.n_transitions} transitions, {cal.n_frames} frames, rest-frame "
-           f"agreement median {a['median_deg']:.1f} / p90 {a['p90_deg']:.1f} / max "
-           f"{a['max_deg']:.1f} deg. An estimate relative to the recorded open hand, "
-           "not a validated Paper 3 coordinate: `T_TMC_fe` and `T_TMC_aa` stay empty."]
+    columns = ac.ESTIMATE_COLUMNS_BY_KIND[cal.kind]
+    others = [c for c in ac.ESTIMATE_COLUMNS if c not in columns]
+    what = (f"the open hand of {cal.n_transitions} transitions" if cal.kind == "openhand"
+            else f"the tmc_neutral posture of {cal.n_transitions} take(s)")
+    reference = ("the recorded open hand" if cal.kind == "openhand"
+                 else "a held reference posture (not the ISB neutral)")
+    out = [f"The thumb TMC estimate (`{'`, `'.join(columns)}`; calibration kind "
+           f"`{cal.kind}`, hand {cal.hand or 'not recorded'}; leap_hand.tmc_estimate, "
+           f"docs/tmc_estimate.md) is in {tmc['filled_rows']} of {tmc['rows']} rows of "
+           f"angles_per_frame.csv and in the `*_est_{cal.kind}_rep` / `_hold_mean` / "
+           f"`_hold_min` / `_hold_max` columns of angles_per_recording.csv; the other "
+           f"kind's columns (`{'`, `'.join(others)}`) are empty. Calibration: {TMC_USED} "
+           f"({tmc['source']}), `{EST_CALIBRATION_COLUMN}` = `{provenance_id(cal)}`: "
+           f"{what}, {cal.n_frames} frames, rest-frame agreement median "
+           f"{a['median_deg']:.1f} / p90 {a['p90_deg']:.1f} / max {a['max_deg']:.1f} deg. "
+           f"A tracker-relative estimate referred to {reference}, not a validated Paper 3 "
+           "coordinate: `T_TMC_fe` and `T_TMC_aa` stay empty."]
     if tmc["not_estimated"]:
-        out += ["", "Not estimated (the calibration is of another session):"]
+        out += ["", "Not estimated (the calibration is of another session or hand, or "
+                    "its hand is not known):"]
         out += [f"- {x}" for x in tmc["not_estimated"]]
     return out
 
 
-def summary_markdown(doc, line, tmc=None) -> str:
+def mapping_summary(mp) -> list:
+    """summary.md lines on the reference-mapped thumb TMC pair."""
+    m = mp.get("mapping")
+    cols = "`, `".join(MAPPED_TAIL)
+    if m is None:
+        return [f"The reference-mapped columns (`{cols}`) are empty in every row: no "
+                "--tmc-mapping was given. No mapping evaluated against a measured "
+                "anatomical reference exists yet (docs/reference_validation.md)."]
+    out = [f"The reference-mapped thumb TMC pair (`{cols}`) used mapping `{m.id}` "
+           f"({rvl.STATUS_TEXT[m.status]}; scope: {m.scope_text()}). It filled "
+           f"{mp['filled_rows']} of {mp['rows']} rows ({TMC_MAPPING_USED})."]
+    if mp["not_applied"]:
+        out += ["", "Not applied (outside the mapping's scope):"]
+        out += [f"- {x}" for x in mp["not_applied"][:20]]
+        if len(mp["not_applied"]) > 20:
+            out.append(f"- ... and {len(mp['not_applied']) - 20} more (all in "
+                       f"{TMC_MAPPING_USED})")
+    return out
+
+
+def summary_markdown(doc, line, tmc=None, mp=None) -> str:
     t, w, bk = doc["totals"], doc["worst"], doc["totals"]["by_kind"]
     rows = [("recordings", "recordings"), ("frames selected", "frames_selected"),
             ("hold frames (static interval)", "hold_frames"),
@@ -1127,11 +1262,24 @@ def summary_markdown(doc, line, tmc=None) -> str:
             ""]
     if tmc is not None:
         out += ["## Thumb TMC estimate", ""] + tmc_summary(tmc) + [""]
+    if mp is not None:
+        out += ["## Reference-mapped thumb TMC", ""] + mapping_summary(mp) + [""]
     return "\n".join(out)
 
 
-def write_outputs(out, root, args, results, failures, n_selected, wall_s, line, tmc):
+def write_outputs(out, root, args, results, failures, n_selected, wall_s, line, tmc,
+                  mapping=None):
     totals, worst, shortest, means, clocks = summarise(results, failures, n_selected)
+    mp = {"mapping": mapping, "rows": totals["frames_selected"],
+          "filled_rows": sum(int(np.sum(np.isfinite(a["mapped"][ac.MAPPED_COLUMNS[0]])))
+                             for a in results if a.get("mapped") is not None),
+          "not_applied": [f"{a['label']}: {a['mapped_note']}" for a in results
+                          if mapping is not None and a.get("mapped") is None]}
+    _write_json(out / TMC_MAPPING_USED, (
+        {"mapping": rvl._clean(mapping.to_json()), "rows_filled": mp["filled_rows"],
+         "rows": mp["rows"], "not_applied": mp["not_applied"]}
+        if mapping is not None else
+        {"mapping": None, "note": "no --tmc-mapping: the mapped columns are empty"}))
     cal = tmc["cal"]
     tmc = {**tmc, "rows": totals["frames_selected"],
            "filled_rows": sum(len(a["frame_ids"]) for a in results if a["est"] is not None),
@@ -1187,7 +1335,7 @@ def write_outputs(out, root, args, results, failures, n_selected, wall_s, line, 
                            "summary": a["summary"], "relations": a["relations"],
                            "fingertip_error": a["fingertip"]} for a in results],
         "pooled_by_class": pooled})
-    (out / "summary.md").write_text(summary_markdown(doc, line, tmc), encoding="utf-8")
+    (out / "summary.md").write_text(summary_markdown(doc, line, tmc, mp), encoding="utf-8")
 
 
 # --- run ------------------------------------------------------------------------------------------
@@ -1225,6 +1373,15 @@ def run(args) -> int:
             print(f"TMC calibration {provenance_id(cal)}, {tmc['source']}; agreement "
                   f"median {a['median_deg']:.1f} / p90 {a['p90_deg']:.1f} / max "
                   f"{a['max_deg']:.1f} deg", flush=True)
+    mapping = None
+    if keys and args.tmc_mapping is not None:
+        try:
+            mapping = rvl.load_mapping(args.tmc_mapping)
+        except rvl.ReferenceError as e:
+            print(f"cannot read the TMC mapping: {e}")
+            return 2
+        print(f"TMC mapping {mapping.id}: {rvl.STATUS_TEXT[mapping.status]}; scope "
+              f"{mapping.scope_text()}", flush=True)
     out.mkdir(parents=True, exist_ok=True)
     wanted = {key: name for name, key in SCENARIOS.items()} if args.scenarios else {}
     results, failures, written, scenario_failures = [], [], [], []
@@ -1236,7 +1393,7 @@ def run(args) -> int:
     for i, key in enumerate(keys, 1):
         try:
             rec = load(root, key, args.gap_threshold)
-            a = analyse(rec, tmc["cal"])
+            a = analyse(rec, tmc["cal"], mapping)
         except Exception as e:   # reported and counted, never skipped silently
             failures.append({"recording": _label(*key), "error": f"{type(e).__name__}: {e}"})
             print(f"LOAD FAILED: {_label(*key)}: {type(e).__name__}: {e}")
@@ -1269,7 +1426,8 @@ def run(args) -> int:
                 f"within_tolerance={within}/{len(keys)}"
                 + ("" if good else f" load_failures={len(failures)}"))
         wall_s = time.perf_counter() - started
-        write_outputs(out, root, args, results, failures, len(keys), wall_s, line, tmc)
+        write_outputs(out, root, args, results, failures, len(keys), wall_s, line, tmc,
+                      mapping)
         for a in results:
             if not a["fidelity"]["within_tolerance"]:
                 detail = a["fidelity"]["within_tolerance_detail"]
@@ -1313,9 +1471,22 @@ def main(argv=None) -> int:
                    help="check OUT/angles_per_frame.csv against OUT/fidelity.json, "
                         "after the run or alone on an existing --out")
     p.add_argument("--tmc-calibration", type=Path, metavar="PATH",
-                   help="open-hand calibration for the thumb TMC estimate (a "
-                        "calibration.json of tmc_estimate_report.py); default: "
+                   help="calibration for the thumb TMC estimate: a calibration.json of "
+                        "tmc_estimate_report.py (open hand, *_est_openhand columns) or "
+                        "of record_poses.py --calibration tmc_neutral (neutral posture "
+                        "take, *_est_neutral columns); default: an open-hand one "
                         "computed from the dataset's transitions")
+    p.add_argument("--tmc-calibration-hand", choices=rc.SIDES, metavar="HAND",
+                   help="the hand (left|right) of a --tmc-calibration file written before "
+                        "the hand field existed; refused when the file records another "
+                        "hand. Without it such a file is applied only when the dataset's "
+                        "metadata/pose_transitions.csv names its transitions and their "
+                        "hand, else the estimate columns stay empty")
+    p.add_argument("--tmc-mapping", type=Path, metavar="PATH",
+                   help="a mapping.json of scripts/leap/reference_validation.py compare: "
+                        "the reference-mapped thumb TMC pair in T_TMC_fe_mapped / "
+                        "T_TMC_aa_mapped, filled only for recordings of the mapping's "
+                        "participant, hand and session, inside its tested range")
     args = p.parse_args(argv)
     runs = args.all or args.static or args.transition or args.scenarios
     checks = [c for c in (args.check_scenarios, args.check_dataset_unchanged) if c]

@@ -41,13 +41,22 @@ THREE PANELS, KEPT APART
              column name and status (calculated, outside Paper 3); the finger
              MCP pairs twice, flexion-first (xyz) and the paper's order; the
              twist of each bone on its digit's line; the six coordinates the
-             camera does not measure named, never filled; and apart, the
+             camera does not measure named, never filled (the title says
+             what "calculated" is: a tracker coordinate); with an optional
+             `mapping_provider`, the two-row "reference-mapped" thumb TMC
+             block (leap_hand.reference_validation: a mapping evaluated
+             against an independent reference, its values only inside its
+             scope, its tag saying reference-evaluated, SYNTHETIC or
+             cross-check; nothing without one); and apart, the
              "estimated" thumb TMC block, fed by an optional `tmc_provider`
-             (not computed without one): the two `_est_openhand` values, the
-             twist about the bone with its residual when the provider gives
-             them, and the calibration's provenance. The script
-             scripts/leap/replay_view.py builds the provider from an
-             open-hand calibration (`leap_hand.tmc_estimate`).
+             (not computed without one): the two estimate values named by
+             the calibration's kind (`_est_openhand` for the session's open
+             hand, `_est_neutral` for a tmc_neutral calibration take; the
+             block's title says which), the twist about the bone with its
+             residual when the provider gives them, and the calibration's
+             provenance. The script scripts/leap/replay_view.py builds the
+             provider from a calibration.json of either kind
+             (`leap_hand.tmc_estimate`, `leap_hand.tmc_calibration_take`).
   Paper 3    the research comparison (`paper3.frame_relation_values`), with
              the class, the MCP-order disclosure and the six angles the
              camera does not give. Not a fidelity number.
@@ -66,7 +75,22 @@ PLAYBACK TIMING (TIMING_DOC says exactly what is logged)
   `PlaybackClock.media_time` and shows `pose_at(rec, t, mode)`, so a late tick
   shows a later frame instead of stretching time. Each tick logs its lateness
   against its timer slot to a `SchedulingLog`; the HUD and the timing log
-  (`write_timing_log`) carry the statistics. Playback stops at the end.
+  (`write_timing_log`) carry the statistics, with the rendered updates, the
+  distinct frames shown and the wall duration of each play run counted
+  apart from the ticks. Playback stops at the end.
+
+RENDERING (profiled 2026-10-24 on the TkAgg window, docs/replay_fidelity.md
+section 7)
+  A full draw paints everything static (the 3D panes, grid, ticks and labels,
+  the panel frames, the timeline markers, the buttons) and is kept as the
+  background. A tick restores it and redraws only what moves: the hand's 3D
+  artists (projected with the axes' current matrix, far to near), the three
+  text panels, the slider and the timeline cursor, then blits the four
+  regions they occupy. The text panels compose their bitmap from a glyph
+  atlas (`_TextPanel`). Before this the whole 3D axes was redrawn each tick
+  (14 ms, nearly all of it the static decorations), each panel was rendered
+  line by line through Pillow (30 ms for the three) and the whole figure was
+  blitted (10 ms): 64 ms a tick, about 11 updates a second at 1x.
 """
 import json
 import textwrap
@@ -86,7 +110,7 @@ from matplotlib.patches import Patch
 from matplotlib.transforms import Bbox
 from matplotlib.widgets import Button, Slider
 from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageColor, ImageDraw, ImageFont
 
 from xr_hand.joints import BONES
 from xr_hand.viz3d import _HAND_COLORS, FINGERTIP_IDX, PALM_POLYGON_IDX
@@ -97,7 +121,13 @@ from . import replay_core as rc
 from . import tmc_estimate as te
 
 SPEEDS = (0.1, 0.25, 0.5, 1.0, 2.0, 4.0)
-TICK_MS = 15
+# Tk's after() on Windows rounds every interval above 1 ms up to the 15.6 ms
+# system timer quantum (measured 2026-10-24: after(5) and after(10) both fire
+# every 15.6 ms, after(1) every 1.0 ms), so with a 15 ms interval a tick came
+# 15.6 to 31 ms after the previous draw ended. With 1 ms the next tick follows
+# the draw at once and the draw time alone sets the rate; the media clock is
+# wall time, so the interval changes nothing about which frame is shown.
+TICK_MS = 1
 TRIAD_M = 0.01                      # joint axes length, 1 cm
 WRITER_STALL_S = 0.05               # HUD flags a writer jump this much over the camera's
 
@@ -121,14 +151,24 @@ FID_POSITION = "FK vs recorded abs26"
 FID_CHAIN = "matrix chain vs quaternion chain (same data, two code paths)"
 FID_BONE = "bone -z axis vs recorded bone vector"
 P3_TITLE = "Paper 3 agreement (research model, not fidelity)"
-ANG_TITLE = "Angles of the displayed source frame (degrees)"
+ANG_TITLE = "Angles of the displayed source frame (degrees; calculated = tracker coordinate)"
 ANG_SIGNS = "flexion + toward the palm; abduction + toward the thumb side; both hands"
 ANG_TWIST = ("digit lines: twist of each bone, <DIGIT>_<BONE>_twist_tracker "
              "(outside Paper 3)")
-ANG_UNAVAILABLE = ("unavailable: " + ", ".join(ac.UNAVAILABLE_COLUMNS)
-                   + " (not measured; see docs/angle_coverage.md)")
-EST_TITLE = "estimated (open-hand calibration; not a validated Paper 3 coordinate)"
+ANG_UNAVAILABLE = ("unavailable: " + ", ".join(ac.UNAVAILABLE_COLUMNS) + " (not measured)")
+EST_TITLES = {
+    "openhand": "estimated (open-hand calibration; not a validated Paper 3 coordinate)",
+    "neutral": ("estimated (tmc_neutral calibration take; not a validated Paper 3 "
+                "coordinate)")}
+EST_TITLE = EST_TITLES["openhand"]        # the block's title with no calibration loaded
 EST_NONE = "not computed (no calibration loaded)"
+EST_LABEL = "unvalidated estimate"
+# the reference-mapped block's tag, by the mapping's status: what its reference was
+MAP_TAGS = {"evaluated": "reference-evaluated",
+            "synthetic_demonstration": "SYNTHETIC, not measured",
+            "cross_check": "cross-check only"}
+C_MAP = "#8fd0ff"
+PANEL_CHARS = 83                          # the angle panel's width (see the RECT_ note)
 MCP_ORDER_LABELS = {"": "(xyz, flexion first)",
                     "_paper_order": "(paper order, abduction first)"}
 RECORDED_NA = "recorded: n/a between source frames"
@@ -142,7 +182,14 @@ TIMING_DOC = (
     "the previous tick's drawing, the GUI and the OS all show up there. "
     "frames_skipped = source frames between consecutive displayed frames "
     "inside one uninterrupted play run; a seek, a pause or a restart begins "
-    "a new run, so a jump is not counted as skipped frames.")
+    "a new run, so a jump is not counted as skipped frames. rendered_updates "
+    "= draws that reached the screen: a blit of the changed regions after a "
+    "tick, or a full draw (not a saved screenshot). frames_shown = ticks that "
+    "displayed a source frame other than the previous tick's (distinct frames "
+    "that appeared on screen). wall_duration_s = wall time from the start of "
+    "a play run to its last tick, summed over the runs; rendered_per_s and "
+    "frames_shown_per_s divide the counts made during the runs by it. "
+    "runs_detail gives the same per run.")
 
 C_BG = "black"
 C_PANEL = "#0a0a0f"
@@ -175,11 +222,12 @@ NOTE_FONT = 7.0
 # figure fractions: [left, bottom, width, height]. At 100 dpi (this machine's
 # TkAgg window and the headless screenshots) every panel font is 9 px with a
 # 5 px advance: the angle panel holds 83 characters (its widest row is 81) and
-# about 56 rows at the window's 804 px height.
+# about 57 rows at the window's 804 px height (56 before the panels' bottom moved
+# from 0.24 to 0.225 on 2026-10-24, clear of the timeline legend below 0.22).
 RECT_3D = [0.005, 0.33, 0.225, 0.55]
-RECT_HUD = [0.235, 0.24, 0.22, 0.72]
-RECT_ANG = [0.46, 0.24, 0.28, 0.72]
-RECT_P3 = [0.745, 0.24, 0.25, 0.72]
+RECT_HUD = [0.235, 0.225, 0.22, 0.735]
+RECT_ANG = [0.46, 0.225, 0.28, 0.735]
+RECT_P3 = [0.745, 0.225, 0.25, 0.735]
 RECT_TIMELINE = [0.06, 0.155, 0.90, 0.045]
 RECT_SLIDER = [0.06, 0.112, 0.90, 0.025]
 
@@ -232,17 +280,82 @@ class _QuietSlider(Slider):
     drawon = False
 
 
+class _GlyphAtlas:
+    """Every character of one font (size and weight) rendered once by Pillow
+    into a cell one advance wide plus the one column a wide glyph spills into
+    the next cell, as uint8 coverage; characters are added as they appear.
+    `strip` composes a line by indexing the atlas, no per-glyph drawing."""
+
+    def __init__(self, font: ImageFont.FreeTypeFont):
+        self.font = font
+        ascent, descent = font.getmetrics()
+        self.h = ascent + descent
+        self.adv = max(1, int(round(font.getlength("M"))))
+        self.ids: Dict[str, int] = {}
+        self._table = np.full(0x10000, -1, dtype=np.int32)   # UTF-16 code unit -> id
+        self._cells: List[np.ndarray] = []
+        self._stack: Optional[np.ndarray] = None
+
+    def _add(self, ch: str) -> None:
+        img = Image.new("L", (self.adv + 1, self.h), 0)
+        ImageDraw.Draw(img).text((0, 0), ch, font=self.font, fill=255)
+        self.ids[ch] = len(self._cells)
+        if ord(ch) < 0x10000:
+            self._table[ord(ch)] = self.ids[ch]
+        self._cells.append(np.asarray(img, dtype=np.uint8))
+        self._stack = None
+
+    def ids_of(self, text: str) -> np.ndarray:
+        """Glyph id per character, rendering the ones not seen yet."""
+        units = np.frombuffer(text.encode("utf-16-le"), dtype=np.uint16)
+        ids = self._table[units]
+        if len(units) != len(text) or (ids < 0).any():   # new glyphs, or beyond the BMP
+            for ch in text:
+                if ch not in self.ids:
+                    self._add(ch)
+            if len(units) != len(text):
+                return np.array([self.ids[ch] for ch in text], dtype=np.int32)
+            ids = self._table[units]
+        return ids
+
+    def strip(self, text: str) -> np.ndarray:
+        """Coverage (h, len(text) * adv) of one line of text."""
+        n = len(text)
+        if n == 0:
+            return np.zeros((self.h, 0), dtype=np.uint8)
+        ids = self.ids_of(text)
+        if self._stack is None:
+            self._stack = np.stack(self._cells)
+        g = self._stack[ids]                                        # (n, h, adv + 1)
+        out = np.ascontiguousarray(g[:, :, :self.adv].transpose(1, 0, 2))
+        out = out.reshape(self.h, n * self.adv)
+        if n > 1:                     # the spill column of glyph i lands on cell i + 1
+            cols = out[:, self.adv::self.adv]
+            np.maximum(cols, g[:-1, :, self.adv].T, out=cols)
+        return out
+
+
 class _TextPanel(Artist):
-    """Coloured monospace lines filling one axes, rasterised with Pillow (a
-    matplotlib dependency) and drawn as one bitmap.
+    """Coloured monospace lines filling one axes, composed from a glyph atlas
+    (`_GlyphAtlas`, Pillow-rendered, matplotlib's monospace font DejaVu Sans
+    Mono) and drawn as one bitmap.
 
     Why not matplotlib Text: matplotlib 3.11's Agg backend lays out and
-    renders text glyph by glyph in Python, about 40 us a glyph. These two
-    panels hold about 5000 glyphs: 450 ms a frame that way, about 11 ms each
-    through Pillow. Same font (matplotlib's monospace, DejaVu Sans Mono).
-    Rendered at draw time at the axes' pixel size and the renderer's dpi
-    (cached until the lines or the size change), so a resized window or a
-    hi-dpi screen gets crisp text. The first line is drawn bold (the title).
+    renders text glyph by glyph in Python, about 40 us a glyph; the three
+    panels hold about 5000 glyphs, 450 ms a frame that way. Why not Pillow's
+    own text drawing line by line (the first version): 0.18 ms a line, about
+    10 ms a panel and 30 ms a tick for the three, the largest cost of a
+    playback tick measured on 2026-10-24. Here each glyph is rendered once;
+    a row of text is its coverage from the atlas blended once over the
+    panel colour and kept (`_row`), so a tick pays only for the rows whose
+    text or colour changed, and the panel is assembled by copying rows into
+    one array: under a millisecond for an unchanged panel, a few for one
+    whose values all changed. Rendered at draw time at the axes' pixel size
+    and the renderer's dpi (cached until the lines or the size change), so a
+    resized window or a hi-dpi screen gets crisp text. The first line is
+    drawn bold (the title). A row's descenders reach into the next row's
+    band (the glyph cell is taller than the line step) and are blended
+    there, as Pillow's line-by-line drawing did.
     """
 
     def __init__(self, ax, fontsize: float, bg: str, pad_px: int = 6,
@@ -252,6 +365,10 @@ class _TextPanel(Artist):
         self.spacing = spacing
         self.lines: List[Tuple[str, str]] = []
         self._fonts: Dict[Tuple[int, bool], ImageFont.FreeTypeFont] = {}
+        self._atlases: Dict[Tuple[int, bool], _GlyphAtlas] = {}
+        self._wrapped: Dict[Tuple[str, int], List[str]] = {}
+        self._rows: Dict[tuple, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self._rgb: Dict[str, np.ndarray] = {}
         self._key = None
         self._rgba: Optional[np.ndarray] = None
         self.rows = 0                   # rows drawn by the last render
@@ -270,34 +387,124 @@ class _TextPanel(Artist):
             self._fonts[(px, bold)] = ImageFont.truetype(font_manager.findfont(prop), px)
         return self._fonts[(px, bold)]
 
+    def _atlas(self, px: int, bold: bool) -> _GlyphAtlas:
+        if (px, bold) not in self._atlases:
+            self._atlases[(px, bold)] = _GlyphAtlas(self._font(px, bold))
+        return self._atlases[(px, bold)]
+
+    def _wrap(self, text: str, width: int) -> List[str]:
+        key = (text, width)
+        if key not in self._wrapped:
+            if len(self._wrapped) > 4096:
+                self._wrapped.clear()
+            self._wrapped[key] = textwrap.wrap(text, width, subsequent_indent="    ") or [""]
+        return self._wrapped[key]
+
+    def _color(self, name: str) -> np.ndarray:
+        if name not in self._rgb:
+            self._rgb[name] = np.array(ImageColor.getrgb(name)[:3], dtype=np.float32)
+        return self._rgb[name]
+
+    def _lut(self, color: str) -> np.ndarray:
+        """(256,) uint32: the RGBA pixel (packed as it lies in memory) of
+        `color` over the panel colour at each coverage value: the blend as one
+        table lookup per pixel."""
+        key = ("lut", color)
+        lut = self._rows.get(key)
+        if lut is None:
+            k = np.arange(256, dtype=np.float32)[:, None] * (1.0 / 255.0)
+            bg, rgb = self._color(self.bg), self._color(color)
+            lut8 = np.empty((256, 4), dtype=np.uint8)
+            lut8[:, :3] = (bg + (rgb - bg) * k + 0.5).astype(np.uint8)
+            lut8[:, 3] = 255
+            lut = self._rows[key] = lut8.view(np.uint32).reshape(256)
+        return lut
+
+    def _row(self, atlas: _GlyphAtlas, piece: str, color: str, px: int, bold: bool,
+             step: int):
+        """(the row's pixels (cell_h, W) as packed uint32 blended over the panel
+        colour, the coverage of its descenders below the line step or None,
+        colour rgb as uint16) of one row of text, kept for the next render: a
+        tick pays only for the rows that changed."""
+        key = (piece, color, px, bold)
+        hit = self._rows.get(key)
+        if hit is None:
+            if len(self._rows) > 4096:
+                self._rows.clear()
+            cov = atlas.strip(piece)
+            below = cov[step:]
+            hit = self._rows[key] = (
+                self._lut(color)[cov],
+                below.astype(np.uint16) if below.size and below.any() else None,
+                self._color(color).astype(np.uint16))
+        return hit
+
     def _render(self, w: int, h: int, dpi: float) -> np.ndarray:
         px = max(6, int(round(self.fontsize * dpi / 72.0)))
         step = int(round(px * self.spacing))
-        width = max(20, int((w - 2 * self.pad) // self._font(px, False).getlength("M")))
-        img = Image.new("RGBA", (w, h), self.bg)
-        draw = ImageDraw.Draw(img)
-        y, self.rows, self.truncated = self.pad, 0, False
+        atlas, bold = self._atlas(px, False), self._atlas(px, True)
+        width = max(20, int((w - 2 * self.pad) // atlas.adv))
+        img32 = np.empty((h, w), dtype=np.uint32)
+        img32[:] = self._lut(self.bg)[0]
+        img = img32.view(np.uint8).reshape(h, w, 4)
+        pad, y, self.rows, self.truncated = self.pad, self.pad, 0, False
+        hang = None                     # the previous row's descenders, for the next band
         for k, (text, color) in enumerate(self.lines):
-            for piece in textwrap.wrap(text, width, subsequent_indent="    ") or [""]:
-                if y + step > h - self.pad:
+            for piece in self._wrap(text, width):
+                if y + step > h - pad:
                     self.truncated = True
                     break
-                draw.text((self.pad, y), piece, font=self._font(px, k == 0), fill=color)
+                row, below, rgb = self._row(bold if k == 0 else atlas, piece, color, px,
+                                            k == 0, step)
+                ww = min(row.shape[1], w - pad)
+                rows_c = min(step, row.shape[0])
+                img32[y:y + rows_c, pad:pad + ww] = row[:rows_c, :ww]
+                if hang is not None:    # blend the row above's descenders over this band
+                    self._hang(img, hang, y, pad, w)
+                hang = None if below is None else (below, rgb)
                 y += step
                 self.rows += 1
-        return np.asarray(img)
+        if hang is not None and y < h:
+            self._hang(img, hang, y, pad, w)
+        return img
+
+    @staticmethod
+    def _hang(img, hang, y, pad, w) -> None:
+        """Blend a row's descenders (coverage below its line step, uint16)
+        over the band of the row below, in integer arithmetic."""
+        cov, rgb = hang
+        d = min(cov.shape[0], img.shape[0] - y)
+        ww = min(cov.shape[1], w - pad)
+        if d <= 0 or ww <= 0:
+            return
+        c = cov[:d, :ww, None]
+        region = img[y:y + d, pad:pad + ww, :3]
+        region[...] = ((region.astype(np.uint16) * (255 - c) + rgb * c + 127) // 255
+                       ).astype(np.uint8)
 
     def draw(self, renderer) -> None:
         if not self.get_visible():
             return
         box = self._ax.get_window_extent(renderer)
-        x0, y0 = int(round(box.x0)), int(round(box.y0))
-        w, h = int(round(box.x1)) - x0, int(round(box.y1)) - y0
+        # one pixel inside the axes: the frame's spines stay in the background
+        x0, y0 = int(round(box.x0)) + 1, int(round(box.y0)) + 1
+        w, h = int(round(box.x1)) - x0 - 1, int(round(box.y1)) - y0 - 1
         if w < 2 or h < 2:
             return
         key = (tuple(self.lines), w, h, renderer.dpi)
         if key != self._key:
             self._rgba, self._key = self._render(w, h, renderer.dpi), key
+        buffer = getattr(renderer, "buffer_rgba", None)
+        if buffer is not None:
+            # Agg: the panel is opaque, so copy it straight into the renderer's
+            # buffer (row 0 at the top) instead of alpha-compositing it through
+            # draw_image (0.8 ms a panel against 0.15; measured 2026-10-24)
+            buf = np.asarray(buffer())
+            top = buf.shape[0] - (y0 + h)
+            if top >= 0 and y0 >= 0 and x0 >= 0 and x0 + w <= buf.shape[1]:
+                buf[top:top + h, x0:x0 + w] = self._rgba
+                self.stale = False
+                return
         gc = renderer.new_gc()
         renderer.draw_image(gc, x0, y0, self._rgba[::-1])   # Agg: first row at the bottom
         gc.restore()
@@ -315,12 +522,22 @@ class ReplayViewer:
     (seconds on the clock given as `now=`, default time.perf_counter) so
     tests can drive them deterministically.
 
-    tmc_provider: optional callable (pos, rot, hand_side) -> dict with the two
-    `angle_coverage.ESTIMATE_COLUMNS` (degrees or None) and a `provenance`
-    string, optionally `tmc_estimate.TWIST` and `tmc_estimate.RESIDUAL`
-    (shown on one line when the twist is given), called on the displayed
-    pose; its numbers go to the angle panel's "estimated" block and nowhere
-    else. Without one that block says "not computed".
+    tmc_provider: optional callable (pos, rot, hand_side) -> dict with `kind`
+    (one of `tmc_estimate.KINDS`; "openhand" when absent), that kind's two
+    estimate columns (`angle_coverage.ESTIMATE_COLUMNS_BY_KIND[kind]`, degrees
+    or None), a `provenance` string, and optionally its twist and residual
+    (`tmc_estimate.keys_for(kind)[2:]`, shown on one line when the twist is
+    given), called on the displayed pose; its numbers go to the angle panel's
+    "estimated" block, titled by the kind, and nowhere else. Without one that
+    block says "not computed".
+
+    mapping_provider: optional callable (pos, rot, hand_side) -> dict with
+    T_TMC_fe_mapped / T_TMC_aa_mapped (degrees or None), `status` (a row
+    status of leap_hand.reference_validation.ROW_STATUSES, or "not_applied"),
+    `mapping_status` (the mapping's: evaluated, synthetic_demonstration or
+    cross_check), `note` (why there is no value) and `scope` (the mapping's
+    scope text), called on the displayed pose; shown in the
+    "reference-mapped" block only.
     """
 
     def __init__(self, rec: rc.Recording, *, mode: str = "hold",
@@ -329,7 +546,8 @@ class ReplayViewer:
                  axes: bool = False, figsize=(15.5, 8.6), dpi=None,
                  now=time.perf_counter,
                  screenshot_dir="results/replay_fidelity/screens",
-                 timing_label: Optional[str] = None, tmc_provider=None):
+                 timing_label: Optional[str] = None, tmc_provider=None,
+                 mapping_provider=None):
         if not rec.frames:
             raise ValueError("recording has no frames")
         if mode not in rc.MODES:
@@ -357,7 +575,8 @@ class ReplayViewer:
         self._fid_cache: Dict[int, dict] = {}
         self._p3_cache: Dict[int, List[dict]] = {}
         self.tmc_provider = tmc_provider
-        self._ang_cache: Dict[int, Tuple[dict, Optional[dict]]] = {}
+        self.mapping_provider = mapping_provider
+        self._ang_cache: Dict[int, Tuple[dict, Optional[dict], Optional[dict]]] = {}
         # scheduling: one record per tick; skipped frames counted per play run
         self.sched = rc.SchedulingLog()
         self._tick_run: List[int] = []       # play run of each tick
@@ -366,6 +585,9 @@ class ReplayViewer:
         self._frames_skipped = 0
         self._next_intended: Optional[float] = None
         self._summary: Optional[dict] = None
+        self._rendered = 0                   # draws that reached the screen
+        self._run_stats: List[dict] = []     # one record per play run (TIMING_DOC)
+        self._run: Optional[dict] = None     # the run in progress
         self._wall0 = float(now())
         self.speed_history = [{"wall_s": 0.0, "media_s": 0.0,
                                "speed": self.clock.speed}]
@@ -522,9 +744,20 @@ class ReplayViewer:
         # Blitting: what changes from frame to frame is animated, so a full
         # draw leaves it out; the draw_event handler keeps that full draw as
         # the background and draws the changing parts on top. A frame then
-        # restores the background and redraws only those (_draw).
-        self._dynamic = [self.ax, self.hud_ax, self.ang_ax, self.p3_ax,
-                         self.slider_ax, self._cursor]
+        # restores the background and redraws only those (_draw_dynamic). The
+        # 3D axes itself is not animated: its panes, grid, ticks and labels
+        # never move and stay in the background; only the hand's artists do.
+        # Likewise the panels' frames and the slider's track and label stay;
+        # the panel bitmaps, the slider's bar, handle and value, and the
+        # timeline cursor move.
+        self._hand_artists = [self._palm, self._bones, *self._triads, self._residuals,
+                              self._joints, self._rec_markers, self._tips]
+        slider_parts = [self.slider.poly, self.slider.valtext]
+        if getattr(self.slider, "_handle", None) is not None:
+            slider_parts.append(self.slider._handle)
+        self._dynamic_2d = [self.hud_panel, self.ang_panel, self.p3_panel, *slider_parts,
+                            self._cursor]
+        self._dynamic = self._hand_artists + self._dynamic_2d
         for a in self._dynamic:
             a.set_animated(True)
         self._bg = None
@@ -624,12 +857,43 @@ class ReplayViewer:
         canvas = self.fig.canvas
         if self._bg is not None and self._bg_key == self._static_key():
             canvas.restore_region(self._bg)
-            renderer = canvas.get_renderer()
-            for a in self._dynamic:
-                a.draw(renderer)
-            canvas.blit(self.fig.bbox)
+            self._draw_dynamic(canvas.get_renderer())
+            for box in self._blit_boxes():
+                canvas.blit(box)
+            self._count_render()
         else:                               # something static changed: full draw
             canvas.draw_idle()
+
+    def _draw_dynamic(self, renderer) -> None:
+        """The animated artists over the background: the hand's 3D artists,
+        projected with the axes' current matrix and drawn far to near (as
+        Axes3D.draw orders every collection), then the text panels, the
+        slider and the timeline cursor."""
+        ax = self.ax
+        ax.M = ax.get_proj()
+        ax.invM = np.linalg.inv(ax.M)
+        depth = [(a.do_3d_projection(), a) for a in self._hand_artists if a.get_visible()]
+        for _z, a in sorted(depth, key=lambda d: d[0] if d[0] == d[0] else -np.inf,
+                            reverse=True):
+            a.draw(renderer)
+        for a in self._dynamic_2d:
+            a.draw(renderer)
+
+    def _blit_boxes(self) -> List[Bbox]:
+        """The screen region a tick can change, as one box: the union of the
+        3D axes (padded, the markers are wider than a point), the three
+        panels, the slider and the timeline; about 85 % of the figure. One
+        blit of it measured 10.6 ms on this machine against 14.5 ms for the
+        whole figure and 12.3 ms for the four regions blitted one by one
+        (the Tk photo update costs per call as well as per pixel)."""
+        return [Bbox.union([self.ax.bbox.expanded(1.15, 1.15), self.hud_ax.bbox,
+                            self.ang_ax.bbox, self.p3_ax.bbox, self.slider_ax.bbox,
+                            self.tl_ax.bbox])]
+
+    def _count_render(self) -> None:
+        self._rendered += 1
+        if self._run is not None:
+            self._run["rendered_updates"] += 1
 
     def _static_key(self) -> tuple:
         """Everything outside the animated artists that can change; a
@@ -647,8 +911,9 @@ class ReplayViewer:
                 and getattr(canvas, "renderer", None) is event.renderer):
             self._bg = canvas.copy_from_bbox(self.fig.bbox)
             self._bg_key = self._static_key()
-        for a in self._dynamic:
-            a.draw(event.renderer)
+        self._draw_dynamic(event.renderer)
+        if not canvas.is_saving():
+            self._count_render()
 
     def _recorded_in_reference(self, d: rc.DisplayedPose) -> np.ndarray:
         """abs26 moved by the same transform as the reconstruction, so the
@@ -815,6 +1080,11 @@ class ReplayViewer:
                         f"ms): mean {s['mean_ms']:.1f}  p95 {s['p95_ms']:.1f}  max "
                         f"{s['max_ms']:.1f}  frames skipped {s['frames_skipped']}",
                         C_DIM))
+            out.append((f"rendering: {s['rendered_updates']} updates; over "
+                        f"{s['wall_duration_s']:.2f} s of play "
+                        f"{_fmt(s['rendered_per_s'], '.1f')} updates/s, "
+                        f"{_fmt(s['frames_shown_per_s'], '.1f')} distinct frames/s",
+                        C_DIM))
         else:
             out.append(("scheduling: no ticks logged yet (logged while playing)", C_DIM))
         if self._status:
@@ -909,14 +1179,16 @@ class ReplayViewer:
                     + ", ".join(p3.UNAVAILABLE), C_DIM))
         return out
 
-    def _angles_of_displayed(self) -> Tuple[dict, Optional[dict]]:
-        """(angle_coverage.all_angles, the tmc_provider's dict or None) of the
-        displayed pose; cached per source frame, an interpolated pose computed
-        each time."""
+    def _angles_of_displayed(self) -> Tuple[dict, Optional[dict], Optional[dict]]:
+        """(angle_coverage.all_angles, the tmc_provider's dict or None, the
+        mapping_provider's dict or None) of the displayed pose; cached per
+        source frame, an interpolated pose computed each time."""
         def compute(pos, rot):
-            est = (None if self.tmc_provider is None
-                   else self.tmc_provider(pos, rot, self.rec.hand_side))
-            return ac.all_angles(pos, rot, self.rec.hand_side), est
+            side = self.rec.hand_side
+            est = None if self.tmc_provider is None else self.tmc_provider(pos, rot, side)
+            mapped = (None if self.mapping_provider is None
+                      else self.mapping_provider(pos, rot, side))
+            return ac.all_angles(pos, rot, side), est, mapped
         d = self.displayed
         if d.source in ("recorded", "held"):
             if d.i0 not in self._ang_cache:
@@ -942,7 +1214,7 @@ class ReplayViewer:
             where = "interpolated pose"
         else:
             where = f"source frame_id {d.frame.frame_id}"
-        angles, est = self._angles_of_displayed()
+        angles, est, mapped = self._angles_of_displayed()
 
         def row(label, column):
             status = ac.status_of(column)
@@ -958,22 +1230,48 @@ class ReplayViewer:
                     f"{bone:<4} {_deg(v):>5}" for bone, v in twist), C_CYAN))
             out.extend(row(label, column) for label, column in rows)
         out.append((ANG_UNAVAILABLE, ANGLE_COLORS["unavailable"]))
+        out.extend(self._mapped_rows(mapped))
         out.append(("", C_TEXT))
-        out.append((EST_TITLE, C_WARN))
-        for column in ac.ESTIMATE_COLUMNS:
+        kind = (est or {}).get("kind") or "openhand"
+        if kind not in te.KINDS:
+            raise ValueError(f"tmc_provider gave kind {kind!r}, expected one of {te.KINDS}")
+        twist_key, residual_key = te.keys_for(kind)[2:]
+        out.append((EST_TITLES[kind], C_WARN))
+        for column in ac.ESTIMATE_COLUMNS_BY_KIND[kind]:
             if est is None:
                 text = EST_NONE
             elif est.get(column) is None:
                 text = "not computed (the provider gave no value)"
             else:
-                text = f"{_deg(est[column])} deg (estimated)"
+                text = f"{_deg(est[column])} deg ({EST_LABEL})"
             out.append((f"{column}: {text}", C_WARN))
         if est is not None:
-            if est.get(te.TWIST) is not None:
-                out.append((f"{te.TWIST}: {_deg(est[te.TWIST])} deg (residual "
-                            f"{_fmt(est.get(te.RESIDUAL), '.1f')} deg)", C_WARN))
+            if est.get(twist_key) is not None:
+                out.append((f"{twist_key}: {_deg(est[twist_key])} deg (residual "
+                            f"{_fmt(est.get(residual_key), '.1f')} deg)", C_WARN))
             out.append((f"provenance: {est.get('provenance') or '(none given)'}", C_DIM))
         return out
+
+    @staticmethod
+    def _mapped_rows(mapped: Optional[dict]) -> List[Tuple[str, str]]:
+        """The reference-mapped block (class docstring, mapping_provider): one
+        row with the tag and the two values (or why they are empty), one with
+        the scope (or why not applied), each cut to the panel's width so the
+        block is two rows whatever it says. Nothing without a provider."""
+        if mapped is None:
+            return []
+        fe, aa = (mapped.get(c) for c in ac.MAPPED_COLUMNS)
+        head = f"mapped ({MAP_TAGS[mapped['mapping_status']]}): "
+        if mapped.get("status") == "not_applied":
+            first, second = head + "not applied to this recording", mapped.get("note")
+        elif fe is None or aa is None:
+            first, second = head + "empty here", mapped.get("note")
+        else:
+            first = (f"{head}{ac.MAPPED_COLUMNS[0]} {_deg(fe)} {ac.MAPPED_COLUMNS[1]} "
+                     f"{_deg(aa)}")
+            second = mapped.get("scope_row") or f"scope {mapped.get('scope')}"
+        cut = lambda s: textwrap.shorten(str(s), PANEL_CHARS, placeholder=" ...")  # noqa
+        return [(cut(first), C_MAP), (cut(second), C_DIM)]
 
     def _sync_widgets(self) -> None:
         self._syncing = True
@@ -1016,10 +1314,18 @@ class ReplayViewer:
         self._last_shown = self.frame_index
         self._next_intended = (self.clock.media_time(now)
                                + self.interval_s * self.clock.speed)
+        wall = float(self._now() if now is None else now)
+        self._run = {"run": self._runs, "speed": self.clock.speed,
+                     "media_start_s": self.clock.media_time(now),
+                     "media_end_s": self.clock.media_time(now),
+                     "wall_start_s": wall, "wall_last_s": wall, "ticks": 0,
+                     "rendered_updates": 0, "frames_shown": 0, "frames_skipped": 0}
+        self._run_stats.append(self._run)
 
     def _pause_clock(self, now) -> float:
         """Pause, clamped to the end of the recording; the media time."""
         self.clock.pause(now)
+        self._run = None
         self._timer.stop()
         end = float(self.t[-1])
         if self.clock.media_time(now) > end:
@@ -1149,32 +1455,68 @@ class ReplayViewer:
         t_now = float(self._now() if now is None else now)
         reached = self.clock.media_time(t_now)
         media = reached
+        run = self._run                    # the run this tick belongs to, even its last
         if media >= float(self.t[-1]):
             media = self._pause_clock(t_now)
             self._status = "end of the recording: paused"
+            self._run = run                # the final draw still counts for this run
         self.displayed = rc.pose_at(self.rec, media, self.mode)
         self.media_t = media
         if self.displayed.i0 is not None:
             self.frame_index = self.displayed.i0
         self.sched.record(self._next_intended, reached, self.frame_index)
         self._tick_run.append(self._runs)
+        skipped = 0
         if self._last_shown is not None:
-            self._frames_skipped += max(0, self.frame_index - self._last_shown - 1)
+            skipped = max(0, self.frame_index - self._last_shown - 1)
+            self._frames_skipped += skipped
+        if run is not None:
+            run["ticks"] += 1
+            run["wall_last_s"] = t_now
+            run["media_end_s"] = media
+            run["frames_skipped"] += skipped
+            if self.frame_index != self._last_shown:
+                run["frames_shown"] += 1
         self._last_shown = self.frame_index
         self._next_intended = reached + self.interval_s * self.clock.speed
         self._summary = None
         self._draw()
+        if not self.playing:
+            self._run = None
         return self.displayed
+
+    def _runs_detail(self) -> List[dict]:
+        out = []
+        for r in self._run_stats:
+            wall = r["wall_last_s"] - r["wall_start_s"]
+            out.append({**{k: v for k, v in r.items()
+                           if k not in ("wall_start_s", "wall_last_s")},
+                        "wall_duration_s": wall,
+                        "rendered_per_s": r["rendered_updates"] / wall if wall > 0 else None,
+                        "frames_shown_per_s": r["frames_shown"] / wall if wall > 0 else None})
+        return out
 
     def timing_summary(self) -> dict:
         """SchedulingLog.stats() over every tick (n, mean_ms, p95_ms, max_ms),
         frames_skipped counted inside play runs (the log's own count would
-        pair the last tick before a seek with the first one after it), plus
-        what is logged, the speed history and the backend."""
+        pair the last tick before a seek with the first one after it), the
+        rendering counts (rendered_updates, frames_shown, wall_duration_s,
+        rendered_per_s, frames_shown_per_s; TIMING_DOC) in all and per run
+        (runs_detail), plus what is logged, the speed history and the
+        backend."""
         if self._summary is None:
             self._summary = {**self.sched.stats(),
                              "frames_skipped": self._frames_skipped}
+        runs = self._runs_detail()
+        wall = sum(r["wall_duration_s"] for r in runs)
+        rendered = sum(r["rendered_updates"] for r in runs)
+        shown = sum(r["frames_shown"] for r in runs)
         return {**self._summary, "runs": self._runs,
+                "rendered_updates": self._rendered, "frames_shown": shown,
+                "wall_duration_s": wall,
+                "rendered_per_s": rendered / wall if wall > 0 else None,
+                "frames_shown_per_s": shown / wall if wall > 0 else None,
+                "runs_detail": runs,
                 "speed_history": [dict(h) for h in self.speed_history],
                 "backend": matplotlib.get_backend(), "label": self.timing_label,
                 "timer_interval_ms": TICK_MS, "what_is_logged": TIMING_DOC}

@@ -16,6 +16,7 @@ import importlib.util
 import io
 import json
 import math
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -50,10 +51,10 @@ def rest_for(hand):
     return R_REST if hand == "left" else MIRROR @ R_REST @ MIRROR
 
 
-def cal_with(rest):
+def cal_with(rest, kind="openhand", hand=None):
     return te.Calibration(R_rest=rest, session="synthetic", n_transitions=1,
                           n_frames=1, per_transition=[], agreement={},
-                          provenance="synthetic rest")
+                          provenance="synthetic rest", kind=kind, hand=hand)
 
 
 def hand_pose(hand, fe=0.0, aa=0.0, tw=0.0, rest=None):
@@ -91,7 +92,7 @@ PAIRS = [(0.0, 0.0), (20.0, 0.0), (0.0, 15.0), (-10.0, 25.0), (35.0, -12.0),
 @pytest.mark.parametrize("fe,aa", PAIRS)
 def test_known_abduction_then_flexion_is_recovered(hand, fe, aa):
     pos, rot = hand_pose(hand, fe, aa)
-    e = te.estimate(pos, rot, hand, cal_with(rest_for(hand)))
+    e = te.estimate(pos, rot, hand, cal_with(rest_for(hand), hand=hand))
     assert e[te.FE] == pytest.approx(fe, abs=1e-9)
     assert e[te.AA] == pytest.approx(aa, abs=1e-9)
     assert e[te.TWIST] == pytest.approx(0.0, abs=1e-9)
@@ -103,7 +104,7 @@ def test_known_abduction_then_flexion_is_recovered(hand, fe, aa):
 @pytest.mark.parametrize("tw", [7.0, -12.5])
 def test_turn_about_the_bone_is_the_twist(hand, tw):
     pos, rot = hand_pose(hand, 25.0, -8.0, tw)
-    e = te.estimate(pos, rot, hand, cal_with(rest_for(hand)))
+    e = te.estimate(pos, rot, hand, cal_with(rest_for(hand), hand=hand))
     assert e[te.FE] == pytest.approx(25.0, abs=1e-9)    # a turn about z leaves
     assert e[te.AA] == pytest.approx(-8.0, abs=1e-9)    # the bone where it is
     assert e[te.TWIST] == pytest.approx(tw, abs=1e-9)
@@ -114,8 +115,8 @@ def test_estimate_uses_the_palm_not_the_wrist():
     pos, rot = hand_pose("left", 30.0, 5.0)
     rot2 = rot.copy()
     rot2[W] = jf.rot_y(40.0) @ rot[W]           # turn the forearm only
-    a = te.estimate(pos, rot, "left", cal_with(R_REST))
-    b = te.estimate(pos, rot2, "left", cal_with(R_REST))
+    a = te.estimate(pos, rot, "left", cal_with(R_REST, hand="left"))
+    b = te.estimate(pos, rot2, "left", cal_with(R_REST, hand="left"))
     assert a[te.FE] == pytest.approx(b[te.FE], abs=1e-12)
     assert a[te.AA] == pytest.approx(b[te.AA], abs=1e-12)
 
@@ -137,7 +138,7 @@ def test_positive_abduction_moves_toward_the_rest_frames_thumb_side_x(hand):
     rest = rest_for(hand)
     radial = 1.0 if hand == "left" else -1.0    # the side +x/-x means radial
     for aa in (3.0, -3.0):
-        e = te.estimate(*hand_pose(hand, 0.0, aa), hand, cal_with(rest))
+        e = te.estimate(*hand_pose(hand, 0.0, aa), hand, cal_with(rest, hand=hand))
         d = bone_motion(hand, 0.0, aa)
         along_rest_x = float(d @ rest[:, 0])
         assert np.sign(e[te.AA]) == np.sign(aa)
@@ -155,7 +156,7 @@ def test_positive_flexion_moves_toward_the_palm(hand):
     rest = rest_for(hand)
     radial = 1.0 if hand == "left" else -1.0
     for fe in (3.0, -3.0):
-        e = te.estimate(*hand_pose(hand, fe, 0.0), hand, cal_with(rest))
+        e = te.estimate(*hand_pose(hand, fe, 0.0), hand, cal_with(rest, hand=hand))
         d = bone_motion(hand, fe, 0.0)
         assert np.sign(e[te.FE]) == np.sign(fe)
         # toward the metacarpal's own palmar side (-y of the rest frame) ...
@@ -185,6 +186,171 @@ def test_axis_parallelism_of_a_parallel_chain():
     assert a["proximal_distal_deg"] == pytest.approx(0.0, abs=1e-6)
     expect = math.degrees(math.acos(float(np.clip(rot[TM][:, 0] @ rot[P][:, 0], -1, 1))))
     assert a["metacarpal_palm_deg"] == pytest.approx(expect, abs=1e-6)
+
+
+# --- a change of reference is not an additive constant (Codex finding 3, 2026-10-24) -----
+def coords(hand, fe, aa):
+    """The TMC rotation the paper's order builds from (fe, aa)."""
+    return jf.rot_y(jf.hand_sign(hand) * aa) @ jf.rot_x(-fe)
+
+
+@pytest.mark.parametrize("hand", ["left", "right"])
+def test_a_reference_change_mixes_the_two_angles_pose_dependently(hand):
+    """Codex's counterexample: with the reference itself at flexion 30 /
+    abduction 20, a pose at 30 / 50 reads 3.32575 / 25.70535 relative to it,
+    not 0 / 30. The would-be 'flexion offset' is 30 at the reference and
+    26.674 at this pose: a reference change is a rotation, and after the
+    abduction-then-flexion decomposition it is not two additive constants.
+    Through `estimate`: the calibration's R_rest carries the reference."""
+    ref, pose = coords(hand, 30.0, 20.0), coords(hand, 30.0, 50.0)
+    fe, aa = jf.paper_order_angles(ref.T @ pose, hand)
+    assert (fe, aa) == pytest.approx((3.32575, 25.70535), abs=1e-5)
+    assert (30.0 - fe, 50.0 - aa) != pytest.approx((30.0, 20.0), abs=1.0)   # not the rest offset
+    pos, rot = hand_pose(hand, 30.0, 50.0)
+    e = te.estimate(pos, rot, hand, cal_with(rest_for(hand) @ ref, hand=hand))
+    assert (e[te.FE], e[te.AA]) == pytest.approx((3.32575, 25.70535), abs=1e-5)
+    # the one additive case: a reference change that is a pure turn about the
+    # first (abduction) axis shifts the abduction alone
+    ref_y = coords(hand, 0.0, 20.0)
+    assert jf.paper_order_angles(ref_y.T @ pose, hand) == pytest.approx((30.0, 30.0), abs=1e-9)
+    # and a pure turn about the flexion axis is not additive either
+    ref_x = coords(hand, 30.0, 0.0)
+    fe_x, aa_x = jf.paper_order_angles(ref_x.T @ pose, hand)
+    assert (fe_x, aa_x) != pytest.approx((0.0, 50.0), abs=1.0)
+
+
+DOC_PHRASES = ("unknown constant", "constant per coordinate", "constant offset",
+               "unknown offset")
+
+
+def test_no_module_or_document_claims_a_constant_offset_from_the_paper():
+    """The claim corrected above must be gone from the code and the pages."""
+    files = ([*(REPO / "src" / "leap_hand").glob("*.py"),
+              *(REPO / "scripts" / "leap").glob("*.py"),
+              *(REPO / "docs").glob("*.md"), REPO / "README.md"])
+    hits = [f"{p.relative_to(REPO)}: {phrase!r}" for p in files
+            for phrase in DOC_PHRASES
+            if phrase in p.read_text(encoding="utf-8", errors="replace").lower()]
+    assert hits == []
+
+
+# --- the calibration's kind and hand (Codex finding 4, 2026-10-24) -------------------------
+def test_outputs_are_named_by_the_calibration_kind():
+    assert te.keys_for("openhand") == te.KEYS == (
+        "T_TMC_fe_est_openhand", "T_TMC_aa_est_openhand", "T_TMC_twist_est_openhand",
+        "T_TMC_residual_est_openhand_deg")
+    assert te.keys_for("neutral") == (
+        "T_TMC_fe_est_neutral", "T_TMC_aa_est_neutral", "T_TMC_twist_est_neutral",
+        "T_TMC_residual_est_neutral_deg")
+    with pytest.raises(ValueError, match="kind must be one of"):
+        te.keys_for("openhand ")
+    pos, rot = hand_pose("left", 12.0, 3.0)
+    open_hand = te.estimate(pos, rot, "left", cal_with(R_REST, hand="left"))
+    neutral = te.estimate(pos, rot, "left", cal_with(R_REST, kind="neutral", hand="left"))
+    assert set(open_hand) == set(te.KEYS) | {"calibration", "kind"}
+    assert set(neutral) == set(te.keys_for("neutral")) | {"calibration", "kind"}
+    assert open_hand["kind"] == "openhand" and neutral["kind"] == "neutral"
+    assert open_hand[te.FE] == pytest.approx(neutral["T_TMC_fe_est_neutral"])
+    with pytest.raises(ValueError, match="kind must be one of"):
+        cal_with(R_REST, kind="open hand")
+    with pytest.raises(ValueError, match="hand must be one of"):
+        cal_with(R_REST, hand="both")
+
+
+def test_calibration_kind_and_hand_survive_json_and_older_files_are_read_or_refused():
+    cal = cal_with(R_REST, kind="neutral", hand="left")
+    doc = json.loads(json.dumps(cal.to_json()))
+    assert doc["kind"] == "neutral" and doc["hand"] == "left"
+    back = te.Calibration.from_json(doc)
+    assert back.kind == "neutral" and back.hand == "left"
+    # a file written before the field existed: the writer's own first words say the kind
+    for prefix, kind in te.PROVENANCE_PREFIXES.items():
+        old = {k: v for k, v in doc.items() if k not in ("kind", "hand")}
+        old["provenance"] = f"{kind} of session X: ..."
+        assert te.Calibration.from_json(old).kind == prefix
+        assert te.Calibration.from_json(old).hand is None
+    # a declared hand fills a file that has none, and may not contradict a recorded one
+    old["provenance"] = f"{te.PROVENANCE_PREFIXES['openhand']} of session X"
+    assert te.Calibration.from_json(old).hand is None
+    assert te.Calibration.from_json(old, hand="right").hand == "right"
+    assert te.Calibration.from_json(doc, hand="left").hand == "left"      # agrees
+    with pytest.raises(ValueError, match="records the left hand; the declared right hand"):
+        te.Calibration.from_json(doc, hand="right")
+    with pytest.raises(ValueError, match="declared hand must be one of"):
+        te.Calibration.from_json(old, hand="both")
+    old["provenance"] = "hand-made test calibration"
+    with pytest.raises(ValueError, match='no "kind".*"kind": "openhand".*"kind": "neutral"'):
+        te.Calibration.from_json(old)
+
+
+@pytest.mark.parametrize("kind", te.KINDS)
+def test_a_calibration_of_the_other_hand_or_of_no_known_hand_is_refused(dataset, kind):
+    """Codex's recheck of 2026-10-24: a known hand applies only to its own
+    hand; an unknown hand (an older file) is never assumed compatible, for
+    either recording hand and either kind, through every entry point."""
+    from leap_hand import tmc_calibration_take as tct
+    for cal_hand, other in (("left", "right"), ("right", "left")):
+        cal = cal_with(rest_for(cal_hand), kind=kind, hand=cal_hand)
+        assert te.mismatch(cal, cal_hand) is None
+        own = te.estimate(*hand_pose(cal_hand, 12.0, 3.0), cal_hand, cal)
+        assert own[te.keys_for(kind)[0]] == pytest.approx(12.0, abs=1e-6)
+        assert te.mismatch(cal, other) == (f"calibration of the {cal_hand} hand, this "
+                                           f"recording is of the {other} hand")
+        with pytest.raises(ValueError, match=f"calibration of the {cal_hand} hand"):
+            te.estimate(*hand_pose(other, 12.0, 3.0), other, cal)
+    right = cal_with(rest_for("right"), hand="right")
+    assert te.mismatch(right, "right", "other") == (
+        "calibration of session synthetic, this recording is of session other")
+    assert te.mismatch(right, "right", "synthetic") is None
+    unknown = cal_with(R_REST, kind=kind)                        # hand not recorded
+    for hand in ("left", "right"):
+        assert te.mismatch(unknown, hand) == te.HAND_UNKNOWN
+        assert "declare it with --tmc-calibration-hand" in te.mismatch(unknown, hand)
+        with pytest.raises(ValueError, match="calibration hand not recorded"):
+            te.estimate(*hand_pose(hand, 12.0, 3.0), hand, unknown)
+    rec = rc.find_transition(dataset, "p3_circular_power", 4)
+    with pytest.raises(ValueError, match="calibration hand not recorded"):
+        te.series(rec, unknown)
+    if kind == "neutral":
+        with pytest.raises(ValueError, match="calibration hand not recorded"):
+            tct.estimate(*hand_pose("left"), "left", unknown)
+
+
+def test_the_hand_of_an_older_file_is_recovered_only_from_its_own_transitions(dataset,
+                                                                             tmp_path):
+    """An older open-hand file names the transitions it used; the dataset's
+    pose_transitions.csv records their hand. Every entry must match one row
+    of the calibration's session and all rows must agree, else nothing."""
+    cal = te.calibrate(dataset)
+    older = te.Calibration.from_json({k: v for k, v in cal.to_json().items() if k != "hand"})
+    assert older.hand is None and te.mismatch(older, "left") == te.HAND_UNKNOWN
+    hand, note = te.hand_from_transitions(older, dataset)
+    assert hand == "left"
+    n = len(older.per_transition)                      # the transitions the calibration used
+    assert n == 3 and [p["name"] for p in older.per_transition] == [
+        "p3_circular_power", "p3_prismatic_precision", "p1_lateral"]
+    assert note == (f"recovered from metadata/pose_transitions.csv: {n} of {n} transitions of "
+                    f"session {SESSION} are left-hand recordings")
+    assert te.mismatch(replace(older, hand=hand), "left") is None
+    # another session than the table's
+    assert te.hand_from_transitions(replace(older, session="another"), dataset)[0] is None
+    # an entry the table does not have
+    hand, note = te.hand_from_transitions(
+        replace(older, per_transition=older.per_transition + [{"name": "p9_none", "take": 1}]),
+        dataset)
+    assert hand is None and note.startswith(f"1 of {n + 1} transitions not matched")
+    assert "p9_none take 1" in note
+    # nothing to match, and no table
+    assert te.hand_from_transitions(replace(older, per_transition=[]), dataset) == (
+        None, "the calibration lists no transitions to match")
+    hand, note = te.hand_from_transitions(older, tmp_path)
+    assert hand is None and note.startswith("cannot read metadata/pose_transitions.csv")
+    # two hands among the matched rows
+    rows = rc.list_transitions(dataset)
+    rows[0]["hand"] = "right"
+    write_table(tmp_path / "mixed" / "metadata" / "pose_transitions.csv", rows)
+    hand, note = te.hand_from_transitions(older, tmp_path / "mixed")
+    assert hand is None and note == "the matched transitions record hands ['left', 'right']"
 
 
 # --- a synthetic dataset --------------------------------------------------------------------
@@ -357,7 +523,10 @@ def test_more_than_one_session_needs_a_choice(tmp_path):
 
 def test_calibration_json_round_trip(dataset):
     cal = te.calibrate(dataset)
+    assert cal.kind == "openhand" and cal.hand == "left"    # from the transition rows
+    assert cal.provenance.startswith(te.PROVENANCE_PREFIXES["openhand"])
     back = te.Calibration.from_json(json.loads(json.dumps(cal.to_json())))
+    assert back.kind == "openhand" and back.hand == "left"
     assert np.array_equal(back.R_rest, cal.R_rest)
     assert back.provenance == cal.provenance
     assert back.agreement == cal.agreement
@@ -390,7 +559,7 @@ def test_paper3_tmc_relation_stays_unavailable(cls):
     angles = p3.series_angles(poses, "left")
     est = {k: [] for k in te.KEYS}
     for pos, rot in poses:
-        e = te.estimate(pos, rot, "left", cal_with(R_REST))
+        e = te.estimate(pos, rot, "left", cal_with(R_REST, hand="left"))
         for k in te.KEYS:
             est[k].append(e[k])
     angles.update({k: np.asarray(v) for k, v in est.items()})

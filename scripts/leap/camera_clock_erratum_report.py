@@ -29,6 +29,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -879,6 +880,15 @@ def print_pdf(html_path, pdf_path):
                         "--no-first-run", f"--user-data-dir={profile}",
                         f"--print-to-pdf={pdf_path}", html_path.resolve().as_uri()],
                        capture_output=True, timeout=300)
+        # Edge 156 returns from the launcher before the PDF is written (about a
+        # second later on this machine), so wait for the file and a stable size.
+        deadline, size = time.monotonic() + 60, -1
+        while time.monotonic() < deadline:
+            now = pdf_path.stat().st_size if pdf_path.is_file() else -1
+            if now > 0 and now == size:
+                break
+            size = now
+            time.sleep(0.5)
     return exe
 
 

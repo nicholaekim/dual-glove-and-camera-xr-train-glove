@@ -4,6 +4,9 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .venv/
+.venv-myo/
+# MuJoCo writes its warning log into the working directory (myosuite_hand_limits.py)
+MUJOCO_LOG.TXT
 
 # MediaPipe model: 7.5 MB third-party binary, re-downloadable (see README)
 models/*.task
@@ -17,6 +20,21 @@ models/*.task
 # locally. It is the professor's data and contains photographs of people, so it
 # stays out of this public repo.
 /reference/
+
+# The target pictures the camera window shows. Eight are frames of that same
+# dataset (reference_poses/sources.txt names each one), so they stay out too;
+# the window shows no picture when one is missing. The two text cards are ours.
+/reference_poses/*.png
+!/reference_poses/crossed_fingers.png
+!/reference_poses/thumb_opposition.png
+
+# graphify: its extraction cache, the mtime manifest and the files holding
+# local paths and token counts never go into the repository.
+/graphify-out/cache/
+/graphify-out/manifest.json
+/graphify-out/cost.json
+/graphify-out/.graphify_root
+/graphify-out/.graphify_python
 
 # Generated training sets and model runs — rebuildable from the script, and
 # the source images belong to the Ultralytics dataset, not to us.

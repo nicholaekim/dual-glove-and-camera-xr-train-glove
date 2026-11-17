@@ -314,9 +314,11 @@ squeeze", and the per-take stability (MAD) rows show adjustment.
 
 Consequence for the recording day: the gloves came off while the recorder was changed. Because the glove's fit and
 calibration must not change between conditions, the five runs are recorded again from step 3, run A included (15
-takes, a few minutes). The first attempt's folder was renamed `recordings\pilot_hoo_2026-10-23_attempt1` (run A
-valid, the B1 deviations, the pre-amendment attempt, its own objects.txt and glove_setup.txt) and the launchers
-record the new session into a fresh `recordings\pilot_hoo`, so no launcher changes.
+takes, a few minutes). The day's two attempts are kept, renamed `recordings\pilot_hoo_2026-10-23_attempt1` (run A
+valid, the B1 deviations, the pre-amendment attempt) and `recordings\pilot_hoo_2026-10-23_attempt2` (run A valid,
+B1 and C deviations, closed incomplete, with its addendum), each with its own objects.txt and glove_setup.txt; the
+launchers record the next session into a fresh `recordings\pilot_hoo`, so no launcher changes. The gate rehearsal
+folder `recordings\pilot_hoo_gate_test` is not pilot data.
 
 ## Amendment of 2026-10-23, second: the object gate
 

@@ -241,30 +241,46 @@ same frames span 1.178 s. The report is `scenarios\timestamp_anomaly.json`.
 
 ## 6. Discontinuity policy
 
-**Where a segment ends.** A segment boundary falls after frame i in either
-of two cases:
+**Where a segment ends.** A segment boundary falls after frame i in any of
+three cases:
 
 - `hand_id[i+1] != hand_id[i]` (`id_change`). The tracker lost the hand, and
   the new id may not even be the same hand.
 - `t[i+1] - t[i] > 0.05 s` on the camera clock (`gap`). 0.05 s is about 4.5
   nominal periods at 90 Hz.
+- a status-0 line of the selected hand sits between frame i and frame i+1
+  (`invalid_status`; added 2026-10-24 after Codex's finding 2). The tracker
+  reported no valid hand there, so the two neighbours are not one continuous
+  motion, however short the interval and whatever the id and the clock say.
 
-A boundary that is both gives both events. The frame ids skipped there are
-counted in the events' details, not as a third event.
+A boundary that is an id change and a gap gives both events. The frame ids
+skipped there are counted in the events' details, not as a third event. An
+invalid-tracking boundary adds no event of its own: the `invalid_status`
+event of the excluded line (its line number, frame id and hand id) is the
+record, and no `dropped_frames` event is written there.
 
 **What happens at a boundary:**
 
 - **No interpolation across it.** `pose_at(..., "interpolate")` lerps world
   positions and slerps world quaternions only inside one segment. Across a
-  boundary it holds the earlier frame and says so in its note.
-- **Dropped frames.** A frame-id skip with the same hand id and a continuous
-  clock is a `dropped_frames` event. It is shown on the timeline and still
-  interpolated.
+  boundary it holds the earlier frame and says so in its note, naming the
+  kinds: "discontinuity (id_change, gap)" or "discontinuity (invalid_status)
+  between frame_id A and B: holding the earlier frame, not interpolated".
+- **Dropped frames.** A frame-id skip with the same hand id, a continuous
+  clock and no invalid line in between is a `dropped_frames` event. It is
+  shown on the timeline and still interpolated.
 - **Status-0 lines.** A status-0 line of the selected hand is excluded from
-  the pose sequence and marked as `invalid_status`.
+  the pose sequence and marked as `invalid_status` at the next selected
+  frame; one before the first selected frame or after the last cuts nothing
+  (there is nothing to interpolate across) and its detail says so.
 
 Measured: 7 boundaries (section 4), every one both an `id_change` and a
-`gap`. There are no `dropped_frames` and no `invalid_status` events.
+`gap`. There are no `dropped_frames` and no `invalid_status` events in the
+dataset, so the invalid-tracking rule changes none of its numbers; it is
+covered by synthetic tests (`tests/test_replay_core.py`, four cases) and by
+Codex's own three-frame file
+(`results\replay_fidelity\codex_corrections_20261024\invalid_frame\`, before
+and after: interpolated with a 10 mm wrist displacement before, held after).
 
 **The identity-change example: p2_s03_power_grasp_finger_side take 1.**
 
@@ -298,16 +314,85 @@ process running), `scripts\leap\replay_view.py --grasp p3_circular_power
 | 1x | 56 | 74.8 / 95.7 / 128.2 | 392 of the 449 frames passed |
 | 0.25x | 84 | 18.6 / 23.4 / 30.4 | 85 |
 
-So at 1x this matplotlib viewer draws about 7 frames per second of a 90 Hz
-recording: the pose shown is always a true source frame at the right media
-time, but most frames are not drawn at full speed. At 0.25x about one frame
-in two is drawn. Frame stepping, event jumps and scrubbing land on exact
-source frames (`displayed pose: recorded` in the HUD) and do not depend on
-the tick rate. Logs: `results\replay_fidelity\timing_tk_p3_circular_power_take1_speed1.json`
+So at 1x this matplotlib viewer drew about 7 frames per second of a 90 Hz
+recording on 2026-10-23: the pose shown is always a true source frame at the
+right media time, but most frames were not drawn at full speed. At 0.25x
+about one frame in two was drawn. Frame stepping, event jumps and scrubbing
+land on exact source frames (`displayed pose: recorded` in the HUD) and do
+not depend on the tick rate. Logs: `results\replay_fidelity\timing_tk_p3_circular_power_take1_speed1.json`
 and `..._speed0.25.json`; a driven interactive session that exercised every
 control on TkAgg while the batch run was competing for CPU is in
 `results\replay_fidelity\interactive_tk\` (81 ticks, mean 78.9 ms, p95
 158.0 ms, max 495.0 ms over four play runs at 1x, 2x and 0.5x).
+
+### Rendering rate after the corrections of 2026-10-24 (Codex's finding 1)
+
+Codex's independent run of the same command (54 ticks for the 449-frame,
+4.989 s recording, 394 source frames skipped) was reproduced before any
+change: three trials on an idle machine gave 52 ticks each, 396 frames
+skipped, lateness mean 82 ms (`results\replay_fidelity\codex_corrections_20261024\timing\before\`).
+One tick on the real TkAgg window was then profiled stage by stage
+(`timing\profile_before.json`; i7-13620H, 1920 x 1080 display at 125 %
+scaling, figure 15.4 x 8.0 in): 64 ms a tick, of which
+
+| Stage of one tick (TkAgg, 2026-10-24) | Before, ms | After, ms |
+|---|---:|---:|
+| the three text panels (Pillow drew every line of text anew) | 30 | 6 (rows composed from a glyph atlas, unchanged rows reused) |
+| the 3D axes redrawn as a whole (13.9 of the 14.5 ms were the static panes, grid, ticks and labels) | 14.5 | about 1.5 (only the hand's artists are redrawn) |
+| blit of the whole figure to the Tk photo image | 10 | 8.7 (one region, 85 % of the figure; the Tk photo update is per pixel) |
+| the slider axes | 2.2 | about 0.5 (only the bar, the handle and the value text) |
+| reconstruction (`pose_at`), fidelity of the new frame, angles, Paper 3 rows, HUD text | about 3 | about 3 (unchanged: every value shown is that of the displayed frame) |
+| timer re-arm between ticks | 15.6 to 31 | about 1 to 3 |
+
+The last row is the second cause, found while measuring: Tk's `after()` on
+this Windows machine rounds any interval above 1 ms up to the 15.6 ms system
+timer quantum (`after(5)` and `after(10)` both fire every 15.6 ms;
+`after(1)` every 1.0 ms), so the old 15 ms interval added 15.6 to 31 ms
+after every draw. `TICK_MS` is now 1: the next tick follows the draw at
+once and the draw time alone sets the rate. The media clock is wall time
+times speed and was not touched; a frame is still chosen by time, so a late
+tick shows a later frame and skipped frames are reported, never hidden.
+
+Measured after the change by `scripts\leap\replay_playback_check.py`
+(three launches of the real window at 1x, p3_circular_power take 1, 6 s
+each, nothing else running; logs and `summary.json` in
+`timing\after\`), first play run of each trial:
+
+| Trial | Ticks | Rendered updates | Distinct frames shown | Frames skipped | Wall s | Frames shown / s | Lateness mean / p95 / max ms |
+|---|---:|---:|---:|---:|---:|---:|---|
+| before 1 | 52 | 52 | 52 | 396 | 4.92 | 10.6 | 82.3 / 95.1 / 125.0 |
+| before 2 | 52 | 52 | 52 | 396 | 4.93 | 10.6 | 82.6 / 100.8 / 130.4 |
+| before 3 | 52 | 52 | 52 | 396 | 4.90 | 10.6 | 82.1 / 95.4 / 136.9 |
+| after 1 | 191 | 190 | 190 | 258 | 5.01 | 38.0 | 25.2 / 28.5 / 136.1 |
+| after 2 | 179 | 178 | 178 | 270 | 5.00 | 35.6 | 26.9 / 32.3 / 168.9 |
+| after 3 | 178 | 177 | 177 | 271 | 5.01 | 35.3 | 27.2 / 33.4 / 148.4 |
+
+(The before rows count ticks as rendered updates and frames shown: every
+tick drew, and every tick landed on a new frame. The after rows are the
+gate K8 run recorded by the ledger's checker; an earlier run of the same
+command a few minutes before gave 187 / 186 / 185 ticks and 37.4 / 37.2 /
+36.9 frames shown per second.) The target was at least
+30 distinct source frames shown per second during the active part of normal
+1x playback on this machine, an engineering target for the viewer, not a
+Paper 3 requirement; a 90 Hz recording still has frames between the drawn
+ones, and every one of them is reachable by stepping (left / right, the
+slider, p / n), which lands on the exact source frame. Lateness here is
+measured against a 1 ms slot, so it is the draw time of the previous tick:
+mean 26 ms, p95 31 ms; the max of about 130 ms is the first tick of a run,
+which pays for the full draw that makes the background. Each timing log now
+carries `rendered_updates`, `frames_shown`, `wall_duration_s`,
+`rendered_per_s` and `frames_shown_per_s`, in all and per play run
+(`runs_detail`); `TIMING_DOC` in the log defines each.
+
+What stayed the same, by test and by the batch run: the numbers in every
+panel are computed from the displayed frame (the per-frame caches are keyed
+by the source frame index), the fidelity lines still come from
+`frame_fidelity` of that frame, the hand is drawn from the same
+reconstruction, and the screenshots still draw everything (the hand's
+artists are drawn after the background in a saved figure too). Visible
+differences: the panel text is now composed from Pillow-rendered glyphs of
+the same font at the same size and spacing, and each panel bitmap starts one
+pixel inside its frame so the frame line stays in the background.
 
 `--scenarios` writes four reports. Each holds the recording's
 `recording_fidelity` and its Paper 3 comparison. `--check-scenarios` holds

@@ -54,6 +54,17 @@ it is off for mock sensors, whose hand shape does not follow the pose called.
 `--hint hand_on_object` (coached leap sessions only) asks the Ultraleap
 service for its tracking for hands occluded by a held object. It needs the
 service's Hyperion license, and the recorder refuses to start without it.
+`--app-screenshot "XR Train"` (coached session) also saves a picture of that
+application's window for every attempt, at the midpoint of the REC hold (the
+moment of the camera still), to `xr_train/<take>.png`; a rejected attempt's
+goes to `rejected/xr_train/`, and the meta.json says where it is, when and
+how it was captured, or why there is none (`app_screenshot*` keys, see
+`xr_hand.app_screenshot`). It is taken on its own thread, never fails a take,
+and the recorder refuses to start if the window cannot be captured.
+`--pose-list FILE.json` takes the poses from a pose list (`items` with `id`,
+`label`, `shape`) and shows each pose's label and shape with its id;
+`--start-at ID` begins at that pose of the list.
+
 Every `<take>.meta.json`, kept or rejected, says `tracking_hints`,
 `hints_confirmed` and `license_hyperion`, and `note` holds `--note` exactly
 as typed (null without it), e.g. which object was in the hand. An
@@ -89,6 +100,8 @@ import argparse
 import json
 import re
 import sys
+import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -147,6 +160,7 @@ from leap_hand.stream import (KNOWN_HINTS, LeapUnavailable, hint_metadata,
                               open_stream)
 
 # The glove side comes from the xr_hand package in this repo.
+from xr_hand.app_screenshot import capture_window, empty_record, window_titles
 from xr_hand.parser import parse_hand_message
 from xr_hand.receiver import OSCHandReceiver, QueueItem
 from xr_hand.recorder import FrameRecorder
@@ -180,6 +194,13 @@ GLOVE_GAP_WARN_S = 0.25
 # disk where it can be counted, looked at and argued with.
 REJECTED = "rejected"
 STILLS = "stills"
+# `--app-screenshot`: where the application window's pictures go, how long an
+# attempt waits for its picture after the hold, and why there is none.
+APP_SHOTS = "xr_train"
+APP_SHOT_WAIT_S = 5.0
+APP_NOT_REACHED = "the attempt ended before the midpoint of its hold"
+APP_TIMEOUT = f"the capture did not finish within {APP_SHOT_WAIT_S:g} s of the hold"
+APP_VANISHED = "the capture reported a file that is not there"
 # Which rule kept or refused an attempt, in every meta (`acceptance_policy`).
 # "strict": the hand never lost for LOST_S and covering COMPLETE_COVERAGE of
 # the hold. The keep-all policy is the pilot's object runs' (--keep-all-
@@ -852,6 +873,38 @@ class Attempt:
     cam_health: Optional[dict] = None
     cam_reacquisitions: int = 0
     tracking_note: str = ""
+    # The application-window screenshot of this attempt (`--app-screenshot`):
+    # `xr_hand.app_screenshot`'s record, {} when the session takes none or the
+    # attempt never reached its hold.
+    app_shot: dict = field(default_factory=dict)
+
+
+def app_shot_meta(session, got: "Attempt", accepted: bool) -> dict:
+    """The meta.json keys about the application screenshot of one attempt.
+
+    {} for a session that takes none, so its meta.json is what it always was.
+    The path is relative to the session folder, like `still`."""
+    window = getattr(session, "app_window", None)
+    if not window:
+        return {}
+    shot = got.app_shot or empty_record(window, APP_NOT_REACHED)
+    folder = Path(APP_SHOTS) if accepted else Path(REJECTED) / APP_SHOTS
+    name = shot.get("file")
+    return {
+        "app_screenshot": str(folder / name) if name else None,
+        "app_screenshot_missing_reason": (None if name else
+                                          shot.get("missing_reason") or STILL_UNKNOWN),
+        # time.time() just before the window was drawn: inside the hold
+        "app_screenshot_captured_at": shot.get("captured_at"),
+        "app_screenshot_method": shot.get("method"),
+        "app_screenshot_window": window,
+        "app_screenshot_process": shot.get("process"),
+        "app_screenshot_size": ([shot["width"], shot["height"]]
+                                if shot.get("width") else None),
+        # True when the picture has no pixel brighter than near-black: it is
+        # kept, and it is not a picture of the hand
+        "app_screenshot_black": shot.get("black"),
+    }
 
 
 @dataclass
@@ -901,7 +954,11 @@ def next_take(out_dir: Path, pose: str, hand: str) -> int:
     return max(numbers, default=0) + 1
 
 
-from leap_hand.protocol import CameraView  # noqa: E402  (the live camera window)
+from leap_hand.protocol import CameraView, reference_path  # noqa: E402  (the live camera window)
+
+# The professor's picture of each pose (reference_poses/sources.txt), shown in
+# the window's top-right corner while that pose is asked for.
+REFERENCE_DIR = Path(__file__).resolve().parents[1] / "reference_poses"
 
 
 class CoachedLeapSession(LeapSyncSession):
@@ -951,7 +1008,9 @@ class CoachedLeapSession(LeapSyncSession):
                  settle: float = DEFAULT_SETTLE, retries: int = DEFAULT_RETRIES,
                  acquire_timeout: float = 60.0, pose_check: bool = True,
                  pose_check_params=DEFAULT_PARAMS, note: Optional[str] = None,
-                 keep_all_tracking: bool = False):
+                 keep_all_tracking: bool = False,
+                 app_window: Optional[str] = None, app_capture=None,
+                 pose_text: Optional[dict] = None):
         super().__init__(leap_source, glove_source, hz=hz, out_dir=out_dir,
                          leap_hz=leap_hz)
         self.hand = hand
@@ -974,6 +1033,16 @@ class CoachedLeapSession(LeapSyncSession):
         self.pose_check_params = pose_check_params
         self.rejected_dir = out_dir / REJECTED
         self.stills_dir = out_dir / STILLS
+        # `--app-screenshot`: the title of an application window to save a
+        # picture of at the midpoint of every REC hold, None for none. The
+        # capture function is passed in so a test can stand in for the window.
+        self.app_window = app_window or None
+        self.app_capture = app_capture
+        self.app_dir = out_dir / APP_SHOTS
+        self._app_thread: Optional[threading.Thread] = None
+        self._app_record: dict = {}
+        # `--pose-list`: {pose id: (label, shape)}, shown with the id.
+        self.pose_text = dict(pose_text or {})
         # Every attempt the pose check threw out, as (pose, what was seen).
         # Printed per pose at the end: the sensors are the arbiter here, so
         # how often they vetoed a take is part of the session's result.
@@ -1108,12 +1177,14 @@ class CoachedLeapSession(LeapSyncSession):
             self.view.caption(
                 view_caption(self._phase, self._pose, self._hud_extra, left,
                              self._take, self._takes),
-                band=self.band)
+                band=self.band,
+                ref=reference_path(REFERENCE_DIR, self._phase, self._pose))
         # The terminal line names the pose too, in the phases where the window
         # used to be the only thing that could have.
         extra = self._hud_extra
         if not extra and self._phase in ("SETTLE", "REC") and self._pose:
-            extra = f"HOLD: {pose_label(self._pose)}"
+            extra = f"HOLD: {self._pose_name(self._pose)}" if self._pose in self.pose_text \
+                else f"HOLD: {pose_label(self._pose)}"
         self.hud.show(hud_line(self._phase, left, fresh, self.hand, self.band,
                                self._glove_hz,
                                saw_other_hand=now - self._other_at < HUD_STALE_S,
@@ -1203,7 +1274,7 @@ class CoachedLeapSession(LeapSyncSession):
                     f"{self.acquire_timeout:g} s ({self._hud_extra})")
 
     def _hold(self, phase: str, seconds: float, cam_rec=None,
-              glove_rec=None, snap=None) -> str:
+              glove_rec=None, snap=None, app_snap=None) -> str:
         """Tick for `seconds`, watching the pinned hand. "" = it survived.
 
         `snap` is a path for the camera window to save one composed frame to,
@@ -1230,6 +1301,10 @@ class CoachedLeapSession(LeapSyncSession):
                     if self.view is not None:
                         self.view.snapshot(snap)
                     snap = None
+                if app_snap and now >= midpoint:
+                    # the same moment, the application's own window
+                    self._app_shot_start(app_snap)
+                    app_snap = None
                 reason = self._lost_reason(now)
                 if not reason:
                     losing = None
@@ -1243,6 +1318,60 @@ class CoachedLeapSession(LeapSyncSession):
             return ""
         finally:
             self._following = False
+
+    # --- the application window's screenshot ------------------------------
+    def _pose_name(self, pose: str) -> str:
+        """`PS01 (middle tip curl, others straight)`, or the id in capitals."""
+        title = pose.replace("_", " ").upper()
+        text = self.pose_text.get(pose)
+        return f"{title} ({text[0]})" if text else title
+
+    def _app_shot_start(self, path: Path) -> None:
+        """Save the application window to `path`, off the frame loop: drawing
+        a window can take tens of milliseconds, and this thread is the
+        capture clock."""
+        self._app_record = {}
+        capture = self.app_capture or capture_window
+
+        def work():
+            try:
+                self._app_record = capture(self.app_window, path)
+            except Exception as e:       # a screenshot never fails a take
+                self._app_record = empty_record(
+                    self.app_window, f"capture error: {type(e).__name__}: {e}")
+
+        self._app_thread = threading.Thread(target=work, name="app-screenshot",
+                                            daemon=True)
+        self._app_thread.start()
+
+    def _app_shot_finish(self, path: Optional[Path]) -> dict:
+        """The record of the attempt's screenshot, once its thread is done.
+        {} for a session that takes none."""
+        if path is None:
+            return {}
+        thread, self._app_thread = self._app_thread, None
+        if thread is None:               # the hold ended before its midpoint
+            return empty_record(self.app_window, APP_NOT_REACHED)
+        thread.join(APP_SHOT_WAIT_S)
+        if thread.is_alive():
+            return empty_record(self.app_window, APP_TIMEOUT)
+        record = dict(self._app_record) or empty_record(self.app_window,
+                                                        STILL_UNKNOWN)
+        if record.get("file") and not path.is_file():
+            record.update(file=None, missing_reason=APP_VANISHED)
+        return record
+
+    def _move_app_shot(self, got: "Attempt", src: Optional[Path],
+                       dst: Path) -> None:
+        """Keep the screenshot's name matched to the take's, kept or rejected."""
+        if src is None or not got.app_shot.get("file"):
+            return
+        if src.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src.replace(dst)
+            got.app_shot["file"] = dst.name
+        else:
+            got.app_shot.update(file=None, missing_reason=APP_VANISHED)
 
     def _settle_files(self, name: str):
         """Both sides' SETTLE clip paths for a take's working name."""
@@ -1271,12 +1400,13 @@ class CoachedLeapSession(LeapSyncSession):
         name = pose_filename(pose, take)          # one name, two files
         stem = name[:-len(".jsonl")]
         still = self.stills_dir / f"{stem}.jpg"
+        app_png = self.app_dir / f"{stem}.png" if self.app_window else None
 
         # The beep goes to a thread: this one is the capture clock now, and a
         # quarter second of blocked frame loop in the middle of a take is a
         # quarter second of hand that nobody recorded.
         self.beeper.beep(1000, 200)
-        self._say(f"      NOW: {pose.replace('_', ' ').upper()}  "
+        self._say(f"      NOW: {self._pose_name(pose)}  "
                   f"({self.settle:g} s to change shape, "
                   f"hand id {self._pinned_id})")
         # THE SETTLE IS RECORDED, to sibling files, and the take is not
@@ -1324,7 +1454,8 @@ class CoachedLeapSession(LeapSyncSession):
         self.beeper.beep(1400, 120)
         t0 = time.time()
         try:
-            lost = self._hold("REC", duration, cam_rec, glove_rec, snap=still)
+            lost = self._hold("REC", duration, cam_rec, glove_rec, snap=still,
+                              app_snap=app_png)
         except BaseException:
             # Ctrl+C included. An interrupted take is an unverified take, and
             # the whole point of this session is that unverified takes do not
@@ -1340,6 +1471,9 @@ class CoachedLeapSession(LeapSyncSession):
             skipped_still_path(still).unlink(missing_ok=True)
             still_capture_path(still).unlink(missing_ok=True)
             full_still_path(still).unlink(missing_ok=True)
+            if app_png is not None:
+                self._app_shot_finish(app_png)
+                app_png.unlink(missing_ok=True)
             raise
         cam_rec.stop()
         glove_rec.stop()
@@ -1348,6 +1482,7 @@ class CoachedLeapSession(LeapSyncSession):
         t1 = time.time()
 
         still_name, still_missing = still_status(still)
+        app_record = self._app_shot_finish(app_png)
         # The camera over the COMMANDED hold, whichever rule ends it: a strict
         # hold cut short by a loss counts the cut-off rest as untracked.
         held = [t for t in self._times if t0 <= t <= t0 + duration]
@@ -1362,6 +1497,7 @@ class CoachedLeapSession(LeapSyncSession):
             second_hand=self.second_hand - before[1],
             still=still_name or "",
             still_missing=still_missing or "",
+            app_shot=app_record,
             # On the meta's microsecond grid, the end from the rounded start,
             # so that hold_end - hold_start is the duration to the microsecond.
             hold_start=round(t0, 6),
@@ -1416,6 +1552,7 @@ class CoachedLeapSession(LeapSyncSession):
                 cam_finalize(path, {self.hand})
         got.file = final.name
         got.still, got.still_missing = self._rename_still(still, final.stem)
+        self._move_app_shot(got, app_png, self.app_dir / f"{final.stem}.png")
         if (got.glove_health.get("max_gap_ms") or 0) > GLOVE_GAP_WARN_S * 1000:
             self._say(f"      ! the glove stream stopped for "
                       f"{got.glove_health['max_gap_ms']:.0f} ms during this "
@@ -1502,6 +1639,8 @@ class CoachedLeapSession(LeapSyncSession):
             src.replace(dst)
         still = self.rejected_dir / STILLS / f"{target}.jpg"
         move_still(self.stills_dir / f"{stem}.jpg", still)
+        self._move_app_shot(got, self.app_dir / f"{stem}.png" if self.app_window else None,
+                            self.rejected_dir / APP_SHOTS / f"{target}.png")
         still_name, missing = still_status(still)
         still_name = still_name or ""
         got.still_missing = missing or ""
@@ -1534,6 +1673,9 @@ class CoachedLeapSession(LeapSyncSession):
         self._pose, self._take, self._takes = pose, take, n_takes
         self._say("", f"--- Pose {pose_idx}/{n_poses}: {title}  "
                       f"(take {take}/{n_takes}, {self.hand} hand) ---")
+        if pose in self.pose_text:
+            label, shape = self.pose_text[pose]
+            self._say(f"      {label}: {shape}" if shape else f"      {label}")
         result = TakeResult(pose=pose, take=take)
         try:
             for attempt in range(1, self.retries + 2):
@@ -1663,6 +1805,9 @@ class CoachedLeapSession(LeapSyncSession):
             # no hint and no note.
             **hint_metadata(getattr(self, "leap", None)),
             "note": getattr(self, "note", None),
+            # `--app-screenshot`: the application window's picture of this
+            # attempt; no keys at all for a session that takes none.
+            **app_shot_meta(self, got, accepted),
         }
 
     def _write_meta(self, result: TakeResult) -> None:
@@ -1696,6 +1841,8 @@ class CoachedLeapSession(LeapSyncSession):
         note = getattr(self, "note", None)
         if note is not None:
             extra += f' --note "{note}"'
+        if self.app_window:
+            extra += f' --app-screenshot "{self.app_window}"'
         return ("python scripts/record_simultaneous.py --camera leap "
                 f"--hand {self.hand} --poses {','.join(failed)} "
                 f"--takes {takes}{extra}")
@@ -1756,6 +1903,19 @@ class CoachedLeapSession(LeapSyncSession):
             if self.stills_dir.is_dir():
                 print(f"  stills:      {self.stills_dir}   (one per take, "
                       "what the window saw mid-record)")
+            if self.app_window:
+                shots = [r.final.app_shot for r in self.takes
+                         if r.complete and r.final]
+                have = sum(1 for a in shots if a.get("file"))
+                black = sum(1 for a in shots if a.get("file") and a.get("black"))
+                print(f"  APP SCREENSHOTS: {have} of {done} kept takes have one "
+                      f"(the {self.app_window!r} window, in {self.app_dir})"
+                      + (f"; {black} of them BLACK, not a picture of the hand"
+                         if black else ""))
+                for r in self.takes:
+                    if r.complete and r.final and not r.final.app_shot.get("file"):
+                        print(f"    no screenshot for {r.final.file}: "
+                              f"{r.final.app_shot.get('missing_reason') or STILL_UNKNOWN}")
             print(f"  fuse + compare:  python scripts/fuse_poses.py "
                   f"{self.out_dir}")
             print(f"  re-check labels: python scripts/check_take_labels.py "
@@ -1770,6 +1930,31 @@ class CoachedLeapSession(LeapSyncSession):
                         for p in failed)
             print("\n  Redo ONLY the poses that failed:")
             print(f"    {self.redo_command(failed, takes)}")
+
+
+def load_pose_list(path) -> Tuple[List[str], dict]:
+    """(pose ids in order, {id: (label, shape)}) from a pose-list JSON: an
+    object with `items`, each with an `id` that is already a file-name safe
+    pose name, and optionally a `label` and a `shape`."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"--pose-list: cannot read {path}: {e}")
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list) or not items:
+        raise SystemExit(f"--pose-list: {path} has no items")
+    ids: List[str] = []
+    text: dict = {}
+    for n, item in enumerate(items, 1):
+        pid = str(item.get("id") or "") if isinstance(item, dict) else ""
+        if not pid or slugify(pid) != pid:
+            raise SystemExit(f"--pose-list: item {n} of {path} needs an id made "
+                             "of lower-case letters, digits and _")
+        if pid in text:
+            raise SystemExit(f"--pose-list: id {pid!r} appears twice in {path}")
+        ids.append(pid)
+        text[pid] = (str(item.get("label") or pid), str(item.get("shape") or ""))
+    return ids, text
 
 
 def main() -> None:
@@ -1863,9 +2048,33 @@ def main() -> None:
                         "losses into its meta.json instead (the pilot's "
                         "object runs, amendment of 2026-10-23; --camera leap "
                         "--hand left|right). ACQUIRE and SETTLE stay strict")
+    p.add_argument("--app-screenshot", default=None, metavar="WINDOW_TITLE",
+                   help="also save a picture of the application window with "
+                        "exactly this title (e.g. \"XR Train\") for every "
+                        "attempt, at the midpoint of its REC hold, to "
+                        "xr_train/<take>.png, and say so in its meta.json "
+                        "(--camera leap --hand left|right). The recorder "
+                        "refuses to start if the window cannot be captured")
+    p.add_argument("--pose-list", default=None, metavar="FILE.json",
+                   help="take the poses from a pose list (items with id, label, "
+                        "shape) instead of --poses, and show each pose's label "
+                        "and shape with its id (--camera leap --hand left|right)")
+    p.add_argument("--start-at", default=None, metavar="POSE_ID",
+                   help="with --pose-list: begin at this pose of the list")
     args = p.parse_args()
 
-    poses = [slugify(x) for x in args.poses.split(",") if slugify(x)]
+    pose_text: dict = {}
+    if args.pose_list:
+        poses, pose_text = load_pose_list(args.pose_list)
+        if args.start_at:
+            if args.start_at not in poses:
+                raise SystemExit(f"--start-at {args.start_at}: not in "
+                                 f"{args.pose_list} ({poses[0]} ... {poses[-1]})")
+            poses = poses[poses.index(args.start_at):]
+    elif args.start_at:
+        raise SystemExit("--start-at needs --pose-list: it names a pose of the list")
+    else:
+        poses = [slugify(x) for x in args.poses.split(",") if slugify(x)]
     if not poses:
         raise SystemExit("no poses given")
     auto_take = str(args.first_take).strip().lower() == "auto"
@@ -1913,11 +2122,35 @@ def main() -> None:
     # writes: anywhere else they would be dropped without a trace, and a take
     # whose condition is not on disk is a take nobody can sort.
     for flag, given in (("--hint", hints), ("--note", args.note is not None),
-                        ("--keep-all-tracking", args.keep_all_tracking)):
+                        ("--keep-all-tracking", args.keep_all_tracking),
+                        ("--app-screenshot", args.app_screenshot)):
         if given and not coached:
             raise SystemExit(
                 f"{flag} needs --camera leap --hand left|right: it is written "
                 "into each take's meta.json, and only that session writes one")
+    if args.pose_list and not coached:
+        raise SystemExit("--pose-list needs --camera leap --hand left|right: "
+                         "only that session shows a pose's label and shape")
+    if args.app_screenshot:
+        # One trial capture before anything is recorded: a session whose every
+        # take says "window minimised" is found out now, not afterwards.
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = capture_window(args.app_screenshot, Path(tmp) / "probe.png")
+        if not probe.get("file"):
+            raise SystemExit(
+                f"--app-screenshot: the window titled {args.app_screenshot!r} "
+                f"cannot be captured ({probe.get('missing_reason')}). Start the "
+                "application and leave its window open, not minimised. Open "
+                f"windows: {', '.join(window_titles()) or 'none'}")
+        if probe.get("black"):
+            raise SystemExit(
+                f"--app-screenshot: the {args.app_screenshot!r} window captures "
+                "as a black picture. Bring it to the front, uncovered, and "
+                "start again")
+        print(f"  app screenshots: the {args.app_screenshot!r} window "
+              f"({probe.get('width')}x{probe.get('height')}, "
+              f"{probe.get('method')}), one per attempt at the midpoint of "
+              "its hold\n")
     # One output folder, one tracking condition: takes made with and without
     # a hint side by side could only be told apart by opening every meta.
     if backend == LEAP:
@@ -2019,7 +2252,8 @@ def main() -> None:
                     settle=args.settle, retries=args.retries,
                     acquire_timeout=args.acquire_timeout,
                     pose_check=pose_check_on, note=args.note,
-                    keep_all_tracking=args.keep_all_tracking)
+                    keep_all_tracking=args.keep_all_tracking,
+                    app_window=args.app_screenshot, pose_text=pose_text)
                 session.view = CameraView(
                     hand=args.hand, band=band,
                     enabled=not (args.no_view or args.mock_leap)).start()

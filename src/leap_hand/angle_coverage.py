@@ -10,10 +10,21 @@ STATUS
   calculated      read off the tracker's bone orientations by a stated
                   decomposition: the 18 Paper 3 coordinates the camera gives,
                   plus the paper-order MCP pairs.
-  estimated       calculated against a calibration the dataset itself
-                  supplies, with stated assumptions; kept in separate
-                  `_est_<calibration>` columns, never merged with the
-                  validated ones (the thumb TMC pair, leap_hand.tmc_estimate).
+  estimated       an UNVALIDATED ESTIMATE: a tracker-relative coordinate
+                  referred to a calibration posture (the thumb TMC pair,
+                  leap_hand.tmc_estimate), with stated assumptions; one entry
+                  per calibration kind, kept in separate `_est_openhand` (the
+                  session's recorded open hand) and `_est_neutral` (a
+                  tmc_neutral calibration take) columns, never merged with
+                  each other or with the reference-evaluated ones.
+  evaluated       a MEASUREMENT EVALUATED AGAINST AN INDEPENDENT REFERENCE, with
+                  its scope: the thumb TMC pair through a mapping fitted and
+                  held-out-tested against a reference device
+                  (leap_hand.reference_validation), `_mapped` columns, filled
+                  only for the participant, hand and tracker session the
+                  mapping was evaluated on and inside its tested range, with a
+                  per-row status (T_TMC_mapped_status) that says synthetic or
+                  cross-check when the reference was. Empty everywhere else.
   unavailable     a coordinate the tracker does not measure: the cell is
                   empty, never 0 and never a Paper 3 prediction; the entry's
                   `requirement` says what recording or calibration would give
@@ -38,8 +49,9 @@ CONVENTIONS (xr_hand.joint_frames, both hands)
 column for one pose and None for the six unavailable Paper 3 coordinates:
 one joint_frames.table_from_world call (the `_tracker` columns) and
 paper3.frame_angles (the 24 and the 8 paper-order MCP values), so the Paper 3
-numbers here are exactly the ones paper3.compare is run on. The two
-`_est_openhand` columns are not in it: they need a calibration.
+numbers here are exactly the ones paper3.compare is run on. The four
+estimate columns (ESTIMATE_COLUMNS, two per kind in ESTIMATE_COLUMNS_BY_KIND)
+are not in it: they need a calibration.
 Pure: no files except `write_coverage_csv`, no window.
 """
 import csv
@@ -54,9 +66,19 @@ from xr_hand.joints import JOINT_NAMES
 
 from . import paper3 as p3
 
-STATUS = ("calculated", "estimated", "unavailable", "outside_paper3")
-STATUS_LABELS = {"calculated": "calculated", "estimated": "estimated",
-                 "unavailable": "unavailable", "outside_paper3": "outside Paper 3"}
+STATUS = ("calculated", "estimated", "evaluated", "unavailable", "outside_paper3")
+STATUS_LABELS = {"calculated": "calculated", "estimated": "unvalidated estimate",
+                 "evaluated": "reference-evaluated", "unavailable": "unavailable",
+                 "outside_paper3": "outside Paper 3"}
+# What each label means, for the viewer's legend and docs/angle_coverage.md.
+STATUS_MEANINGS = {
+    "calculated": "a calculated tracker coordinate (read off the bone orientations)",
+    "outside_paper3": "a calculated tracker coordinate that is not one of Paper 3's 24",
+    "estimated": "an unvalidated estimate (tracker-relative, zero at a calibration posture)",
+    "evaluated": ("a measurement evaluated against an independent reference, valid only "
+                  "inside its scope (participant, hand, session, tested range)"),
+    "unavailable": "not measured: the cell is empty"}
+MAPPED_COLUMNS: Tuple[str, ...] = ("T_TMC_fe_mapped", "T_TMC_aa_mapped")
 
 
 @dataclass(frozen=True)
@@ -84,6 +106,8 @@ SIGN_TWIST = ("positive with the back of the bone turning toward the little "
 ZERO_PHALANX = "bone in line with the parent"
 ZERO_METACARPAL = "metacarpal along the reference frame's -z"
 ZERO_OPEN_HAND = "the session's open-hand pose"
+ZERO_NEUTRAL = ("the tmc_neutral posture held in a calibration take (thumb beside the "
+                "index, in the plane of the palm; docs/tmc_calibration_protocol.md)")
 METHOD_XYZ = "xyz: R = Rx(a) Ry(b) Rz(c), flexion first (joint_frames.joint_angles)"
 METHOD_MCP = ("xyz (flexion first, joint_frames.joint_angles); paper_order "
               "(abduction first then flexion, the paper's D-H order, "
@@ -92,6 +116,7 @@ METHOD_ESTIMATE = ("paper_order on R_rest^T (R_palm^T R_metacarpal); see "
                    "leap_hand.tmc_estimate")
 METHOD_NONE = "none: not measured"
 REF_ESTIMATE = "palm frame via the session's open-hand rest frame"
+REF_ESTIMATE_NEUTRAL = "palm frame via the rest frame of a tmc_neutral calibration take"
 
 THUMB_TMC_REQUIREMENT = (
     "a calibration recording with the thumb in an anatomically defined "
@@ -113,6 +138,11 @@ CMC_AA_REQUIREMENT = (
 ESTIMATE_CALIBRATION = (
     "the session's open-hand frames: transitions with a movement_start_time_s, "
     "frames before movement_start_time_s - 0.1 s (leap_hand.tmc_estimate)")
+ESTIMATE_CALIBRATION_NEUTRAL = (
+    "a tmc_neutral calibration take of the same session and hand "
+    "(scripts/leap/record_poses.py --calibration tmc_neutral, "
+    "docs/tmc_calibration_protocol.md; leap_hand.tmc_calibration_take), its "
+    "calibration.json given as --tmc-calibration; none recorded yet (2026-10-24)")
 TMC_NOTE = (
     "not measured as the paper defines it: the wrist-frame XYZ pair of the "
     "thumb metacarpal is about the hand's axes (the thumb's own flexion axis is "
@@ -120,10 +150,39 @@ TMC_NOTE = (
     "converted because the paper's thumb frame is a drawing (Figure 1, p.3); "
     "the dataset's cell is blank")
 ESTIMATE_NOTE = (
-    "NOT a validated Paper 3 coordinate: relative to the recorded open hand, "
-    "it differs from the paper's zero by an unknown constant per coordinate "
-    "(Paper 3 gives its zero only as a drawing, Figure 1 p.3); the Table 6 "
-    "relation T_TMC_fe ~ 11/10 T_MCP_fe stays unavailable")
+    "NOT a validated Paper 3 coordinate: a tracker-relative coordinate, the thumb "
+    "metacarpal against the tracker's palm referred to the recorded open hand; a "
+    "change of reference (to the paper's zero, a drawing in Figure 1 p.3, or to an "
+    "anatomical frame) turns both components by pose-dependent amounts (cross-talk), "
+    "not by a constant per angle, so no zero offset ties it to the paper's "
+    "(docs/tmc_estimate.md); the Table 6 relation T_TMC_fe ~ 11/10 T_MCP_fe stays "
+    "unavailable")
+ESTIMATE_NOTE_NEUTRAL = (
+    "NOT a validated Paper 3 coordinate: the same tracker-relative coordinate "
+    "referred to a held reference posture instead of the incidental open hand; the "
+    "posture stands in for the ISB first-CMC neutral and is not that neutral, and the "
+    "cross-talk caveat is the same (docs/tmc_estimate.md)")
+SIGN_MAPPED_FE = ("flexion positive with the metacarpal head moving across the palm "
+                  "toward the little finger, in the plane of the palm (both hands)")
+SIGN_MAPPED_AA = ("abduction positive with the metacarpal head moving palmarly, out of "
+                  "the plane of the palm (palmar abduction; both hands)")
+REF_MAPPED = ("the reference device's trapezium (proximal) frame, through the rotation "
+              "fitted from the tracker's palm frame (leap_hand.reference_validation)")
+ZERO_MAPPED = "the reference capture's declared zero (e.g. the ISB neutral)"
+METHOD_MAPPED = ("the reference's declared rotation order on A R_pm b, with A and b "
+                 "fitted on calibration trials only and the errors measured on held-out "
+                 "trials (leap_hand.reference_validation)")
+MAPPED_NOTE = (
+    "reference-evaluated only inside the scope of the mapping that produced it: the "
+    "participant, hand and tracker session it was evaluated on, inside its tested range, "
+    "with the row status T_TMC_mapped_status (evaluated_in_range; synthetic_demonstration "
+    "or cross_check when the reference was synthetic or not an anatomical reference); "
+    "empty elsewhere, and empty in every row of the 2026-10-08 dataset. No mapping "
+    "evaluated against a measured anatomical reference exists yet (2026-10-24)")
+MAPPED_REQUIREMENT = (
+    "a validation session recorded with scripts/leap/record_validation.py while an "
+    "anatomical reference device records the same hand (docs/validation_capture_protocol.md), "
+    "compared with scripts/leap/reference_validation.py compare")
 CMC_NOTE = (
     "the wrist-frame metacarpal flexion is the forearm-to-palm bend, not the "
     "palm arc; against the palm it is a constant of the tracker's rigid hand")
@@ -169,6 +228,13 @@ def _thumb() -> List[Entry]:
             Entry("thumb TMC", movement, None, "estimated",
                   (f"{name}_est_openhand",), REF_ESTIMATE, ZERO_OPEN_HAND, sign,
                   METHOD_ESTIMATE, ESTIMATE_NOTE, ESTIMATE_CALIBRATION, None),
+            Entry("thumb TMC", movement, None, "estimated",
+                  (f"{name}_est_neutral",), REF_ESTIMATE_NEUTRAL, ZERO_NEUTRAL, sign,
+                  METHOD_ESTIMATE, ESTIMATE_NOTE_NEUTRAL, ESTIMATE_CALIBRATION_NEUTRAL,
+                  None),
+            Entry("thumb TMC", movement, None, "evaluated", (f"{name}_mapped",),
+                  REF_MAPPED, ZERO_MAPPED, SIGN_MAPPED_FE if k == "fe" else SIGN_MAPPED_AA,
+                  METHOD_MAPPED, MAPPED_NOTE, MAPPED_REQUIREMENT, None),
         ]
     out += _phalanx("thumb MCP", "THUMB_METACARPAL", "T", "MCP", "T_MCP_fe",
                     "THUMB_PROXIMAL", "Table 3")
@@ -246,26 +312,33 @@ COVERAGE: List[Entry] = (_thumb()
                          + _wrist_and_twist())
 
 # Every column all_angles returns, in table order (the six unavailable Paper 3
-# names included, always None); the estimate's two; the six.
+# names included, always None); the estimate's four, two per kind; the six.
 ALL_ANGLE_COLUMNS: List[str] = []
 for _e in COVERAGE:
     if _e.status in ("calculated", "outside_paper3"):
         ALL_ANGLE_COLUMNS += list(_e.output_columns)
     elif _e.status == "unavailable" and _e.paper3_name in p3.UNAVAILABLE:
         ALL_ANGLE_COLUMNS.append(_e.paper3_name)
+ESTIMATE_COLUMNS_BY_KIND: Dict[str, Tuple[str, str]] = {
+    kind: (f"T_TMC_fe_est_{kind}", f"T_TMC_aa_est_{kind}") for kind in ("openhand", "neutral")}
 ESTIMATE_COLUMNS: Tuple[str, ...] = tuple(
-    c for e in COVERAGE if e.status == "estimated" for c in e.output_columns)
+    c for cols in ESTIMATE_COLUMNS_BY_KIND.values() for c in cols)
 UNAVAILABLE_COLUMNS: Tuple[str, ...] = tuple(p3.UNAVAILABLE)
 
 _STATUS_OF: Dict[str, str] = {c: "unavailable" for c in UNAVAILABLE_COLUMNS}
 for _e in COVERAGE:
     _STATUS_OF.update({c: _e.status for c in _e.output_columns})
 
-assert len(COVERAGE) == 43
+assert len(COVERAGE) == 47
+assert MAPPED_COLUMNS == tuple(c for e in COVERAGE if e.status == "evaluated"
+                               for c in e.output_columns)
 assert len(ALL_ANGLE_COLUMNS) == len(set(ALL_ANGLE_COLUMNS)) == 68
 assert set(p3.ANGLE_NAMES) <= set(ALL_ANGLE_COLUMNS)
 assert set(ALL_ANGLE_COLUMNS) == set(p3.ANGLE_NAMES) | set(TRACKER_SOURCE)
-assert ESTIMATE_COLUMNS == ("T_TMC_fe_est_openhand", "T_TMC_aa_est_openhand")
+assert set(ESTIMATE_COLUMNS) == {c for e in COVERAGE if e.status == "estimated"
+                                 for c in e.output_columns}
+assert ESTIMATE_COLUMNS == ("T_TMC_fe_est_openhand", "T_TMC_aa_est_openhand",
+                            "T_TMC_fe_est_neutral", "T_TMC_aa_est_neutral")
 assert all(e.status in STATUS for e in COVERAGE)
 assert all(e.requirement for e in COVERAGE if e.status == "unavailable")
 

@@ -24,7 +24,8 @@ What "as recorded" means, and how each part is checked:
             writer's `wall_time`, then frame index at the nominal rate. Every
             fallback is named in `Timeline.reason` and as a `clock_defect`
             event. Frames are never reordered, and never interpolated across
-            a hand-id change or a time gap.
+            a hand-id change, a time gap or an invalid-tracking line (a
+            status-0 line of the selected hand between two selected frames).
 
 None of this is physical accuracy against the person's hand: that needs a
 reference measurement this dataset does not have.
@@ -303,9 +304,11 @@ def load_recording(path, hand_side: str, hand_ids: Optional[Sequence[int]] = Non
 
     Selected: `hand_side == hand_side`, `hand_id in hand_ids` (any id when
     None) and `status != 0`. Every other line is counted in `lines_excluded`;
-    a status-0 line of the selected hand is also an `invalid_status` event.
-    The file order is kept: a clock that disagrees with it is rejected by
-    `build_timeline`, the frames are not sorted to suit it.
+    a status-0 line of the selected hand is also an `invalid_status` event,
+    and when it sits between two selected frames it ends a segment there
+    (`find_segments`): playback never interpolates across it. The file order
+    is kept: a clock that disagrees with it is rejected by `build_timeline`,
+    the frames are not sorted to suit it.
     """
     if hand_side not in SIDES:
         raise ValueError(f"hand_side must be one of {SIDES}, got {hand_side!r}")
@@ -317,6 +320,7 @@ def load_recording(path, hand_side: str, hand_ids: Optional[Sequence[int]] = Non
     frames: List[SourceFrame] = []
     events: List[Event] = []
     excluded = {"other_hand": 0, "other_id": 0, "invalid_status": 0}
+    invalid_before: List[int] = []     # the selected frame each status-0 line precedes
     for line_no, d in lines:
         if d.get("hand_side") != hand_side:
             excluded["other_hand"] += 1
@@ -329,20 +333,26 @@ def load_recording(path, hand_side: str, hand_ids: Optional[Sequence[int]] = Non
                 "invalid_status", len(frames), fid, fid, None,
                 f"line {line_no}: status 0 (frame_id {fid}, hand_id "
                 f"{d.get('hand_id')}), excluded from the pose sequence"))
+            invalid_before.append(len(frames))
         else:
             frames.append(_source_frame(d, len(frames), line_no))
     if not frames:
         raise ValueError(f"{path}: no {hand_side} hand line with hand_ids {ids} "
                          f"and status != 0 ({len(lines)} lines, excluded {excluded})")
     for e in events:
-        e.index = min(e.index, len(frames) - 1)
+        if e.index == 0:
+            e.detail += "; before the first selected frame"
+        elif e.index > len(frames) - 1:
+            e.index = len(frames) - 1
+            e.detail += "; after the last selected frame"
 
     timeline = build_timeline(frames)
     if timeline.fallback:
         i = timeline.reports[CLOCK_PREFERENCE[0]].first_defect or 0
         events.append(Event("clock_defect", i, frames[i - 1].frame_id if i else None,
                             frames[i].frame_id, None, timeline.reason))
-    segments, boundary_events = find_segments(frames, timeline.t, gap_threshold_s)
+    segments, boundary_events = find_segments(frames, timeline.t, gap_threshold_s,
+                                              invalid_before=invalid_before)
     events = sorted(events + boundary_events, key=lambda e: e.index)
     return Recording(
         path=path, kind=kind, name=name or path.stem, take=take,
@@ -514,18 +524,27 @@ def build_timeline(frames: Sequence[SourceFrame],
 
 
 def find_segments(frames: Sequence[SourceFrame], t: np.ndarray,
-                  gap_threshold_s: float = GAP_THRESHOLD_S
+                  gap_threshold_s: float = GAP_THRESHOLD_S, *,
+                  invalid_before: Sequence[int] = ()
                   ) -> Tuple[List[Segment], List[Event]]:
     """Split where playback must not interpolate: a hand-id change (the
-    tracker lost the hand; the new id may not even be the same hand) or a
-    camera-clock gap over the threshold. A boundary that is both gives both
+    tracker lost the hand; the new id may not even be the same hand), a
+    camera-clock gap over the threshold, or an invalid-tracking line between
+    the two frames (`invalid_before` holds the index of the selected frame
+    each status-0 line of the selected hand precedes; `load_recording` fills
+    it). The tracker reported no valid hand there, so the two neighbours are
+    not one continuous motion however short the interval and whatever the id
+    and the clock say. A boundary that is an id change and a gap gives both
     events; the frame ids skipped there are counted in their details, not as
-    a third event. A frame-id skip with the id and the clock continuous is a
+    a third event. An invalid-tracking cut adds no event of its own: the
+    `invalid_status` event at that index already names the line. A frame-id
+    skip with the id, the clock and the tracking continuous is a
     `dropped_frames` event inside the segment."""
     segments: List[Segment] = []
     events: List[Event] = []
     if not frames:
         return segments, events
+    invalid = {int(i) for i in invalid_before}
     start = 0
     for i in range(len(frames) - 1):
         a, b = frames[i], frames[i + 1]
@@ -541,7 +560,7 @@ def find_segments(frames: Sequence[SourceFrame], t: np.ndarray,
         if dt > gap_threshold_s:
             cut.append(Event("gap", i + 1, a.frame_id, b.frame_id, dt,
                              f"dt {dt:.4f} s > {gap_threshold_s:g} s; {ids}"))
-        if cut:
+        if cut or (i + 1) in invalid:
             segments.append(Segment(start, i, a.hand_id))
             events.extend(cut)
             start = i + 1
@@ -811,9 +830,9 @@ def pose_at(rec: Recording, t: float, mode: str = "hold") -> DisplayedPose:
     hold: the latest source frame at or before t ("recorded" when t is exactly
     a source time, else "held"). interpolate: lerp of world positions and
     slerp of world quaternions between the two bracketing frames, but only
-    inside one segment; across a boundary the earlier frame is held and the
-    note says why. Before the first frame nothing is shown ("unavailable");
-    after the last, the last is held.
+    inside one segment; across a boundary (id change, gap, invalid tracking)
+    the earlier frame is held and the note says why. Before the first frame
+    nothing is shown ("unavailable"); after the last, the last is held.
     """
     if mode not in MODES:
         raise ValueError(f"mode must be one of {MODES}, got {mode!r}")
@@ -834,8 +853,14 @@ def pose_at(rec: Recording, t: float, mode: str = "hold") -> DisplayedPose:
         return _shown(frame, "held", i0, "")
     nxt = rec.frames[i0 + 1]
     if any(s.end == i0 for s in rec.segments):
-        kinds = [e.kind for e in rec.events
-                 if e.index == i0 + 1 and e.kind in ("id_change", "gap")]
+        here = [e for e in rec.events if e.index == i0 + 1]
+        kinds = [e.kind for e in here if e.kind in ("id_change", "gap")]
+        # A cut with no id change and no gap is an invalid-tracking cut. An
+        # invalid_status event at the last frame may instead be a line after
+        # it (load_recording clamps it there), so it is named only when the
+        # cut cannot be anything else or the index is not the last frame.
+        if any(e.kind == "invalid_status" for e in here) and (not kinds or i0 + 1 < n - 1):
+            kinds.append("invalid_status")
         return _shown(frame, "held", i0,
                       f"discontinuity ({', '.join(kinds) or 'segment boundary'}) "
                       f"between frame_id {frame.frame_id} and {nxt.frame_id}: "

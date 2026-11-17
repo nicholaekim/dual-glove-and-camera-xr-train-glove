@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 from leap_hand.protocol import (IMAGES_OFF, NO_TRACKED_HAND, STILL_UNKNOWN, CameraView,
                                 crop_hand, full_still_path, hand_crop_box, image_banner,
-                                move_still,
-                                save_still, skipped_still_path,
+                                move_still, parse_status, paste_reference, reference_label,
+                                reference_path, save_still, status_text, skipped_still_path,
                                 skipped_still_text, still_capture_meta, still_capture_path,
                                 still_capture_record, still_status, write_still_capture)
 
@@ -40,6 +40,71 @@ def test_caption_writes_text_and_band_and_skips_repeats(tmp_path):
 
 def test_unknown_hand_means_both():
     assert CameraView(hand=None, enabled=False).hand == "both"
+
+
+# --- the reference picture of the pose being asked for --------------------------
+
+def test_status_round_trips_the_reference_picture():
+    ref = "C:\\repo\\reference_poses\\crossed_fingers.png"
+    text = status_text("HOLD: CROSSED FINGERS   REC 5s", band=(18, 28), ref=ref)
+    assert parse_status(text) == ("HOLD: CROSSED FINGERS   REC 5s", (18.0, 28.0), None, ref)
+    assert parse_status(status_text("ACQUIRE"))[3] is None          # no ref: None
+
+
+def test_view_client_sends_the_reference_and_drops_it_when_none(tmp_path):
+    v = CameraView(hand="left", band=(18, 28), enabled=True)
+    v._status = tmp_path / "status.txt"
+    ref = tmp_path / "fist.png"
+    v.caption("HOLD: FIST   REC 4s", band=(18, 28), ref=ref)
+    assert parse_status(v._status.read_text(encoding="utf-8"))[3] == str(ref)
+    v.snapshot(tmp_path / "stills" / "fist_take1.jpg")              # a still keeps the ref
+    assert parse_status(v._status.read_text(encoding="utf-8"))[2:] == \
+        (str(tmp_path / "stills" / "fist_take1.jpg"), str(ref))
+    v.caption("idle", band=(18, 28))                                # no ref: none sent
+    assert "ref=" not in v._status.read_text(encoding="utf-8")
+    v._proc = None
+    v.close()
+
+
+def test_reference_path_only_for_a_pose_phase_and_an_existing_file(tmp_path):
+    (tmp_path / "fist.png").write_bytes(b"png")
+    for phase in ("ACQUIRE", "SETTLE", "REC"):
+        assert reference_path(tmp_path, phase, "fist") == str(tmp_path / "fist.png")
+    assert reference_path(tmp_path, "idle", "fist") is None
+    assert reference_path(tmp_path, "REC", "") is None
+    assert reference_path(tmp_path, "REC", "pinch") is None           # no file: nothing
+    assert reference_label(tmp_path / "crossed_fingers.png") == "TARGET: CROSSED FINGERS"
+
+
+def test_paste_reference_draws_only_the_top_right_and_leaves_the_clean_frame():
+    import numpy as np
+    rng = np.random.default_rng(1)
+    frame = rng.integers(0, 256, (768, 768, 3), dtype=np.uint8)
+    clean = frame.copy()                         # what compose() keeps for the still
+    before = frame.copy()
+    ref_img = np.full((180, 240, 3), 200, np.uint8)
+    said = []
+
+    def put(f, text, org):
+        said.append((text, org))
+        x, y = org
+        f[y - 17:y, x:758] = 255                 # a label-sized mark, like cv2.putText
+
+    box = paste_reference(frame, ref_img, "TARGET: FIST", put)
+    assert box == (518, 124, 758, 304)
+    x0, y0, x1, y1 = box
+    assert np.array_equal(frame[y0:y1, x0:x1], ref_img)
+    assert said == [("TARGET: FIST", (518, 114))]   # over the picture, one line above
+    changed = np.argwhere((frame != before).any(axis=2))
+    assert changed[:, 0].min() >= 124 - 10 - 17 and changed[:, 0].max() < y1
+    assert changed[:, 1].min() >= 384 and changed[:, 1].max() < x1   # the right half only
+    assert np.array_equal(clean, before)         # a copy taken before is untouched
+    # a long label runs left past the picture, never off the frame
+    said.clear()
+    paste_reference(before.copy(), ref_img, "TARGET: THUMB OPPOSITION", put)
+    assert said[0][1] == (758 - 17 * 24, 114)
+    # a picture wider than the frame is not drawn at all
+    assert paste_reference(before.copy(), np.zeros((10, 800, 3), np.uint8), "x", put) is None
 
 
 # --- the "camera images are off" banner --------------------------------------
