@@ -21,6 +21,7 @@ from leap_hand.paired_pose import (INDETERMINATE, LABEL, OPPOSITE, SAME, SIMULTA
                                    compare_points, frame_nearest, handedness, palm_side_mm,
                                    same_handedness, stillness, take_moment, to_palm_frame,
                                    window_speed_mm_s)
+from leap_hand.protocol import still_capture_meta, still_capture_record, write_still_capture
 from test_fusion import _write_glove_take, _write_leap_take, make_hand
 
 REPO = Path(__file__).resolve().parents[1]
@@ -376,6 +377,51 @@ def test_selection_with_no_accepted_take_says_re_record_and_investigate():
     assert cf["pose_classifier"] == "none" and bw["pose_classifier"] == "none"
     assert bw["note"] == s.BENT_WRIST_CONTROL and cf["note"] == ""
     assert [r["pose"] for r in sel] == ["crossed_fingers", "bent_wrist"]   # protocol order
+
+
+def test_a_save_time_stamp_is_not_reported_as_a_capture_stamp(tmp_path):
+    """The camera window had no image stamp for take 1's still, so its sidecar
+    holds the save time (source "saved_at"); take 2's holds the image's own."""
+    s = _script()
+    session, out = tmp_path / "session", tmp_path / "out"
+    saved, stamped = "fist_left_take1_a", "fist_left_take2_b"
+    moments = {}
+    for stem in (saved, stamped):
+        moments[stem] = _synthetic_take(session, stem)
+        still = session / "stills" / f"{stem}.jpg"
+        # the viewer's sidecar, then the recorder's copy of it into the take meta
+        write_still_capture(still, still_capture_record(
+            saved_at=moments[stem], **({} if stem == saved else
+                                       {"capture_time": moments[stem], "timestamp_us": 5000000,
+                                        "frame_id": 4})))
+        _meta(session, stem, **still_capture_meta(still))
+
+    m = take_moment(session, saved)
+    assert m.source != STILL_CAPTURE and "save time" in m.source
+    assert m.t == moments[saved]                          # the time is kept, only named
+    assert take_moment(session, stamped).source == STILL_CAPTURE
+
+    assert s.main([str(session), "--out", str(out)]) == 0
+    rows = {r["take"]: r for r in _rows(out / "comparison.csv")}
+    assert rows[saved]["status"] == "ok" and rows[saved]["moment_source"] == m.source
+    assert rows[stamped]["moment_source"] == STILL_CAPTURE
+    on_camera_clock = "matched on the camera's clock"
+    notes = (out / saved / "notes.txt").read_text(encoding="utf-8")
+    assert f"source: {m.source}" in notes and on_camera_clock not in notes
+    assert on_camera_clock in (out / stamped / "notes.txt").read_text(encoding="utf-8")
+    assert m.source in (out / "README.md").read_text(encoding="utf-8")   # the label explained
+    assert s.check_outputs(out) == 0
+
+    # the selection rule wants a capture stamp: take 1 passes everything else
+    (fail,) = s.auto_failures(rows[saved])
+    assert "moment_source" in fail
+    assert s.auto_failures(rows[stamped]) == []
+    _write_csv(out / "visual_checks.csv", s.VISUAL_COLUMNS,
+               [dict(r, intended_pose_seen="yes") for r in _rows(out / "visual_checks.csv")])
+    assert s.main(["--select", str(out)]) == 0
+    (fist,) = _rows(out / "selection.csv")
+    assert (fist["accepted_take"], fist["rejected_takes"]) == (stamped, saved)
+    assert "moment_source" in fist["rejected_reasons"]
 
 
 def test_select_refuses_a_blank_visual_cell_and_writes_the_table_when_filled(tmp_path, capsys):

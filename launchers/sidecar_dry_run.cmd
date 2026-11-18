@@ -11,5 +11,5 @@ echo Checking the still's timestamp through the paired-pose tool:
 echo.
 type results\paired_pose\sidecar_dry_run\comparison.csv
 echo.
-echo PASS if the moment_source column above says "still capture time". FAIL if it says "still file write time".
+echo PASS if the moment_source column above says "still capture time". FAIL if it says "still save time" or "still file write time".
 pause

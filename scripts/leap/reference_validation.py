@@ -18,6 +18,9 @@ with the fix):
                         the comparison: report.json, report.md,
                         matched_samples.csv and mapping.json in --out
                         -> COMPARISON DONE: ... | COMPARISON REFUSED: ...
+                        (the DONE line ends with "sync: <the report's sync
+                        note>" when fewer than three sync events left their
+                        pairing unchecked)
   observability --dataset ROOT --out DIR
                         over every recording of the dataset: how far each
                         metacarpal moves against the tracker's palm
@@ -102,7 +105,10 @@ def cmd_compare(args) -> int:
     report = rv.compare(ref, trk, trials, tmc_calibration=cal,
                         tmc_calibration_path=args.tmc_calibration)
     rv.write_report(report, args.out)
-    print(summary_line("COMPARISON DONE", report))
+    sync = report["sync"]     # events but no residual: the report's note says what was not checked
+    unchecked = sync.get("events") and sync.get("residual_max_s") is None
+    print(summary_line("COMPARISON DONE", report)
+          + (f" sync: {sync['note']}" if unchecked else ""))
     print(f"  {rv.STATUS_TEXT[report['status']]}")
     print(f"  report: {Path(args.out) / 'report.md'}")
     return 0

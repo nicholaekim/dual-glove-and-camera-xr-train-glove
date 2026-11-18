@@ -39,6 +39,14 @@ runs, which keep every completed hold), hold_completed, the camera's tracked
 fraction of the hold, its re-acquisitions and tracking_note, empty for a
 meta written before them, which counts as strict.
 
+Attempts that ended before their hold (amendment of 2026-11-17): no open hand
+acquired in time, or the hand lost during the settle. They leave no take
+file and no meta, so they are counted on their own (n_attempts_before_hold),
+beside the attempts that reached the hold: from the recorder's
+<run>/attempts_before_hold.log, and for takes recorded before the recorder
+wrote it, from the attempt numbers in the take's metas (a floor, see
+`before_hold_rows`).
+
 The object gate (second amendment of 2026-10-23), per run and grasp: the raw
 IR audit stills <run>/audit/<grasp>_*_L.png and the typed confirmations in
 <run>/audit/confirmations.txt; a run without them counts 0.
@@ -55,6 +63,7 @@ import datetime
 import json
 import sys
 from bisect import bisect_left
+from collections import Counter
 from pathlib import Path
 from statistics import median
 
@@ -85,6 +94,9 @@ REJECTED_BY = [("n_rejected_hand_lost", "was lost"),
                ("n_rejected_reacquired", "re-acquired"),
                ("n_rejected_low_coverage", "covered only")]
 REJECTED_OTHER = "n_rejected_other"
+# Where the recorder lists the attempts that ended before their hold
+# (record_simultaneous.BEFORE_HOLD_LOG), one JSON line each.
+BEFORE_HOLD_LOG = "attempts_before_hold.log"
 META_END, LAST_STAMP = "meta hold_end", "later last stamp"
 # The recorder's acceptance_policy (a meta without one was recorded strict);
 # KEEP_ALL keeps every completed hold, its losses in tracking_note.
@@ -109,7 +121,8 @@ SUMMARY_COLUMNS = (
     ["level", "run", "condition", "grasp", "n_valid_takes", "n_expected_takes",
      "n_invalid_takes", "n_unusable_takes", "n_missing_takes", "n_attempts",
      "n_rejected", "n_rejected_hand_lost", "n_rejected_reacquired",
-     "n_rejected_low_coverage", "n_rejected_other", "attempt_coverage_median",
+     "n_rejected_low_coverage", "n_rejected_other", "n_attempts_before_hold",
+     "attempt_coverage_median",
      "attempt_coverage_min", "cam_tracked_fraction_median",
      "cam_tracked_fraction_min", "cam_reacquisitions_worst",
      "n_strict_policy_takes", "n_keep_all_takes", "n_audit_stills",
@@ -249,11 +262,13 @@ def accepted_metas(run_dir: Path) -> list:
 
 
 def attempt_rows(run_dir: Path, label: str) -> list:
-    """Every attempt the recorder made in the run: the kept takes' metas in
-    leap/ and the refused attempts' in rejected/leap/, any `accepted` value.
-    Under the strict policy the recorder keeps a take only while the hand
-    stayed tracked, so the camera losing the hand shows HERE, not in the kept
-    takes' coverage; under keep-all it shows in their tracked fraction."""
+    """Every attempt of the run that reached its hold: the kept takes' metas
+    in leap/ and the refused attempts' in rejected/leap/, any `accepted`
+    value. (An attempt that ended before the hold has no meta: see
+    `before_hold_rows`.) Under the strict policy the recorder keeps a take
+    only while the hand stayed tracked, so the camera losing the hand shows
+    HERE, not in the kept takes' coverage; under keep-all it shows in their
+    tracked fraction."""
     rows = []
     for folder in (run_dir / "leap", run_dir / "rejected" / "leap"):
         for path in sorted(folder.glob("*.meta.json")):
@@ -261,8 +276,45 @@ def attempt_rows(run_dir: Path, label: str) -> list:
             rows.append({"run": label, "grasp": str(meta["pose"]),
                          "accepted": bool(meta.get("accepted")),
                          "why": meta.get("why") or "",
-                         "coverage": meta.get("coverage")})
+                         "coverage": meta.get("coverage"),
+                         # which attempt at which take it was, for
+                         # `before_hold_rows`
+                         "take": meta.get("take"),
+                         "number": meta.get("attempts")})
     return rows
+
+
+def before_hold_rows(run_dir: Path, label: str, held: list) -> list:
+    """One row per attempt of the run that ended before its hold (no open
+    hand acquired in time, or the hand lost during the settle) and so left
+    no take file and no meta; `held` is the run's `attempt_rows`.
+
+    The recorder lists them in <run>/attempts_before_hold.log (amendment of
+    2026-11-17), one JSON line each. A take recorded before that shows them
+    only through the attempt numbers in its metas: every time the recorder
+    starts a take it numbers the attempts from 1, and an attempt that reached
+    its hold left one meta carrying its number. The fewest attempts those
+    numbers allow, less the metas, ended before the hold. That is a floor:
+    an attempt after the last meta of its take left nothing to count, nor did
+    a take of which no attempt reached the hold."""
+    path = run_dir / BEFORE_HOLD_LOG
+    lines = (path.read_text(encoding="utf-8").splitlines()
+             if path.is_file() else [])
+    logged = [{"run": label, "grasp": str(d["pose"]), "take": d.get("take"),
+               "number": d.get("attempts")}
+              for d in (json.loads(s) for s in lines if s.strip())]
+    numbers: dict = {}                # (grasp, take) -> how often each number
+    for a in held + logged:
+        if isinstance(a["number"], int):
+            numbers.setdefault((a["grasp"], a["take"]),
+                               Counter())[a["number"]] += 1
+    unseen = []
+    for (grasp, _), n in numbers.items():
+        # a number seen c times: c starts of the take got at least that far
+        least = sum(max(n[k] for k in range(j, max(n) + 1))
+                    for j in range(1, max(n) + 1))
+        unseen += [{"run": label, "grasp": grasp}] * (least - sum(n.values()))
+    return logged + unseen
 
 
 def audit_rows(run_dir: Path, label: str) -> list:
@@ -284,10 +336,11 @@ def audit_rows(run_dir: Path, label: str) -> list:
 
 # --- the summary --------------------------------------------------------------------
 def summarise(level: str, run: str, condition: str, grasp: str, takes: list,
-              expected: int, attempts: list, audits=()) -> dict:
+              expected: int, attempts: list, audits=(), before=()) -> dict:
     """One row over `takes` (any status): every take counted, only the valid
-    ones measured; every attempt of the group, kept or refused, whatever
-    its take's validity; and its object gate's stills and confirmations."""
+    ones measured; every attempt of the group that reached its hold, kept or
+    refused, whatever its take's validity; its object gate's stills and
+    confirmations; and how many attempts ended before the hold (`before`)."""
     valid = [t for t in takes if t["status"] == OK]
     invalid = sum(t["status"].startswith(INVALID) for t in takes)
     refused = [a["why"] for a in attempts if not a["accepted"]]
@@ -309,6 +362,7 @@ def summarise(level: str, run: str, condition: str, grasp: str, takes: list,
            "n_attempts": len(attempts), "n_rejected": len(refused),
            **{key: reasons.count(key)
               for key in [k for k, _ in REJECTED_BY] + [REJECTED_OTHER]},
+           "n_attempts_before_hold": len(before),
            "attempt_coverage_median": median(covered) if covered else None,
            "attempt_coverage_min": min(covered) if covered else None,
            "cam_tracked_fraction_median": median(tracked) if tracked else None,
@@ -379,10 +433,11 @@ def grid_grasps(rows: list) -> list:
     return GRASPS + sorted({t["grasp"] for t in rows} - set(GRASPS))
 
 
-def summary_rows(takes: list, attempts: list, audits=()) -> list:
+def summary_rows(takes: list, attempts: list, audits=(), before=()) -> list:
     """Every run x grasp of the grid, recorded or not: every take counted,
-    only the valid ones measured, every attempt and audit row counted."""
-    grasps = grid_grasps(takes + attempts)
+    only the valid ones measured, every attempt (those that reached the hold
+    and, in `before`, those that did not) and audit row counted."""
+    grasps = grid_grasps(takes + attempts + list(before))
 
     def tried(runs, grasp=None, rows=attempts):
         return [t for t in rows
@@ -402,12 +457,14 @@ def summary_rows(takes: list, attempts: list, audits=()) -> list:
                   else 1 if grasp in GRASPS else 0)
         rows = [summarise(level, label, condition, grasp, pick({label}, one),
                           EXPECTED[label] * factor, tried({label}, one),
-                          tried({label}, one, audits))
+                          tried({label}, one, audits),
+                          tried({label}, one, before))
                 for label, _, condition, _ in RUNS]
         rows.append(summarise(pooled_level, "B", "B", grasp,
                               pick({"B1", "B2"}, one), EXPECTED["B"] * factor,
                               tried({"B1", "B2"}, one),
-                              tried({"B1", "B2"}, one, audits)))
+                              tried({"B1", "B2"}, one, audits),
+                              tried({"B1", "B2"}, one, before)))
         return rows
 
     per_grasp = {g: scope(g, "run_grasp", "run_grasp_pooledB")
@@ -491,6 +548,8 @@ def table(cols: list) -> list:
     line("rejected: re-acquired", "n_rejected_reacquired", "{}")
     line("rejected: low coverage", "n_rejected_low_coverage", "{}")
     line("rejected: other", "n_rejected_other", "{}")
+    line("attempts ended before the hold (no file)", "n_attempts_before_hold",
+         "{}")
     line("coverage over all attempts median", "attempt_coverage_median",
          "{:.2f}")
     line("coverage over all attempts min", "attempt_coverage_min", "{:.2f}")
@@ -548,8 +607,14 @@ def report(root, window_s, max_dt, run_lines, takes, summary) -> str:
         f"coverage: leap_hand.protocol.coverage (holes longer than "
         f"{LOSS_GAP_S:g} s) and gaps over 100 ms, per sensor, inside the "
         "window",
-        "attempts: every attempt the recorder made, kept or rejected "
+        "attempts: every attempt that reached its hold, kept or rejected "
         "(rejected/leap), with the recorder's own coverage of each",
+        "attempts ended before the hold: no open hand acquired in time, or "
+        "the hand lost during the settle; no take file and no meta. Counted "
+        f"from the recorder's {BEFORE_HOLD_LOG} (amendment of 2026-11-17) "
+        "and, for a take recorded before it, from the attempt numbers in the "
+        "take's metas, which is a floor: an attempt after the last meta of "
+        "its take left nothing to count",
         f"policy: the recorder's acceptance_policy per valid take, {STRICT} "
         f"when the meta has none; {KEEP_ALL} (amendment of 2026-10-23) keeps "
         "every completed hold, so its losses show in the camera tracked "
@@ -619,7 +684,7 @@ def main(argv=None) -> int:
     out = a.out or ((a.root if a.root is not None
                      else next(iter(given.values())).parent) / "comparison")
 
-    takes, attempts, audits, run_lines, unkept = [], [], [], [], []
+    takes, attempts, before, audits, run_lines, unkept = [], [], [], [], [], []
     for label, folder, condition, expected in RUNS:
         if label in given:
             run_dir, name = given[label], str(given[label])
@@ -629,15 +694,21 @@ def main(argv=None) -> int:
         metas = accepted_metas(run_dir) if run_dir is not None else []
         # counted even for a run with no take kept: its refusals are the data
         tried = attempt_rows(run_dir, label) if run_dir is not None else []
+        early = (before_hold_rows(run_dir, label, tried)
+                 if run_dir is not None else [])
         attempts += tried
+        before += early
         if run_dir is not None:
             audits += audit_rows(run_dir, label)
         if not metas:
             # "absent" only when nothing was attempted: a run the camera lost
             # every time was recorded, and must not read as never recorded
-            said = (f"{label} ({name}): 0 takes kept ({len(tried)} attempt"
-                    f"{'' if len(tried) == 1 else 's'}, all rejected)"
-                    if tried else f"{label} ({name}): absent")
+            made = [f"{len(rows)} attempt{'' if len(rows) == 1 else 's'}{how}"
+                    for rows, how in ((tried, ", all rejected"),
+                                      (early, " ended before the hold"))
+                    if rows]
+            said = (f"{label} ({name}): 0 takes kept ({'; '.join(made)})"
+                    if made else f"{label} ({name}): absent")
             run_lines.append(said)
             unkept.append(f"run {said}")
             continue
@@ -648,9 +719,10 @@ def main(argv=None) -> int:
         run_lines.append(f"{label} ({name}): {len(got)} take"
                          f"{'' if len(got) == 1 else 's'} ({n_ok} valid)")
 
-    # Nothing to write only when no run folder holds any meta at all: attempts
-    # with no take kept are a result (the camera lost the hand every time).
-    if not takes and not attempts:
+    # Nothing to write only when no run folder shows any attempt at all:
+    # attempts with no take kept are a result (the camera lost the hand every
+    # time), whether or not they got as far as the hold.
+    if not takes and not attempts and not before:
         where = (a.root if a.root is not None
                  else ", ".join(str(v) for v in given.values()))
         print(f"nothing to compare under {where}")
@@ -671,7 +743,7 @@ def main(argv=None) -> int:
     for s in unkept:
         print(s)
 
-    summary = summary_rows(takes, attempts, audits)
+    summary = summary_rows(takes, attempts, audits, before)
     out.mkdir(parents=True, exist_ok=True)
     write_csv(out / "takes.csv", TAKE_COLUMNS, takes)
     write_csv(out / "summary.csv", SUMMARY_COLUMNS, summary)

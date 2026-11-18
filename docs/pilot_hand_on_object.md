@@ -249,8 +249,9 @@ accepted take's `.meta.json`, camera file and glove file, and writes three files
   report prints numbers only; the reading is the table in the next section.
 
 A take whose `hints_confirmed` contradicts its run (false in C, true in A or B) is listed under "invalid takes" with
-its numbers kept in `takes.csv`, and left out of every summary; record it again. A run folder that is missing or has
-no accepted take is reported as absent, so the script also runs on a partial session.
+its numbers kept in `takes.csv`, and left out of every summary; record it again. A run folder that is missing or
+shows no attempt at all is reported as absent, and one with attempts but no accepted take is listed with its attempt
+counts, so the script also runs on a partial session.
 
 ## How the result is read, decided before recording
 
@@ -341,6 +342,54 @@ object run without them is visible as such. Mimed runs have no gate. Two setting
 images" ON in the Ultraleap Control Panel (a setting, no hardware), and the both-gloves launcher
 (`pilot_step3_gloves_both.cmd`) because XR Trainer streams both gloves whether or not the right one is used; the
 record must say what was connected.
+
+## Amendment of 2026-11-17: attempts that ended before the hold, and what counts as a re-acquisition
+
+Made after a code review of the recorder and the comparison, before the pilot is recorded again: there is no
+`recordings\pilot_hoo` yet, and the two sessions of 2026-10-23 are the only pilot data on disk.
+
+What was wrong. The comparison's report said its attempt rows held "every attempt the recorder made, kept or
+rejected". They did not. An attempt can end before its 5 s hold starts: no open hand acquired in the time allowed, or
+the hand lost (or found again under a new id) during the settle. The recorder has no recording of such an attempt to
+keep or to set aside (the settle clip is deleted, and `rejected\` holds only attempts a verdict was passed on), so it
+wrote nothing, and the comparison, which counts meta files, never saw it. A run in which no attempt reached its hold
+read as "absent". In the object runs the settle is where the hand closes on the object, and it stays strict under
+`--keep-all-tracking`, so these are losses with the object in the hand.
+
+What changes.
+
+1. The recorder appends one line per such attempt to `<run>\attempts_before_hold.log`: JSON, the keys of a rejected
+   attempt's meta (`pose`, `take`, the attempt's number in `attempts`, the reason in `why`, `accepted` false, `file`
+   and `hold_start` null). It still writes no take file, no settle clip and nothing under `rejected\` for it.
+2. The comparison counts them in a new column of `summary.csv`, `n_attempts_before_hold`, and a new row of
+   `report.txt`, "attempts ended before the hold (no file)", per run and grasp. A run with such attempts and nothing
+   else is listed with them ("0 takes kept (2 attempts ended before the hold)"), not as absent.
+3. The report's line about the attempt rows now says what they always held: every attempt that reached its hold.
+
+What does not change. `n_attempts`, `n_rejected`, the four reason counts and the coverage over attempts are computed
+as before, from the metas in `leap\` and `rejected\leap\`, and give the same values on the same files (checked on
+both sessions of 2026-10-23: `takes.csv` identical, every earlier column of `summary.csv` unchanged in every row).
+The new count stands beside them, never inside them. Option rejected: adding these attempts to `n_attempts` and
+`n_rejected`, which would have changed two pre-registered columns for runs already recorded and mixed an exact
+count with the floor described next.
+
+What the runs already recorded can and cannot show. They have no log. Their metas carry attempt numbers: every time
+the recorder starts a take it numbers the attempts from 1, a kept take's meta carries the number it was kept on and a
+rejected attempt's meta its own. The fewest attempts those numbers allow, less the metas, are counted as ended before
+the hold. That is a floor. It cannot show an attempt made after the last meta of its take, a take of which no attempt
+reached the hold, or the reason (acquisition or settle, lost or re-acquired). On the sessions of 2026-10-23 it shows
+2 in run A of the first (`cylindrical_object` takes 1 and 5) and 1 in run A of the second (`spherical_object` take 4).
+For takes recorded from this amendment on, the log makes the count exact.
+
+A second correction of the same date, in the recorder. It reported a loss as a re-acquisition ("the tracker let go
+and re-acquired the hand (id a -> b)", and one `cam_reacquisitions`) whenever any other hand id of the same side had
+been seen at any earlier moment of the attempt, even while the acquired hand was still tracked; the comparison then
+filed the attempt under "rejected: re-acquired" instead of "rejected: hand lost", and a kept object take could carry
+the re-acquired text in `tracking_note` beside `cam_reacquisitions` 0. From now on it is a re-acquisition only when
+the other id is seen after the acquired hand's last frame; otherwise the same loss is reported as "the left hand was
+lost for ...". Metas already written are not rewritten. One of them says re-acquired (first session of 2026-10-23,
+run A, `cylindrical_object` take 1, rejected attempt 1, `second_hand_frames` 4), and the files cannot tell which it
+was: the recorder does not write the other id's frames, and the meta does not say when they came.
 
 ## What would make the pilot invalid
 

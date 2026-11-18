@@ -387,6 +387,50 @@ def test_recording_fidelity_is_json_and_can_fail(tmp_path):
     assert bad["position_residual_m"]["worst_joint"] == "INDEX_TIP"
 
 
+@pytest.mark.filterwarnings("ignore:invalid value encountered in det:RuntimeWarning")
+def test_a_nan_coordinate_in_a_later_frame_fails_the_fidelity_gate(tmp_path):
+    """A coordinate that is not a number was never checked, so it cannot be
+    within tolerance, whichever frame and joint holds it: here the fourth
+    frame of six and a ring joint, neither of them the first."""
+    ring = "RING_PROXIMAL"
+    assert JOINT_INDEX[ring] > 0
+
+    lost = clock_lines(6)                           # one recorded position is null
+    lost[3]["abs26"][JOINT_INDEX[ring]] = [None, None, None]
+    fid = rc.recording_fidelity(load(tmp_path, lost, name="lost.jsonl"))
+    assert fid["within_tolerance"] is False
+    assert fid["within_tolerance_detail"]["position_m"]["ok"] is False
+    assert fid["position_residual_m"]["worst_frame_id"] == 1003
+    assert fid["position_residual_m"]["worst_joint"] == ring
+    # the bones that end and start at that joint have no direction to compare
+    assert fid["bone_direction_deg"]["within_expectation"] is False
+    assert fid["bone_direction_deg"]["worst_bone"] in ("RING_METACARPAL", ring)
+
+    broken = clock_lines(6)                         # the chain itself is not a number
+    joint = next(j for j in broken[3]["joints"] if j["name"] == ring)
+    joint["x"] = joint["qx"] = float("nan")
+    fid = rc.recording_fidelity(load(tmp_path, broken, name="broken.jsonl"))
+    assert fid["within_tolerance"] is False
+    assert {k: d["ok"] for k, d in fid["within_tolerance_detail"].items()} == {
+        "position_m": False, "chain_deg": False, "chain_m": False}
+    assert fid["chain_deg"]["worst_frame_id"] == 1003
+    assert fid["chain_m"]["worst_frame_id"] == 1003
+    assert fid["quat_norm"]["within_tolerance"] is False
+
+
+@pytest.mark.parametrize("frame,joint", [(0, "PALM"), (0, "RING_PROXIMAL"),
+                                         (3, "PALM"), (5, "LITTLE_TIP")])
+def test_a_null_recorded_position_fails_the_gate_wherever_it_sits(tmp_path, frame, joint):
+    """First, middle and last frame; first, middle and last joint."""
+    lines = clock_lines(6)
+    lines[frame]["abs26"][JOINT_INDEX[joint]] = [None, None, None]
+    fid = rc.recording_fidelity(load(tmp_path, lines))
+    assert fid["within_tolerance"] is False
+    assert fid["within_tolerance_detail"]["position_m"]["ok"] is False
+    assert fid["position_residual_m"]["worst_frame_id"] == 1000 + frame
+    assert fid["position_residual_m"]["worst_joint"] == joint
+
+
 # --- timestamp-based playback and speed -------------------------------------------
 def test_playback_clock_speed_pause_and_seek():
     clk = rc.PlaybackClock(speed=2.0)

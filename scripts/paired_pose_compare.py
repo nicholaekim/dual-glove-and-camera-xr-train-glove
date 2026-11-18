@@ -68,7 +68,7 @@ from leap_hand.paired_pose import (BONES, CAPTURE_CLOCK, CHAINS, HANDEDNESS_MARG
                                    INDETERMINATE, LABEL, OPPOSITE, SAME, SIMULTANEITY,
                                    TIMING_LABEL,
                                    SPEED_STEP_S, STILL_CAPTURE, STILL_MM_S, STILL_MTIME,
-                                   STILL_WINDOW_S, DegeneratePalm, axis_definition,
+                                   STILL_SAVED, STILL_WINDOW_S, DegeneratePalm, axis_definition,
                                    bone_lengths, compare_points, find_meta, frame_nearest,
                                    handedness, load_frames, palm_side_mm, points_mm,
                                    still_file, stillness, take_moment, to_palm_frame,
@@ -304,6 +304,10 @@ def take_notes(i: dict) -> str:
         lines.append("  the image frame's own LeapC timestamp converted to the wall clock the same "
                      "way as the tracking frames' capture_time, so still and tracking frame are "
                      "matched on the camera's clock")
+    elif moment.source == STILL_SAVED:
+        lines.append("  this is when the camera window saved the still: it had no LeapC timestamp "
+                     "for the image it showed, so the delay since that image's capture is "
+                     "unknown (not recorded in this take) and adds to every dt below")
     else:
         lines.append("  this is when the JPEG finished writing, a little after its IR image was "
                      "captured; that write delay is unknown (not recorded in this take) and adds "
@@ -345,7 +349,8 @@ def take_notes(i: dict) -> str:
         "precision (not measured; the two clock reads in the callback are microseconds apart); "
         f"glove the transmission delay above ({lag}), not corrected"
         + ("; the moment: plus the unknown still write delay" if moment.source == STILL_MTIME
-           else ""),
+           else "; the moment: plus the unknown delay from the image's capture to the still's "
+                "save" if moment.source == STILL_SAVED else ""),
         "",
         f"stillness: {i['still']} (mean 21-point speed of the wrist-centred points over the "
         f"frames within {STILL_WINDOW_S:g} s of the selected frame: glove "
@@ -653,7 +658,9 @@ nor its PALM point is among the 21.)
 - Axes: {axis_definition()}
 - The moment: the photo's. From the take meta's `still_capture_time` (the camera window's
   record of when the still's IR image was captured, on the wall clock) when the take has
-  it, labelled "{STILL_CAPTURE}"; otherwise the still file's modification time,
+  it, labelled "{STILL_CAPTURE}"; when the window had no image timestamp for the still, that
+  record is only when the window saved it (the meta's `still_capture_time_source` is
+  "saved_at"), labelled "{STILL_SAVED}"; otherwise the still file's modification time,
   labelled "{STILL_MTIME}", which is when the JPEG finished writing, a little after its
   image was captured. A take with neither is refused.
 - Nearest the photo's moment: each sensor's frame is the one of its own file nearest it on the
@@ -668,8 +675,9 @@ nor its PALM point is among the 21.)
   for the right, measured 5 October 2026 on closing movements), so the glove frame's dt is
   to arrival, not to the hand. When the moment is "{STILL_CAPTURE}", it is the image
   frame's own LeapC timestamp converted to the wall clock the same way, so still and
-  tracking frame are matched on the camera's clock; when it is the file write time, the
-  unknown write delay adds to every dt. notes.txt carries a timing uncertainty line,
+  tracking frame are matched on the camera's clock; when it is the still's save time or
+  the file write time, the unknown delay since the image's capture adds to every dt.
+  notes.txt carries a timing uncertainty line,
   separate from dt: camera one frame period (1000 / framerate ms, from the take's frames)
   plus the frame-age precision; glove the transmission delay above, not corrected.
 - Stillness: for each sensor, the mean 21-point speed in mm/s over its frames within

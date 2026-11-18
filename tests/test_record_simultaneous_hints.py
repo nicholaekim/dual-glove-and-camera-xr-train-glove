@@ -9,15 +9,19 @@ licensed service would (`leap_hand.mock.MockLeapStream`), so a mock run
 writes what a hinted camera run writes. Whether the real service accepts the
 hint is `tests/test_leap_hand.py -k hint`.
 """
+import copy
 import importlib.util
 import json
 import math
+import re
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from leap_hand.mock import MockLeapStream
+from test_leap_hand import ScriptedLeap
 from test_pose_check import MOCK_PARAMS
 
 REPO = Path(__file__).resolve().parents[1]
@@ -355,6 +359,8 @@ def test_a_clean_strict_take_has_the_tracking_keys(tmp_path, monkeypatch):
     assert meta["cam_reacquisitions"] == 0
     assert meta["cam_gaps_over_100ms"] == 0 and meta["cam_max_gap_ms"] < 100
     assert meta["tracking_note"] == "" and meta["why"] == ""
+    # every attempt reached its hold, so there is nothing to list
+    assert not (tmp_path / "sync" / "attempts_before_hold.log").exists()
 
 
 def test_keep_all_tracking_through_main_writes_the_policy(tmp_path,
@@ -389,6 +395,228 @@ def test_keep_all_tracking_is_refused_where_hint_is(argv, tmp_path,
     assert "--keep-all-tracking needs --camera leap --hand left|right" in str(
         e.value)
     assert not out.exists(), "refused before anything was recorded"
+
+
+def stray_then_lost_session(sync, out_dir, monkeypatch, keep_all: bool,
+                            back_as=None):
+    """A coached session on a scripted camera. The acquired left hand (id
+    2001) delivers through the whole settle; for the settle's first 0.1 s
+    every other camera frame is a second left-labelled hand (id 9999), in
+    between frames of ours. From 0.3 s into the hold id 2001 is gone and
+    nothing else is in view: a plain loss. With `back_as`, a left hand under
+    that id is in view from then on instead: a re-acquisition. The plan
+    follows the session's own phase, so it does not depend on how long the
+    acquire took."""
+    monkeypatch.setattr(sync, "beep", lambda *a, **k: None)
+    seen = {"frames": 0}
+
+    def plan(t):
+        seen["frames"] += 1
+        phase = seen["session"]._phase
+        if (phase == "SETTLE" and t - seen.setdefault("settle", t) < 0.1
+                and seen["frames"] % 2):
+            return [("left", 9999, 5_000_000)]
+        if phase == "REC" and t - seen.setdefault("rec", t) >= 0.3:
+            return [("left", back_as, 0)] if back_as else []
+        return [("left", 2001, 5_000_000)]
+
+    leap = ScriptedLeap(plan)
+    leap.start()
+    seen["session"] = sync.CoachedLeapSession(
+        leap, sync.MockGloveSource(), hz=None, out_dir=out_dir, hand="left",
+        settle=0.3, acquire_timeout=10.0, pose_check=False, retries=0,
+        keep_all_tracking=keep_all)
+    return seen["session"]
+
+
+def test_a_plain_loss_after_a_stray_hand_id_is_not_called_a_reacquisition(
+        tmp_path, monkeypatch):
+    """Another hand id of the same side seen while ours was still delivering
+    is a second hand in view. When ours later vanishes with nothing else in
+    view, that is a loss: `why`, `tracking_note` and `cam_reacquisitions`
+    all say so, under the strict rule and with --keep-all-tracking."""
+    sync = load_sync()
+    lost = r"the left hand was lost for \d\.\d s during the take"
+
+    strict = tmp_path / "strict"
+    session = stray_then_lost_session(sync, strict, monkeypatch, keep_all=False)
+    session.run_take("cylindrical_object", 1, 1, 1, 1, duration=1.5, prep=0)
+    session.finish()
+    assert list((strict / "leap").glob("*.meta.json")) == [], "nothing kept"
+    meta = only_meta(strict / "rejected" / "leap")
+    assert meta["second_hand_frames"] > 0, "the stray id was seen"
+    assert re.fullmatch(lost, meta["why"]), meta["why"]
+    assert meta["tracking_note"] == meta["why"]
+    assert meta["cam_reacquisitions"] == 0
+    cam = [json.loads(s) for s in (strict / "rejected" / "leap" / meta["file"])
+           .read_text(encoding="utf-8").splitlines()]
+    assert {d["hand_id"] for d in cam} == {2001}
+
+    kept = tmp_path / "keep_all"
+    session = stray_then_lost_session(sync, kept, monkeypatch, keep_all=True)
+    session.run_take("cylindrical_object", 1, 1, 1, 1, duration=1.5, prep=0)
+    session.finish()
+    meta = only_meta(kept / "leap")
+    assert meta["accepted"] is True and meta["why"] == ""
+    assert meta["second_hand_frames"] > 0, "the stray id was seen"
+    assert re.fullmatch(lost, meta["tracking_note"]), meta["tracking_note"]
+    assert meta["cam_reacquisitions"] == 0
+
+
+def test_a_hand_that_comes_back_under_a_new_id_is_still_a_reacquisition(
+        tmp_path, monkeypatch):
+    """The other half: ours stops and a left hand under a new id delivers
+    in its place. The strict rule names that id, not the stray seen earlier,
+    and counts one re-acquisition."""
+    sync = load_sync()
+    session = stray_then_lost_session(sync, tmp_path / "sync", monkeypatch,
+                                      keep_all=False, back_as=2002)
+    session.run_take("cylindrical_object", 1, 1, 1, 1, duration=1.5, prep=0)
+    session.finish()
+    meta = only_meta(tmp_path / "sync" / "rejected" / "leap")
+    assert meta["why"] == ("the tracker let go and re-acquired the hand "
+                           "(id 2001 -> 2002) during the take")
+    assert meta["tracking_note"] == meta["why"]
+    assert meta["cam_reacquisitions"] == 1
+
+
+class SameSideLeap(ScriptedLeap):
+    """ScriptedLeap, with a hand object of its own for every hand the plan
+    names. ScriptedLeap sets each planned id on the one object it has per
+    side, so two left hands in one frame would come out as the second of
+    them twice."""
+
+    def drain(self, max_items: int = 16):
+        now = time.time()
+        out = []
+        while self._next <= now and len(out) < max_items:
+            t = self._next - self._t0
+            self._next += 1.0 / self.hz
+            self.frames += 1
+            shapes = dict(self._shape.generate(1))
+            for side, hand_id, visible_us in self.plan(t):
+                lh = copy.copy(shapes[side])
+                lh.hand_id, lh.visible_time_us = hand_id, int(visible_us)
+                lh.capture_time, lh.framerate = now, self.hz
+                out.append((side, lh))
+        return out
+
+
+def second_hand_beside_ours_session(sync, out_dir, monkeypatch,
+                                    keep_all: bool, ours_first: bool):
+    """A coached session on a scripted camera that reports a second left
+    hand (id 9999) in the same tracking event as the acquired one (id 2001),
+    after it or before it, through the settle and the hold's first 0.3 s.
+    From then on nothing is in view: a plain loss."""
+    monkeypatch.setattr(sync, "beep", lambda *a, **k: None)
+    seen = {}
+    both = [("left", 2001, 5_000_000), ("left", 9999, 5_000_000)]
+
+    def plan(t):
+        phase = seen["session"]._phase
+        if phase == "REC" and t - seen.setdefault("rec", t) >= 0.3:
+            return []
+        if phase in ("SETTLE", "REC"):
+            return both if ours_first else both[::-1]
+        return both[:1]
+
+    leap = SameSideLeap(plan)
+    leap.start()
+    seen["session"] = sync.CoachedLeapSession(
+        leap, sync.MockGloveSource(), hz=None, out_dir=out_dir, hand="left",
+        settle=0.3, acquire_timeout=10.0, pose_check=False, retries=0,
+        keep_all_tracking=keep_all)
+    return seen["session"]
+
+
+def test_a_second_hand_in_the_same_batch_does_not_make_a_later_loss_a_reacquisition(
+        tmp_path, monkeypatch):
+    """A camera reports a second hand in the same tracking event as ours, so
+    one drained batch holds both. Ours was delivering beside the other id,
+    whichever of the two the event lists first; when both then leave the
+    view, that is a loss, under the strict rule and with
+    --keep-all-tracking."""
+    sync = load_sync()
+    lost = r"the left hand was lost for \d\.\d s during the take"
+    for ours_first in (True, False):
+        order = "ours_first" if ours_first else "ours_last"
+
+        strict = tmp_path / order / "strict"
+        session = second_hand_beside_ours_session(
+            sync, strict, monkeypatch, keep_all=False, ours_first=ours_first)
+        session.run_take("cylindrical_object", 1, 1, 1, 1, duration=1.5,
+                         prep=0)
+        session.finish()
+        assert list((strict / "leap").glob("*.meta.json")) == [], order
+        meta = only_meta(strict / "rejected" / "leap")
+        assert meta["second_hand_frames"] > 0, "the second hand was seen"
+        assert re.fullmatch(lost, meta["why"]), (order, meta["why"])
+        assert meta["tracking_note"] == meta["why"], order
+        assert meta["cam_reacquisitions"] == 0, order
+        cam = [json.loads(s)
+               for s in (strict / "rejected" / "leap" / meta["file"])
+               .read_text(encoding="utf-8").splitlines()]
+        assert {d["hand_id"] for d in cam} == {2001}, order
+
+        kept = tmp_path / order / "keep_all"
+        session = second_hand_beside_ours_session(
+            sync, kept, monkeypatch, keep_all=True, ours_first=ours_first)
+        session.run_take("cylindrical_object", 1, 1, 1, 1, duration=1.5,
+                         prep=0)
+        session.finish()
+        meta = only_meta(kept / "leap")
+        assert meta["accepted"] is True and meta["why"] == "", order
+        assert meta["second_hand_frames"] > 0, "the second hand was seen"
+        assert re.fullmatch(lost, meta["tracking_note"]), (
+            order, meta["tracking_note"])
+        assert meta["cam_reacquisitions"] == 0, order
+        cam = [json.loads(s) for s in (kept / "leap" / meta["file"])
+               .read_text(encoding="utf-8").splitlines()]
+        assert {d["hand_id"] for d in cam} == {2001}, order
+
+
+def test_an_attempt_that_ends_before_its_hold_leaves_a_line_and_no_file(
+        tmp_path, monkeypatch):
+    """The hand is lost in the first settle and never seen again, so the
+    retry finds no hand to acquire: two attempts, neither reached its REC
+    hold. Neither has a recording to keep or to set aside; each leaves one
+    line in attempts_before_hold.log, in a rejected attempt's meta's terms,
+    so that it can still be counted (scripts/pilot_compare.py)."""
+    sync = load_sync()
+    monkeypatch.setattr(sync, "beep", lambda *a, **k: None)
+    seen = {"gone": False}
+
+    def plan(t):
+        seen["gone"] = seen["gone"] or seen["session"]._phase == "SETTLE"
+        return [] if seen["gone"] else [("left", 2001, 5_000_000)]
+
+    leap = ScriptedLeap(plan)
+    leap.start()
+    out = tmp_path / "sync"
+    session = seen["session"] = sync.CoachedLeapSession(
+        leap, sync.MockGloveSource(), hz=None, out_dir=out, hand="left",
+        settle=0.7, acquire_timeout=0.5, pose_check=False, retries=1,
+        note=NOTE)
+    session.run_take("cylindrical_object", 1, 1, 1, 1, duration=0.6, prep=0)
+    session.finish()
+
+    log = out / "attempts_before_hold.log"
+    assert [p for p in out.rglob("*") if p.is_file()] == [log]
+    lines = [json.loads(s)
+             for s in log.read_text(encoding="utf-8").splitlines()]
+    assert len(lines) == 2
+    for number, line in enumerate(lines, start=1):
+        assert (line["accepted"], line["pose"], line["take"],
+                line["attempts"]) == (False, "cylindrical_object", 1, number)
+        assert line["file"] is None and line["hold_start"] is None
+        assert line["hold_completed"] is False
+        assert hint_keys(line) == UNHINTED and line["note"] == NOTE
+    lost, timed_out = lines
+    assert re.fullmatch(
+        r"the left hand was lost for \d\.\d s during the settle", lost["why"])
+    assert lost["hand_id"] == 2001
+    assert timed_out["why"].startswith("no acquirable left hand in 0.5 s")
+    assert timed_out["hand_id"] is None
 
 
 class SpyView:

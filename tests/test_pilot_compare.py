@@ -9,6 +9,10 @@ flexion joints (index, middle, ring, little; MCP and PIP) gets the angle a
 test prescribes as a function of the time into the take, so every number the
 script reports is known before it runs. Camera at 90 Hz, glove at 60 Hz,
 capture_time 6 ms before wall_time on both, as the recorders stamp them.
+
+One test records with the recorder itself, on mock sensors and a scripted
+camera (`record_object_take`): what it checks is what the recorder leaves
+behind for an attempt that never reached its hold.
 """
 import csv
 import functools
@@ -20,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from test_joint_frames import made_line
+from test_leap_hand import ScriptedLeap
 from xr_hand import joint_frames as jf
 
 REPO = Path(__file__).resolve().parents[1]
@@ -119,11 +124,13 @@ def make_take(run_dir, pose="cylindrical_object", take=1, hand="left",
 
 def rejected_meta(run_dir, pose, take, attempt, why, coverage, hand="left"):
     """A refused attempt's meta where the recorder moves it:
-    <run>/rejected/leap/<stem>_attempt<N>.meta.json, accepted false."""
+    <run>/rejected/leap/<stem>_attempt<N>.meta.json, accepted false, its
+    attempt number in `attempts`."""
     stem = f"{pose}_{hand}_take{take}_20261021_120000_attempt{attempt}"
     folder = Path(run_dir) / "rejected" / "leap"
     folder.mkdir(parents=True, exist_ok=True)
     meta = {"accepted": False, "hand": hand, "pose": pose, "take": take,
+            "attempts": attempt,
             "coverage": coverage, "why": why, "file": f"{stem}.jsonl",
             "tracking_hints": [], "hints_confirmed": False,
             "license_hyperion": None, "note": "synthetic attempt"}
@@ -587,7 +594,7 @@ def test_rejected_attempts_are_counted_by_reason_beside_the_kept_takes(
     assert tip["attempt_coverage_median"] == tip["attempt_coverage_min"] == ""
 
     report = (out / "report.txt").read_text(encoding="ascii")
-    assert ("attempts: every attempt the recorder made, kept or rejected "
+    assert ("attempts: every attempt that reached its hold, kept or rejected "
             "(rejected/leap), with the recorder's own coverage of each"
             in report.splitlines())
     lines = report.splitlines()
@@ -638,6 +645,140 @@ def test_a_run_whose_every_attempt_was_rejected_is_not_called_absent(
         r = rows[key]
         assert (r["n_valid_takes"], r["n_attempts"], r["n_rejected"]) == (
             "0", "2", "2"), key
+
+
+def record_object_take(run_dir, monkeypatch, gone, **session):
+    """One take of cylindrical_object by the real recorder
+    (scripts/record_simultaneous.py) into `run_dir`, on mock sensors, the way
+    the pilot's object runs are recorded (--keep-all-tracking; the acquire
+    and the settle stay strict). The scripted camera shows the open left
+    hand unless `gone(n, phase)` says it is out of view, given the session's
+    phase and how many settles have begun so far."""
+    spec = importlib.util.spec_from_file_location(
+        "repo_script_record_simultaneous_pilot",
+        REPO / "scripts" / "record_simultaneous.py")
+    recorder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(recorder)
+    monkeypatch.setattr(recorder, "beep", lambda *a, **k: None)
+    seen = {"settles": 0, "phase": ""}
+
+    def plan(t):
+        phase = seen["session"]._phase
+        if phase == "SETTLE" and seen["phase"] != "SETTLE":
+            seen["settles"] += 1
+        seen["phase"] = phase
+        return ([] if gone(seen["settles"], phase)
+                else [("left", 2001, 5_000_000)])
+
+    leap = ScriptedLeap(plan)
+    leap.start()
+    seen["session"] = recorder.CoachedLeapSession(
+        leap, recorder.MockGloveSource(), hz=None, out_dir=run_dir,
+        hand="left", settle=0.7, pose_check=False, keep_all_tracking=True,
+        **session)
+    seen["session"].run_take("cylindrical_object", 1, 1, 1, 1, duration=0.8,
+                             prep=0)
+    seen["session"].finish()
+
+
+def test_attempts_that_ended_before_the_hold_are_counted(tmp_path, capsys,
+                                                         monkeypatch):
+    """An attempt that ends before its hold (the hand lost during the settle,
+    or no open hand acquired in time) leaves no take file and no meta. It was
+    still made: the comparison counts it, beside the attempts that reached
+    the hold, and a run in which no attempt got that far is not absent."""
+    root = tmp_path / "pilot"
+    # B1: the camera loses the hand in the settle of attempts 1 and 2; the
+    # third attempt is kept
+    b1 = root / FOLDER["B1"]
+    record_object_take(b1, monkeypatch, retries=2, acquire_timeout=10.0,
+                       gone=lambda n, phase: phase == "SETTLE" and n <= 2)
+    (kept,) = (b1 / "leap").glob("*.meta.json")
+    assert json.loads(kept.read_text(encoding="utf-8"))["attempts"] == 3
+    assert not (b1 / "rejected").exists(), "no attempt was judged and refused"
+    # B2: lost in the first settle and never seen again, so the retry finds
+    # no hand to acquire; no attempt reaches a hold
+    b2 = root / FOLDER["B2"]
+    record_object_take(b2, monkeypatch, retries=1, acquire_timeout=0.5,
+                       gone=lambda n, phase: n >= 1)
+    assert list(b2.rglob("*.meta.json")) == []
+    capsys.readouterr()
+
+    out = tmp_path / "out"
+    load_compare().main(["--root", str(root), "--out", str(out),
+                         "--window", "0.5"])
+    text = capsys.readouterr().out.splitlines()
+    rows = {(r["level"], r["run"], r["grasp"]): r
+            for r in read_rows(out / "summary.csv")}
+
+    def counts(level, run, grasp="cylindrical_object"):
+        r = rows[(level, run, grasp)]
+        return (r["n_valid_takes"], r["n_attempts"], r["n_rejected"],
+                r.get("n_attempts_before_hold"))
+
+    # three attempts were made in B1: one reached the hold, two did not
+    assert counts("run_grasp", "B1") == ("1", "1", "0", "2")
+    assert counts("run_grasp", "B2") == ("0", "0", "0", "2")
+    assert counts("run_grasp_pooledB", "B") == ("1", "1", "0", "4")
+    assert counts("run_all", "B2", "all") == ("0", "0", "0", "2")
+    assert counts("run_grasp", "A") == ("0", "0", "0", "0")
+    assert counts("run_grasp", "B1", "tip_object") == ("0", "0", "0", "0")
+
+    said = "B2 (B2_object): 0 takes kept (2 attempts ended before the hold)"
+    report = (out / "report.txt").read_text(encoding="ascii").splitlines()
+    assert f"run {said}" in text and said in report
+    assert "run B2 (B2_object): absent" not in text
+    assert "B2 (B2_object): absent" not in report
+    assert "B1 (B1_object): 1 take (1 valid)" in report
+    assert ("attempts: every attempt that reached its hold, kept or rejected "
+            "(rejected/leap), with the recorder's own coverage of each"
+            in report)
+    assert not any("every attempt the recorder made" in s for s in report)
+    block = report[report.index("== cylindrical_object =="):
+                   report.index("== spherical_object ==")]
+    at = next(i for i, s in enumerate(block)
+              if s.startswith("rejected: other"))
+    label = "attempts ended before the hold (no file)"
+    assert block[at + 1].startswith(label)
+    assert block[at + 1][len(label):].split() == ["0", "2", "0", "2", "0", "4"]
+
+
+def test_a_run_recorded_before_the_log_shows_them_by_its_attempt_numbers(
+        tmp_path):
+    """A run recorded before the recorder listed them has no
+    attempts_before_hold.log. What it has: every time the recorder starts a
+    take it numbers the attempts from 1, and each attempt that reached its
+    hold left one meta carrying its number. The fewest attempts those numbers
+    allow, less the metas, ended before the hold: a floor. The counts of the
+    attempts that did reach the hold stay what they were. (Takes 1, 4 and 5
+    are those of run A of 2026-10-23, attempt 1, as their metas are on
+    disk.)"""
+    run = tmp_path / "pilot" / FOLDER["A"]
+    lost = "the left hand was lost for 0.5 s during the take"
+    # take 1 was started twice: two metas say attempt 2, so each start made
+    # at least two attempts, and three of those four left a meta
+    make_take(run, take=1, length=0.7, meta_extra={"attempts": 2})
+    rejected_meta(run, "cylindrical_object", 1, 1, lost, 0.4)
+    rejected_meta(run, "cylindrical_object", 1, 2, lost, 0.4)
+    # take 4: attempts 1 and 2 refused, 3 kept; every one left a meta
+    make_take(run, take=4, length=0.7, meta_extra={"attempts": 3})
+    rejected_meta(run, "cylindrical_object", 4, 1, lost, 0.4)
+    rejected_meta(run, "cylindrical_object", 4, 2, lost, 0.4)
+    # take 5: kept on attempt 2, and nothing is left of attempt 1
+    make_take(run, take=5, length=0.7, meta_extra={"attempts": 2})
+    # take 2: a meta without the number shows nothing either way
+    make_take(run, take=2, length=0.7)
+    out = tmp_path / "out"
+    assert load_compare().main(["--root", str(tmp_path / "pilot"), "--out",
+                                str(out), "--window", "0.5"]) == 0
+    rows = {(r["level"], r["run"], r["grasp"]): r
+            for r in read_rows(out / "summary.csv")}
+    for key in (("run_grasp", "A", "cylindrical_object"),
+                ("run_all", "A", "all")):
+        r = rows[key]
+        assert (r["n_valid_takes"], r["n_attempts"], r["n_rejected"],
+                r["n_rejected_hand_lost"]) == ("4", "8", "4", "4"), key
+        assert r["n_attempts_before_hold"] == "2", key   # takes 1 and 5
 
 
 def test_attempts_alone_are_still_written_out(tmp_path, capsys):

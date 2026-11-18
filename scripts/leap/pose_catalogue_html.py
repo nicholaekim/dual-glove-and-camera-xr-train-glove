@@ -94,8 +94,9 @@ def build(doc_text: str) -> str:
                 out.append('<p class="note">The pictures are not photographs and not recorded takes. '
                            'Each is MyoSuite\'s MyoHand model posed at the midpoint of '
                            'the pose\'s template ranges (joint values clamped to the model\'s own limits, '
-                           'so a full curl shows PIP 90; the finger MCP alone is let back to -40 for the '
-                           'picture, so a finger pressed back is drawn pressed back), with the thumb base '
+                           'so a full curl shows PIP 90; only the finger MCP, let back to -40, and the wrist, '
+                           'let 35 toward the little finger, go past them for the picture, so a finger '
+                           'pressed back and a wrist tilted that way are drawn as asked), with the thumb base '
                            'placed by eye from the pose\'s words, seen from '
                            'the palm side as the Leap would see it and from the thumb side. Rendered by '
                            '<code>scripts/leap/pose_catalogue_render.py</code>.</p>')

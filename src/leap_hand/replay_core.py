@@ -670,9 +670,19 @@ def reconstruct_quaternion_chain(frame: SourceFrame) -> Tuple[np.ndarray, np.nda
     return np.array(wp), np.array([quat_canonical(q) for q in wq])
 
 
+def worst_of(items, key=lambda x: x):
+    """The item with the largest key, a NaN key counting as the largest of
+    all. max() skips a NaN unless it comes first, so a value that could not
+    be measured would drop out of the verdict it has to fail."""
+    items = list(items)
+    return items[int(np.argmax([key(x) for x in items]))]
+
+
 def _stats(values) -> Dict[str, Optional[float]]:
     v = [x for x in values if x is not None]
-    return {"max": max(v) if v else None, "mean": float(np.mean(v)) if v else None}
+    # np.max for the reason worst_of gives: one NaN makes the maximum NaN
+    return {"max": float(np.max(v)) if v else None,
+            "mean": float(np.mean(v)) if v else None}
 
 
 def frame_fidelity(frame: SourceFrame) -> dict:
@@ -714,7 +724,8 @@ def frame_fidelity(frame: SourceFrame) -> dict:
     length = np.linalg.norm(vec, axis=1)
     angle = np.degrees(np.arctan2(np.linalg.norm(np.cross(axis, vec), axis=1),
                                   np.einsum("ij,ij->i", axis, vec)))
-    per_bone = {n: (float(a) if ln > 0.0 else None)   # no direction for length 0
+    # no direction for length 0; a NaN length is not 0 and keeps its NaN angle
+    per_bone = {n: (float(a) if ln != 0.0 else None)
                 for n, a, ln in zip(BONE_NAMES, angle, length)}
     out["bone_direction_deg"] = {"per_bone": per_bone, **_stats(per_bone.values())}
     out["bone_length_mm"] = {n: float(ln * 1000.0) for n, ln in zip(BONE_NAMES, length)}
@@ -723,7 +734,7 @@ def frame_fidelity(frame: SourceFrame) -> dict:
 
 def _worst(per: List[dict], key: str) -> Tuple[Optional[float], Optional[dict]]:
     scored = [(p[key]["max"], p) for p in per if p[key]["max"] is not None]
-    return max(scored, key=lambda s: s[0]) if scored else (None, None)
+    return worst_of(scored, key=lambda s: s[0]) if scored else (None, None)
 
 
 def recording_fidelity(rec: Recording) -> dict:
@@ -734,6 +745,8 @@ def recording_fidelity(rec: Recording) -> dict:
     needs the position residual, the chain angle and the chain position at or
     under their declared values; a recording without abs26 cannot be
     declared within tolerance, because its positions were never checked.
+    A NaN (a null or NaN coordinate in any frame and joint) is the worst
+    value of its quantity and is under no limit.
     """
     per = [frame_fidelity(f) for f in rec.frames]
     measured = [p for p in per if p["position_residual_m"]["per_joint"] is not None]
@@ -755,8 +768,8 @@ def recording_fidelity(rec: Recording) -> dict:
         **_stats([v for p in measured
                   for v in p["bone_direction_deg"]["per_bone"].values()]),
         "worst_frame_id": b_frame["frame_id"] if b_frame else None,
-        "worst_bone": (max((n for n in BONE_NAMES if per_bone_max[n] is not None),
-                           key=per_bone_max.get) if b_frame else None),
+        "worst_bone": (worst_of((n for n in BONE_NAMES if per_bone_max[n] is not None),
+                                key=per_bone_max.get) if b_frame else None),
         "per_bone_max": per_bone_max,
         "expectation": expectation,
         "within_expectation": None if b_max is None else b_max <= expectation,
@@ -767,9 +780,10 @@ def recording_fidelity(rec: Recording) -> dict:
         lengths[n] = ({"mean": float(v.mean()), "sd": float(v.std(ddof=1)) if len(v) > 1
                        else 0.0, "min": float(v.min()), "max": float(v.max())}
                       if len(v) else None)
-    q_min = min(p["quat_norm"]["min"] for p in per)
-    q_max = max(p["quat_norm"]["max"] for p in per)
-    q_dev = max(abs(q_max - 1.0), abs(1.0 - q_min))
+    # np.min and np.max keep a NaN wherever it sits; min() and max() do not
+    q_min = float(np.min([p["quat_norm"]["min"] for p in per]))
+    q_max = float(np.max([p["quat_norm"]["max"] for p in per]))
+    q_dev = float(np.max([abs(q_max - 1.0), abs(1.0 - q_min)]))
 
     tl = rec.timeline
     dts = np.diff(tl.t)
@@ -796,10 +810,10 @@ def recording_fidelity(rec: Recording) -> dict:
         "bone_length_mm": lengths,
         "quat_norm": {"min": q_min, "max": q_max, "max_deviation": q_dev,
                       "within_tolerance": q_dev <= TOLERANCES["quat_norm"]["value"]},
-        "rotation_det": {"min": min(p["rotation_det"]["min"] for p in per),
-                         "max": max(p["rotation_det"]["max"] for p in per)},
-        "rotation_orthogonality": {"max": max(p["rotation_orthogonality"]["max"]
-                                              for p in per)},
+        "rotation_det": {"min": float(np.min([p["rotation_det"]["min"] for p in per])),
+                         "max": float(np.max([p["rotation_det"]["max"] for p in per]))},
+        "rotation_orthogonality": {"max": float(np.max(
+            [p["rotation_orthogonality"]["max"] for p in per]))},
         "timeline": {"source": tl.source, "fallback": tl.fallback, "reason": tl.reason,
                      "duration_s": float(tl.t[-1] - tl.t[0]),
                      "nominal_period_s": tl.nominal_period_s,

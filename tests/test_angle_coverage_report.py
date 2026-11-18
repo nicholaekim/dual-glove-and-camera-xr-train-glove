@@ -177,3 +177,14 @@ def test_the_pdf_is_printed_when_a_browser_exists(dataset, tmp_path):
     pdf = tmp_path / "out" / "report.pdf"
     assert pdf.is_file() and pdf.read_bytes()[:4] == b"%PDF"
     assert last_line(text).endswith("pdf=yes")
+
+
+def test_pdf_is_written_when_out_is_given_as_a_relative_path(dataset, tmp_path, monkeypatch):
+    if next((b for b in rep.BROWSERS if b.is_file()), None) is None:
+        pytest.skip("no Edge or Chrome on this machine to print the PDF")
+    monkeypatch.chdir(tmp_path)
+    code, text = report(["--dataset", dataset, "--out", "out"])
+    assert code == 0, text
+    pdf = tmp_path / "out" / "report.pdf"
+    assert pdf.is_file() and pdf.read_bytes()[:4] == b"%PDF"
+    assert last_line(text).endswith("pdf=yes")

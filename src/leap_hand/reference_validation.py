@@ -673,7 +673,8 @@ def load_reference(folder) -> ReferenceCapture:
             ev = sync.get("events")
             if not isinstance(ev, list) or not ev:
                 raise ReferenceError(f"{w}: sync.method {sync['method']!r} needs "
-                                     "sync.events (at least one, two to measure drift)")
+                                     "sync.events (at least one, two to measure drift, "
+                                     "three to check the pairing)")
             for e in ev:
                 if not isinstance(e, dict) or _num(e.get("reference_time_s")) is None:
                     raise ReferenceError(f"{w}: every sync event needs reference_time_s")
@@ -1007,9 +1008,11 @@ def tap_times(rec: rc.Recording) -> List[dict]:
 def build_clock(ref: ReferenceCapture, trk: TrackerSession) -> Optional[ClockMap]:
     """The reference-to-tracker clock (ClockMap), or None for per_take. Events
     with a tracker_file and tap_index are resolved from that take's detected
-    taps. With two or more events, offset and scale by least squares; every
-    residual must stay within sync.uncertainty_s, and the scale within
-    MAX_DRIFT of 1, else the events are refused as mispaired."""
+    taps. With two or more events, offset and scale by least squares, the scale
+    within MAX_DRIFT of 1; with three or more, every residual within
+    sync.uncertainty_s; else the events are refused as mispaired. One or two
+    events leave no residual: none is reported and the note says the pairing
+    is not checked."""
     method = ref.sync["method"]
     if method == "per_take":
         return None
@@ -1052,7 +1055,11 @@ def build_clock(ref: ReferenceCapture, trk: TrackerSession) -> Optional[ClockMap
             raise ReferenceError("sync events all at one reference time")
         scale, offset = (float(v) for v in np.polyfit(x, y, 1))
         note = f"{len(events)} events: offset and drift by least squares"
-    res = (y - (offset + scale * x)).tolist()
+    if len(events) < 3:                  # the fit is exact: no residual can show a mispairing
+        res = []
+        note += "; pairing not checked, fewer than three events leave no residual"
+    else:
+        res = (y - (offset + scale * x)).tolist()
     if abs(scale - 1.0) > MAX_DRIFT:
         raise ReferenceError(f"the sync events imply a clock scale of {scale:.6f} (drift "
                              f"{scale - 1:+.2%}), beyond {MAX_DRIFT:g}: the events are "
@@ -1651,7 +1658,8 @@ def _clean(x):
 
 def write_report(report: dict, out) -> dict:
     """report.json, report.md, matched_samples.csv and (when fitted) mapping.json
-    into `out`; returns {name: path}."""
+    into `out`; returns {name: path}. With no mapping fitted, a mapping.json an
+    earlier run left in `out` is removed."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     mapping = report.get("_mapping")
@@ -1689,6 +1697,8 @@ def write_report(report: dict, out) -> dict:
         paths["mapping.json"] = out / "mapping.json"
         report["mapping_file"] = str(out / "mapping.json")
         report["mapping_id"] = mapping.id
+    else:                                # an earlier run's mapping is not this run's result
+        (out / "mapping.json").unlink(missing_ok=True)
     (out / "report.json").write_text(json.dumps(_clean(report), indent=2) + "\n",
                                      encoding="utf-8")
     paths["report.json"] = out / "report.json"
@@ -1708,6 +1718,7 @@ def _stat_line(name, s) -> str:
 
 def report_markdown(r: dict) -> str:
     ref, trk = r["reference"], r["tracker_session"]
+    res_max = r["sync"].get("residual_max_s")
     lines = [f"# Reference comparison: {ref['participant']}, {ref['hand']} hand, session "
              f"{ref['session']}", "",
              f"**Status: {r['status']}** ({r['status_text']}).", "",
@@ -1718,7 +1729,7 @@ def report_markdown(r: dict) -> str:
              f"- Sync: {r['sync'].get('method')}; " + (
                  f"offset {r['sync']['offset_s']:.6f} s, drift {r['sync']['drift']:+.2e}, "
                  f"declared uncertainty {r['sync']['uncertainty_s'] * 1e3:.1f} ms, "
-                 f"residual max {_f((r['sync'].get('residual_max_s') or 0) * 1e3)} ms "
+                 f"residual max {'n/a' if res_max is None else f'{res_max * 1e3:.1f} ms'} "
                  f"({r['sync']['note']})" if "offset_s" in r["sync"] else r["sync"]["note"]),
              f"- Split by trial: calibration {r['split']['calibration_trials']}, held out "
              f"{r['split']['heldout_trials']} ({len(r['split']['calibration_samples'])} / "

@@ -509,6 +509,62 @@ def test_sync_refuses_events_that_disagree_or_imply_a_wild_drift(tmp_path):
         run_compare(tmp_path / "w", b, h, rows)
 
 
+def test_two_sync_events_do_not_pass_the_clock_check_unexamined(tmp_path):
+    """The last event paired 100 ms late, 14 s after the first. With a correct
+    event between them the pairing is refused; those two alone fit a line
+    exactly, so the report must give no residual and say the pairing was not
+    checked, not read as a perfect sync."""
+    b = build(tmp_path)
+    rows, events = _shared_events(b, 6995.5, 1.0, jitter=(0.0, 0.0, 0.1))
+    sync = {"method": "shared_events", "uncertainty_s": 0.002}
+    with pytest.raises(rv.ReferenceError, match="more than the declared uncertainty 2.0 ms"):
+        run_compare(tmp_path / "three", b, header(b, sync={**sync, "events": events}), rows)
+    r = run_compare(tmp_path, b, header(b, sync={**sync, "events": events[::2]}), rows)
+    rv.write_report(r, tmp_path / "out")
+    on_disk = json.loads((tmp_path / "out" / "report.json").read_text(encoding="utf-8"))["sync"]
+    assert len(on_disk["events"]) == 2
+    assert on_disk["residual_max_s"] is None and on_disk["residual_rms_s"] is None
+    assert "pairing not checked" in on_disk["note"]
+    line = next(x for x in (tmp_path / "out" / "report.md").read_text(
+        encoding="utf-8").splitlines() if x.startswith("- Sync:"))
+    assert "pairing not checked" in line and "residual max 0.0 ms" not in line
+
+
+def test_the_console_says_when_the_pairing_of_sync_events_was_not_checked(tmp_path, capsys):
+    """compare on the console. Three sync events are checked against the line:
+    the summary, the status, the report path and nothing else. Two events (the
+    last paired 100 ms late, accepted because two fit a line exactly) exit 0
+    all the same, so the COMPARISON DONE line itself must carry the report's
+    sync note, which says the pairing was not checked."""
+    spec = importlib.util.spec_from_file_location(
+        "rv_cli", REPO / "scripts" / "leap" / "reference_validation.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    b = build(tmp_path)
+    rows, events = _shared_events(b, 6995.5, 1.0)
+    _, late = _shared_events(b, 6995.5, 1.0, jitter=(0.0, 0.0, 0.1))
+
+    def compare(name, ev):
+        h = header(b, sync={"method": "shared_events", "uncertainty_s": 0.002, "events": ev})
+        out = tmp_path / name / "cmp"
+        assert cli.main(["compare", "--reference", str(write_ref(tmp_path / name, b, h, rows)),
+                         "--tracker-session", str(b["folder"]), "--calibration-trials", "1",
+                         "--out", str(out)]) == 0
+        done, *rest = capsys.readouterr().out.splitlines()
+        assert rest == ["  " + rv.STATUS_TEXT["evaluated"], f"  report: {out / 'report.md'}"]
+        return done, json.loads((out / "report.json").read_text(encoding="utf-8"))["sync"]
+
+    done, sync = compare("three", events)
+    assert sync["residual_max_s"] is not None and "pairing" not in sync["note"]
+    assert re.fullmatch(
+        r"COMPARISON DONE: data_origin=measured status=evaluated calibration_samples=\d+ "
+        r"heldout_samples=\d+ excluded=\d+ mapping=tmcmap-[0-9a-f]{12} "
+        r"mapped_fe_mae=\d+\.\d\d mapped_aa_mae=\d+\.\d\d", done), done
+    done, sync = compare("two", late[::2])
+    assert done.startswith("COMPARISON DONE: data_origin=measured status=evaluated ")
+    assert "pairing not checked" in sync["note"] and sync["note"] in done, done
+
+
 def _tap_take(tmp, hand="left", taps=(1.0, 2.0, 3.0), n=400, cut_after=None):
     folder = Path(tmp)
     lines = []
@@ -866,3 +922,29 @@ def test_split_a_calibration_trial_with_one_movement_is_refused_in_the_report(tm
     r = run_compare(tmp_path, b, rows=rows)
     assert "do not determine the mapping" in r["joints"]["thumb_tmc"]["mapping"]["refused"]
     assert r["_mapping"] is None
+
+
+def test_a_refused_fit_leaves_no_mapping_file_from_an_earlier_run(tmp_path):
+    """compare twice into one --out: the second run's fit is refused, so the
+    folder must not still hold the first run's mapping.json."""
+    spec = importlib.util.spec_from_file_location(
+        "rv_cli", REPO / "scripts" / "leap" / "reference_validation.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    b = build(tmp_path)
+    out = tmp_path / "cmp"
+
+    def compare(reference):
+        return cli.main(["compare", "--reference", str(reference), "--tracker-session",
+                         str(b["folder"]), "--calibration-trials", "1", "--out", str(out)])
+    assert compare(write_ref(tmp_path, b)) == 0
+    assert rv.load_mapping(out / "mapping.json").session == b["session"]
+    one_plane = [r for r in b["rows"]
+                 if not (r["trial"] == 1 and r["movement"] == "tmc_abduction_sweep")]
+    again = write_ref(tmp_path / "again", b, rows=one_plane)
+    assert compare(again) == 0
+    report = json.loads((out / "report.json").read_text(encoding="utf-8"))
+    assert "refused" in report["joints"]["thumb_tmc"]["mapping"]
+    assert "mapping_file" not in report
+    assert not (out / "mapping.json").exists()
+    assert compare(again) == 0                           # and with none left to remove

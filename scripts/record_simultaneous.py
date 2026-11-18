@@ -50,6 +50,11 @@ working from memory. A refused attempt is MOVED to `<out-dir>/rejected/`,
 never deleted: the two sensors being evaluated are the ones vetoing the take,
 so the exclusions have to stay countable. `--no-pose-check` turns it off, and
 it is off for mock sensors, whose hand shape does not follow the pose called.
+An attempt that ends before its REC hold (no open hand acquired within
+`--acquire-timeout`, or the hand lost during the settle) has no recording to
+keep or set aside; it leaves one line in `<out-dir>/attempts_before_hold.log`
+(JSON, the keys of a rejected attempt's meta.json, `file` null), so that it
+can still be counted (scripts/pilot_compare.py).
 
 `--hint hand_on_object` (coached leap sessions only) asks the Ultraleap
 service for its tracking for hands occluded by a held object. It needs the
@@ -194,6 +199,12 @@ GLOVE_GAP_WARN_S = 0.25
 # disk where it can be counted, looked at and argued with.
 REJECTED = "rejected"
 STILLS = "stills"
+# One JSON line per attempt that ended before its REC hold (no hand acquired
+# in time, or the hand lost during the settle). Such an attempt has no
+# recording to keep or to set aside, so this line in the session folder is
+# the only record that it was made (docs/pilot_hand_on_object.md, amendment
+# of 2026-11-17). Not .jsonl: the tools that read every .jsonl read takes.
+BEFORE_HOLD_LOG = "attempts_before_hold.log"
 # `--app-screenshot`: where the application window's pictures go, how long an
 # attempt waits for its picture after the hold, and why there is none.
 APP_SHOTS = "xr_train"
@@ -1111,6 +1122,7 @@ class CoachedLeapSession(LeapSyncSession):
         """
         self.glove_total += self._pump_glove(glove_rec)
         hands = []
+        ours = False                     # the pinned hand is in this batch
         now = time.time()
         for _side, lh in self.leap.drain(64):
             if lh.framerate:
@@ -1148,7 +1160,7 @@ class CoachedLeapSession(LeapSyncSession):
             self.cam_sides.add(lh.hand_side)
             hands.append(lh)
             if self._pinned_id is not None:
-                self._pinned_at = now
+                self._pinned_at, ours = now, True
             if cam_rec is not None:
                 cam_rec.record(lh)
                 self._heights.append(reading.height_cm)
@@ -1156,6 +1168,10 @@ class CoachedLeapSession(LeapSyncSession):
                     self._angles.append(reading.view_angle_deg)
                 self._times.append(float(lh.capture_time)
                                    if lh.capture_time is not None else now)
+        if ours:
+            # ours delivered in this batch: another id in it, before ours or
+            # after, was a second hand, not the id ours came back under
+            self._changed_to = None
         self._show_hud(now)
         # Nothing in this loop blocks — the beeps are on their own thread — so
         # yield the CPU rather than spin on an empty queue.
@@ -1269,9 +1285,10 @@ class CoachedLeapSession(LeapSyncSession):
                 self._hud_extra = ""
                 return
             if now - t0 > self.acquire_timeout:
-                raise TimeoutError(
-                    f"no acquirable {self.hand} hand in "
-                    f"{self.acquire_timeout:g} s ({self._hud_extra})")
+                why = (f"no acquirable {self.hand} hand in "
+                       f"{self.acquire_timeout:g} s ({self._hud_extra})")
+                self._log_before_hold(Attempt(why=why), attempt)
+                raise TimeoutError(why)
 
     def _hold(self, phase: str, seconds: float, cam_rec=None,
               glove_rec=None, snap=None, app_snap=None) -> str:
@@ -1439,10 +1456,12 @@ class CoachedLeapSession(LeapSyncSession):
             settle_glove.stop()
         if lost:
             self._drop_settle(name)
-            return Attempt(why=f"{lost} during the settle",
-                           hand_id=self._pinned_id,
-                           rejected_chirality=self.rejected_chirality - before[0],
-                           second_hand=self.second_hand - before[1])
+            got = Attempt(why=f"{lost} during the settle",
+                          hand_id=self._pinned_id,
+                          rejected_chirality=self.rejected_chirality - before[0],
+                          second_hand=self.second_hand - before[1])
+            self._log_before_hold(got, attempt)
+            return got
 
         cam_rec = self.make_cam_recorder(pose, take)
         glove_rec = StampedFrameRecorder(hz=self.hz, pose=pose, take=take)
@@ -1588,6 +1607,22 @@ class CoachedLeapSession(LeapSyncSession):
         self._hud_extra = ""
 
     # --- what happens to an attempt that did not stand --------------------
+    def _log_before_hold(self, got: Attempt, attempt: int) -> None:
+        """One line in `attempts_before_hold.log` for an attempt that ended
+        before its REC hold: no hand acquired in time, or lost in the settle.
+
+        It has no recording, so nothing of it goes to `rejected/`, which
+        holds the attempts a verdict was passed on. Without this line it
+        would leave no trace, and a count of the attempts a session made
+        (scripts/pilot_compare.py) would miss it. The line is what a rejected
+        attempt's meta.json would say, with no file.
+        """
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        line = self._meta_dict(got, accepted=False, file=None, still="",
+                               attempts=attempt)
+        with open(self.out_dir / BEFORE_HOLD_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(line) + "\n")
+
     def _reject(self, name: str, stem: str, attempt: int, got: Attempt) -> str:
         """Move both files of a failed attempt under `rejected/`. Never delete.
 
@@ -1723,7 +1758,7 @@ class CoachedLeapSession(LeapSyncSession):
         return (f"kept (tracking lost {gap:.1f} s, {n} re-acquisition"
                 f"{'' if n == 1 else 's'})")
 
-    def _meta_dict(self, got: Attempt, accepted: bool, file: str,
+    def _meta_dict(self, got: Attempt, accepted: bool, file: Optional[str],
                    still: str, attempts: int) -> dict:
         """Everything known about one attempt, accepted or not.
 

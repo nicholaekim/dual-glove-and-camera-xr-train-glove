@@ -32,6 +32,7 @@ from typing import List, NamedTuple, Optional, Sequence, Tuple
 import numpy as np
 
 from cam_hand.fusion import palm_basis
+from leap_hand.protocol import FROM_SAVED_AT
 from leap_hand.transition import POSE_SETTLE_SPEED_MM_S, SPEED_STEP_S
 from xr_hand.keypoints21 import MP21_NAMES, frame_to_keypoints21
 from xr_hand.recorder import FrameRecorder
@@ -62,6 +63,7 @@ BONES: List[Tuple[int, int]] = [pair for chain in CHAINS.values()
                                 for pair in zip((WRIST,) + chain[:-1], chain)]
 
 STILL_CAPTURE = "still capture time"
+STILL_SAVED = "still save time (the camera window had no image stamp)"
 STILL_MTIME = "still file write time (no capture stamp in this take)"
 CAPTURE_CLOCK = "capture_time"
 WALL_CLOCK = "wall_time"
@@ -69,7 +71,7 @@ WALL_CLOCK = "wall_time"
 
 class Moment(NamedTuple):
     t: float                    # time.time() seconds
-    source: str                 # STILL_CAPTURE or STILL_MTIME
+    source: str                 # STILL_CAPTURE, STILL_SAVED or STILL_MTIME
     still: Optional[Path]       # the still's file, None when it is not on disk
 
 
@@ -110,9 +112,11 @@ def take_moment(session, take_stem: str, meta: Optional[dict] = None) -> Optiona
     """The photo's moment, or None when the take has no way to say it.
 
     Priority: the meta's `still_capture_time` (the viewer's record of when
-    the still's IR image was captured), else the still file's modification
-    time (when the JPEG finished writing; sessions made before the record
-    existed), else None and the caller refuses the take."""
+    the still's IR image was captured; STILL_SAVED when the meta's
+    `still_capture_time_source` says it is only when the viewer saved the
+    still), else the still file's modification time (when the JPEG finished
+    writing; sessions made before the record existed), else None and the
+    caller refuses the take."""
     if meta is None:
         path = find_meta(session, take_stem)
         if path is None:
@@ -122,7 +126,8 @@ def take_moment(session, take_stem: str, meta: Optional[dict] = None) -> Optiona
     on_disk = still if still is not None and still.is_file() else None
     stamp = meta.get("still_capture_time")
     if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
-        return Moment(float(stamp), STILL_CAPTURE, on_disk)
+        saved = meta.get("still_capture_time_source") == FROM_SAVED_AT
+        return Moment(float(stamp), STILL_SAVED if saved else STILL_CAPTURE, on_disk)
     if on_disk is not None:
         return Moment(on_disk.stat().st_mtime, STILL_MTIME, on_disk)
     return None

@@ -87,7 +87,7 @@ metacarpal's direction and back. All errors are reported in this convention.
 
 | Method | When | How the reference clock reaches the tracker's (`timestamp_us`) |
 |---|---|---|
-| `shared_events` | sync taps seen by both devices | each event pairs a `reference_time_s` with `tracker_timestamp_us` or with `tracker_file` + `tap_index` (resolved from the taps the tracker detected in that take). One event: offset only. Two or more: offset and drift by least squares; every event within `uncertainty_s` of the line, drift within 1 %, else refused |
+| `shared_events` | sync taps seen by both devices | each event pairs a `reference_time_s` with `tracker_timestamp_us` or with `tracker_file` + `tap_index` (resolved from the taps the tracker detected in that take). One event: offset only. Two or more: offset and drift by least squares, drift within 1 %, else refused. Three or more: every event within `uncertainty_s` of the line, else refused; one or two events leave no residual, so the report gives none and says the pairing is not checked |
 | `hardware_trigger` | a shared trigger line | as `shared_events` (the trigger instants as events) |
 | `same_clock` | the reference wrote the tracker's own clock | reference seconds are `timestamp_us` / 1e6 (in `clock.units`) |
 | `per_take` | goniometer holds | no clock: each sample names its take; the whole take is the hold |

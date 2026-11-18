@@ -6,9 +6,10 @@ catalogue's template range for every camera-given angle, with the thumb's
 TMC set from the pose's thumb state in words (and from the finger it is
 aimed at, when the pose names one). Joint values are clamped to MyoHand's
 own ranges, so a full curl shows PIP 90, not the catalogue's 85 to 110,
-with one exception: the finger MCP is allowed back to -40 for the picture,
+with two exceptions: the finger MCP is allowed back to -40 for the picture,
 so a finger pressed back past straight is drawn that way (MyoHand itself
-stops at straight).
+stops at straight), and the wrist is allowed to tilt 35 toward the little
+finger, so an ulnar deviation is drawn in full (MyoHand itself stops at 10).
 
 Runs in the MyoSuite venv:
 
@@ -63,6 +64,9 @@ FINGER_NUM = {"I": 2, "M": 3, "R": 4, "L": 5}
 # MyoHand stops the finger MCP at 0 (straight). For the picture only, the lower limit is
 # opened to the catalogue's envelope (-40), so a finger pressed back is drawn pressed back.
 RENDER_LOWER = {f"mcp{n}_flexion_r": math.radians(-40) for n in FINGER_NUM.values()}
+# Likewise the wrist: MyoHand stops at 10 toward the little finger (deviation_r -10), and the
+# catalogue's ulnar poses ask 20 to 35, so that limit is opened to the envelope (-35) as well.
+RENDER_LOWER["deviation_r"] = math.radians(-35)
 
 
 def mid(r):
@@ -82,10 +86,10 @@ def joint_targets(mod, pose) -> dict:
     q["mp_flexion_r"] = -math.radians(mid(r["T_MCP_fe"]))
     q["ip_flexion_r"] = -math.radians(mid(r["T_IP"]))
     q["cmc_flexion_r"], q["cmc_abduction_r"] = TMC_TARGET.get((pose.thumb, pose.thumb_target), TMC[pose.thumb])
-    # wrist: flexion positive toward the palm in both; deviation positive toward the thumb
-    # in the catalogue, positive toward the little finger in MyoHand
+    # wrist: flexion positive toward the palm and deviation positive toward the thumb,
+    # in the catalogue and in MyoHand alike
     q["flexion_r"] = math.radians(mid(r["WRIST_fe"]))
-    q["deviation_r"] = -math.radians(mid(r["WRIST_dev"]))
+    q["deviation_r"] = math.radians(mid(r["WRIST_dev"]))
     q["pro_sup_r"] = 0.0
     return q
 

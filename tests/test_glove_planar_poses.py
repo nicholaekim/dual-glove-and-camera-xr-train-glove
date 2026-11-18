@@ -8,6 +8,8 @@ import re
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 CSV_PATH = REPO / "protocols" / "glove_planar_poses_50.csv"
 JSON_PATH = REPO / "protocols" / "glove_planar_poses_50.json"
@@ -225,3 +227,18 @@ def test_document_table_lists_every_id_once_and_names_setup_and_sources():
     assert '--app-screenshot "XR Train"' in launcher and "%START%" in launcher
     for name in ("Dragusanu", "Isaac", "Ingram", "Chen", "Cobos", "Jia", "MyoHand"):
         assert name in text
+
+
+# --- pdf --------------------------------------------------------------------------------------
+def test_the_pdf_is_written_when_its_path_is_relative(tmp_path, monkeypatch):
+    mod = _load("glove_planar_poses_pdf", REPO / "scripts" / "leap" / "glove_planar_poses_pdf.py")
+    if next((b for b in mod.BROWSERS if b.is_file()), None) is None:
+        pytest.skip("no Edge or Chrome on this machine to print the PDF")
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "page.html").write_text(
+        "<!doctype html><html><head><title>one line</title></head><body><p>one line</p></body></html>",
+        encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert mod.print_pdf(Path("out") / "page.html", Path("out") / "page.pdf") is not None
+    pdf = tmp_path / "out" / "page.pdf"
+    assert pdf.is_file() and pdf.read_bytes()[:4] == b"%PDF"

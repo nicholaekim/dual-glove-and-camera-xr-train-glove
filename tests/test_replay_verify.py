@@ -792,6 +792,36 @@ def test_a_residual_over_tolerance_fails_the_run(tmp_path):
     assert float(rows[0]["pos_residual_um_max"]) == pytest.approx(3.0, abs=0.9)
 
 
+def test_a_null_coordinate_in_a_later_recording_fails_the_run_and_is_the_worst_value(tmp_path):
+    """One recorded position of the second recording is null, in its sixth
+    frame and on a ring joint. That recording is outside tolerance, and the
+    worst-values table names it instead of the largest number among the rest."""
+    root = make_dataset(tmp_path / "dataset")
+    lines = [json.loads(x) for x in (root / CIRC2).read_text(encoding="utf-8").splitlines()]
+    lines[5]["abs26"][JOINT_INDEX["RING_PROXIMAL"]] = [None, None, None]
+    write_jsonl(root / CIRC2, lines)
+    out = tmp_path / "out"
+    code, text = run(["--dataset", root, "--out", out, "--all"])
+    assert code == 1
+    assert text.strip().splitlines()[-1].startswith(
+        "FIDELITY FAIL: static=3 transitions=1 frames=42 within_tolerance=3/4")
+    assert ("OUTSIDE TOLERANCE: static p3_circular_power take 2: "
+            "position_m nan > 1e-06") in text
+    rows = read_csv(out / "fidelity_per_recording.csv")
+    assert [r["within_tolerance"] for r in rows] == ["true", "false", "true", "true"]
+    bad = rows[1]
+    assert bad["pos_residual_um_max"] == ""                  # not a number: left blank
+    # the two bones at that joint have no length in that frame, so no spread either
+    assert bad["bone_len_sd_mm_max"] == ""
+    assert bad["bone_len_sd_bone"] in ("RING_METACARPAL", "RING_PROXIMAL")
+    worst = json.loads((out / "fidelity.json").read_text(encoding="utf-8"))["worst"]
+    for key in ("position_residual_um", "bone_direction_deg", "bone_length_sd_mm"):
+        assert worst[key]["recording"] == "static p3_circular_power take 2", key
+        assert worst[key]["value"] is None, key              # NaN is written as null
+    assert (worst["position_residual_um"]["frame_id"],
+            worst["position_residual_um"]["joint"]) == (1105, "RING_PROXIMAL")
+
+
 def test_a_recording_that_cannot_be_loaded_fails_the_run(tmp_path):
     root = make_dataset(tmp_path / "dataset")
     (root / TRANS).unlink()

@@ -75,7 +75,7 @@ def print_pdf(html_path: Path, pdf_path: Path):
     with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as profile:
         subprocess.run([str(exe), "--headless=new", "--disable-gpu", "--no-pdf-header-footer",
                         "--no-first-run", f"--user-data-dir={profile}",
-                        f"--print-to-pdf={pdf_path}", html_path.resolve().as_uri()],
+                        f"--print-to-pdf={pdf_path.resolve()}", html_path.resolve().as_uri()],
                        capture_output=True, timeout=600)
         # Edge 156 returns before the PDF is written: wait for the file and a stable size.
         deadline, size = time.monotonic() + 120, -1

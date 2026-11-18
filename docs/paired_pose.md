@@ -230,8 +230,10 @@ those takes (then `comparison.csv`, and so the selection, covers only them);
 - The moment is the photo's: the still the camera window saves at the midpoint of the
   REC hold. Sessions recorded from 2026-11-03 on carry its capture time in the take's
   meta (`still_capture_time`, from the viewer's `<still>.json`: the image frame's LeapC
-  timestamp on the wall clock); older ones, day 2 included, fall back to the still file's
-  write time (plus an unknown write delay), and every output says which. The still has
+  timestamp on the wall clock, or, when the window had no image timestamp, only the time
+  it saved the still, reported as "still save time", never as a capture time); older
+  ones, day 2 included, fall back to the still file's write time (plus an unknown write
+  delay), and every output says which. The still has
   nothing drawn on it (no skeleton, no aiming ring, no caption): it is the window's IR
   frame with its brightness lifted for the eye (x2.2 + 8), mirrored as the window shows
   it, cropped to the tracked hand. Stills recorded before the window change of 2026-11-05

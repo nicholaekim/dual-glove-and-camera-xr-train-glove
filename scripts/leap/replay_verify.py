@@ -473,7 +473,7 @@ def recording_row(a) -> dict:
     ex = f["counts"]["lines_excluded"]
     kinds = Counter(e["kind"] for e in f["events"])
     sds = {n: v["sd"] for n, v in f["bone_length_mm"].items() if v}
-    sd_bone = max(sds, key=sds.get) if sds else None
+    sd_bone = rc.worst_of(sds, key=sds.get) if sds else None
     pos, bone = f["position_residual_m"], f["bone_direction_deg"]
     return {
         "kind": a["kind"], "name": a["name"], "take": a["take"],
@@ -799,7 +799,7 @@ def _worst(results, value, where=None, tolerance=None):
     scored = [(v, a) for v, a in scored if v is not None]
     if not scored:
         return None
-    v, a = max(scored, key=lambda s: s[0])
+    v, a = rc.worst_of(scored, key=lambda s: s[0])     # a NaN is the worst there is
     return {"value": v, "tolerance": tolerance, "recording": a["label"],
             "kind": a["kind"], "name": a["name"], "take": a["take"],
             **(where(a) if where else {})}
@@ -875,8 +875,8 @@ def summarise(results, failures, n_selected):
                                       lambda a: fd(a)["quat_norm"]["max_deviation"],
                                       tolerance=tol["quat_norm"]),
         "bone_length_sd_mm": _worst(
-            results, lambda a: max(sd_of(a).values(), default=None),
-            lambda a: {"bone": max(sd_of(a), key=sd_of(a).get)}),
+            results, lambda a: rc.worst_of(sd_of(a).values()) if sd_of(a) else None,
+            lambda a: {"bone": rc.worst_of(sd_of(a), key=sd_of(a).get)}),
     }
     shortest = None
     for a in results:

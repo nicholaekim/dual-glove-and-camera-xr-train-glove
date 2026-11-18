@@ -138,6 +138,21 @@ def test_out_folder_and_pdf(erratum, tmp_path):
     assert not (folder / "report.html").exists()      # --out, not the erratum folder
 
 
+def test_pdf_is_written_when_the_folder_is_given_as_a_relative_path(erratum, tmp_path,
+                                                                    monkeypatch):
+    browser = next((b for b in rep.BROWSERS if b.is_file()), None)
+    if browser is None:
+        pytest.skip("no Edge or Chrome on this machine to print the PDF")
+    _, folder = erratum
+    folder = copy_of(folder, tmp_path)
+    monkeypatch.chdir(tmp_path)
+    code, text = report(["--erratum", folder.name])
+    assert code == 0, text
+    pdf = folder / "report.pdf"
+    assert pdf.is_file() and pdf.read_bytes()[:4] == b"%PDF"
+    assert text.strip().splitlines()[-1].endswith("pdf=yes")
+
+
 def test_no_browser_leaves_the_html_and_says_so(erratum, tmp_path, monkeypatch):
     _, folder = erratum
     monkeypatch.setattr(rep, "BROWSERS", (tmp_path / "no-such-browser.exe",))
