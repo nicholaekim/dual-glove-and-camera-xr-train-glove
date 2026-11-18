@@ -2309,3 +2309,392 @@ def test_without_protocol_the_plain_session_is_unchanged(rp, monkeypatch, tmp_pa
     # the 5 frames/s default per hand, not every frame
     assert len(lines) <= 2 * 8
     assert not (out / "session.json").exists()
+
+
+# --- the tracking hint (--hint hand_on_object) -----------------------------------------
+# The mock reports a requested hint as confirmed by a licensed service, so a
+# rehearsal writes what a hinted camera run writes (leap_hand.mock).
+HINT_KEYS = ("tracking_hints", "hints_confirmed", "license_hyperion")
+HINTED = {"tracking_hints": ["hand_on_object"], "hints_confirmed": True,
+          "license_hyperion": True}
+UNHINTED = {"tracking_hints": [], "hints_confirmed": False,
+            "license_hyperion": None}
+
+
+def hint_keys(d: dict) -> dict:
+    return {k: d[k] for k in HINT_KEYS}
+
+
+def test_a_hint_session_writes_the_hint_in_session_json_and_every_take(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """H3: session.json, every take entry in it (redone or kept) and every
+    take's meta carry the three keys, and nothing that was there is gone."""
+    real = rp.Reviewer
+    monkeypatch.setattr(rp, "Reviewer",
+                        lambda auto=False: real(keys=iter(["r", "\r", "\r"])))
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--takes", "1",
+                                    "--items", "tip_pinch,hook",
+                                    "--hint", "hand_on_object"))
+    folder = session_dir(out)
+    session = read_json(folder / "session.json")
+    assert SESSION_FIELDS <= set(session)
+    assert hint_keys(session) == HINTED
+    takes = session["takes"]
+    assert [(t["item"], t["accepted"]) for t in takes] == [
+        ("tip_pinch", False), ("tip_pinch", True), ("hook", True)]
+    for entry in takes:
+        assert hint_keys(entry) == HINTED, entry["name"]
+        meta = read_json(folder / entry["files"]["meta"])
+        assert META_FIELDS <= set(meta)
+        assert hint_keys(meta) == HINTED, entry["name"]
+    assert "hint:    hand_on_object" in capsys.readouterr().out
+
+
+def test_a_session_with_no_hint_says_none_in_session_json_and_every_take(
+        rp, monkeypatch, tmp_path, protocol_file):
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook"))
+    folder = session_dir(out)
+    session = read_json(folder / "session.json")
+    assert hint_keys(session) == UNHINTED
+    (entry,) = session["takes"]
+    assert hint_keys(entry) == UNHINTED
+    assert hint_keys(read_json(folder / entry["files"]["meta"])) == UNHINTED
+
+
+def test_resume_with_a_different_hint_is_refused_and_the_same_hint_carries_on(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """One session folder, one tracking condition."""
+    real = rp.Reviewer
+    monkeypatch.setattr(rp, "Reviewer",
+                        lambda auto=False: real(auto=auto, keys=iter(["\r", "q"])))
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--items", "hook",
+                                    "--takes", "2", "--hint", "hand_on_object"))
+    folder = session_dir(out)
+    # the end table's resume command asks for the session's own hint
+    printed = capsys.readouterr().out
+    (command,) = [line for line in printed.splitlines() if "--resume" in line]
+    assert command.strip().endswith("--hint hand_on_object")
+    before = (folder / "session.json").read_bytes()
+
+    with pytest.raises(SystemExit) as e:
+        run(rp, monkeypatch, "--mock", "--protocol", protocol_file, "--hand",
+            "left", "--resume", folder, "--auto-accept", "--no-open")
+    message = str(e.value)
+    assert "tracking hint hand_on_object" in message
+    assert "no tracking hint" in message
+    assert "one tracking condition" in message
+    assert "--hint hand_on_object" in message
+    assert (folder / "session.json").read_bytes() == before, "nothing written"
+    assert session_dir(out) == folder
+
+    # the same hint resumes the same session, and its new take says so too
+    run(rp, monkeypatch, "--mock", "--protocol", protocol_file, "--hand", "left",
+        "--resume", folder, "--auto-accept", "--no-open",
+        "--hint", "hand_on_object")
+    session = read_json(folder / "session.json")
+    assert [(t["take"], t["accepted"]) for t in session["takes"]] == [
+        (1, True), (2, False), (2, True)]
+    assert hint_keys(session) == HINTED
+    assert all(hint_keys(t) == HINTED for t in session["takes"])
+
+
+def test_resume_of_a_session_without_a_hint_refuses_a_hint(
+        rp, monkeypatch, tmp_path, protocol_file):
+    """...and a session written before the hints existed counts as none."""
+    real = rp.Reviewer
+    monkeypatch.setattr(rp, "Reviewer",
+                        lambda auto=False: real(auto=auto, keys=iter(["\r", "q"])))
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--items", "hook",
+                                    "--takes", "2"))
+    folder = session_dir(out)
+    path = folder / "session.json"
+    old = read_json(path)
+    for key in HINT_KEYS:                     # as written before 2026-10-16
+        old.pop(key)
+        for entry in old["takes"]:
+            entry.pop(key)
+    path.write_text(json.dumps(old, indent=2), encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="one tracking condition"):
+        run(rp, monkeypatch, "--mock", "--protocol", protocol_file, "--hand",
+            "left", "--resume", folder, "--auto-accept", "--no-open",
+            "--hint", "hand_on_object")
+    assert read_json(path) == old
+
+    run(rp, monkeypatch, "--mock", "--protocol", protocol_file, "--hand", "left",
+        "--resume", folder, "--auto-accept", "--no-open")
+    session = read_json(path)
+    assert session["takes"][:2] == old["takes"], "earlier entries untouched"
+    assert hint_keys(session) == UNHINTED
+    assert hint_keys(session["takes"][2]) == UNHINTED
+
+
+def test_hint_is_refused_without_a_protocol_and_by_unknown_name(rp, monkeypatch,
+                                                                tmp_path,
+                                                                protocol_file):
+    # the plain session writes no session.json or meta to record it in
+    with pytest.raises(SystemExit):
+        run(rp, monkeypatch, "--mock", "--poses", "fist", "--takes", "1",
+            "--hint", "hand_on_object", "--out-dir", tmp_path / "poses")
+    assert not (tmp_path / "poses").exists()
+    with pytest.raises(SystemExit):
+        run(rp, monkeypatch, *mock_args(protocol_file, tmp_path / "grasps",
+                                        "--hint", "hand_on_objects"))
+    assert not (tmp_path / "grasps").exists()
+
+
+# --- both hands in one take (--both) -----------------------------------------------
+def test_both_hands_grades_the_other_hand_and_keeps_the_take(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    """The plain mock shows both hands: with --both the right hand is graded
+    from the same take with the same gate, and written beside the left."""
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook", "--both"))
+    folder = session_dir(out)
+    session = read_json(folder / "session.json")
+    assert session["both_hands"] is True
+    (entry,) = session["takes"]
+    assert entry["accepted"] is True, entry["reason"]
+    meta = read_json(folder / entry["files"]["meta"])
+    second = meta["second_hand"]
+    assert second["hand"] == "right" and second["passed"] is True
+    assert second["gate_reason"] == ""
+    assert second["tracked_fraction"] >= 0.9
+    assert second["hand_ids"]
+    assert not set(second["hand_ids"]) & set(meta["operator_hand_ids"])
+    assert second["static_interval"] and second["curls"]
+    keys = folder / entry["files"]["keypoints_second"]
+    assert keys.is_file() and keys.name.endswith("_right_keypoints.txt")
+    assert keys.read_text(encoding="utf-8") != (
+        folder / entry["files"]["keypoints"]).read_text(encoding="utf-8")
+    assert "right hand: tracked" in capsys.readouterr().out
+
+
+def test_without_both_hands_flag_the_meta_has_no_second_hand(
+        rp, monkeypatch, tmp_path, protocol_file):
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook"))
+    folder = session_dir(out)
+    session = read_json(folder / "session.json")
+    assert "both_hands" not in session       # the files of a one-hand session
+    (entry,) = session["takes"]              # are what they were before --both
+    meta = read_json(folder / entry["files"]["meta"])
+    assert "second_hand" not in meta
+    assert "keypoints_second" not in entry["files"]
+
+
+def test_both_hands_grading_fails_when_the_other_hand_is_not_in_the_take(
+        rp, monkeypatch, tmp_path, protocol_file):
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    meta = read_json(folder / entry["files"]["meta"])
+    lines = read_lines(folder / entry["files"]["leap"])
+    ours = meta["operator_hand_ids"]
+    both = rp.grade_second_hand(lines, ours, 1.0, rp.DEFAULT_STATIC_S, "right")
+    assert both.passed and not set(both.hand_ids) & set(ours)
+    alone = rp.grade_second_hand([x for x in lines if x["hand_id"] in ours],
+                                 ours, 1.0, rp.DEFAULT_STATIC_S, "right")
+    assert not alone.passed and "no hand" in alone.gate_reason
+
+
+def test_both_hands_rejects_the_take_when_the_other_hand_fails_the_gate(
+        rp, monkeypatch, tmp_path, protocol_file, capsys):
+    real = rp.grade_second_hand
+
+    def missing(rows, operator_ids, duration_s, static_s, hand):
+        return real([], operator_ids, duration_s, static_s, hand)
+
+    monkeypatch.setattr(rp, "grade_second_hand", missing)
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook", "--both",
+                                    "--retries", "0"))
+    folder = session_dir(out)
+    (entry,) = read_json(folder / "session.json")["takes"]
+    assert entry["accepted"] is False
+    assert entry["reason"].startswith("right hand: no hand")
+    meta = read_json(folder / entry["files"]["meta"])
+    assert meta["second_hand"]["passed"] is False
+    assert meta["gate"]["passed"] is True          # the operator's own hand passed
+    assert "REJECTED by the gate: right hand:" in capsys.readouterr().out
+
+
+def test_two_hands_in_view_open_hand_acquires_the_operators_hand(rp):
+    """2026-11-12 19:10, --both on the real camera: the left palm 16 cm to the
+    side at 22 cm up (not "centred"), the right palm 6 cm to the side. OPEN
+    HAND acquired the right hand, and the gate threw every such take away
+    ("fitted the hand as a right hand"). With the operator's label required
+    and the two-hands side limit, it acquires the left."""
+    from leap_hand.mock import MockLeapStream
+
+    def hands(side, x_mm, n=90):
+        s = MockLeapStream(dropout_every=0, reacquire_every=0, noise_mm=0.0,
+                           sides=(side,),
+                           script=lambda i: {"origin_mm": (x_mm, 220.0, 42.0),
+                                             "curl": 0.0})
+        return [lh for _sd, lh in s.generate(n)]
+
+    left, right = hands("left", -162.0), hands("right", 60.0)
+    assert rp.hand_seen(left[0], 0.0).offset_cm == pytest.approx(16.0, abs=0.5)
+
+    def watch(hands_in_view, **kw):
+        w = rp.OpenHandWatch(prefer="left", **kw)
+        for k, frame in enumerate(zip(*hands_in_view)):
+            for lh in frame:
+                w.add(lh, 100.0 + k / 90)
+        return w
+
+    got = watch((left, right)).acquired()
+    assert got is not None and got.lh.hand_side == "right"      # what went wrong
+    both = dict(label="left", lateral=rp.BOTH_LATERAL_FRACTION)
+    got = watch((left, right), **both).acquired()
+    assert got is not None and got.lh.hand_side == "left"
+    # only the other hand in view: never acquired, and the status does not coach it
+    w = watch((right,), **both)
+    assert w.acquired() is None
+    assert w.status(100.0 + 89 / 90).startswith("no hand seen")
+
+
+def test_two_hands_in_view_form_watch_never_adopts_the_other_hands_new_id(rp):
+    """2026-11-12 19:12: both hands were lost for a moment, the right one came
+    back first under a new id within 10 cm of where the left had been, and
+    the coaching followed it. With `only`, a new id under the other label is
+    another hand; the operator's hand under a new id is still followed."""
+    import dataclasses
+
+    from leap_hand.mock import MockLeapStream
+
+    s = MockLeapStream(dropout_every=0, reacquire_every=0, sides=("left",))
+    lhs = [lh for _sd, lh in s.generate(20)]
+    stray = dataclasses.replace(lhs[5], hand_id=777, hand_side="right")
+    w = rp.FormWatch(rp.hand_seen(lhs[0], 10.0), others=set())
+    w.add(stray, 10.1)
+    assert 777 in w.mine                    # one hand in view: a chirality flip
+    w = rp.FormWatch(rp.hand_seen(lhs[0], 10.0), others=set(), only="left")
+    w.add(stray, 10.1)
+    assert 777 in w.others and w.mine == {lhs[0].hand_id}
+    w.add(dataclasses.replace(lhs[6], hand_id=778), 10.1)
+    assert w.hid == 778 and 778 in w.mine
+
+
+def test_finger_poses_ready_watch_ignores_a_travelling_hand(rp):
+    """2026-11-12: every catalogue pose was sent back once with CLOSED TOO
+    SOON right at the READY beep. READY judged the mean joint speed over the
+    camera, and a hand held in the air drifts faster than its 50 mm/s. With
+    `pose` the whole hand's movement is taken out first: an open hand carried
+    across at 108 mm/s is not closing, a hand that closes still is."""
+    from leap_hand.mock import CoachedActor, MockLeapStream
+    from leap_hand.transition import POSE_MOVE_SPEED_MM_S
+
+    carried = MockLeapStream(
+        dropout_every=0, reacquire_every=0, sides=("left",),
+        script=lambda i: {"origin_mm": (-60.0 + 1.2 * i, 220.0, 42.0), "curl": 0.0})
+    lhs = [lh for _sd, lh in carried.generate(90)]
+
+    def watch(hands, **kw):
+        w = rp.ReadyWatch(rp.hand_seen(hands[0], 50.0), others=set(),
+                          label="left", **kw)
+        got = None
+        for k, lh in enumerate(hands[1:]):
+            w.add(lh, 50.0 + k / 90)
+            got = got or w.closing()
+        return w, got
+
+    _w, got = watch(lhs)
+    assert got is not None and got[0] >= rp.MOVE_SPEED_MM_S      # what went wrong
+    pose = dict(pose=True, move_mm_s=POSE_MOVE_SPEED_MM_S)
+    w, got = watch(lhs, **pose)
+    assert got is None and w.fastest[0] < POSE_MOVE_SPEED_MM_S
+    # a real close before the GO beep is still one
+    actor = CoachedActor(operator="left", close_before_cue=1, close_s=0.5)
+    s = MockLeapStream(dropout_every=0, reacquire_every=0, script=actor)
+    s.start()
+    actor.phase("open", 0)
+    actor.phase("ready", 0)
+    closing = [lh for side, lh in s.generate(90) if side == "left"]
+    _w, got = watch(closing, **pose)
+    assert got is not None and got[0] >= POSE_MOVE_SPEED_MM_S
+
+
+def test_finger_poses_a_one_finger_bend_is_a_close_after_the_cue(rp, tmp_path):
+    """2026-11-12, B01 (only the index half curls): sent back three times
+    with "no close after the GO beep", because one finger moves the mean of
+    26 joints by less than 50 mm/s. With --finger-poses a fingertip moving
+    150 mm/s or faster against the palm is a close; a still hand is not."""
+    from types import SimpleNamespace
+
+    from leap_hand.mock import MockLeapStream
+    from leap_hand.transition import JOINT_INDEX
+
+    s = MockLeapStream(dropout_every=0, reacquire_every=0, noise_mm=0.0,
+                       sides=("left",), script=lambda i: {"curl": 0.0})
+    lhs = [lh for _sd, lh in s.generate(180)]                    # 2 s
+    t0 = 1000.0
+    share = {"INDEX_INTERMEDIATE": 0.3, "INDEX_DISTAL": 0.6, "INDEX_TIP": 1.0}
+
+    def rows(bend_mm):
+        out = []
+        for i, lh in enumerate(lhs):
+            pos = [list(p) for p in lh.abs26]
+            w = min(1.0, max(0.0, (i / 90 - 0.5) / 0.3))         # 0.5 to 0.8 s
+            for name, k in share.items():
+                pos[JOINT_INDEX[name]][1] -= k * bend_mm / 1000 * w * w * (3 - 2 * w)
+            out.append({"hand_side": "left", "hand_id": lh.hand_id, "status": 1,
+                        "frame_id": i, "framerate": 90.0, "abs26": pos,
+                        "wall_time": t0 + i / 90, "capture_time": t0 + i / 90})
+        return out
+
+    def judged(bend_mm, finger_poses):
+        path = tmp_path / f"forming_{bend_mm}_{finger_poses}.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in rows(bend_mm)) + "\n",
+                        encoding="utf-8")
+        me = SimpleNamespace(prep=2.0, hand="left", finger_poses=finger_poses,
+                             _coaching={})
+        forming = SimpleNamespace(path=path, t0=t0, follow=None)
+        return me, rp.ProtocolSession._closed_before_cue(me, forming, t0 + 2.0)
+
+    _me, early = judged(50, False)
+    assert early is not None and early["peak_speed_mm_s"] < rp.MOVE_SPEED_MM_S
+    me, early = judged(50, True)
+    assert early is None
+    assert me._coaching["tip_peak_speed_mm_s"] >= rp.TIP_MOVE_SPEED_MM_S
+    _me, early = judged(0, True)
+    assert early is not None                                     # nothing moved
+
+
+def test_finger_poses_session_says_so_and_resumes_with_the_flag(
+        rp, monkeypatch, tmp_path, protocol_file):
+    out = tmp_path / "grasps"
+    run(rp, monkeypatch, *mock_args(protocol_file, out, "--auto-accept",
+                                    "--takes", "1", "--items", "hook",
+                                    "--finger-poses"))
+    folder = session_dir(out)
+    session = read_json(folder / "session.json")
+    (entry,) = session["takes"]
+    assert entry["accepted"] is True
+    assert session["finger_poses"] == {"ready_pose_speed_mm_s": 25.0,
+                                       "tip_move_speed_mm_s": 150.0,
+                                       "tip_threshold_read_on": "2026-11-12"}
+    assert session["recorder_rules"] == "2026-10-07"             # the grasp set's
+    assert read_json(folder / entry["files"]["meta"])["finger_poses"] is True
+    plain = tmp_path / "plain"
+    run(rp, monkeypatch, *mock_args(protocol_file, plain, "--auto-accept",
+                                    "--takes", "1", "--items", "hook"))
+    session = read_json(session_dir(plain) / "session.json")
+    assert "finger_poses" not in session
+    assert "finger_poses" not in read_json(
+        session_dir(plain) / session["takes"][0]["files"]["meta"])
+    from types import SimpleNamespace
+    me = SimpleNamespace(protocol_path=Path(protocol_file), mock=True, hand="left",
+                         session_dir=folder, coach=True, finger_poses=True)
+    assert rp.ProtocolSession.resume_command(me).endswith(" --finger-poses")

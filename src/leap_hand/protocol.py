@@ -41,6 +41,7 @@ Everything here is plain values and formatting with no I/O, so the live
 sessions can run it and `leap_hand.stats` can re-apply it to a recording
 months later.
 """
+import json
 import math
 import re
 from pathlib import Path
@@ -605,18 +606,25 @@ def view_caption(phase: str, pose: str, extra: str = "",
 QUIT = "__quit__"
 
 
-def status_text(caption: str, band=None, snap=None) -> str:
-    """The status file's contents, as the viewer parses them back."""
+def status_text(caption: str, band=None, snap=None, ref=None) -> str:
+    """The status file's contents, as the viewer parses them back.
+
+    `ref` is the path of the reference picture of the pose being asked for
+    (`reference_poses/<pose>.png`, see `reference_path`); the window draws it
+    in its top-right corner so the operator can copy it."""
     body = (caption or "").strip()
     if band:
         body += f"\nband={band[0]:g},{band[1]:g}"
     if snap:
         body += f"\nsnap={snap}"
+    if ref:
+        body += f"\nref={ref}"
     return body
 
 
 def parse_status(text: str):
-    """`status_text` backwards: (caption, band or None, snap or None).
+    """`status_text` backwards: (caption, band or None, snap or None,
+    ref or None).
 
     Unknown keys and malformed values are ignored rather than raising: the
     viewer is a child process watching a file that the parent may be halfway
@@ -627,6 +635,7 @@ def parse_status(text: str):
     caption = lines[0].strip() if lines else ""
     band = None
     snap = None
+    ref = None
     for line in lines[1:]:
         line = line.strip()
         if line.startswith("band="):
@@ -638,7 +647,63 @@ def parse_status(text: str):
                 band = (low, high)
         elif line.startswith("snap="):
             snap = line[5:].strip() or None
-    return caption, band, snap
+        elif line.startswith("ref="):
+            ref = line[4:].strip() or None
+    return caption, band, snap, ref
+
+
+# --- the reference picture of the pose being asked for --------------------------
+# The operator does not always know what a pose should look like. The pictures
+# in `reference_poses/` are the professor's own tracker frames (she defined the
+# pose list; `reference_poses/sources.txt` names each frame), and the window
+# shows the one for the pose being recorded in its top-right corner. Only on
+# the annotated window frame: the still is cut from the clean frame and never
+# carries it.
+REFERENCE_PHASES = ("ACQUIRE", "SETTLE", "REC")   # the phases that name a pose
+REFERENCE_WIDTH = 240                               # px, in the 768 px window
+REFERENCE_TOP = 124                                 # below the caption and two hand lines
+REFERENCE_MARGIN = 10
+
+
+def reference_path(ref_dir, phase: str, pose: str) -> Optional[str]:
+    """`<ref_dir>/<pose>.png` while `phase` asks for `pose`, else None.
+    None too when the picture is not on disk: the window then shows none."""
+    if str(phase or "").upper() not in REFERENCE_PHASES or not pose:
+        return None
+    path = Path(ref_dir) / f"{pose}.png"
+    return str(path) if path.is_file() else None
+
+
+def reference_label(ref) -> str:
+    """`.../crossed_fingers.png` -> `TARGET: CROSSED FINGERS`."""
+    return f"TARGET: {Path(ref).stem.replace('_', ' ').upper()}"
+
+
+def paste_reference(frame, ref_img, label: str, put,
+                    top: int = REFERENCE_TOP, margin: int = REFERENCE_MARGIN,
+                    char_px: int = 17):
+    """Draw `ref_img` (already scaled) into the top-right corner of `frame`,
+    in place, with `label` on one line above it, written by `put(frame, text,
+    org)`. Returns the picture's (x0, y0, x1, y1), or None if it does not fit.
+
+    Draws on `frame` and nothing else: the caller passes the annotated window
+    frame, never the clean one a still is cut from. The label starts at the
+    picture's left edge, or further left so a long one still ends at the
+    picture's right edge; `char_px` is the
+    caption font's width per character (Hershey simplex, scale 0.75)."""
+    height, width = frame.shape[:2]
+    h, w = ref_img.shape[:2]
+    x1 = width - margin
+    x0 = x1 - w
+    y0 = top
+    y1 = min(height, y0 + h)
+    if x0 < 0 or y1 <= y0:
+        return None
+    frame[y0:y1, x0:x1] = ref_img[:y1 - y0]
+    if label:
+        lx = max(margin, min(x0, x1 - char_px * len(label)))
+        put(frame, label, (lx, y0 - 10))
+    return x0, y0, x1, y1
 
 
 # --- the viewer's "no picture" banner ----------------------------------------
@@ -739,6 +804,16 @@ def hand_crop_box(points: Sequence[Sequence[float]], size: int,
     return int(x0), int(y0), int(x1), int(y1)
 
 
+def crop_hand(plain, px):
+    """(crop, box): `plain` cut to `hand_crop_box(px, width)`, a copy with
+    nothing drawn on it, or (None, None) when there is no hand to crop to."""
+    box = hand_crop_box(px, plain.shape[1])
+    if box is None:
+        return None, None
+    x0, y0, x1, y1 = box
+    return plain[y0:y1, x0:x1].copy(), box
+
+
 # Why a take has no still. Written into its meta.json as
 # `still_missing_reason`, so a still the viewer skipped on purpose can be told
 # apart from one that is missing because something failed.
@@ -786,15 +861,131 @@ def still_status(still_path) -> Tuple[Optional[str], Optional[str]]:
     return None, STILL_UNKNOWN
 
 
+# When the still was taken. The viewer writes `<still>.json` beside the JPEG
+# (`fist_take1_x.jpg.json`) with the capture instant of the IR image the
+# still was cut from, so a comparison timed by the photo does not have to
+# read the time off the file's mtime, which is when the JPEG finished writing.
+# `capture_time` is on the wall clock, derived the way the recorder derives it
+# for tracking frames: time.time() when the image event arrived minus the
+# frame's age on the LeapC clock (LeapGetNow() - the image's timestamp).
+# Without a LeapC stamp it is `saved_at`, and `capture_time_source` says so.
+STILL_CAPTURE_SUFFIX = ".json"
+FROM_IMAGE = "leapc_image_timestamp"
+FROM_SAVED_AT = "saved_at"
+STILL_CAPTURE_KEYS = ("still_capture_time", "still_timestamp_us", "still_frame_id",
+                      "still_capture_time_source")
+
+
+def still_capture_path(still_path) -> Path:
+    """`<still>.json`: the capture record beside the still."""
+    p = Path(still_path)
+    return p.with_name(p.name + STILL_CAPTURE_SUFFIX)
+
+
+def still_capture_record(saved_at: float, capture_time: Optional[float] = None,
+                         timestamp_us: Optional[int] = None,
+                         frame_id: Optional[int] = None,
+                         full: Optional[str] = None) -> dict:
+    """The sidecar's contents for a still saved at `saved_at` (time.time()).
+
+    `capture_time`, `timestamp_us` and `frame_id` are those of the IR image
+    the still was made from; with no capture_time it falls back to
+    `saved_at`, named as such. `full` is the file name of the uncropped
+    frame the still was cut from (`full_still_path`), None when there is
+    none: the record describes both pictures, which are one frame."""
+    return {"capture_time": float(saved_at if capture_time is None else capture_time),
+            "capture_time_source": FROM_SAVED_AT if capture_time is None else FROM_IMAGE,
+            "timestamp_us": None if timestamp_us is None else int(timestamp_us),
+            "frame_id": None if frame_id is None else int(frame_id),
+            "saved_at": float(saved_at),
+            "full": None if full is None else str(full)}
+
+
+# The uncropped frame a hand still was cut from, `<stem>.full.jpg` beside
+# `<stem>.jpg`. It shows the whole camera view, the operator included, so it
+# stays in the session folder: it never goes into a professor's folder.
+FULL_SUFFIX = ".full.jpg"
+
+
+def full_still_path(still_path) -> Path:
+    """`<stem>.full.jpg`: the whole frame the still `<stem>.jpg` was cut from."""
+    p = Path(still_path)
+    return p.with_name(p.stem + FULL_SUFFIX)
+
+
+def save_still(still_path, still, stamp, saved_at: float, imwrite,
+               full=None, cut_from=None) -> Path:
+    """Write the still, the uncropped frame it was cut from (when `full` is
+    given) and the sidecar describing both; returns the sidecar's path.
+
+    `stamp` is (capture_time, timestamp_us, frame_id) of the one image both
+    pictures show. `cut_from` is the array the crop was taken from, and it
+    must BE `full` (the same object, not an equal copy): cropping can then
+    neither move the timestamp nor take its picture from another frame.
+    `imwrite(path, array)` is cv2.imwrite in the viewer."""
+    if full is not None and cut_from is not full:
+        raise ValueError("the still was not cut from the full frame saved with it")
+    full_name = None
+    if full is not None:
+        imwrite(str(full_still_path(still_path)), full)
+        full_name = full_still_path(still_path).name
+    imwrite(str(still_path), still)
+    cap, ts, fid = stamp
+    return write_still_capture(still_path, still_capture_record(
+        saved_at=saved_at, capture_time=cap, timestamp_us=ts, frame_id=fid, full=full_name))
+
+
+def write_still_capture(still_path, record: dict) -> Path:
+    path = still_capture_path(still_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def still_capture_meta(still_path) -> dict:
+    """The sidecar as the take meta's four `still_*` keys, all None when
+    there is no still, no sidecar (sessions made before it existed) or it
+    cannot be read."""
+    out = dict.fromkeys(STILL_CAPTURE_KEYS)
+    if not still_path:
+        return out
+    try:
+        rec = json.loads(still_capture_path(still_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return out
+    if not isinstance(rec, dict):
+        return out
+    out.update(still_capture_time=rec.get("capture_time"),
+               still_timestamp_us=rec.get("timestamp_us"),
+               still_frame_id=rec.get("frame_id"),
+               still_capture_time_source=rec.get("capture_time_source"))
+    return out
+
+
 def move_still(src, dst) -> None:
     """Move a take's still, and the viewer's note if it left one instead, to
-    the name `dst`. The note follows the same renaming rule as the JPEG so
-    `still_status(dst)` still finds it. Nothing to move, nothing created."""
+    the name `dst`. The note, the uncropped frame and the capture record
+    follow the same renaming rule as the JPEG so `still_status(dst)` and
+    `still_capture_meta(dst)` still find them. The record's `full` names the
+    uncropped frame, so it is rewritten to the frame's new name when that
+    frame moved with it (the only field touched). Nothing to move, nothing
+    created."""
     src, dst = Path(src), Path(dst)
-    for a, b in ((src, dst), (skipped_still_path(src), skipped_still_path(dst))):
+    for a, b in ((src, dst), (skipped_still_path(src), skipped_still_path(dst)),
+                 (full_still_path(src), full_still_path(dst)),
+                 (still_capture_path(src), still_capture_path(dst))):
         if a.is_file():
             b.parent.mkdir(parents=True, exist_ok=True)
             a.replace(b)
+    rec_path = still_capture_path(dst)
+    if rec_path.is_file() and full_still_path(dst).is_file():
+        try:
+            rec = json.loads(rec_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(rec, dict) and rec.get("full") != full_still_path(dst).name:
+            rec["full"] = full_still_path(dst).name
+            rec_path.write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
 
 
 # --- stream health -----------------------------------------------------------
@@ -936,6 +1127,7 @@ class CameraView:
         # moment the still is taken.
         self._caption = ""
         self._snap = None
+        self._ref = None
 
     def start(self):
         if not self.enabled or self._proc is not None:
@@ -959,10 +1151,13 @@ class CameraView:
         atexit.register(self.close)
         return self
 
-    def caption(self, text, band=None):
-        """Set the window's caption (and optionally its height band). Cheap to
-        call every HUD refresh: the file is only rewritten when it changes."""
+    def caption(self, text, band=None, ref=None):
+        """Set the window's caption (and optionally its height band and the
+        reference picture `ref` of the pose being asked for; None shows no
+        picture). Cheap to call every HUD refresh: the file is only rewritten
+        when it changes."""
         self._caption = (text or "").strip()
+        self._ref = str(ref) if ref else None
         self._write_status(band)
 
     def snapshot(self, path):
@@ -996,7 +1191,7 @@ class CameraView:
     def _write_status(self, band=None):
         if not self.enabled or self._status is None:
             return
-        body = status_text(self._caption, band, self._snap)
+        body = status_text(self._caption, band, self._snap, self._ref)
         if body == self._last:
             return
         self._last = body

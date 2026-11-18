@@ -582,6 +582,564 @@ def test_stream_rejects_an_unknown_tracking_mode():
         LeapStream(mode="sideways")
 
 
+# --- tracking hints (--hint hand_on_object) ---------------------------------
+# A whole LeapStream.start() against a fake `leap` module (installed through
+# sys.modules, as the no-bindings test above does) and a fake (ffi, libleapc)
+# behind the stream's `_leapc` hook. The fakes are shaped like the bindings:
+# `connection.get_devices()` returns devices that are NOT open, whose
+# `c_data_device` is None until `device.open()`; and like LeapC: the hints
+# go in as a C array of strings ending in NULL. Every call lands in one list,
+# so the order of the tracking-mode calls, the device wait and the hint
+# calls can be read off it.
+#
+# And like the camera on 2026-10-17: on a multi-device aware connection (the
+# kind hints need) the plain LeapGetTrackingMode is never answered, so the
+# bindings' get_tracking_mode() times out; LeapGetTrackingModeEx on the open
+# device is answered with a TrackingMode event, reporting the mode the
+# device was set to with LeapSetTrackingModeEx. What the plain
+# LeapSetTrackingMode does to a device there is unknown: the fake says
+# nothing, so a device never set with the Ex call reports HMD.
+FAKE_NULL = object()                     # ffi.NULL
+FAKE_CONNECTION_PTR = "LEAP_CONNECTION#1"
+
+
+class FakeTrackingMode(Enum):
+    Desktop = 0
+    HMD = 1
+    ScreenTop = 2
+
+
+class FakeEventType(Enum):
+    TrackingMode = 13
+
+
+class FakeCannotOpenDevice(Exception):
+    pass
+
+
+class FakeLeapTimeoutError(Exception):
+    pass
+
+
+class FakeCString:
+    """What `ffi.new("char[]", b"...")` gives: the bytes, NUL-terminated."""
+
+    def __init__(self, value: bytes):
+        self.value = bytes(value)
+
+
+class FakeDevice:
+    """`leap.Device`: `c_data_device` is the LEAP_DEVICE, None until opened."""
+
+    def __init__(self, calls, handle: str = "LEAP_DEVICE#1", is_open=False,
+                 serial: str = "LP-FAKE-170"):
+        self.calls = calls
+        self.handle = handle
+        self.serial = serial
+        self._open = handle if is_open else None
+
+    @property
+    def c_data_device(self):
+        return self._open
+
+    def open(self):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def opened():
+            if self._open is not None:
+                raise FakeCannotOpenDevice("Device is already open")
+            self.calls.append(("open_device", self.handle))
+            self._open = self.handle
+            try:
+                yield self
+            finally:
+                self._open = None
+                self.calls.append(("close_device", self.handle))
+        return opened()
+
+    def get_info(self):
+        from types import SimpleNamespace
+        if self._open is None:
+            raise RuntimeError("DeviceNotOpenException")
+        return SimpleNamespace(serial=self.serial)
+
+
+class FakeConnection:
+    """`leap.Connection`: connect() delivers the connection and device events
+    on the spot, so the device wait ends at once."""
+
+    def __init__(self, sdk, **options):
+        self.sdk = sdk
+        self.options = options
+        self.listeners = []
+        self.mode = None
+        self.disconnected = False
+        self._waiting = None             # (event type, events caught)
+        sdk.connections.append(self)
+
+    def add_listener(self, listener):
+        self.listeners.append(listener)
+
+    def connect(self):
+        from types import SimpleNamespace
+        self.sdk.calls.append("connect")
+        for listener in self.listeners:
+            listener.on_connection_event(None)
+            # the device event's own device, opened by the listener for its serial
+            listener.on_device_event(SimpleNamespace(
+                device=FakeDevice([], handle="LEAP_DEVICE#event")))
+
+    def set_tracking_mode(self, mode):
+        self.sdk.calls.append("set_tracking_mode")
+        self.mode = mode
+
+    def get_tracking_mode(self):
+        self.sdk.calls.append("get_tracking_mode")
+        if self.options.get("multi_device_aware"):
+            raise FakeLeapTimeoutError("Did not received expected event in time")
+        return self.mode
+
+    def _call_and_wait_for_event(self, event_type, func=None, args=None, *,
+                                 timeout=None):
+        """The bindings' own: listen for `event_type`, THEN call `func`."""
+        caught = []
+        self._waiting = (event_type, caught)
+        try:
+            if func is not None:
+                func(*(args or ()))
+        finally:
+            self._waiting = None
+        if not caught:
+            raise FakeLeapTimeoutError("Did not received expected event in time")
+        return caught[-1]
+
+    def emit(self, event_type, event):
+        if self._waiting is not None and self._waiting[0] == event_type:
+            self._waiting[1].append(event)
+
+    def get_connection_ptr(self):
+        return FAKE_CONNECTION_PTR
+
+    def get_devices(self):
+        self.sdk.calls.append("get_devices")
+        return list(self.sdk.devices)
+
+    def subscribe_events(self, device):
+        self.sdk.calls.append(("subscribe_events", device.c_data_device))
+
+    def disconnect(self):
+        self.sdk.calls.append("disconnect")
+        self.disconnected = True
+
+
+class FakeFFI:
+    NULL = FAKE_NULL
+
+    def __init__(self):
+        self.made = []                   # (ctype, init) of every ffi.new
+
+    def new(self, ctype, init=None):
+        self.made.append((ctype, init))
+        if ctype == "bool*":
+            return [False]
+        if ctype == "char[]":
+            return FakeCString(init)
+        if ctype == "const char*[]":
+            return list(init)
+        raise AssertionError(f"unexpected ffi.new({ctype!r})")
+
+
+class FakeLeapC:
+    """The two LeapC functions the stream calls itself."""
+
+    def __init__(self, sdk):
+        self.sdk = sdk
+
+    def LeapCheckLicenseFlag(self, conn, flag, enabled):
+        self.sdk.calls.append(("LeapCheckLicenseFlag", conn, flag))
+        enabled[0] = self.sdk.licensed
+        return self.sdk.license_code
+
+    def LeapSetTrackingModeEx(self, conn, device, mode):
+        self.sdk.calls.append(("LeapSetTrackingModeEx", conn, device, mode))
+        if self.sdk.set_mode_code == 0:
+            self.sdk.device_modes[device] = FakeTrackingMode(mode)
+        return self.sdk.set_mode_code
+
+    def LeapGetTrackingModeEx(self, conn, device):
+        from types import SimpleNamespace
+        self.sdk.calls.append(("LeapGetTrackingModeEx", conn, device))
+        if self.sdk.answer_mode and self.sdk.get_mode_code == 0:
+            mode = self.sdk.device_modes.get(device, FakeTrackingMode.HMD)
+            self.sdk.connections[-1].emit(
+                FakeEventType.TrackingMode,
+                SimpleNamespace(current_tracking_mode=mode))
+        return self.sdk.get_mode_code
+
+    def LeapSetDeviceHints(self, conn, device, hints):
+        decoded = [None if h is FAKE_NULL else h.value.decode("ascii")
+                   for h in hints]
+        self.sdk.calls.append(("LeapSetDeviceHints", conn, device, decoded))
+        stream = self.sdk.stream
+        if stream is not None:
+            # a frame tracked while the hint was being set, i.e. before it
+            # took effect: it must never reach a recording
+            stream._enqueue(("left", "frame from before the hint"))
+            stream.frames += 1
+        return self.sdk.hints_code
+
+
+class FakeLeapSDK:
+    def __init__(self):
+        import types
+
+        self.calls = []
+        self.devices = []
+        self.connections = []
+        self.stream = None
+        self.licensed = True
+        self.license_code = 0
+        self.hints_code = 0
+        self.set_mode_code = 0           # LeapSetTrackingModeEx's result
+        self.get_mode_code = 0           # LeapGetTrackingModeEx's result
+        self.answer_mode = True          # a TrackingMode event comes back
+        self.device_modes = {}           # LEAP_DEVICE -> mode set with the Ex call
+        self.ffi = FakeFFI()
+        self.lib = FakeLeapC(self)
+        module = types.ModuleType("leap")
+        module.Connection = lambda **options: FakeConnection(self, **options)
+        module.Listener = type("FakeListener", (), {})
+        module.LeapError = Exception
+        module.exceptions = types.SimpleNamespace(
+            LeapCannotOpenDeviceError=FakeCannotOpenDevice,
+            LeapTimeoutError=FakeLeapTimeoutError)
+        module.EventType = FakeEventType
+        module.TrackingMode = FakeTrackingMode
+        module.get_now = lambda: 0
+        self.module = module
+
+    def names(self):
+        return [c if isinstance(c, str) else c[0] for c in self.calls]
+
+    def hint_calls(self):
+        return [c for c in self.calls
+                if isinstance(c, tuple) and c[0] == "LeapSetDeviceHints"]
+
+
+@pytest.fixture
+def fake_sdk(monkeypatch):
+    import sys
+
+    from leap_hand import stream as stream_module
+
+    sdk = FakeLeapSDK()
+    sdk.devices = [FakeDevice(sdk.calls)]
+    monkeypatch.setitem(sys.modules, "leap", sdk.module)
+
+    def leapc():
+        sdk.calls.append("_leapc")
+        return sdk.ffi, sdk.lib
+    monkeypatch.setattr(stream_module, "_leapc", leapc)
+
+    # mark the moment the device wait is over in the call list
+    real_wait = LeapStream._wait_for_device
+
+    def wait(self):
+        real_wait(self)
+        sdk.calls.append("device_wait_done")
+    monkeypatch.setattr(LeapStream, "_wait_for_device", wait)
+    return sdk
+
+
+def _hinted(sdk, **kwargs) -> LeapStream:
+    stream = LeapStream(hints=["hand_on_object"], device_timeout=1.0, **kwargs)
+    sdk.stream = stream
+    return stream
+
+
+def test_hint_is_set_once_per_device_after_the_device_wait(fake_sdk):
+    """H1: one LeapSetDeviceHints, the exact NULL-terminated list, after the
+    device wait, and no frame from before it counted."""
+    from leap_hand.stream import hint_metadata
+
+    stream = _hinted(fake_sdk)
+    stream.start()
+
+    (call,) = fake_sdk.hint_calls()
+    # the connection, the device's own LEAP_DEVICE (opened for the call),
+    # and the hints followed by the NULL that ends the C array
+    assert call == ("LeapSetDeviceHints", FAKE_CONNECTION_PTR, "LEAP_DEVICE#1",
+                    ["hand_on_object", None])
+    assert ("char[]", b"hand_on_object") in fake_sdk.ffi.made
+    assert [c for c, _ in fake_sdk.ffi.made].count("const char*[]") == 1
+
+    names = fake_sdk.names()
+    assert names.index("set_tracking_mode") < names.index("device_wait_done")
+    assert names.index("device_wait_done") < names.index("LeapCheckLicenseFlag")
+    assert names.index("LeapCheckLicenseFlag") < names.index("LeapSetTrackingModeEx")
+    # per device: the mode set, the hint, then the mode confirmed
+    assert names.index("LeapSetTrackingModeEx") < names.index("LeapSetDeviceHints")
+    assert names.index("LeapSetDeviceHints") < names.index("LeapGetTrackingModeEx")
+    assert ("LeapCheckLicenseFlag", FAKE_CONNECTION_PTR, b"Hyperion") in fake_sdk.calls
+
+    # the frame tracked while the hint was being set was discarded
+    assert stream.drain(64) == [] and stream.frames == 0
+    assert stream.tracking_mode_confirmed is True
+
+    assert stream.hints_requested == ["hand_on_object"]
+    assert stream.hints_confirmed is True
+    assert stream.license_hyperion is True
+    assert hint_metadata(stream) == {"tracking_hints": ["hand_on_object"],
+                                     "hints_confirmed": True,
+                                     "license_hyperion": True}
+    # LeapC interprets hints only from a multi-device aware client
+    assert fake_sdk.connections[0].options == {"response_timeout": 5.0,
+                                               "multi_device_aware": True}
+    stream.stop()
+    assert fake_sdk.connections[0].disconnected
+    # what was confirmed stays readable after stop(), for the recorder
+    assert stream.hints_confirmed is True and stream.license_hyperion is True
+
+
+def test_hint_opens_an_unopened_device_subscribes_and_closes_it(fake_sdk):
+    """The bindings list devices unopened (`c_data_device` None); LeapC wants
+    an open handle, and a multi-device aware client must subscribe."""
+    stream = _hinted(fake_sdk)
+    stream.start()
+    device = fake_sdk.devices[0]
+    sequence = [c for c in fake_sdk.calls if isinstance(c, tuple)
+                and c[0] != "LeapCheckLicenseFlag"]
+    # the mode set, the hint and the mode check all on the one open handle
+    assert sequence == [
+        ("open_device", "LEAP_DEVICE#1"),
+        ("subscribe_events", "LEAP_DEVICE#1"),
+        ("LeapSetTrackingModeEx", FAKE_CONNECTION_PTR, "LEAP_DEVICE#1",
+         FakeTrackingMode.Desktop.value),
+        ("LeapSetDeviceHints", FAKE_CONNECTION_PTR, "LEAP_DEVICE#1",
+         ["hand_on_object", None]),
+        ("LeapGetTrackingModeEx", FAKE_CONNECTION_PTR, "LEAP_DEVICE#1"),
+        ("close_device", "LEAP_DEVICE#1"),
+    ]
+    assert device.c_data_device is None
+    stream.stop()
+
+
+def test_hint_connection_confirms_the_mode_per_device_not_with_the_plain_call(
+        fake_sdk):
+    """The camera, 2026-10-17: on the multi-device aware connection the
+    plain LeapGetTrackingMode is never answered. The hinted start sets and
+    confirms the mode on the open device with the Ex calls instead."""
+    stream = _hinted(fake_sdk, mode="hmd")
+    stream.start()
+    names = fake_sdk.names()
+    assert "get_tracking_mode" not in names, "it times out on this connection"
+    assert names.count("set_tracking_mode") == 1, "the plain set stays, once"
+    ex = [c for c in fake_sdk.calls if isinstance(c, tuple)
+          and c[0] in ("LeapSetTrackingModeEx", "LeapGetTrackingModeEx")]
+    assert ex == [
+        ("LeapSetTrackingModeEx", FAKE_CONNECTION_PTR, "LEAP_DEVICE#1",
+         FakeTrackingMode.HMD.value),
+        ("LeapGetTrackingModeEx", FAKE_CONNECTION_PTR, "LEAP_DEVICE#1"),
+    ]
+    assert len(fake_sdk.hint_calls()) == 1
+    assert stream.tracking_mode_confirmed is True
+    assert stream.hints_confirmed is True
+    stream.stop()
+
+
+def test_hint_device_reporting_another_mode_is_fatal(fake_sdk):
+    fake_sdk.lib.LeapSetTrackingModeEx = (
+        lambda conn, device, mode: fake_sdk.calls.append(
+            ("LeapSetTrackingModeEx", conn, device, mode)) or 0)  # sets nothing
+    stream = _hinted(fake_sdk)
+    with pytest.raises(LeapUnavailable, match="not FakeTrackingMode.Desktop"):
+        stream.start()
+    assert stream.tracking_mode_confirmed is False
+    assert stream.hints_confirmed is False
+    assert fake_sdk.connections[0].disconnected
+    assert ("close_device", "LEAP_DEVICE#1") in fake_sdk.calls
+
+
+def test_hint_device_mode_set_refused_names_the_code(fake_sdk):
+    fake_sdk.set_mode_code = 0xE2010001 - (1 << 32)
+    stream = _hinted(fake_sdk)
+    with pytest.raises(LeapUnavailable) as e:
+        stream.start()
+    message = str(e.value)
+    assert "could not set the desktop tracking mode" in message
+    assert "LeapSetTrackingModeEx returned 0xE2010001" in message
+    assert fake_sdk.hint_calls() == [], "no hint on a device in an unknown mode"
+    assert fake_sdk.connections[0].disconnected
+
+
+def test_hint_device_mode_never_confirmed_is_fatal(fake_sdk):
+    fake_sdk.answer_mode = False
+    stream = _hinted(fake_sdk)
+    with pytest.raises(LeapUnavailable, match="never confirmed the desktop"):
+        stream.start()
+    assert stream.tracking_mode_confirmed is False
+    assert stream.hints_confirmed is False
+    assert fake_sdk.connections[0].disconnected
+
+
+def test_hint_uses_an_already_open_device_handle_as_it_is(fake_sdk):
+    fake_sdk.devices = [FakeDevice(fake_sdk.calls, handle="LEAP_DEVICE#7",
+                                   is_open=True)]
+    stream = _hinted(fake_sdk)
+    stream.start()
+    names = fake_sdk.names()
+    assert "open_device" not in names
+    assert fake_sdk.hint_calls() == [("LeapSetDeviceHints", FAKE_CONNECTION_PTR,
+                                      "LEAP_DEVICE#7", ["hand_on_object", None])]
+    assert ("LeapGetTrackingModeEx", FAKE_CONNECTION_PTR,
+            "LEAP_DEVICE#7") in fake_sdk.calls
+    stream.stop()
+
+
+def test_hint_is_set_on_every_device_once(fake_sdk):
+    fake_sdk.devices = [FakeDevice(fake_sdk.calls, handle="LEAP_DEVICE#1"),
+                        FakeDevice(fake_sdk.calls, handle="LEAP_DEVICE#2")]
+    stream = _hinted(fake_sdk)
+    stream.start()
+    assert [c[2] for c in fake_sdk.hint_calls()] == ["LEAP_DEVICE#1",
+                                                     "LEAP_DEVICE#2"]
+    assert fake_sdk.names().count("LeapCheckLicenseFlag") == 1
+    assert stream.hints_confirmed is True
+    stream.stop()
+
+
+def test_hint_none_requested_calls_nothing_and_leaves_the_license_unread(fake_sdk):
+    """H2: no hint, no hint call of any kind, and the metadata says none."""
+    from leap_hand.stream import hint_metadata
+
+    stream = LeapStream(device_timeout=1.0)
+    fake_sdk.stream = stream
+    stream.start()
+    names = fake_sdk.names()
+    for never in ("_leapc", "LeapCheckLicenseFlag", "LeapSetDeviceHints",
+                  "LeapSetTrackingModeEx", "LeapGetTrackingModeEx",
+                  "get_devices", "subscribe_events", "open_device"):
+        assert never not in names, never
+    # the connection is exactly the one it always was
+    assert fake_sdk.connections[0].options == {"response_timeout": 5.0}
+    assert names == ["connect", "set_tracking_mode", "device_wait_done",
+                     "get_tracking_mode"]
+    assert stream.hints_requested == []
+    assert stream.hints_confirmed is False
+    assert stream.license_hyperion is None
+    assert hint_metadata(stream) == {"tracking_hints": [],
+                                     "hints_confirmed": False,
+                                     "license_hyperion": None}
+    stream.stop()
+
+
+def test_hint_without_the_hyperion_license_refuses_with_the_next_step(fake_sdk):
+    """H2: the service would ignore the hint silently, so the stream refuses."""
+    fake_sdk.licensed = False
+    stream = _hinted(fake_sdk)
+    with pytest.raises(LeapUnavailable) as e:
+        stream.start()
+    message = str(e.value)
+    assert "Hyperion" in message and "Next step" in message
+    assert "check_setup.py" in message and "without --hint" in message
+    assert fake_sdk.hint_calls() == [], "no hint is sent without the license"
+    assert stream.license_hyperion is False
+    assert stream.hints_confirmed is False
+    # fatal like a wrong tracking mode: the connection is closed behind it
+    assert fake_sdk.connections[0].disconnected
+
+
+def test_hint_license_check_that_fails_refuses_and_names_the_code(fake_sdk):
+    fake_sdk.license_code = 0xE2010004 - (1 << 32)    # signed, as cffi gives it
+    stream = _hinted(fake_sdk)
+    with pytest.raises(LeapUnavailable) as e:
+        stream.start()
+    message = str(e.value)
+    assert "Hyperion" in message and "Next step" in message
+    assert "0xE2010004" in message
+    assert stream.license_hyperion is None, "a failed check is not a reading"
+    assert fake_sdk.hint_calls() == []
+    assert fake_sdk.connections[0].disconnected
+
+
+def test_hint_refused_by_the_service_is_fatal_and_names_the_code(fake_sdk):
+    fake_sdk.hints_code = 0xE2010001 - (1 << 32)
+    stream = _hinted(fake_sdk)
+    with pytest.raises(LeapUnavailable) as e:
+        stream.start()
+    assert "LeapSetDeviceHints returned 0xE2010001" in str(e.value)
+    assert "Next step" in str(e.value)
+    assert stream.hints_confirmed is False
+    assert stream.license_hyperion is True
+    assert fake_sdk.connections[0].disconnected
+    # the device opened for the call was closed again on the way out
+    assert ("close_device", "LEAP_DEVICE#1") in fake_sdk.calls
+
+
+def test_hint_with_no_device_listed_is_refused(fake_sdk):
+    fake_sdk.devices = []
+    stream = _hinted(fake_sdk)
+    with pytest.raises(LeapUnavailable, match="no device to set"):
+        stream.start()
+    assert stream.hints_confirmed is False
+    assert fake_sdk.connections[0].disconnected
+
+
+def test_hint_without_the_compiled_bindings_names_the_setup_step(fake_sdk,
+                                                                 monkeypatch):
+    from leap_hand import stream as stream_module
+
+    def missing():
+        raise ImportError("No module named 'leapc_cffi'")
+    monkeypatch.setattr(stream_module, "_leapc", missing)
+    stream = _hinted(fake_sdk)
+    with pytest.raises(LeapUnavailable) as e:
+        stream.start()
+    assert "setup_bindings.ps1" in str(e.value) and "Next step" in str(e.value)
+    assert fake_sdk.connections[0].disconnected
+
+
+def test_an_unknown_hint_is_refused_before_anything_connects():
+    from leap_hand.stream import KNOWN_HINTS, check_hints
+
+    assert KNOWN_HINTS == ("hand_on_object",)
+    with pytest.raises(ValueError, match="hand_on_objects"):
+        LeapStream(hints=["hand_on_objects"])
+    with pytest.raises(ValueError):
+        MockLeapStream(hints=["microgestures"])
+    with pytest.raises(TypeError):
+        LeapStream(hints="hand_on_object")        # a string, not a list of them
+    # each hint once, in the order asked
+    assert check_hints(["hand_on_object", "hand_on_object"]) == ("hand_on_object",)
+
+
+def test_mock_stream_reports_the_hint_metadata():
+    from leap_hand.stream import hint_metadata
+
+    assert hint_metadata(MockLeapStream(hints=["hand_on_object"])) == {
+        "tracking_hints": ["hand_on_object"], "hints_confirmed": True,
+        "license_hyperion": True}
+    assert hint_metadata(MockLeapStream()) == {
+        "tracking_hints": [], "hints_confirmed": False, "license_hyperion": None}
+    # a source that knows nothing about hints reads as none
+    assert hint_metadata(object()) == hint_metadata(None) == {
+        "tracking_hints": [], "hints_confirmed": False, "license_hyperion": None}
+
+
+def test_open_stream_passes_the_hints_through(monkeypatch):
+    from leap_hand.stream import open_stream
+
+    mock = open_stream(mock=True, hints=("hand_on_object",))
+    assert mock.hints_requested == ["hand_on_object"] and mock.hints_confirmed
+    monkeypatch.setattr(LeapStream, "start", lambda self: None)
+    live = open_stream(hints=("hand_on_object",))
+    assert isinstance(live, LeapStream)
+    assert live.hints_requested == ["hand_on_object"]
+    assert live.hints_confirmed is False, "confirmed only by start()"
+    assert open_stream().hints_requested == []
+
+
 def test_hand_side_falls_back_to_the_string_form(monkeypatch):
     """Without the bindings, `str(hand.type)` is all there is to go on."""
     import sys
@@ -2323,6 +2881,31 @@ def test_record_frame_writes_the_professor_format_on_the_mock(tmp_path: Path,
     # the take it came from is kept beside it
     assert len(takes) == 1
     assert len(analyse_file(takes[0])) == 2       # both hands recorded
+
+
+def test_record_frame_mock_never_writes_into_the_real_frames_folder(
+        tmp_path: Path, monkeypatch):
+    """A --mock run with no --out-dir goes beside the real frames, never among
+    them: the keypoint file has no timestamp, so a mock run of a frame already
+    recorded would overwrite the real deliverable."""
+    import sys
+
+    record_frame = _load_script("record_frame")
+    monkeypatch.setattr(record_frame, "beep", lambda *a, **k: None)
+    monkeypatch.chdir(tmp_path)
+    real = Path("recordings") / "leap" / "prof_frames"
+    real.mkdir(parents=True)
+    (real / "frame_128166_keypoints.txt").write_text("real take\n")
+    monkeypatch.setattr(sys, "argv", [
+        "record_frame.py", "128166", "--mock", "--prep", "0", "--seconds", "1",
+    ])
+    record_frame.main()
+
+    mock_dir = Path("recordings") / "leap" / "prof_frames_mock"
+    assert (mock_dir / "frame_128166_keypoints.txt").is_file()
+    assert len(list((mock_dir / "frame_128166").glob("*.jsonl"))) == 1
+    assert (real / "frame_128166_keypoints.txt").read_text() == "real take\n"
+    assert sorted(p.name for p in real.iterdir()) == ["frame_128166_keypoints.txt"]
 
 
 def test_record_frame_keeps_only_the_hand_you_asked_for(tmp_path: Path,

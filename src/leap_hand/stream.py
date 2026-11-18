@@ -23,11 +23,39 @@ wants): `PolicyFlag` is **not** exported from the package root. It is
 `leap.enums.PolicyFlag`, and it goes through
 `connection.set_policy_flags(flags_to_set=[leap.enums.PolicyFlag.Images])`,
 which waits for a Policy event and returns the flags now in force.
+
+Tracking hints (`hints=("hand_on_object",)`). LeapC 6.2 lets a client tell
+the service how the hands will be used, per device, with
+`LeapSetDeviceHints(connection, device, hints[])`; `hand_on_object` asks for
+the tracking Ultraleap tunes for hands occluded by a held object, and it
+needs the service's Hyperion license. The bindings wrap neither call, so
+they go through `leapc_cffi` directly (`_leapc()`). Three facts from
+LeapC.h decide how:
+
+  * a hint the service does not know or is not licensed for is ignored
+    without an error, so the Hyperion flag is read first
+    (`LeapCheckLicenseFlag`) and its absence is fatal: a take labelled
+    "hand_on_object" that was tracked without it is worse than no take;
+  * the hints "will only be interpreted for multi-device aware clients" and
+    the call "will return an error if the client is not", so a stream with
+    hints opens its connection multi-device aware, and then subscribes to
+    each device's events, which such a client must do to receive them. On
+    that connection the plain LeapGetTrackingMode is never answered (the
+    camera, 2026-10-17), so the mode is also set and confirmed per device,
+    with LeapSetTrackingModeEx and LeapGetTrackingModeEx;
+  * the call takes an OPEN device handle (`LeapOpenDevice`), and the
+    bindings' `connection.get_devices()` returns unopened devices whose
+    `c_data_device` is None, so each device is opened for the call.
+
+With no hints nothing of this runs and the connection is exactly the one it
+always was. `hints_requested`, `hints_confirmed` and `license_hyperion` say
+what happened; `hint_metadata()` is how the recorders write them down.
 """
 import logging
 import time
+from contextlib import ExitStack
 from queue import Empty, Full, Queue
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from .to_openxr import leap_hand_from_api
 from .types import LeapHand
@@ -41,6 +69,60 @@ SETUP_SCRIPT = r"powershell -ExecutionPolicy Bypass -File scripts\leap\setup_bin
 CHECK_SCRIPT = r"python scripts\leap\check_setup.py"
 
 TRACKING_MODES = ("desktop", "hmd", "screentop")
+
+# The tracking hints a recording may ask for (LeapC.h, \ingroup Hints). Only
+# the one this repo has a use and a test for: the service ignores a name it
+# does not know without saying so, so a typo must stop here instead.
+KNOWN_HINTS = ("hand_on_object",)
+# The license feature flag the hand_on_object hint needs (LeapC.h).
+HYPERION_FLAG = "Hyperion"
+LEAP_SUCCESS = 0                       # eLeapRS_Success
+
+
+def _leapc():
+    """`(ffi, libleapc)` of the compiled LeapC bindings, imported on use.
+
+    The one way this module reaches LeapC functions the `leap` package does
+    not wrap. A function of its own so the tests can replace it: the fake
+    SDK objects have no cffi behind them.
+    """
+    from leapc_cffi import ffi, libleapc  # noqa: PLC0415 — optional, lazy
+    return ffi, libleapc
+
+
+def check_hints(hints: Sequence[str]) -> Tuple[str, ...]:
+    """`hints` as a tuple, each name once, or ValueError naming the bad one."""
+    if isinstance(hints, (str, bytes)):
+        raise TypeError("hints is a sequence of hint names, not one string: "
+                        f"hints=({hints!r},)")
+    out: List[str] = []
+    for hint in hints:
+        if hint not in KNOWN_HINTS:
+            raise ValueError(f"unknown tracking hint {hint!r}; the known ones "
+                             f"are {KNOWN_HINTS}")
+        if hint not in out:
+            out.append(hint)
+    return tuple(out)
+
+
+def hint_metadata(source) -> dict:
+    """The three keys a take's metadata carries about tracking hints.
+
+      tracking_hints     the hints the stream was asked for, [] for none
+      hints_confirmed    True only when the service accepted them on every
+                         device (a mock says True when it was given any)
+      license_hyperion   the service's Hyperion flag as read, None when it
+                         was not read (no hints asked for, or no stream)
+
+    Read off whatever `source` is (a `LeapStream`, the mock, a test double
+    or None), so a source that knows nothing about hints reads as none.
+    """
+    license_flag = getattr(source, "license_hyperion", None)
+    return {
+        "tracking_hints": list(getattr(source, "hints_requested", None) or []),
+        "hints_confirmed": bool(getattr(source, "hints_confirmed", False)),
+        "license_hyperion": None if license_flag is None else bool(license_flag),
+    }
 
 
 class LeapUnavailable(RuntimeError):
@@ -63,6 +145,9 @@ class LeapStream:
         mode_timeout: seconds allowed for the tracking-mode round trip.
         queue_maxsize: hands buffered before the oldest are dropped. At 90 Hz
             with two hands, 480 is about 2.7 s of slack.
+        hints: tracking hints to request on every device, from
+            `KNOWN_HINTS` (ValueError otherwise). Empty: none, and nothing
+            hint-related is called. See the module docstring.
     """
 
     def __init__(
@@ -71,6 +156,7 @@ class LeapStream:
         device_timeout: float = 5.0,
         mode_timeout: float = 5.0,
         queue_maxsize: int = 480,
+        hints: Sequence[str] = (),
     ):
         if mode not in TRACKING_MODES:
             raise ValueError(f"mode must be one of {TRACKING_MODES}, got {mode!r}")
@@ -78,6 +164,9 @@ class LeapStream:
         self.device_timeout = float(device_timeout)
         self.mode_timeout = float(mode_timeout)
         self.queue: "Queue[QueueItem]" = Queue(maxsize=queue_maxsize)
+        # the hints asked for, checked now so a bad name fails before any
+        # connection is made
+        self.hints_requested: List[str] = list(check_hints(hints))
 
         self._leap = None
         self._connection = None
@@ -93,6 +182,12 @@ class LeapStream:
         self.dropped = 0
         self.framerate = 0.0
         self.last_event_time: Optional[float] = None
+        # False until the service has accepted `hints_requested` on every
+        # device; the Hyperion flag as read, None until it is read (it is
+        # read only when hints are asked for). Kept after stop(): a recorder
+        # writes them down after the stream is closed.
+        self.hints_confirmed = False
+        self.license_hyperion: Optional[bool] = None
 
     # --- SDK loading ----------------------------------------------------
     @staticmethod
@@ -233,17 +328,33 @@ class LeapStream:
         is up and the queue is emptied straight after, so not one frame
         captured in some previous session's mode can reach a recording.
 
+        With hints, the device wait is followed by the Hyperion check and,
+        on every device, the mode set, the hint and the mode confirmed
+        (`_apply_hints`); then the queue is emptied once more, so no frame
+        from before the hint took effect is counted either. The mode is set
+        and confirmed per device because on the multi-device aware
+        connection hints need, the plain LeapGetTrackingMode is never
+        answered (the camera, 2026-10-17: the mode check timed out).
+
         Raises:
             LeapUnavailable: bindings missing, service not running, no device
-                within `device_timeout` seconds, or the tracking mode could
-                not be set and confirmed. Whatever the reason, the LeapC
-                connection is closed before the error leaves this method.
+                within `device_timeout` seconds, the tracking mode could not
+                be set and confirmed, or hints were asked for and the
+                service has no Hyperion license or refused them. Whatever the
+                reason, the LeapC connection is closed before the error
+                leaves this method.
         """
         self._leap = self.import_leap()
         self._warned_device = False
+        self.hints_confirmed = False
+        self.license_hyperion = None
         # response_timeout bounds the mode round trip below; the default of
         # 10 s is a long time to sit in front of a camera wondering.
-        self._connection = self._leap.Connection(response_timeout=self.mode_timeout)
+        options = {"response_timeout": self.mode_timeout}
+        if self.hints_requested:
+            # LeapC interprets hints only from a multi-device aware client.
+            options["multi_device_aware"] = True
+        self._connection = self._leap.Connection(**options)
         self._listener = self._build_listener()
         self._connection.add_listener(self._listener)
 
@@ -266,17 +377,27 @@ class LeapStream:
             self._set_tracking_mode()
             self._discard_pending()
             self._wait_for_device()
-            self._verify_tracking_mode()
+            if self.hints_requested:
+                # per device: the mode set and confirmed with the Ex calls,
+                # the hint between them (`_apply_hints`)
+                self._apply_hints()
+            else:
+                self._verify_tracking_mode()
             # Frames that arrived between the set and its confirmation were
-            # queued in an unconfirmed mode; only what follows counts.
+            # queued in an unconfirmed mode, and with hints, before the hint
+            # took effect; only what follows counts.
             self._discard_pending()
         except BaseException:
             self._safe_disconnect()
             raise
 
-    def _set_tracking_mode(self) -> None:
+    def _set_tracking_mode(self, set_mode=None) -> None:
+        """The connection-wide set, or `set_mode()` (one device's, with hints)."""
         try:
-            self._connection.set_tracking_mode(self._tracking_mode())
+            if set_mode is None:
+                self._connection.set_tracking_mode(self._tracking_mode())
+            else:
+                set_mode()
         except Exception as e:
             raise LeapUnavailable(
                 f"could not set the {self.mode} tracking mode ({e}).\n"
@@ -319,7 +440,7 @@ class LeapStream:
             "  No camera to hand? Every script here takes --mock."
         )
 
-    def _verify_tracking_mode(self) -> None:
+    def _verify_tracking_mode(self, ask=None) -> None:
         """Confirm the server really is in the mode we asked for.
 
         This runs after the device wait, not straight after the set, because
@@ -329,10 +450,13 @@ class LeapStream:
         "no camera plugged in" into a slow, misleading mode error. The set
         itself already happened before any frame was counted, which is what
         keeps the data honest; this is the confirmation.
+
+        `ask()`, when given, replaces the connection-wide question with one
+        device's (the hinted start, `_hint_open_device`).
         """
         want = self._tracking_mode()
         try:
-            got = self._connection.get_tracking_mode()
+            got = self._connection.get_tracking_mode() if ask is None else ask()
         except Exception as e:
             raise LeapUnavailable(
                 f"a device is tracking but the service never confirmed the "
@@ -353,6 +477,159 @@ class LeapStream:
             )
         self.tracking_mode_confirmed = True
         log.info("tracking mode confirmed: %s", got)
+
+    # --- tracking hints ---------------------------------------------------
+    def _apply_hints(self) -> None:
+        """Read the Hyperion flag, then set `hints_requested` on every device.
+
+        Nothing is called without hints. Every failure is fatal, for the
+        same reason a wrong tracking mode is: the recording would carry a
+        condition it was not made under.
+        """
+        if not self.hints_requested:
+            return
+        ffi, libleapc = self._load_leapc()
+        conn = self._connection.get_connection_ptr()
+        self._check_hyperion(ffi, libleapc, conn)
+
+        try:
+            devices = list(self._connection.get_devices())
+        except Exception as e:
+            raise LeapUnavailable(
+                f"could not list the devices to set the "
+                f"{self._hint_text()} hint on ({type(e).__name__}: {e}).\n"
+                f"  Next step: {CHECK_SCRIPT}, or record without --hint"
+            ) from e
+        if not devices:
+            raise LeapUnavailable(
+                f"the service lists no device to set the {self._hint_text()} "
+                "hint on, although it reported one a moment ago.\n"
+                "  Next step: check the cable and the Ultraleap Control "
+                f"Panel, then: {CHECK_SCRIPT}")
+
+        # One C array for every device. `strings` owns the bytes the array
+        # points at and stays referenced until the last call has returned.
+        strings = [ffi.new("char[]", h.encode("ascii"))
+                   for h in self.hints_requested]
+        array = ffi.new("const char*[]", strings + [ffi.NULL])
+        for device in devices:
+            self._hint_device(libleapc, conn, device, array)
+        self.hints_confirmed = True
+        log.info("tracking hints %s set on %d device(s), serial %s",
+                 self.hints_requested, len(devices), self.device_serial)
+
+    def _load_leapc(self):
+        try:
+            return _leapc()
+        except ImportError as e:
+            raise LeapUnavailable(
+                "the compiled LeapC bindings (leapc_cffi) are not importable "
+                f"here ({e}), and tracking hints are set through them.\n"
+                f"  Next step: {SETUP_SCRIPT}, then {CHECK_SCRIPT}, or record "
+                "without --hint"
+            ) from e
+
+    def _check_hyperion(self, ffi, libleapc, conn) -> None:
+        """`license_hyperion` from the service, or LeapUnavailable."""
+        enabled = ffi.new("bool*")
+        code = libleapc.LeapCheckLicenseFlag(conn, HYPERION_FLAG.encode("ascii"),
+                                             enabled)
+        if code != LEAP_SUCCESS:
+            raise LeapUnavailable(
+                "the Ultraleap service did not answer the Hyperion license "
+                f"check (LeapCheckLicenseFlag returned {self._rs_text(code)}), "
+                f"so whether the {self._hint_text()} hint would be honoured is "
+                "unknown and the recording could be labelled with a condition "
+                "it was not made under.\n"
+                f"  Next step: run {CHECK_SCRIPT}, or record without --hint")
+        self.license_hyperion = bool(enabled[0])
+        if not self.license_hyperion:
+            raise LeapUnavailable(
+                "the Ultraleap service here has no Hyperion license, so the "
+                f"{self._hint_text()} hint would be ignored and the recording "
+                "would be labelled with a condition it was not made under.\n"
+                f"  Next step: run {CHECK_SCRIPT}, or record without --hint")
+
+    def _hint_device(self, libleapc, conn, device, array) -> None:
+        """`_hint_open_device` on one device, opening it if it is not open.
+        A device the bindings list is not open: its `c_data_device` is None
+        until `device.open()` gives it a handle."""
+        if getattr(device, "c_data_device", None) is not None:
+            self._hint_open_device(libleapc, conn, device, array)
+            return
+        with ExitStack() as opened:
+            try:
+                opened.enter_context(device.open())
+            except Exception as e:
+                raise LeapUnavailable(
+                    f"could not open the device to set the {self._hint_text()} "
+                    f"hint (is another app using the camera?): {e}.\n"
+                    "  Next step: close the other Ultraleap apps, then: "
+                    f"{CHECK_SCRIPT}"
+                ) from e
+            # closed again on the way out, as the bindings' own
+            # multi-device example does after subscribing
+            self._hint_open_device(libleapc, conn, device, array)
+
+    def _hint_open_device(self, libleapc, conn, device, array) -> None:
+        """Subscribe, set the mode, set the hints, confirm the mode: all on
+        the one open handle. The mode goes through LeapSetTrackingModeEx and
+        LeapGetTrackingModeEx because on this multi-device aware connection
+        the plain LeapGetTrackingMode is never answered."""
+        try:
+            self._connection.subscribe_events(device)
+        except Exception as e:
+            raise LeapUnavailable(
+                "could not subscribe to the device's events, which a "
+                "multi-device aware connection (the kind hints need) must do "
+                f"to receive them ({type(e).__name__}: {e}).\n"
+                f"  Next step: {CHECK_SCRIPT}, or record without --hint"
+            ) from e
+        handle = device.c_data_device
+        mode = self._tracking_mode()
+
+        def checked(name: str, code) -> None:
+            if code != LEAP_SUCCESS:
+                raise RuntimeError(f"{name} returned {self._rs_text(code)}")
+
+        def ask():
+            # the bindings' get_tracking_mode() for one device: listen for
+            # the TrackingMode event first, then ask
+            event = self._connection._call_and_wait_for_event(
+                self._leap.EventType.TrackingMode,
+                lambda: checked("LeapGetTrackingModeEx",
+                                libleapc.LeapGetTrackingModeEx(conn, handle)))
+            return event.current_tracking_mode
+
+        self._set_tracking_mode(lambda: checked(
+            "LeapSetTrackingModeEx",
+            libleapc.LeapSetTrackingModeEx(conn, handle, mode.value)))
+        code = libleapc.LeapSetDeviceHints(conn, handle, array)
+        if code != LEAP_SUCCESS:
+            raise LeapUnavailable(
+                f"the service refused the {self._hint_text()} hint "
+                f"(LeapSetDeviceHints returned {self._rs_text(code)}, device "
+                f"{self.device_serial}), so the recording would be labelled "
+                "with a condition it was not made under.\n"
+                f"  Next step: run {CHECK_SCRIPT}, or record without --hint")
+        self._verify_tracking_mode(ask)
+
+    def _hint_text(self) -> str:
+        return ", ".join(self.hints_requested)
+
+    def _rs_text(self, code) -> str:
+        """An eLeapRS code as its name and hex, e.g. 'Timeout (0xE2010004)'."""
+        try:
+            value = int(code)
+        except (TypeError, ValueError):
+            return repr(code)
+        name = None
+        try:
+            name = self._leap.enums.RS(value).name
+        except Exception:
+            pass
+        text = f"0x{value & 0xFFFFFFFF:08X}"
+        return f"{name} ({text})" if name else text
 
     def _safe_disconnect(self) -> None:
         """Close the LeapC connection, whatever state it is in."""
@@ -395,16 +672,19 @@ def open_stream(
     mode: str = "desktop",
     device_timeout: float = 5.0,
     pose: Optional[str] = None,
+    hints: Sequence[str] = (),
 ):
     """The one line every script uses: a real stream, or the mock.
 
     Returns an already-started source with `drain()`, `stop()` and the stats
-    attributes the HUDs read. `pose` is honoured by the mock only.
+    attributes the HUDs read. `pose` is honoured by the mock only; `hints`
+    by both (the mock only records them, see `MockLeapStream`).
     """
     if mock:
         from .mock import MockLeapStream
-        source = MockLeapStream(pose=pose)
+        source = MockLeapStream(pose=pose, hints=hints)
     else:
-        source = LeapStream(mode=mode, device_timeout=device_timeout)
+        source = LeapStream(mode=mode, device_timeout=device_timeout,
+                            hints=hints)
     source.start()
     return source

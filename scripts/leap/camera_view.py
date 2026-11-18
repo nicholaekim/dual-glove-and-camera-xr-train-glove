@@ -22,10 +22,22 @@ It is fed from the SDK's callback at a few microseconds a frame, so the
 window does not lag for it.
 
 Other scripts start it for you and feed it a caption through --status-file.
+With `ref=<path>` there the window also shows that picture (the professor's
+frame of the pose being recorded, `reference_poses/`), 240 px wide in its
+top-right corner under "TARGET: <POSE>", on the annotated window frame only.
 The still a recorder asks for there (`snap=<path>`) is cropped to the tracked
 hand, which reduces what it shows to the hand and a margin around it (a hand
-held near the face can still include part of it). With no hand tracked it
-writes a `<stem>.skipped.txt` note instead of the JPEG.
+held near the face can still include part of it). The still has nothing drawn
+on it (no skeleton, no aiming ring, no caption): it is the IR image with its
+brightness lifted for the eye (x2.2 + 8), mirrored as the window shows it.
+With no hand tracked it
+writes a `<stem>.skipped.txt` note instead of the JPEG. Beside every still it
+writes `<still>.json`: when the IR image in it was captured (wall clock, from
+the image's LeapC timestamp), its LeapC timestamp and frame id, and when the
+file was saved. Beside a cropped still it also keeps the uncropped frame it
+was cut from, `<stem>.full.jpg` (the same frame object, so the same moment;
+the sidecar's `full` names it). The full frame shows the operator and stays
+in the session folder: it never goes into a professor's folder.
 """
 import argparse, math, os, threading, time
 
@@ -35,7 +47,8 @@ import leap
 from leap import enums
 from leapc_cffi import ffi, libleapc
 
-from leap_hand.protocol import (NO_TRACKED_HAND, QUIT, hand_crop_box, image_banner, parse_status,
+from leap_hand.protocol import (NO_TRACKED_HAND, QUIT, REFERENCE_WIDTH, crop_hand, image_banner,
+                                parse_status, paste_reference, reference_label, save_still,
                                 skipped_still_path, skipped_still_text)
 from leap_hand.tracking_quality import (HandState, LiveLossTracker, Sample, decode_device_status,
                                         image_stats)
@@ -67,7 +80,12 @@ lock = threading.Lock()
 # over a perfectly good picture of the hand.
 # `px` is the tracked hands' pixels in the unmirrored frame the last compose()
 # drew, and `px_t` the time of the tracking event they came from.
-state = {"img": None, "img_t": None, "images": 0,
+# `img_stamp` is (wall-clock capture time, LeapC timestamp in us, frame id)
+# of the image in `img`, each None when LeapC did not give it; `shown_stamp`
+# is that of the image the last compose() drew, which is the one a still is
+# cut from (see leap_hand.protocol.still_capture_record).
+state = {"img": None, "img_t": None, "images": 0, "img_stamp": (None, None, None),
+         "shown_stamp": (None, None, None),
          "hands": [], "hands_t": 0.0, "fps": 0.0, "frames": 0,
          "px": [], "px_t": 0.0}
 HANDS_FRESH_S = 0.25              # older tracking than this is drawn as no hand
@@ -99,11 +117,20 @@ class Listener(leap.Listener):
             img = image_to_numpy(e.image[0])
         except Exception:
             return
+        now = time.time()
+        # When the camera took this image, on the wall clock: the recorder's
+        # rule for tracking frames (leap_hand.stream), now minus the image's
+        # age on the LeapC clock, read here because only here are both held.
+        try:
+            ts = int(e.c_data.info.timestamp)
+            stamp = (now - (leap.get_now() - ts) / 1e6, ts, int(e.c_data.info.frame_id))
+        except Exception:
+            stamp = (None, None, None)
         with lock:
             state["img"] = img
-            state["img_t"] = time.time()       # a picture IS here, whatever
+            state["img_t"] = now               # a picture IS here, whatever
             state["images"] += 1               # the policy reply said
-        now = time.time()
+            state["img_stamp"] = stamp
         if now - tq["image_t"] >= 0.1:
             try:
                 tq["image"] = image_stats(img)
@@ -211,35 +238,55 @@ def parent_alive():
 
 
 def read_status():
-    """The status file: (caption, snapshot path or None), band applied as a side effect.
+    """The status file: (caption, snapshot path or None, reference picture path
+    or None), band applied as a side effect.
 
     Line 1 is the caption; the rest are `key=value` in any order — `band=LOW,HIGH`
-    (cm) moves the height target, `snap=<path>` asks for one still. The format
-    lives in leap_hand.protocol so the recorder that writes it and this viewer
-    cannot drift apart."""
+    (cm) moves the height target, `snap=<path>` asks for one still, `ref=<path>`
+    is the reference picture of the pose being asked for. The format lives in
+    leap_hand.protocol so the recorder that writes it and this viewer cannot
+    drift apart."""
     global LOW, HIGH
     if not args.status_file:
-        return "", None
+        return "", None, None
     try:
         with open(args.status_file, encoding="utf-8") as fh:
             text = fh.read()
     except OSError:
-        return "", None
-    caption, band, snap = parse_status(text)
+        return "", None, None
+    caption, band, snap, ref = parse_status(text)
     if band:
         LOW, HIGH = band
-    return caption, snap
+    return caption, snap, ref
 
 
-def read_caption():
-    return read_status()[0]
+_refs = {}                        # reference picture path -> image scaled to REFERENCE_WIDTH
+
+
+def reference_image(path):
+    """The reference picture at `path`, scaled to REFERENCE_WIDTH px wide, or None.
+    Loaded once per path; a missing or unreadable file is retried, not cached."""
+    if path in _refs:
+        return _refs[path]
+    if not os.path.isfile(path):
+        return None
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    img = cv2.resize(img, (REFERENCE_WIDTH, max(1, round(h * REFERENCE_WIDTH / w))),
+                     interpolation=cv2.INTER_AREA)
+    _refs[path] = img
+    return img
 
 
 def compose():
-    """(annotated frame, plain frame): both mirrored with the skeleton drawn;
-    the plain one has no text and no border, for cropping a still from."""
+    """(annotated frame, plain frame), both mirrored. The plain frame is the
+    lifted IR image with nothing drawn on it (no skeleton, no ring, no text,
+    no border), for cropping a still from."""
     with lock:
         img = None if state["img"] is None else state["img"].copy()
+        state["shown_stamp"] = state["img_stamp"]
         hands_t = state["hands_t"]
         hands = list(state["hands"]) if time.time() - hands_t < HANDS_FRESH_S else []
         fps = state["fps"]; frames = state["frames"]; img_t = state["img_t"]
@@ -248,8 +295,9 @@ def compose():
         frame = np.zeros((size, size, 3), np.uint8)
     else:
         img = cv2.resize(img, (size, size), interpolation=cv2.INTER_LINEAR)
-        img = cv2.convertScaleAbs(img, alpha=2.2, beta=8)               # the raw IR image is dark; lift it for the eye
+        img = cv2.convertScaleAbs(img, alpha=2.2, beta=8)               # the IR image is dark as captured; lift it for the eye
         frame = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    clean = frame.copy()                                                 # the still's source: nothing drawn on it
     # where the camera's own axis is: a ring for the sweet spot 22 cm above the lens
     c = to_px((0.0, 220.0, 0.0))
     if c:
@@ -276,14 +324,20 @@ def compose():
     with lock:
         state["px"] = px; state["px_t"] = hands_t
     frame = cv2.flip(frame, 1)                                           # mirror: your left hand on the left
-    plain = frame.copy()
+    plain = cv2.flip(clean, 1)                                           # mirrored exactly like the window
     # ---- text, after the flip so it reads normally
     wanted = [args.hand] if args.hand != "both" else ["left", "right"]
     seen = {h["side"]: h for h in hands}
     y = 30
-    caption = read_caption()
+    caption, _snap, ref = read_status()
     if caption and caption != QUIT:
         put(frame, caption, (14, y), 0.75, (0, 255, 255), 2); y += 34
+    # the professor's picture of the pose being asked for, on `frame` only:
+    # `plain`, which every still is cut from, never carries it
+    ref_img = reference_image(ref) if ref else None
+    if ref_img is not None:
+        paste_reference(frame, ref_img, reference_label(ref),
+                        lambda f, t, o: put(f, t, o, 0.75, (0, 255, 255), 2))
     ok_all = True
     for side in wanted:
         h = seen.get(side)
@@ -312,27 +366,19 @@ def compose():
     return frame, plain
 
 
-def hand_still(plain, caption):
-    """The plain frame cropped to the hand tracked right now, with the caption
-    on it, or None when no hand is tracked. The whole frame is never the
-    fallback: it has the operator in it."""
+def hand_still(plain):
+    """(crop, the array it was cut from): the plain frame cropped to the hand
+    tracked right now, nothing drawn on it, or (None, plain) when no hand
+    is tracked. The whole frame is never the fallback for the still: it has
+    the operator in it (it is kept separately, `<stem>.full.jpg`, in the
+    session folder only)."""
     with lock:
         px = list(state["px"]); px_t = state["px_t"]
     if not px or time.time() - px_t >= HANDS_FRESH_S:
-        return None
+        return None, plain
     size = plain.shape[1]
-    box = hand_crop_box([(size - 1 - x, y) for x, y in px], size)       # mirrored, as the picture is
-    if box is None:
-        return None
-    x0, y0, x1, y1 = box
-    crop = plain[y0:y1, x0:x1].copy()
-    if caption and caption != QUIT:
-        room = crop.shape[1] - 16
-        width = cv2.getTextSize(caption, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 5)[0][0] or 1
-        scale = max(0.3, min(0.75, room / width))
-        thick = 2 if scale >= 0.6 else 1
-        put(crop, caption, (8, 8 + int(24 * scale)), scale, (0, 255, 255), thick)
-    return crop
+    crop, _ = crop_hand(plain, [(size - 1 - x, y) for x, y in px])      # mirrored, as the picture is
+    return crop, plain
 
 
 WIN = "Ultraleap camera view"
@@ -355,10 +401,24 @@ try:
         # is written, only a note saying so, which the recorder copies into
         # the take's meta.json: a still skipped on purpose is then not
         # mistaken for one lost to a crash.
-        caption_now, want_snap = read_status()
+        caption_now, want_snap, _ref = read_status()
         if want_snap and want_snap != snapped:
             snapped = want_snap
-            still = last if args.still == "full" else hand_still(last_plain, caption_now)
+            # ONE frame for everything this still says: `source` is the plain
+            # frame compose() just returned, `stamp` the capture stamp of the
+            # image that compose() drew into it (only compose() sets it, on
+            # this thread). The crop is cut from `source` and the uncropped
+            # `<stem>.full.jpg` IS `source`, so cropping neither changes the
+            # timestamp nor takes its picture from another frame;
+            # save_still() refuses a crop whose `cut_from` is not that object.
+            source = last_plain
+            with lock:
+                stamp = state["shown_stamp"]
+            if args.still == "full":
+                still, full, cut_from = last, None, None
+            else:
+                still, cut_from = hand_still(source)
+                full = source
             try:
                 os.makedirs(os.path.dirname(want_snap) or ".", exist_ok=True)
                 if still is None:
@@ -366,7 +426,10 @@ try:
                         fh.write(skipped_still_text(NO_TRACKED_HAND, time.time()))
                     print(f"still skipped, no hand tracked: {want_snap}")
                 else:
-                    cv2.imwrite(want_snap, still)
+                    assert full is None or cut_from is full, "crop and full frame are not one frame"
+                    # the JPEG, `<stem>.full.jpg`, and `<still>.json` describing both
+                    save_still(want_snap, still, stamp, time.time(), cv2.imwrite,
+                               full=full, cut_from=cut_from)
             except Exception as ex:
                 print("could not write the snapshot:", ex)
         if not args.no_window:

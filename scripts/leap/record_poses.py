@@ -31,6 +31,23 @@ no sunlight and no other IR sources.
 
 Ctrl+C at any point keeps the takes recorded so far.
 
+A calibration take (--calibration tmc_neutral)
+----------------------------------------------
+`--calibration tmc_neutral --hand left` records one posture, the thumb's
+neutral of docs/tmc_calibration_protocol.md, held still 3 times for 5 s with
+every frame kept, into recordings/protocol/tmc_neutral/<stamp>_<hand>/
+(protocol_mock with --mock). Per take: the JSONL (pose "tmc_neutral") and a
+`<take>.meta.json` sidecar with the posture definition, the hand, the
+commanded hold (hold_start, hold_end), the operator, the --goniometer note,
+the mock flag and the tool commit. At the end: `calibration.json`, the
+`tmc_estimate.Calibration` that `leap_hand.tmc_calibration_take` reads from
+the takes (the hold measured from the frames' own timestamps), and one line
+`TMC NEUTRAL CALIBRATION OK: ...`. The mock holds its open palm, not the
+posture: a rehearsal exercises the files, not the thumb.
+
+  python scripts/leap/record_poses.py --calibration tmc_neutral --hand left
+  python scripts/leap/record_poses.py --mock --calibration tmc_neutral --hand left --takes 2 --duration 3 --prep 1
+
 The professor's grasp set (--protocol, Set A)
 ---------------------------------------------
 `--protocol protocols/grasps.json --hand left` runs Set A of
@@ -197,6 +214,14 @@ What changes from the plain session, and why:
   five kept takes, recording only takes 4 and 5 of a grasp that has three,
   and the session then counts five as its target.
 
+  One tracking condition per session. `--hint hand_on_object` asks the
+  Ultraleap service for its tracking for hands occluded by a held object,
+  which needs the service's Hyperion license; without it the recorder
+  refuses to start. session.json, every take entry in it and every take's
+  meta say `tracking_hints`, `hints_confirmed` and `license_hyperion`, and
+  `--resume` refuses a session recorded with other hints, so one folder
+  never mixes the two conditions.
+
   python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left
   python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left --items hook,lateral_key --takes 1
   python scripts/leap/record_poses.py --protocol protocols/grasps.json --hand left --resume recordings/protocol/grasps/<session>
@@ -237,20 +262,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
+from leap_hand import tmc_calibration_take as tct
 from leap_hand.protocol import (LATERAL_FRACTION_MAX, hand_view_angle_deg,
                                 lateral_offset_cm, palm_height_cm,
                                 row_height_cm, row_view_angle_deg)
 from leap_hand.recorder import LeapRecorder
 from leap_hand.static_interval import (DEFAULT_STATIC_S, FOLLOW_RADIUS_M,
                                        MIN_TRACKED_FRACTION, row_frame,
-                                       summarise_take)
-from leap_hand.stream import LeapUnavailable, open_stream
+                                       row_hand_id, summarise_take)
+from leap_hand.stream import (KNOWN_HINTS, LeapUnavailable, hint_metadata,
+                              open_stream)
 from leap_hand.tracking_quality import (LOSS_GAP_S, cause_label, causes_for,
                                         fix_for, state_from_leaphand,
                                         take_losses, take_reason)
 from leap_hand.transition import (FORMING_LOST_KEY, MOVE_SPEED_MM_S,
-                                  SPEED_STEP_S, FormingSummary,
-                                  centred_speeds, summarise_forming)
+                                  POSE_MOVE_SPEED_MM_S, SPEED_STEP_S,
+                                  TIP_MOVE_SPEED_MM_S, TIP_THRESHOLDS_READ_ON,
+                                  FormingSummary, centred_speeds,
+                                  fingertip_peak_mm_s, pose_speeds,
+                                  summarise_forming)
 from xr_hand.recorder import finalize_pose_name, hand_tag, pose_filename, slugify
 
 # The same list the glove records, so the two datasets are comparable pose for
@@ -266,6 +296,7 @@ POSE_HINTS = {
     "peace": "index + middle extended in a V, others curled",
     "pinch": "thumb and index fingertips touching, others relaxed",
     "three": "index + middle + ring extended, little and thumb curled",
+    tct.POSE: tct.POSE_DEFINITION["text"],
 }
 
 STREAM_WAIT_TIMEOUT = 120.0   # s to wait for the first hands
@@ -280,6 +311,17 @@ LEGACY_DURATION = 5.0
 LEGACY_PREP = 5.0
 LEGACY_HZ = 5.0
 LEGACY_OUT = Path("recordings") / "leap" / "poses"
+
+# A calibration take (--calibration): one posture held still, every frame
+# kept, a metadata sidecar per take and the session's calibration.json, in a
+# session folder under recordings/protocol/<name>/ (protocol_mock with
+# --mock), the grasp set's layout. The mock cannot make the posture; it holds
+# the pose named here instead, so a rehearsal exercises the files only.
+CALIBRATIONS = (tct.POSE,)
+CALIBRATION_MOCK_POSE = {tct.POSE: "open_palm"}
+CALIBRATION_TAKES = 3
+CALIBRATION_DURATION = 5.0
+CALIBRATION_PREP = 5.0
 
 
 def beep(freq: int = 880, ms: int = 180, volume: Optional[float] = None) -> None:
@@ -341,11 +383,15 @@ def tone_wav(freq: float, ms: float, volume: float) -> bytes:
 
 
 class Session:
-    def __init__(self, source, hz, out_dir: Path, raw: bool = False):
+    def __init__(self, source, hz, out_dir: Path, raw: bool = False,
+                 calibration: Optional[dict] = None):
         self.source = source
         self.hz = hz
         self.out_dir = out_dir
         self.raw = raw
+        # A calibration session (--calibration): the facts every take's
+        # sidecar starts from; None in the plain session, which writes none.
+        self.calibration = calibration
         self.results = []
         self._ids = {}            # hand_side -> last hand_id, for re-acquisitions
         self._reacquired = 0
@@ -430,7 +476,8 @@ class Session:
             print(f"    Hold: {hint}")
         # The mock can act out the pose, so a dry run looks like a real one.
         if hasattr(self.source, "set_pose"):
-            self.source.set_pose(pose if pose in ("open_palm", "fist") else None)
+            shown = CALIBRATION_MOCK_POSE.get(pose, pose)
+            self.source.set_pose(shown if shown in ("open_palm", "fist") else None)
 
         for s in range(int(round(prep)), 0, -1):
             if s <= 3:
@@ -452,6 +499,7 @@ class Session:
             beep(1000, 250)
             self._discard_backlog()
             recorder.start(path)
+            hold_start = time.time()
             print(f"      REC {duration:g} s - hold it ", end="", flush=True)
             try:
                 t_end = time.time() + duration
@@ -467,6 +515,7 @@ class Session:
                 # take (partial data is still labeled data) or drop it if empty.
                 print(flush=True)
                 recorder.stop()
+                hold_end = time.time()
                 beep(500, 300)
                 entry = {"pose": pose, "take": take, "frames": recorder.count,
                          "hands": hand_tag(recorder.hands_seen),
@@ -483,6 +532,21 @@ class Session:
                             if entry["reacquired"] else "")
                     print(f"      saved {recorder.count} frames "
                           f"({entry['hands']}{note}) -> {final.name}\n")
+                    if self.calibration is not None:
+                        # The take's sidecar: the session's fixed facts plus
+                        # this hold as commanded (wall clock). The loader
+                        # measures the hold again from the frames' own
+                        # timestamps and keeps both.
+                        meta = {**self.calibration, "take": take, "takes": n_takes,
+                                "duration_s": duration, "prep_s": prep,
+                                "hold_start": round(hold_start, 6),
+                                "hold_end": round(hold_end, 6),
+                                "frames": recorder.count, "hands": entry["hands"],
+                                "reacquired": entry["reacquired"],
+                                "file": final.name, "recorded": iso_now(hold_start)}
+                        meta_path = final.with_suffix(tct.META_SUFFIX)
+                        write_json(meta_path, meta)
+                        entry["meta"] = meta_path.name
                 self.results.append(entry)
 
     def _raw_capture(self, path: Path):
@@ -1688,24 +1752,30 @@ class OpenHandWatch:
 
     def __init__(self, band=OPEN_BAND_CM, max_angle: float = OPEN_MAX_ANGLE_DEG,
                  hold_s: float = OPEN_HOLD_S, gap_s: float = OPEN_GAP_S,
-                 prefer: Optional[str] = None):
+                 prefer: Optional[str] = None, label: Optional[str] = None,
+                 lateral: float = LATERAL_FRACTION_MAX):
         self.band = tuple(band)
         self.max_angle = float(max_angle)
         self.hold_s = float(hold_s)
         self.gap_s = float(gap_s)
         self.prefer = prefer
+        # --both: two hands are in view on purpose, so the centring cannot tell
+        # them apart. Only a hand the tracker labels `label` is acquired, and
+        # `lateral` is wider, since the pair straddles the module.
+        self.label = label
+        self.lateral = float(lateral)
         self.runs: Dict[int, List[float]] = {}    # hand id -> [first ts, last ts]
         self.latest: Dict[int, HandSeen] = {}
 
     def fits(self, h: HandSeen) -> bool:
         return (self.band[0] <= h.height_cm <= self.band[1]
                 and h.angle_deg is not None and h.angle_deg <= self.max_angle
-                and self.centred(h))
+                and self.centred(h)
+                and (self.label is None or h.lh.hand_side == self.label))
 
-    @staticmethod
-    def centred(h: HandSeen) -> bool:
-        """Over the module: nearer its axis than 0.6 times the height."""
-        return h.offset_cm <= LATERAL_FRACTION_MAX * h.height_cm
+    def centred(self, h: HandSeen) -> bool:
+        """Over the module: nearer its axis than `lateral` (0.6) times the height."""
+        return h.offset_cm <= self.lateral * h.height_cm
 
     def add(self, lh, now: float) -> None:
         h = hand_seen(lh, now)
@@ -1736,7 +1806,8 @@ class OpenHandWatch:
                 if k != hid and now - h.wall <= window}
 
     def _current(self, now: float) -> Optional[HandSeen]:
-        fresh = [h for h in self.latest.values() if now - h.wall <= FORM_LOST_S]
+        fresh = [h for h in self.latest.values() if now - h.wall <= FORM_LOST_S
+                 and (self.label is None or h.lh.hand_side == self.label)]
         if not fresh:
             return None
         fresh.sort(key=lambda h: (h.lh.hand_side != self.prefer, -h.wall))
@@ -1809,7 +1880,8 @@ class FormWatch:
     """
 
     def __init__(self, start: HandSeen, others: Set[int],
-                 lost_s: float = FORM_LOST_S):
+                 lost_s: float = FORM_LOST_S, only: Optional[str] = None):
+        self.only = only                 # --both: a new id under the other label is the other hand
         self.hid = int(start.lh.hand_id)
         self.mine = {self.hid}
         self.last = start
@@ -1823,6 +1895,9 @@ class FormWatch:
         hid = int(lh.hand_id)
         if hid not in self.mine:
             if hid in self.others:
+                return
+            if self.only is not None and lh.hand_side != self.only:
+                self.others.add(hid)
                 return
             frame = getattr(lh, "frame_id", None)
             if frame is not None and frame == getattr(self.last.lh, "frame_id", None):
@@ -1875,8 +1950,13 @@ class ReadyWatch(FormWatch):
 
     def __init__(self, start: HandSeen, others: Set[int],
                  label: Optional[str] = None, lost_s: float = FORM_LOST_S,
-                 move_mm_s: float = MOVE_SPEED_MM_S):
-        super().__init__(start, others, lost_s)
+                 move_mm_s: float = MOVE_SPEED_MM_S, only: Optional[str] = None,
+                 pose: bool = False):
+        super().__init__(start, others, lost_s, only=only)
+        # --finger-poses: the speed of the pose, the whole hand's movement
+        # taken out (`pose_speeds`), so a hand drifting over the camera with
+        # its fingers still is not closing
+        self.pose = bool(pose)
         self.label = label
         self.move_mm_s = float(move_mm_s)
         self._t: List[float] = []
@@ -1911,8 +1991,14 @@ class ReadyWatch(FormWatch):
         ready = int(np.searchsorted(t, t[-1] - SPEED_STEP_S / 2.0, side="right"))
         if ready <= self._judged:
             return None
-        speeds = centred_speeds(t, self._pos, SPEED_STEP_S,
-                                start=self._judged)[:ready - self._judged]
+        if self.pose:
+            lo = int(np.searchsorted(t, t[self._judged] - SPEED_STEP_S / 2.0,
+                                     side="left"))
+            speeds = pose_speeds(t[lo:], self._pos[lo:], SPEED_STEP_S)[
+                self._judged - lo:ready - lo]
+        else:
+            speeds = centred_speeds(t, self._pos, SPEED_STEP_S,
+                                    start=self._judged)[:ready - self._judged]
         for k, v in enumerate(speeds):
             if np.isnan(v):
                 continue
@@ -2033,7 +2119,8 @@ class Attempt:
 
 
 def load_session(folder: Path, hand: str, sha256: str, mock: bool,
-                 raw: Optional[bytes] = None) -> dict:
+                 raw: Optional[bytes] = None,
+                 hints: Tuple[str, ...] = ()) -> dict:
     """An earlier session's session.json, checked before `--resume` adds to it.
 
     Refused when it is not a grasp session, is another hand's, was a mock
@@ -2043,6 +2130,11 @@ def load_session(folder: Path, hand: str, sha256: str, mock: bool,
     orientation hints added on lines of their own (`sha256_without_hints`
     of today's bytes, `raw`, is the session's sha256): the grasps, takes and
     timings are then byte for byte the ones the session was recorded with.
+
+    Also refused when it was recorded with other tracking hints (`--hint`)
+    than `hints`: one session folder, one tracking condition. A session
+    written before the hints existed has no `tracking_hints` and was
+    recorded with none.
     """
     path = Path(folder) / "session.json"
     try:
@@ -2058,6 +2150,13 @@ def load_session(folder: Path, hand: str, sha256: str, mock: bool,
     if bool(old.get("mock")) != mock:
         raise SystemExit(f"cannot resume {folder}: it was "
                          f"{'a mock' if old.get('mock') else 'a camera'} session")
+    recorded = sorted(set(old.get("tracking_hints") or []))
+    if recorded != sorted(set(hints)):
+        raise SystemExit(
+            f"cannot resume {folder}: it was recorded with "
+            f"{hint_text(recorded)} and this run asks for {hint_text(hints)}; "
+            "a session folder holds one tracking condition, so resume it with "
+            f"{hint_flags(recorded) or 'no --hint'}, or start a new session")
     if old.get("protocol_sha256") != sha256:
         if raw is None or sha256_without_hints(raw) != old.get("protocol_sha256"):
             raise SystemExit(f"cannot resume {folder}: the protocol file has "
@@ -2066,6 +2165,19 @@ def load_session(folder: Path, hand: str, sha256: str, mock: bool,
         print(f"note: the protocol file differs from the one {Path(folder).name} "
               "was recorded with only by per-grasp orientation hints; resuming it")
     return old
+
+
+def hint_text(hints) -> str:
+    """'tracking hint hand_on_object', or 'no tracking hint'."""
+    hints = list(hints)
+    if not hints:
+        return "no tracking hint"
+    return f"tracking hint{'s' if len(hints) > 1 else ''} {', '.join(hints)}"
+
+
+def hint_flags(hints) -> str:
+    """The `--hint` options that ask for `hints`, '' for none."""
+    return " ".join(f"--hint {h}" for h in hints)
 
 
 def make_session_dir(root: Path, hand: str) -> Path:
@@ -2077,6 +2189,75 @@ def make_session_dir(root: Path, hand: str) -> Path:
             return folder
         except FileExistsError:
             time.sleep(0.2)
+
+
+# --- both hands in one take (--both) ------------------------------------------------
+# The coaching follows the operator's hand as always. The other hand makes the
+# same pose beside it, its lines are in the same leap file, and it is graded
+# from them with the same gate. A take is kept only when both hands pass.
+# With --both each hand sits to one side of the module, so OPEN HAND lets the
+# operator's hand be as far to the side as it is high (45 degrees off the
+# axis) instead of `LATERAL_FRACTION_MAX`. 2026-11-12: the left palm 16 cm to
+# the side at 22 cm up tracked 100 percent and was refused as not centred.
+BOTH_LATERAL_FRACTION = 1.0
+
+# --- the pose catalogue's poses (--finger-poses) -------------------------------------
+# What a session's `finger_poses` says. On 2026-11-12 every catalogue pose was
+# sent back once with CLOSED TOO SOON at the READY beep (the hands held in the
+# air drift faster than READY's 50 mm/s mean joint speed: inside the static
+# intervals of that day's 51 kept takes it reached 5 to 54 mm/s while the pose
+# itself moved 0.9 to 32), and B01, one finger bending, three times with no
+# close after the GO beep. With the flag READY judges the pose speed against
+# `POSE_MOVE_SPEED_MM_S`, and a fingertip at `TIP_MOVE_SPEED_MM_S` or faster
+# against the palm after the GO beep is a close (`leap_hand.transition`).
+FINGER_POSES = {"ready_pose_speed_mm_s": POSE_MOVE_SPEED_MM_S,
+                "tip_move_speed_mm_s": TIP_MOVE_SPEED_MM_S,
+                "tip_threshold_read_on": TIP_THRESHOLDS_READ_ON}
+
+
+def other_hand(hand: str) -> str:
+    return "right" if hand == "left" else "left"
+
+
+def grade_second_hand(rows, operator_ids, duration_s: float, static_s: float,
+                      hand: str):
+    """The `hand` hand of a --both take, measured like the operator's: every
+    line that is not one of the operator's hand ids, through `summarise_take`
+    with the label required (a skeleton fitted as the wrong hand is a
+    mirrored model of it)."""
+    ours = set(operator_ids)
+    theirs = [r for r in rows if row_hand_id(r) not in ours]
+    return summarise_take(theirs, duration_s, static_s, prefer=hand,
+                          min_tracked=MIN_TRACKED, require_label=hand)
+
+
+def second_hand_dict(s, hand: str) -> dict:
+    """The other hand's block of a --both take's meta. No line number: the
+    summary frame is named by its frame id and hand id in the leap file."""
+    row = s.medoid_row
+    height = None if row is None else row_height_cm(row)
+    angle = None if row is None else row_view_angle_deg(row)
+    return {
+        "hand": hand,
+        "passed": s.passed,
+        "gate_reason": s.gate_reason,
+        "tracked_fraction": round(s.tracked_fraction, 4),
+        "tracked_frames": s.tracked_frames,
+        "expected_frames": s.expected_frames,
+        "reacquisitions": s.reacquisitions,
+        "hand_ids": list(s.hand_ids),
+        "hand_labels": dict(s.hand_labels),
+        "static_interval": None if s.interval is None else [
+            round(s.interval[0], 6), round(s.interval[1], 6)],
+        "medoid_wall_time": None if row is None else s.medoid_wall_time,
+        "medoid_frame_id": None if row is None else row.get("frame_id"),
+        "medoid_hand_id": None if row is None else row.get("hand_id"),
+        "grab_strength": s.grab_strength,
+        "pinch_strength": s.pinch_strength,
+        "curls": s.curls,
+        "palm_height_cm": None if height is None else round(height, 1),
+        "view_angle_deg": None if angle is None else round(angle, 1),
+    }
 
 
 class ProtocolSession(Session):
@@ -2108,7 +2289,14 @@ class ProtocolSession(Session):
                  coach: bool = True,
                  acquire_timeout: float = OPEN_HAND_TIMEOUT_S,
                  lost_wait: float = LOST_WAIT_S,
-                 form_window: float = FORM_WINDOW_S):
+                 form_window: float = FORM_WINDOW_S, both: bool = False,
+                 finger_poses: bool = False):
+        # --finger-poses, for the pose catalogue: READY judges the pose and
+        # not the hand's travel, and one finger moving is a close after the
+        # cue (`FINGER_POSES`). The grasp set's rules stay RECORDER_RULES.
+        self.finger_poses = bool(finger_poses)
+        self.both = bool(both)                 # --both: grade the other hand too
+        self._second = None                    # its summary, for the current attempt
         self.session_dir = (Path(resume[0]) if resume is not None
                             else make_session_dir(out_root, hand))
         super().__init__(_Tap(source), hz=None, out_dir=self.session_dir, raw=raw)
@@ -2219,6 +2407,8 @@ class ProtocolSession(Session):
     def session_dict(self) -> dict:
         """Contract section 3, plus how this session was run."""
         return {
+            **({"both_hands": True} if self.both else {}),
+            **({"finger_poses": FINGER_POSES} if self.finger_poses else {}),
             "set": SET_NAME,
             "protocol_file": repo_relative(self.protocol_path),
             "protocol_name": self.protocol.get("name"),
@@ -2230,6 +2420,10 @@ class ProtocolSession(Session):
             "operator": self.operator,
             "camera": "leap",
             "mock": self.mock,
+            # the tracking hints asked for (--hint; one condition per
+            # session folder, `load_session`), whether the service confirmed
+            # them, and its Hyperion flag as read (null: not read, no hint)
+            **hint_metadata(self.source),
             "glove": False,
             "started": self.started,
             "ended": self.ended,
@@ -2405,7 +2599,9 @@ class ProtocolSession(Session):
         lo, hi = OPEN_BAND_CM
         print(f"      {OPEN_HAND_TEXT}: {lo:g} to {hi:g} cm above the module, "
               "held still until the READY beeps")
-        watch = OpenHandWatch(prefer=self.hand)
+        watch = (OpenHandWatch(prefer=self.hand, label=self.hand,
+                               lateral=BOTH_LATERAL_FRACTION)
+                 if self.both else OpenHandWatch(prefer=self.hand))
         deadline = time.time() + self.acquire_timeout
         need = None
         while True:
@@ -2438,7 +2634,10 @@ class ProtocolSession(Session):
         self._act("ready")
         print(f"      {READY_TEXT}: {READY_PAUSE_S:g} s")
         self._caption(READY_TEXT)
-        watch = ReadyWatch(start, others, label=self.hand)
+        watch = ReadyWatch(start, others, label=self.hand,
+                           only=self.hand if self.both else None,
+                           **({"pose": True, "move_mm_s": POSE_MOVE_SPEED_MM_S}
+                              if self.finger_poses else {}))
         state = "hand acquired: keep it open and still"
         self._copy_open(state, READY_PAUSE_S, status=READY_STATUS, force=True)
         while True:
@@ -2478,6 +2677,14 @@ class ProtocolSession(Session):
                               require_label=self.hand, prefer=self.hand)
         if s.peak_speed_mm_s is None or s.peak_speed_mm_s >= MOVE_SPEED_MM_S:
             return None
+        if getattr(self, "finger_poses", False):
+            # one finger bending barely moves the mean of 26 joints
+            tip = fingertip_peak_mm_s(rows, forming.t0, now, follow=forming.follow,
+                                      require_label=self.hand, prefer=self.hand)
+            if tip is not None and tip >= TIP_MOVE_SPEED_MM_S:
+                if self._coaching is not None:
+                    self._coaching["tip_peak_speed_mm_s"] = round(tip, 1)
+                return None
         return {"during": "make", "after_s": round(max(0.0, now - forming.t0), 2),
                 "peak_speed_mm_s": round(s.peak_speed_mm_s, 1),
                 "peak_at_s": round(s.peak_at_s, 3)}
@@ -2520,7 +2727,7 @@ class ProtocolSession(Session):
         self._act("form")
         cue_go()
         print(f"      {MAKE_TEXT}: {self.prep:g} s")
-        watch = FormWatch(start, others)
+        watch = FormWatch(start, others, only=self.hand if self.both else None)
 
         def observe(lh, now):
             watch.add(lh, now)
@@ -2741,6 +2948,7 @@ class ProtocolSession(Session):
             self.source.set_pose(iid if iid in ("open_palm", "fist") else None)
         self._now = (item, n)
         self._coaching = None
+        self._second = None
         self._follow = None              # stays None with --no-coach
         self._forming = None if not self.coach else FormingCapture(
             self.folder(FORMING_DIR) / f"{name}.jsonl", iid, n,
@@ -2814,6 +3022,15 @@ class ProtocolSession(Session):
         lines = self.review_lines(item, n, attempt, summary, t_start)
         for line in lines[1:]:
             print(f"      {line}")
+        second = None
+        if self.both:
+            other = other_hand(self.hand)
+            second = self._second = grade_second_hand(
+                rows, summary.hand_ids, t_stop - t_start, self.static_s, other)
+            lines.append(f"{other} hand: tracked "
+                         f"{second.tracked_fraction * 100:.0f} %"
+                         + ("" if second.passed else "   NOT PASSED"))
+            print(f"      {lines[-1]}")
 
         if not summary.passed:
             print(f"      REJECTED by the gate: {gate_text}")
@@ -2822,6 +3039,15 @@ class ProtocolSession(Session):
                                   accepted=False, reason=gate_text,
                                   by="gate", decided_at=time.time(),
                                   losses=losses, gate_text=gate_text)
+        if second is not None and not second.passed:
+            # The operator's hand passed; the meta's gate block stays its own,
+            # and the other hand's reason is in `second_hand`.
+            why = f"{other} hand: {second.gate_reason}"
+            print(f"      REJECTED by the gate: {why}")
+            return self._conclude(item, n, attempt, name, summary,
+                                  (t_start, t_stop), missing,
+                                  accepted=False, reason=why, by="gate",
+                                  decided_at=time.time(), losses=losses)
 
         self._caption(f"REVIEW {label} take {n}: Enter keep, r redo, q quit")
         try:
@@ -2965,6 +3191,17 @@ class ProtocolSession(Session):
                                                 summary.medoid_wall_time)
             keypoints.write_text(block + "\n", encoding="utf-8")
         files["keypoints"] = self.rel(keypoints)
+        if self.both:
+            # the other hand's summary frame, the same block beside the first
+            keys2, second = None, self._second
+            if second is not None and second.medoid_row is not None:
+                keys2 = (self.folder(KEYPOINTS_DIR, rejected)
+                         / f"{name}_{other_hand(self.hand)}_keypoints.txt")
+                keys2.parent.mkdir(parents=True, exist_ok=True)
+                keys2.write_text(prof_exporter().frame_block(
+                    row_frame(second.medoid_row), second.medoid_wall_time) + "\n",
+                    encoding="utf-8")
+            files["keypoints_second"] = self.rel(keys2)
         meta_path = self.folder(META_DIR, rejected) / f"{name}.json"
         files["meta"] = self.rel(meta_path)
         note = self.session_dir / REJECTED_DIR / f"{name}.reason.txt"
@@ -2990,7 +3227,12 @@ class ProtocolSession(Session):
             "accepted": accepted, "reason": reason, "decided_at": decided_at,
             "decided_by": by, "tracked_fraction": meta["tracked_fraction"],
             "grab_strength": meta["grab_strength"],
-            "pinch_strength": meta["pinch_strength"], "files": files})
+            "pinch_strength": meta["pinch_strength"],
+            # the stream's hint state as the take was decided, as in its meta
+            "tracking_hints": meta["tracking_hints"],
+            "hints_confirmed": meta["hints_confirmed"],
+            "license_hyperion": meta["license_hyperion"],
+            "files": files})
         self.write_session()
         got = Attempt(item=iid, take=n, attempt=attempt, name=name,
                       accepted=accepted, reason=reason,
@@ -3058,6 +3300,12 @@ class ProtocolSession(Session):
         height = None if row is None else row_height_cm(row)
         angle = None if row is None else row_view_angle_deg(row)
         return {
+            # --both only: the other hand, graded from the same take (None
+            # when the attempt never reached a take)
+            **({"second_hand": None if self._second is None else
+                second_hand_dict(self._second, other_hand(self.hand))}
+               if self.both else {}),
+            **({"finger_poses": True} if self.finger_poses else {}),
             "item": str(item["id"]),
             "take": n,
             "hand": self.hand,
@@ -3087,6 +3335,10 @@ class ProtocolSession(Session):
             "protocol_name": self.protocol.get("name"),
             "protocol_version": self.protocol.get("version"),
             "mock": self.mock,
+            # the tracking hints the stream was asked for (--hint), whether
+            # the service confirmed them, and its Hyperion flag as read,
+            # all as they stood when this take was decided
+            **hint_metadata(self.source),
             "take_start": round(span[0], 6),
             "take_end": round(span[1], 6),
             "duration_s": round(span[1] - span[0], 3),
@@ -3187,10 +3439,16 @@ class ProtocolSession(Session):
     def resume_command(self) -> str:
         """The command that records what this session is still missing."""
         protocol = repo_relative(self.protocol_path).replace("/", os.sep)
+        # the session's own hints, or `load_session` refuses the command
+        hints = hint_flags(hint_metadata(getattr(self, "source", None))
+                           ["tracking_hints"])
         return (rf".venv\Scripts\python.exe scripts\leap\record_poses.py "
                 f"{'--mock ' if self.mock else ''}--protocol {protocol} "
                 f"--hand {self.hand} --resume \"{self.session_dir}\""
-                f"{'' if self.coach else ' --no-coach'}")
+                f"{' --both' if getattr(self, 'both', False) else ''}"
+                f"{'' if self.coach else ' --no-coach'}"
+                f"{' ' + hints if hints else ''}"
+                f"{' --finger-poses' if getattr(self, 'finger_poses', False) else ''}")
 
 
 def make_mock_source(dropout: float = 0.0, coach: bool = True,
@@ -3198,8 +3456,12 @@ def make_mock_source(dropout: float = 0.0, coach: bool = True,
                      other_hand: str = "same",
                      close_s: Optional[float] = None,
                      close_early: int = 0,
-                     back_after: Optional[float] = None):
+                     back_after: Optional[float] = None,
+                     hints: Tuple[str, ...] = ()):
     """The synthetic camera behind `--mock`, started.
+
+    `hints` (`--hint`) changes no hand: the mock records them and reports
+    them confirmed, so a rehearsal writes the metadata a hinted run would.
 
     Coached, the `hand` acts the take out (`leap_hand.mock.CoachedActor`):
     an open palm at OPEN HAND, held open through READY, closing at the
@@ -3228,12 +3490,14 @@ def make_mock_source(dropout: float = 0.0, coach: bool = True,
                                                     hold_dropout=dropout,
                                                     operator=hand,
                                                     other_hand=other_hand,
-                                                    **acting))
+                                                    **acting),
+                                hints=hints)
     elif dropout > 0:
         source = MockLeapStream(dropout_every=90, reacquire_every=0,
-                                dropout_frames=max(1, min(89, round(90 * dropout))))
+                                dropout_frames=max(1, min(89, round(90 * dropout))),
+                                hints=hints)
     else:
-        source = MockLeapStream(dropout_every=0, reacquire_every=0)
+        source = MockLeapStream(dropout_every=0, reacquire_every=0, hints=hints)
     # Skip the mock hand past its first 0.3 s of visibility, which the
     # recorder drops as settling: a live hand has been in view that long
     # by the time the stream wait is over, and with --prep 0 the first
@@ -3306,6 +3570,7 @@ def run_protocol(args, parser) -> None:
             parser.error(f"{flag} must be above 0 seconds")
 
     protocol, sha = load_protocol(args.protocol)
+    hints = tuple(dict.fromkeys(args.hint or ()))   # each --hint once, in order
     resume = None
     # Each setting comes from the command line, else from the session being
     # resumed (a session keeps one timing throughout), else from the file.
@@ -3323,7 +3588,7 @@ def run_protocol(args, parser) -> None:
     waits = {"lost_wait_s": LOST_WAIT_S, "form_window_s": FORM_WINDOW_S}
     if args.resume is not None:
         old = load_session(args.resume, args.hand, sha, bool(args.mock),
-                           raw=Path(args.protocol).read_bytes())
+                           raw=Path(args.protocol).read_bytes(), hints=hints)
         resume = (Path(args.resume), old)
         for key in base:
             # A plain countdown's seconds are not a forming time, nor the
@@ -3367,10 +3632,11 @@ def run_protocol(args, parser) -> None:
                                   close_s=min(MOCK_CLOSE_MAX_S,
                                               MOCK_CLOSE_SHARE * prep),
                                   close_early=args.mock_close_early or 0,
-                                  back_after=args.mock_back_after)
+                                  back_after=args.mock_back_after,
+                                  hints=hints)
     else:
         try:
-            source = open_stream(mode=args.mode)
+            source = open_stream(mode=args.mode, hints=hints)
         except LeapUnavailable as e:
             raise SystemExit(f"\nNo live tracking: {e}\n")
 
@@ -3391,7 +3657,8 @@ def run_protocol(args, parser) -> None:
             operator=args.operator, auto_accept=args.auto_accept,
             resume=resume, panel=panel, coach=coach,
             acquire_timeout=OPEN_HAND_TIMEOUT_S, lost_wait=lost_wait,
-            form_window=form_window)
+            form_window=form_window, both=args.both,
+            finger_poses=args.finger_poses)
 
         # coached: about 2 s to show the open hand, READY, plus the beeps
         eta = len(items) * takes * (prep + duration + (
@@ -3431,6 +3698,13 @@ def run_protocol(args, parser) -> None:
                                "(--auto-accept)" if args.auto_accept else REVIEW_KEYS))
         print("  picture: " + ("off (--no-panel)" if panel is None
                                else panel.describe()))
+        if hints:
+            # a live stream that got this far has confirmed them (start()
+            # refuses otherwise)
+            said = ("mock: written to the metadata, the hands are unchanged"
+                    if args.mock else
+                    "confirmed by the service, Hyperion license present")
+            print(f"  hint:    {', '.join(hints)} ({said})")
         print(f"  folder:  {session.session_dir}")
         if resume is not None:
             kept = sum(session.accepted.values())
@@ -3466,6 +3740,86 @@ def run_protocol(args, parser) -> None:
                     os.startfile(str(session.session_dir))
                 except (AttributeError, OSError):
                     pass
+
+
+def run_calibration(args, parser) -> None:
+    """`--calibration tmc_neutral`: the posture of `tct.POSE_DEFINITION` held
+    still `--takes` times, every frame kept, a sidecar per take and the
+    session's calibration.json (module docstring; the protocol is
+    docs/tmc_calibration_protocol.md)."""
+    if args.hand is None:
+        parser.error("--calibration needs --hand left or right: the hand that "
+                     "holds the posture")
+    if args.poses is not None:
+        parser.error("--calibration records one posture; --poses does not apply")
+    others = [flag for flag, value in (
+        ("--items", args.items), ("--still", args.still), ("--resume", args.resume),
+        ("--retries", args.retries), ("--static-s", args.static_s),
+        ("--auto-accept", args.auto_accept), ("--no-open", args.no_open),
+        ("--both", args.both), ("--finger-poses", args.finger_poses),
+        ("--no-panel", args.no_panel), ("--note", args.note), ("--hint", args.hint),
+        ("--no-coach", args.no_coach), ("--lost-wait", args.lost_wait),
+        ("--form-window", args.form_window), ("--mock-dropout", args.mock_dropout),
+        ("--mock-lose-forming", args.mock_lose_forming),
+        ("--mock-back-after", args.mock_back_after),
+        ("--mock-close-early", args.mock_close_early),
+        ("--mock-other-hand", args.mock_other_hand)) if value not in (None, False)]
+    if others:
+        parser.error(f"{', '.join(others)} only apply with --protocol")
+    if args.raw and args.mock:
+        raise SystemExit("--raw needs a live camera: there is no LeapC stream "
+                         "behind --mock")
+    takes = CALIBRATION_TAKES if args.takes is None else args.takes
+    duration = CALIBRATION_DURATION if args.duration is None else args.duration
+    prep = CALIBRATION_PREP if args.prep is None else args.prep
+    # Every frame by default: the hold is measured from the frames' own
+    # timestamps, and the chordal mean wants all of them.
+    hz = 0.0 if args.hz is None else args.hz
+    root = (args.out_dir if args.out_dir is not None else
+            (MOCK_PROTOCOL_OUT if args.mock else PROTOCOL_OUT).parent / args.calibration)
+    folder = make_session_dir(root, args.hand)
+    fixed = {"kind": tct.CALIBRATION_KIND, "calibration": args.calibration,
+             "pose": tct.POSE, "pose_definition": dict(tct.POSE_DEFINITION),
+             "hand": args.hand, "operator": args.operator,
+             "goniometer": args.goniometer, "mock": bool(args.mock), "hz": hz,
+             "recorder_rules": RECORDER_RULES, "tool_commit": tool_commit(),
+             "session": folder.name}
+    print("=" * 62)
+    print(f"Calibration take: {args.calibration}, {args.hand} hand, {takes} takes "
+          f"x {duration:g} s  (~{takes * (prep + duration) / 60:.1f} min)")
+    print(f"  posture: {tct.POSE_DEFINITION['text']}")
+    print(f"  rate:  {'every frame' if not hz else f'{hz:g} frames/s'}   output: {folder}")
+    print("  Make the posture during the countdown and keep it still from the "
+          "REC beep to the stop beep; lift the hand and make it again before "
+          "each take.")
+    print("=" * 62 + "\n")
+    try:
+        source = open_stream(mock=args.mock, mode=args.mode)
+    except LeapUnavailable as e:
+        raise SystemExit(f"\nNo live tracking: {e}\n")
+    if args.mock:
+        print(f"Mock mode: synthetic hands hold {CALIBRATION_MOCK_POSE[args.calibration]}, "
+              "not the posture (no camera needed).\n")
+    session = Session(source, hz=hz or None, out_dir=folder, raw=args.raw,
+                      calibration=fixed)
+    try:
+        if not args.mock:
+            session.wait_for_stream()
+        for take in range(1, takes + 1):
+            session.run_take(args.calibration, take, takes, 1, 1, duration, prep)
+    except KeyboardInterrupt:
+        print("\nInterrupted - keeping the takes recorded so far.")
+    finally:
+        source.stop()
+        session.print_summary()
+    try:
+        cal = tct.calibrate(folder)
+    except ValueError as e:
+        raise SystemExit(f"TMC NEUTRAL CALIBRATION FAILED: {e}\n  folder: {folder}")
+    write_json(folder / "calibration.json", cal.to_json())
+    print(tct.summary_line(cal))
+    print(f"  folder:      {folder}")
+    print(f"  calibration: {folder / 'calibration.json'}")
 
 
 def main() -> None:
@@ -3527,11 +3881,30 @@ def main() -> None:
                         "grasp (headless runs); the review opens its own window")
     g.add_argument("--no-open", action="store_true",
                    help="do not open the session folder at the end")
+    g.add_argument("--both", action="store_true",
+                   help="both hands make the pose in one take: the coaching "
+                        "follows --hand, the other hand is graded from the "
+                        "same take with the same gate, and the take is kept "
+                        "only when both pass")
+    g.add_argument("--finger-poses", action="store_true",
+                   help="for the pose catalogue: READY calls a close before "
+                        "the GO beep only when the pose changes (not when the "
+                        "hand drifts over the camera), and a pose that bends "
+                        "one finger counts as made after the GO beep")
     g.add_argument("--note", default=None,
                    help="orientation note stored in every take's meta, e.g. "
                         "'palm turned 30 degrees toward the lens'")
     g.add_argument("--operator", default=None,
                    help="who recorded the session, for session.json")
+    g.add_argument("--hint", action="append", choices=KNOWN_HINTS, default=None,
+                   metavar="NAME",
+                   help="ask the Ultraleap service for a tracking hint on every "
+                        "device; hand_on_object is its tracking for hands "
+                        "occluded by a held object and needs the service's "
+                        "Hyperion license (the recorder refuses to start "
+                        "without it). Written to session.json and every take; "
+                        "a resumed session keeps the hints it was recorded "
+                        "with")
     g.add_argument("--no-coach", action="store_true",
                    help="the plain GET READY countdown instead of the coached "
                         "take (OPEN HAND, then MAKE THE GRASP, then HOLD STILL)")
@@ -3568,18 +3941,44 @@ def main() -> None:
                    help="with --mock: the other hand stays open 25 cm to the "
                         "side instead of copying the operator's hand, to "
                         "rehearse a take with the idle hand in view")
+    c = p.add_argument_group("a calibration take (docs/tmc_calibration_protocol.md)")
+    c.add_argument("--calibration", choices=CALIBRATIONS, default=None,
+                   help="record one calibration posture instead of the pose "
+                        "list: tmc_neutral is the thumb's neutral posture, held "
+                        f"still {CALIBRATION_TAKES} times for "
+                        f"{CALIBRATION_DURATION:g} s (--takes, --duration and "
+                        "--prep change that), every frame kept, with a .meta.json "
+                        "sidecar per take and the session's calibration.json; "
+                        "needs --hand")
+    c.add_argument("--goniometer", default=None, metavar="TEXT",
+                   help="with --calibration: a goniometer reading taken on the "
+                        "posture before the run, as written on the sheet "
+                        "(readings, axes, instrument, who read it); kept in "
+                        "every take's sidecar and in the calibration's provenance")
     args = p.parse_args()
 
     if args.protocol is not None:
+        if args.calibration is not None:
+            p.error("--protocol and --calibration are two different sessions; "
+                    "give one")
         run_protocol(args, p)
         return
+    if args.calibration is not None:
+        run_calibration(args, p)
+        return
+    if args.goniometer is not None:
+        p.error("--goniometer only applies with --calibration")
     protocol_only = [flag for flag, value in (
         ("--hand", args.hand), ("--items", args.items), ("--still", args.still),
         ("--resume", args.resume),
         ("--retries", args.retries), ("--static-s", args.static_s),
         ("--auto-accept", args.auto_accept), ("--no-open", args.no_open),
+        ("--both", args.both), ("--finger-poses", args.finger_poses),
         ("--no-panel", args.no_panel),
         ("--note", args.note), ("--operator", args.operator),
+        # the plain session writes no session.json and no meta, so nothing
+        # would record which condition its takes were made under
+        ("--hint", args.hint),
         ("--no-coach", args.no_coach),
         ("--lost-wait", args.lost_wait), ("--form-window", args.form_window),
         ("--mock-dropout", args.mock_dropout),

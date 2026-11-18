@@ -101,18 +101,18 @@ def test_every_phase_of_a_real_take_fits_the_window():
 # --- the status file the window is driven through ---------------------------
 def test_status_text_round_trips():
     text = status_text("REC  FIST", band=(18, 28), snap="C:\\tmp\\a.jpg")
-    assert parse_status(text) == ("REC  FIST", (18.0, 28.0), "C:\\tmp\\a.jpg")
+    assert parse_status(text) == ("REC  FIST", (18.0, 28.0), "C:\\tmp\\a.jpg", None)
 
 
 def test_status_without_the_optional_lines():
-    assert parse_status(status_text("NOW: FIST")) == ("NOW: FIST", None, None)
+    assert parse_status(status_text("NOW: FIST")) == ("NOW: FIST", None, None, None)
     assert status_text("NOW: FIST") == "NOW: FIST"
 
 
 def test_a_torn_or_odd_status_file_is_ignored_not_fatal():
-    caption, band, snap = parse_status("HOLD\nband=oops\nsnap=\nother=1")
-    assert (caption, band, snap) == ("HOLD", None, None)
-    assert parse_status("") == ("", None, None)
+    caption, band, snap, ref = parse_status("HOLD\nband=oops\nsnap=\nref=\nother=1")
+    assert (caption, band, snap, ref) == ("HOLD", None, None, None)
+    assert parse_status("") == ("", None, None, None)
 
 
 def test_snapshot_is_a_noop_without_a_window():
@@ -129,7 +129,7 @@ def test_snapshot_asks_for_one_still_without_losing_the_caption(tmp_path):
     lines = v._status.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "REC  HOLD: FIST   REC 4s"
     assert lines[-1] == f"snap={tmp_path / 'stills' / 'fist_take1.jpg'}"
-    caption, _band, snap = parse_status(v._status.read_text(encoding="utf-8"))
+    caption, _band, snap, _ref = parse_status(v._status.read_text(encoding="utf-8"))
     assert caption == "REC  HOLD: FIST   REC 4s"
     assert Path(snap).name == "fist_take1.jpg"
     v._proc = None

@@ -62,12 +62,13 @@ export and the viewers, never to stand in for measured data.
 import math
 import random
 from collections import deque
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from xr_hand.kinematics import mat3_to_quat, quat_canonical
 
+from .stream import check_hints
 from .to_openxr import from_leap_mm
 from .types import LeapHand
 
@@ -139,8 +140,17 @@ class MockLeapStream:
         cycle_seconds: float = 4.0,
         sides: Tuple[str, ...] = ("left", "right"),
         script=None,
+        hints: Sequence[str] = (),
     ):
         self.hz = float(hz)
+        # Tracking hints, checked like LeapStream's and reported as if a
+        # licensed service had accepted them: there is no service behind a
+        # mock, and nothing about the generated hands changes. This is so a
+        # rehearsal writes the same metadata a real hinted run would.
+        self.hints_requested: List[str] = list(check_hints(hints))
+        self.hints_confirmed = bool(self.hints_requested)
+        self.license_hyperion: Optional[bool] = (
+            True if self.hints_requested else None)
         self.pose = pose
         self.noise_mm = float(noise_mm)
         self.dropout_every = int(dropout_every)

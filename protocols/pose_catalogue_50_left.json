@@ -1,0 +1,412 @@
+{
+ "name": "pose_catalogue_50_left",
+ "version": 1,
+ "description": "Half of the 100 catalogue poses, the ones assigned to the left hand (alternating in catalogue order); the other half is in the other hand's file. The 100 catalogue poses of docs/pose_catalogue_100.md, camera only, bare left hand; pictures are MyoHand renders (palm view, side view), not photographs. Written by scripts/leap/pose_catalogue_protocol.py.",
+ "setup": "camera only, bare hand, palm toward the camera about 30 cm above it, held still 3 s",
+ "images_dir": "../results/pose_catalogue/panels_left",
+ "takes_per_item": 1,
+ "duration_s": 5.0,
+ "prep_s": 5.0,
+ "items": [
+  {
+   "id": "A01",
+   "label": "A01 ASL A",
+   "group": "ASL handshape",
+   "shape": "fist with the thumb straight alongside the index, not across the fingers",
+   "orientation": "fist with the thumb straight alongside the index, not across the fingers",
+   "image": "A01.png"
+  },
+  {
+   "id": "A04",
+   "label": "A04 ASL D",
+   "group": "ASL handshape",
+   "shape": "index straight up, middle, ring and little half curled with their tips on the thumb",
+   "orientation": "index straight up, middle, ring and little half curled with their tips on the thumb",
+   "image": "A04.png"
+  },
+  {
+   "id": "A08",
+   "label": "A08 ASL L",
+   "group": "ASL handshape",
+   "shape": "index up and thumb out, an L; middle, ring and little curled",
+   "orientation": "index up and thumb out, an L; middle, ring and little curled",
+   "image": "A08.png"
+  },
+  {
+   "id": "A10",
+   "label": "A10 ASL X",
+   "group": "ASL handshape",
+   "shape": "index bent to a hook, other fingers curled, thumb across them",
+   "orientation": "index bent to a hook, other fingers curled, thumb across them",
+   "image": "A10.png"
+  },
+  {
+   "id": "A14",
+   "label": "A14 ASL 7",
+   "group": "ASL handshape",
+   "shape": "thumb tip on the ring fingertip, index, middle and little straight",
+   "orientation": "thumb tip on the ring fingertip, index, middle and little straight",
+   "image": "A14.png"
+  },
+  {
+   "id": "B01",
+   "label": "B01 index half curled, others straight",
+   "group": "single finger",
+   "shape": "only the index finger half curled, thumb out",
+   "orientation": "only the index finger half curled, thumb out",
+   "image": "B01.png"
+  },
+  {
+   "id": "B03",
+   "label": "B03 index tabletop, others straight",
+   "group": "single finger",
+   "shape": "only the index finger bent 90 at the MCP with PIP and DIP straight, thumb out",
+   "orientation": "only the index finger bent 90 at the MCP with PIP and DIP straight, thumb out",
+   "image": "B03.png"
+  },
+  {
+   "id": "B05",
+   "label": "B05 index slightly curled, others straight",
+   "group": "single finger",
+   "shape": "only the index finger curled a quarter of the way, thumb out",
+   "orientation": "only the index finger curled a quarter of the way, thumb out",
+   "image": "B05.png"
+  },
+  {
+   "id": "B07",
+   "label": "B07 middle hooked, others straight",
+   "group": "single finger",
+   "shape": "only the middle finger bent at PIP and DIP with its MCP straight, thumb out",
+   "orientation": "only the middle finger bent at PIP and DIP with its MCP straight, thumb out",
+   "image": "B07.png"
+  },
+  {
+   "id": "B09",
+   "label": "B09 middle hyperextended, others straight",
+   "group": "single finger",
+   "shape": "only the middle finger pressed back past straight, the others flat, thumb out",
+   "orientation": "only the middle finger pressed back past straight, the others flat, thumb out",
+   "image": "B09.png"
+  },
+  {
+   "id": "B11",
+   "label": "B11 ring half curled, others straight",
+   "group": "single finger",
+   "shape": "only the ring finger half curled, thumb out",
+   "orientation": "only the ring finger half curled, thumb out",
+   "image": "B11.png"
+  },
+  {
+   "id": "B13",
+   "label": "B13 ring tabletop, others straight",
+   "group": "single finger",
+   "shape": "only the ring finger bent 90 at the MCP with PIP and DIP straight, thumb out",
+   "orientation": "only the ring finger bent 90 at the MCP with PIP and DIP straight, thumb out",
+   "image": "B13.png"
+  },
+  {
+   "id": "B15",
+   "label": "B15 ring slightly curled, others straight",
+   "group": "single finger",
+   "shape": "only the ring finger curled a quarter of the way, thumb out",
+   "orientation": "only the ring finger curled a quarter of the way, thumb out",
+   "image": "B15.png"
+  },
+  {
+   "id": "B17",
+   "label": "B17 little hooked, others straight",
+   "group": "single finger",
+   "shape": "only the little finger bent at PIP and DIP with its MCP straight, thumb out",
+   "orientation": "only the little finger bent at PIP and DIP with its MCP straight, thumb out",
+   "image": "B17.png"
+  },
+  {
+   "id": "B19",
+   "label": "B19 little hyperextended, others straight",
+   "group": "single finger",
+   "shape": "only the little finger pressed back past straight, the others flat, thumb out",
+   "orientation": "only the little finger pressed back past straight, the others flat, thumb out",
+   "image": "B19.png"
+  },
+  {
+   "id": "B21",
+   "label": "B21 middle finger up, others curled",
+   "group": "single finger",
+   "shape": "middle straight, index, ring and little curled, thumb across",
+   "orientation": "middle straight, index, ring and little curled, thumb across",
+   "image": "B21.png"
+  },
+  {
+   "id": "C01",
+   "label": "C01 quarter curl, thumb out",
+   "group": "whole hand",
+   "shape": "all four fingers curled a quarter of the way, together, thumb out",
+   "orientation": "all four fingers curled a quarter of the way, together, thumb out",
+   "image": "C01.png"
+  },
+  {
+   "id": "C03",
+   "label": "C03 tabletop, thumb out",
+   "group": "whole hand",
+   "shape": "all four fingers bent 90 at the MCP, PIP and DIP straight, thumb out",
+   "orientation": "all four fingers bent 90 at the MCP, PIP and DIP straight, thumb out",
+   "image": "C03.png"
+  },
+  {
+   "id": "C05",
+   "label": "C05 tip curl, thumb out",
+   "group": "whole hand",
+   "shape": "MCPs straight, PIP and DIP of every finger half bent, thumb out",
+   "orientation": "MCPs straight, PIP and DIP of every finger half bent, thumb out",
+   "image": "C05.png"
+  },
+  {
+   "id": "C07",
+   "label": "C07 open claw, fingers apart",
+   "group": "whole hand",
+   "shape": "fingers half curled and spread apart, thumb out",
+   "orientation": "fingers half curled and spread apart, thumb out",
+   "image": "C07.png"
+  },
+  {
+   "id": "C09",
+   "label": "C09 flat hand, fingers together, thumb out",
+   "group": "whole hand",
+   "shape": "flat hand with the four fingers touching, thumb out",
+   "orientation": "flat hand with the four fingers touching, thumb out",
+   "image": "C09.png"
+  },
+  {
+   "id": "C10",
+   "label": "C10 relaxed open hand",
+   "group": "whole hand",
+   "shape": "fingers a quarter curled and slightly apart, thumb out, a resting hand",
+   "orientation": "fingers a quarter curled and slightly apart, thumb out, a resting hand",
+   "image": "C10.png"
+  },
+  {
+   "id": "D02",
+   "label": "D02 spread fingers, thumb along",
+   "group": "thumb",
+   "shape": "fingers spread, thumb adducted along the index",
+   "orientation": "fingers spread, thumb adducted along the index",
+   "image": "D02.png"
+  },
+  {
+   "id": "D05",
+   "label": "D05 thumb to index base",
+   "group": "thumb",
+   "shape": "fingers flat and spread, thumb tip on the base of the index finger",
+   "orientation": "fingers flat and spread, thumb tip on the base of the index finger",
+   "image": "D05.png"
+  },
+  {
+   "id": "D07",
+   "label": "D07 thumb to little base",
+   "group": "thumb",
+   "shape": "fingers flat and spread, thumb tip on the base of the little finger",
+   "orientation": "fingers flat and spread, thumb tip on the base of the little finger",
+   "image": "D07.png"
+  },
+  {
+   "id": "D09",
+   "label": "D09 thumb MCP bent",
+   "group": "thumb",
+   "shape": "fingers spread and flat, thumb out and bent at its MCP with the tip straight",
+   "orientation": "fingers spread and flat, thumb out and bent at its MCP with the tip straight",
+   "image": "D09.png"
+  },
+  {
+   "id": "D10",
+   "label": "D10 hitch-hiker",
+   "group": "thumb",
+   "shape": "fingers curled, thumb pressed back past straight",
+   "orientation": "fingers curled, thumb pressed back past straight",
+   "image": "D10.png"
+  },
+  {
+   "id": "D12",
+   "label": "D12 thumb to ring tip, others curled",
+   "group": "thumb",
+   "shape": "thumb tip on the ring fingertip, index, middle and little curled",
+   "orientation": "thumb tip on the ring fingertip, index, middle and little curled",
+   "image": "D12.png"
+  },
+  {
+   "id": "E02",
+   "label": "E02 index and little curled",
+   "group": "combination",
+   "shape": "index and little fully curled, middle and ring straight, thumb out",
+   "orientation": "index and little fully curled, middle and ring straight, thumb out",
+   "image": "E02.png"
+  },
+  {
+   "id": "E04",
+   "label": "E04 index and middle half curled",
+   "group": "combination",
+   "shape": "index and middle half curled, ring and little straight, thumb out",
+   "orientation": "index and middle half curled, ring and little straight, thumb out",
+   "image": "E04.png"
+  },
+  {
+   "id": "E06",
+   "label": "E06 index and middle hooked",
+   "group": "combination",
+   "shape": "index and middle bent at PIP and DIP only, ring and little straight, thumb out",
+   "orientation": "index and middle bent at PIP and DIP only, ring and little straight, thumb out",
+   "image": "E06.png"
+  },
+  {
+   "id": "E08",
+   "label": "E08 Vulcan salute",
+   "group": "combination",
+   "shape": "all fingers straight, index with middle and ring with little, a gap between middle and ring, thumb out",
+   "orientation": "all fingers straight, index with middle and ring with little, a gap between middle and ring, thumb out",
+   "image": "E08.png"
+  },
+  {
+   "id": "E10",
+   "label": "E10 little finger split",
+   "group": "combination",
+   "shape": "all fingers straight, little finger abducted away, the other three together",
+   "orientation": "all fingers straight, little finger abducted away, the other three together",
+   "image": "E10.png"
+  },
+  {
+   "id": "E17",
+   "label": "E17 index and middle tip curl",
+   "group": "combination",
+   "shape": "index and middle with PIP and DIP half bent, ring and little curled, thumb out",
+   "orientation": "index and middle with PIP and DIP half bent, ring and little curled, thumb out",
+   "image": "E17.png"
+  },
+  {
+   "id": "E19",
+   "label": "E19 ring and little tabletop",
+   "group": "combination",
+   "shape": "ring and little bent 90 at the MCP only, index and middle straight, thumb out",
+   "orientation": "ring and little bent 90 at the MCP only, index and middle straight, thumb out",
+   "image": "E19.png"
+  },
+  {
+   "id": "E20",
+   "label": "E20 index and middle quarter curl",
+   "group": "combination",
+   "shape": "index and middle a quarter curled, ring and little straight, thumb out",
+   "orientation": "index and middle a quarter curled, ring and little straight, thumb out",
+   "image": "E20.png"
+  },
+  {
+   "id": "F02",
+   "label": "F02 staircase up",
+   "group": "mixed depth",
+   "shape": "index fully curled, middle half, ring a quarter, little straight, thumb out",
+   "orientation": "index fully curled, middle half, ring a quarter, little straight, thumb out",
+   "image": "F02.png"
+  },
+  {
+   "id": "F04",
+   "label": "F04 inner fingers half",
+   "group": "mixed depth",
+   "shape": "middle and ring half curled, index and little fully curled, thumb out",
+   "orientation": "middle and ring half curled, index and little fully curled, thumb out",
+   "image": "F04.png"
+  },
+  {
+   "id": "F06",
+   "label": "F06 radial full, ulnar half",
+   "group": "mixed depth",
+   "shape": "index and middle fully curled, ring and little half curled, thumb out",
+   "orientation": "index and middle fully curled, ring and little half curled, thumb out",
+   "image": "F06.png"
+  },
+  {
+   "id": "F08",
+   "label": "F08 tabletop, thumb across",
+   "group": "mixed depth",
+   "shape": "all four fingers bent 90 at the MCP only, thumb across the palm",
+   "orientation": "all four fingers bent 90 at the MCP only, thumb across the palm",
+   "image": "F08.png"
+  },
+  {
+   "id": "F11",
+   "label": "F11 index up, rest half",
+   "group": "mixed depth",
+   "shape": "index straight, middle, ring and little half curled, thumb out",
+   "orientation": "index straight, middle, ring and little half curled, thumb out",
+   "image": "F11.png"
+  },
+  {
+   "id": "G01",
+   "label": "G01 open hand, wrist extended",
+   "group": "wrist",
+   "shape": "fingers spread and straight, thumb out, wrist bent back",
+   "orientation": "fingers spread and straight, thumb out, wrist bent back",
+   "image": "G01.png"
+  },
+  {
+   "id": "G03",
+   "label": "G03 open hand, ulnar deviation",
+   "group": "wrist",
+   "shape": "fingers spread and straight, thumb out, hand tilted toward the little-finger side",
+   "orientation": "fingers spread and straight, thumb out, hand tilted toward the little-finger side",
+   "image": "G03.png"
+  },
+  {
+   "id": "G05",
+   "label": "G05 fist, wrist extended",
+   "group": "wrist",
+   "shape": "fist with the thumb across, wrist bent back",
+   "orientation": "fist with the thumb across, wrist bent back",
+   "image": "G05.png"
+  },
+  {
+   "id": "G07",
+   "label": "G07 fist, ulnar deviation",
+   "group": "wrist",
+   "shape": "fist with the thumb across, hand tilted toward the little-finger side",
+   "orientation": "fist with the thumb across, hand tilted toward the little-finger side",
+   "image": "G07.png"
+  },
+  {
+   "id": "G09",
+   "label": "G09 half fist, wrist extended",
+   "group": "wrist",
+   "shape": "fingers half curled, thumb out, wrist bent back",
+   "orientation": "fingers half curled, thumb out, wrist bent back",
+   "image": "G09.png"
+  },
+  {
+   "id": "G11",
+   "label": "G11 index point, wrist flexed",
+   "group": "wrist",
+   "shape": "index straight, others curled under the thumb, wrist bent toward the palm",
+   "orientation": "index straight, others curled under the thumb, wrist bent toward the palm",
+   "image": "G11.png"
+  },
+  {
+   "id": "G13",
+   "label": "G13 L shape, wrist extended",
+   "group": "wrist",
+   "shape": "index up and thumb out, other fingers curled, wrist bent back",
+   "orientation": "index up and thumb out, other fingers curled, wrist bent back",
+   "image": "G13.png"
+  },
+  {
+   "id": "G17",
+   "label": "G17 open claw, wrist flexed",
+   "group": "wrist",
+   "shape": "fingers half curled and spread, thumb out, wrist bent toward the palm",
+   "orientation": "fingers half curled and spread, thumb out, wrist bent toward the palm",
+   "image": "G17.png"
+  },
+  {
+   "id": "G19",
+   "label": "G19 shaka, ulnar deviation",
+   "group": "wrist",
+   "shape": "thumb and little finger out, other fingers curled, hand tilted toward the little-finger side",
+   "orientation": "thumb and little finger out, other fingers curled, hand tilted toward the little-finger side",
+   "image": "G19.png"
+  }
+ ]
+}
