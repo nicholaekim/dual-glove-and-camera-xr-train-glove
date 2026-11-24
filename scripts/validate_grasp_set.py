@@ -1,6 +1,6 @@
 """Check a built grasp hand-in folder (no hardware).
 
-  .venv\\Scripts\\python.exe scripts\\validate_grasp_set.py "..\\xr trainer\\grasp set for professor 2026-10-01"
+  .venv\\Scripts\\python.exe scripts\\validate_grasp_set.py "xr trainer\\grasp set for professor 2026-10-01"
   .venv\\Scripts\\python.exe scripts\\validate_grasp_set.py <folder> --session recordings\\protocol\\grasps\\<session> --write
 
 Reads the finished folder back and measures everything again from the files

@@ -32,7 +32,7 @@ import numpy as np
 from cam_hand.synth_glove import apply_glove
 
 HERE = Path(__file__).resolve().parents[1]
-DEFAULT_ZIP = (HERE.parent / "xr trainer" / "vision-experiment" / "datasets"
+DEFAULT_ZIP = (HERE / "xr trainer" / "vision-experiment" / "datasets"
                / "hand-keypoints.zip")
 N_KPT = 21
 MIN_VISIBLE = 17          # instances with fewer usable landmarks are skipped

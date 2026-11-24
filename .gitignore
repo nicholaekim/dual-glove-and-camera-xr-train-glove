@@ -41,3 +41,8 @@ models/*.task
 datasets/
 runs/
 captures/
+
+# The former Desktop folder with the hand-in documents, the reference data and
+# archived copies lives here on the author's machine only. It holds other
+# people's data and never goes into this public repo.
+/xr trainer/

@@ -33,7 +33,7 @@ Usage:
   .venv\\Scripts\\python.exe scripts\\leap\\reference_validation.py check recordings\\validation\\reference\\P01_left
   .venv\\Scripts\\python.exe scripts\\leap\\reference_validation.py taps --session recordings\\protocol\\validation\\20261101_101500_left
   .venv\\Scripts\\python.exe scripts\\leap\\reference_validation.py compare --reference <ref folder> --tracker-session <session folder> --calibration-trials 1 --out results\\reference_validation\\<session>
-  .venv\\Scripts\\python.exe scripts\\leap\\reference_validation.py observability --dataset "C:\\Users\\nkim2\\OneDrive\\Desktop\\xr trainer\\grasp set 2026-10-08 organized" --out results\\reference_validation\\observability
+  .venv\\Scripts\\python.exe scripts\\leap\\reference_validation.py observability --dataset "C:\\Users\\nkim2\\OneDrive\\Desktop\\non glove xr trainer\\xr trainer\\grasp set 2026-10-08 organized" --out results\\reference_validation\\observability
   .venv\\Scripts\\python.exe scripts\\leap\\reference_validation.py example --out results\\reference_validation\\example
 """
 import argparse

@@ -41,9 +41,9 @@ from leap_hand.diagnostics import (
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO / "scripts" / "leap"
-# The scratch folder the two tools were written in. Outside the repo, and not
+# The scratch folder the two tools were written in. Git-ignored, and not
 # every checkout has it, so the recorded-data checks skip rather than fail.
-SCRATCH = Path(r"C:\Users\nkim2\OneDrive\Desktop\xr trainer")
+SCRATCH = REPO / "xr trainer"
 SWEEP_CSV = SCRATCH / "dead_zone_right_ring_20260920_200435.csv"
 HOLD_CSV = SCRATCH / "hold_drift_right_fist_20260918_190912.csv"
 # `results/` is gitignored, so this one skips on a fresh checkout too.

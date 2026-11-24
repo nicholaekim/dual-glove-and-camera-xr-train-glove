@@ -6,7 +6,7 @@ each of those, in order, so the operator only has to copy the photo the window
 shows and hold still: one command for the whole batch instead of 21.
 
 Usage:
-  python scripts/leap/record_prof_frames.py --reference "..\\xr trainer\\xr trainer poses"
+  python scripts/leap/record_prof_frames.py --reference "xr trainer\\xr trainer poses"
   python scripts/leap/record_prof_frames.py --reference ... --only 153624,156023
   python scripts/leap/record_prof_frames.py --reference ... --all      # every frame, DONE ones too
   python scripts/leap/record_prof_frames.py --reference ... --rewrite  # no camera, redo the files

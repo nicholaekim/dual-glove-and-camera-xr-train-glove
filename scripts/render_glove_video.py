@@ -8,7 +8,7 @@ time. Every picture says along its bottom edge that it is drawn from the
 glove's joint data and is not camera footage.
 
   python scripts/render_glove_video.py recordings/protocol/finger_flexion/20261013_180909_left
-  python scripts/render_glove_video.py <session> --out "..\\xr trainer\\glove animations\\<session>"
+  python scripts/render_glove_video.py <session> --out "xr trainer\\glove animations\\<session>"
   python scripts/render_glove_video.py <session> --items index,index_fast
 
 The videos go to `<session>\\videos\\<take>.mp4` unless `--out` names another

@@ -2,7 +2,7 @@
 
   .venv\\Scripts\\python.exe scripts\\rebuild_grasp_set.py ^
       --session recordings\\protocol\\grasps\\20261001_101621_left ^
-      --out "..\\xr trainer\\grasp set for professor 2026-10-01" --operator "N Kim"
+      --out "xr trainer\\grasp set for professor 2026-10-01" --operator "N Kim"
 
   ... --transitions recordings\\protocol\\transitions\\<session>   adds the
       takes of a transition session (scripts\\leap\\record_transitions.py)

@@ -7,7 +7,7 @@ skeleton tracks.
 
 Run with the OLD project's interpreter, which has ultralytics:
 
-  & "..\\xr trainer\\summer-xr-trainer\\.venv\\Scripts\\python.exe" scripts/predict_glove.py --source cam
+  & "xr trainer\\summer-xr-trainer\\.venv\\Scripts\\python.exe" scripts/predict_glove.py --source cam
   & "...python.exe" scripts/predict_glove.py --source some/folder --save
 
 Deliberately depends on ultralytics only, not on this project's cam_hand

@@ -86,7 +86,7 @@ def main() -> None:
     print(f"saved {saved} frames to {args.out}")
     if saved:
         print("Check what a detector makes of them:")
-        print('  & "..\\xr trainer\\summer-xr-trainer\\.venv\\Scripts\\python.exe" '
+        print('  & "xr trainer\\summer-xr-trainer\\.venv\\Scripts\\python.exe" '
               f'scripts/predict_glove.py --source {args.out} --conf 0.05 --save')
 
 

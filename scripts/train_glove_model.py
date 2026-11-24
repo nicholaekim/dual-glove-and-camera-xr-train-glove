@@ -4,7 +4,7 @@ Run this with the OLD project's interpreter, which already has ultralytics and
 the pretrained weights; this new project's venv deliberately does not carry a
 second multi-gigabyte torch install:
 
-  & "..\\xr trainer\\summer-xr-trainer\\.venv\\Scripts\\python.exe" scripts/train_glove_model.py --epochs 50
+  & "xr trainer\\summer-xr-trainer\\.venv\\Scripts\\python.exe" scripts/train_glove_model.py --epochs 50
 
 The dataset comes from scripts/build_glove_dataset.py — bare hands from the
 Ultralytics hand-keypoints set, repainted to look gloved, keeping their
@@ -24,7 +24,7 @@ import os
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
-OLD_VISION = HERE.parent / "xr trainer" / "vision-experiment"
+OLD_VISION = HERE / "xr trainer" / "vision-experiment"
 DEFAULT_WEIGHTS = OLD_VISION / "yolo11n-pose.pt"
 DEFAULT_DATA = HERE / "datasets" / "glove_synth" / "glove_synth.yaml"
 

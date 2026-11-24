@@ -36,7 +36,7 @@ What is measured
   worst       the three landmarks furthest apart after the better fit.
 
 Usage:
-  python scripts/leap/compare_prof_frames.py recordings/leap/prof_frames --reference "..\\xr trainer\\xr trainer poses"
+  python scripts/leap/compare_prof_frames.py recordings/leap/prof_frames --reference "xr trainer\\xr trainer poses"
   python scripts/leap/compare_prof_frames.py recordings/leap/prof_frames --csv results/prof_frames.csv
 """
 from __future__ import annotations

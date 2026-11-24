@@ -28,8 +28,8 @@ from xr_hand.kinematics import (
 WRIST = JOINT_INDEX["WRIST"]
 PALM = JOINT_INDEX["PALM"]
 FINGERS = ("INDEX", "MIDDLE", "RING", "LITTLE")
-DATASET = Path(r"C:\Users\nkim2\OneDrive\Desktop\xr trainer"
-               r"\grasp set 2026-10-08 organized")
+DATASET = (Path(__file__).resolve().parents[1] / "xr trainer"
+           / "grasp set 2026-10-08 organized")
 needs_dataset = pytest.mark.skipif(not DATASET.exists(),
                                    reason="real dataset not on this machine")
 

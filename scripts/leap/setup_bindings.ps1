@@ -33,7 +33,7 @@
 
 .PARAMETER Source
     Where to clone/find the bindings. Default:
-    <Desktop>\xr trainer\reference\ultraleap\leapc-python-bindings, the
+    <repo>\xr trainer\reference\ultraleap\leapc-python-bindings, the
     archive folder the plan puts the installer and LeapSDK in; falls back to
     this repo's own reference\ultraleap\ if that is not there. Created if
     missing.
@@ -64,10 +64,10 @@ $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 
 function Get-ArchiveRoot {
     # Plan section 1 archives the installer and the LeapSDK into
-    # <Desktop>\xr trainer\reference\ultraleap. Prefer that; fall back to this
-    # repo's own (gitignored) reference folder if the sibling is not there.
+    # <repo>\xr trainer\reference\ultraleap. Prefer that; fall back to this
+    # repo's own (gitignored) reference folder if that one is not there.
     $candidates = @(
-        (Join-Path (Split-Path -Parent $RepoRoot) "xr trainer\reference\ultraleap"),
+        (Join-Path $RepoRoot "xr trainer\reference\ultraleap"),
         (Join-Path $RepoRoot "reference\ultraleap")
     )
     foreach ($c in $candidates) {
