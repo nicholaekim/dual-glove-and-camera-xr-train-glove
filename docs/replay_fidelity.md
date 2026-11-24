@@ -23,7 +23,7 @@ need a reference measurement this dataset does not have.
 ## 1. The run
 
 ```
-.venv\Scripts\python.exe scripts\leap\replay_verify.py --dataset "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized" --out results\replay_fidelity --all --scenarios
+.venv\Scripts\python.exe scripts\leap\replay_verify.py --dataset "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set 2026-10-08 organized" --out results\replay_fidelity --all --scenarios
 ```
 
 ```
@@ -44,7 +44,7 @@ only read. The script refuses an `--out` folder inside the dataset.
 | Check | Command | Result |
 |---|---|---|
 | scenario facts (R7) | `replay_verify.py --check-scenarios results\replay_fidelity` | `SCENARIOS OK` |
-| dataset unchanged (R9) | `replay_verify.py --check-dataset-unchanged "C:\Users\nkim2\AppData\Local\Temp\hand-forensic-20261023-iqxo3s8o\baseline_sha256.json" "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized"` | `DATASET UNCHANGED (1206 files, 167 JSONL)` |
+| dataset unchanged (R9) | `replay_verify.py --check-dataset-unchanged "C:\Users\nkim2\AppData\Local\Temp\hand-forensic-20261023-iqxo3s8o\baseline_sha256.json" "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set 2026-10-08 organized"` | `DATASET UNCHANGED (1206 files, 167 JSONL)` |
 
 The dataset check covers only the files the forensic baseline lists under
 the dataset root: 1,206 files of type .csv, .json, .jsonl, .md, .py and .txt,
@@ -721,7 +721,7 @@ writer stall, plus two real-data tests that skip without the dataset);
 gates: `GATES_camera_clock_erratum.md`.
 
 ```
-.venv\Scripts\python.exe scripts\leap\camera_clock_erratum.py --dataset "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized" --out results\replay_fidelity\camera_clock_erratum
+.venv\Scripts\python.exe scripts\leap\camera_clock_erratum.py --dataset "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set 2026-10-08 organized" --out results\replay_fidelity\camera_clock_erratum
 ```
 
 ```

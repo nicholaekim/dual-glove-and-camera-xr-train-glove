@@ -72,9 +72,9 @@ Result (gate V17, and `full_suite.log`): `1516 passed, 5 skipped in 1292.20s (0:
 ## 4. Existing-dataset fidelity results
 
 ```
-.venv\Scripts\python.exe scripts\leap\replay_verify.py --dataset "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized" --out results\replay_fidelity\reference_validation_20261024\batch --all --scenarios --check-angle-exports --tmc-mapping results\replay_fidelity\reference_validation_20261024\example\comparison\mapping.json
+.venv\Scripts\python.exe scripts\leap\replay_verify.py --dataset "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set 2026-10-08 organized" --out results\replay_fidelity\reference_validation_20261024\batch --all --scenarios --check-angle-exports --tmc-mapping results\replay_fidelity\reference_validation_20261024\example\comparison\mapping.json
 .venv\Scripts\python.exe scripts\leap\replay_verify.py --check-scenarios results\replay_fidelity\reference_validation_20261024\batch
-.venv\Scripts\python.exe scripts\leap\replay_verify.py --check-dataset-unchanged "C:\Users\nkim2\AppData\Local\Temp\hand-forensic-20261023-iqxo3s8o\baseline_sha256.json" "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized"
+.venv\Scripts\python.exe scripts\leap\replay_verify.py --check-dataset-unchanged "C:\Users\nkim2\AppData\Local\Temp\hand-forensic-20261023-iqxo3s8o\baseline_sha256.json" "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set 2026-10-08 organized"
 ```
 
 Results (gates V13 to V15):

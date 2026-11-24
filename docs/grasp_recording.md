@@ -662,7 +662,7 @@ has your hand's skeleton drawn on it to that hand.
 Double-click `rebuild_professor_grasp_set.cmd` on the Desktop. It runs:
 
 ```
-.venv\Scripts\python.exe scripts\rebuild_grasp_set.py --session recordings\protocol\grasps\20261001_101621_left --out "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set for professor 2026-10-01" --operator "N Kim"
+.venv\Scripts\python.exe scripts\rebuild_grasp_set.py --session recordings\protocol\grasps\20261001_101621_left --out "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set for professor 2026-10-01" --operator "N Kim"
 ```
 
 Run it again after every recording session. It does three things, and
@@ -752,7 +752,7 @@ two lines per camera frame.
 ### Step 11. No hardware: check a folder without rebuilding it
 
 ```
-.venv\Scripts\python.exe scripts\validate_grasp_set.py "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set for professor 2026-10-01"
+.venv\Scripts\python.exe scripts\validate_grasp_set.py "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set for professor 2026-10-01"
 ```
 
 It prints the same report as step 10's third part and changes nothing.

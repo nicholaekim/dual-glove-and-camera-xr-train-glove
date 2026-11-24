@@ -38,8 +38,7 @@ from xr_hand.joints import JOINT_INDEX, JOINT_NAMES
 from xr_hand.kinematics import absolute_to_relative, mat3_to_quat
 
 REPO = Path(__file__).resolve().parents[1]
-DATASET = Path(r"C:\Users\nkim2\OneDrive\Desktop\xr trainer"
-               r"\grasp set 2026-10-08 organized")
+DATASET = REPO / "xr trainer" / "grasp set 2026-10-08 organized"
 needs_dataset = pytest.mark.skipif(not DATASET.exists(),
                                    reason="real dataset not on this machine")
 spec = importlib.util.spec_from_file_location(

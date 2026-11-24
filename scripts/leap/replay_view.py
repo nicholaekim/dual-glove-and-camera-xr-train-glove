@@ -57,7 +57,7 @@ results/replay_fidelity/timing_<name>_take<take>.json) records the lateness of
 every playback tick and the frames skipped (leap_hand.replay_viewer.TIMING_DOC).
 
 Usage:
-  .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --dataset "C:\\Users\\nkim2\\OneDrive\\Desktop\\xr trainer\\grasp set 2026-10-08 organized" --grasp p3_circular_power --take 1
+  .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --dataset "C:\\Users\\nkim2\\OneDrive\\Desktop\\non glove xr trainer\\xr trainer\\grasp set 2026-10-08 organized" --grasp p3_circular_power --take 1
   .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --dataset "<root>" --transition p3_circular_precision_thumb_2_fingers --take 4
   .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --file recordings\\some_take.jsonl --hand left --hand-ids "573 574"
   .venv\\Scripts\\python.exe scripts\\leap\\replay_view.py --dataset "<root>" --grasp p2_s03_power_grasp_finger_side --take 1 --mode interpolate --reference wrist --overlay --axes

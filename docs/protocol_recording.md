@@ -235,7 +235,7 @@ in part 2 and part 3. The hand-in folder is built from them by
 options take several folders each), for example:
 
 ```powershell
-.venv\Scripts\python.exe scripts\package_professor_set.py --out "..\xr trainer\glove flexion and sequences <date>" --flexion <Set B left folder> <Set B right folder> --sequences <Set C left folder> <Set C right folder> --operator "N Kim"
+.venv\Scripts\python.exe scripts\package_professor_set.py --out "xr trainer\glove flexion and sequences <date>" --flexion <Set B left folder> <Set B right folder> --sequences <Set C left folder> <Set C right folder> --operator "N Kim"
 ```
 
 Beside each take's files it writes the take's joint angles frame by frame
@@ -261,7 +261,7 @@ those facts. On 2026-10-15 the slow and fast index were left out of Set B
 on both hands:
 
 ```powershell
-.venv\Scripts\python.exe scripts\package_professor_set.py --out "..\xr trainer\glove flexion and sequences 2026-10-15" --flexion recordings\protocol\finger_flexion\20261015_204941_left recordings\protocol\finger_flexion\20261015_210752_right --sequences recordings\protocol\sequences\20261015_212038_left recordings\protocol\sequences\20261015_214026_right --operator "N Kim" --not-recorded-reason "the operator chose to record the five items at the 4 s pace only, not the slow (6 s) or the fast (1 s) index"
+.venv\Scripts\python.exe scripts\package_professor_set.py --out "xr trainer\glove flexion and sequences 2026-10-15" --flexion recordings\protocol\finger_flexion\20261015_204941_left recordings\protocol\finger_flexion\20261015_210752_right --sequences recordings\protocol\sequences\20261015_212038_left recordings\protocol\sequences\20261015_214026_right --operator "N Kim" --not-recorded-reason "the operator chose to record the five items at the 4 s pace only, not the slow (6 s) or the fast (1 s) index"
 ```
 
 ## A video of each take
@@ -273,7 +273,7 @@ hand at its palm and from its side, the cue in force in words and each
 digit's flexion angles. Use the folder path the recorder printed:
 
 ```powershell
-.venv\Scripts\python.exe scripts\render_glove_video.py recordings\protocol\finger_flexion\<folder> --out "..\xr trainer\glove animations\<name>"
+.venv\Scripts\python.exe scripts\render_glove_video.py recordings\protocol\finger_flexion\<folder> --out "xr trainer\glove animations\<name>"
 ```
 
 Every picture says along its bottom edge that it is drawn from the glove's

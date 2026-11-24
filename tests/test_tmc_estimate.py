@@ -35,8 +35,7 @@ spec = importlib.util.spec_from_file_location(
 report = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(report)
 
-DATASET = Path(r"C:\Users\nkim2\OneDrive\Desktop\xr trainer"
-               r"\grasp set 2026-10-08 organized")
+DATASET = REPO / "xr trainer" / "grasp set 2026-10-08 organized"
 needs_dataset = pytest.mark.skipif(not DATASET.exists(),
                                    reason="real dataset not on this machine")
 

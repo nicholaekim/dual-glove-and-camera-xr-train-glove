@@ -15,7 +15,7 @@ measuring the detection rate of each instead of guessing:
 Read the result honestly. If every row is 0%, no setting will fix it: the
 model was trained on bare skin and does not recognise the glove as a hand.
 That is a finding about the sensor, not a bug, and the fallback is a detector
-fine-tuned on gloved hands (see ../xr trainer/vision-experiment).
+fine-tuned on gloved hands (see xr trainer/vision-experiment).
 
   python scripts/tune_detection.py
   python scripts/tune_detection.py --frames 60      # longer, steadier sample
@@ -135,7 +135,7 @@ def main() -> None:
             print("   2. record the camera on the BARE hand and the glove on")
             print("      the other, accepting they are different hands")
             print("   3. fine-tune a pose detector on gloved-hand images")
-            print("      (../xr trainer/vision-experiment already does this)")
+            print("      (xr trainer/vision-experiment already does this)")
         else:
             print(f"Best: boost={best[2]}, min_det={best[3]:g} "
                   f"-> {best[0]:.0f}% of frames, mean score {best[1]:.2f}")

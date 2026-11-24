@@ -21,7 +21,7 @@ mistake is visible immediately.
 Output is a YOLO pose dataset that trains directly:
 
   python scripts/label_frames.py --source captures/gloved --out datasets/real_gloved
-  & "..\\xr trainer\\summer-xr-trainer\\.venv\\Scripts\\python.exe" scripts/train_glove_model.py \\
+  & "xr trainer\\summer-xr-trainer\\.venv\\Scripts\\python.exe" scripts/train_glove_model.py \\
       --data datasets/real_gloved/real_gloved.yaml --weights runs/glove_pose_v2/weights/best.pt \\
       --epochs 40 --imgsz 512
 """
@@ -159,7 +159,7 @@ def main() -> None:
     print(f"labelled {saved} frames  (train {n_train}, val {n_val}) -> {args.out}")
     if n_train and n_val:
         print("\nFine-tune the v2 model on them:")
-        print('  & "..\\xr trainer\\summer-xr-trainer\\.venv\\Scripts\\python.exe" '
+        print('  & "xr trainer\\summer-xr-trainer\\.venv\\Scripts\\python.exe" '
               f'scripts/train_glove_model.py --data {yaml_path} '
               '--weights runs/glove_pose_v2/weights/best.pt --epochs 40 --imgsz 512 '
               '--name glove_pose_real')

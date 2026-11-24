@@ -21,7 +21,7 @@ from the session folders every time instead of being assembled by hand:
     <out>\\sequences\\<hand>\\ the same layout, with sequence_check.csv in
                   place of flexion_report.txt
 
-  python scripts/package_professor_set.py --out "..\\xr trainer\\grasp and flexion set for professor 2026-09-28" ^
+  python scripts/package_professor_set.py --out "xr trainer\\grasp and flexion set for professor 2026-09-28" ^
       --grasps recordings/protocol/grasps/20260928_101500_left ^
       --flexion recordings/protocol/finger_flexion/20260928_140501_left recordings/protocol/finger_flexion/20260928_150210_right ^
       --sequences recordings/protocol/sequences/20260928_143012_left recordings/protocol/sequences/20260928_153340_right ^
@@ -1902,7 +1902,7 @@ def main(argv=None) -> int:
                     "session folders (accepted takes only; no image but "
                     "the grasp takes' pictures cut to the hand).")
     p.add_argument("--out", type=Path, required=True,
-                   help="the hand-in folder, e.g. \"..\\xr trainer\\grasp and "
+                   help="the hand-in folder, e.g. \"xr trainer\\grasp and "
                         "flexion set for professor 2026-09-28\"")
     p.add_argument("--grasps", type=Path, default=None,
                    help="Set A session folder")

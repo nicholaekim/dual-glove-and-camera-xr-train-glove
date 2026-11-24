@@ -184,7 +184,7 @@ From the repository root:
 
 ```
 .venv\Scripts\python.exe -m pytest tests/test_tmc_estimate.py -q
-.venv\Scripts\python.exe scripts\leap\tmc_estimate_report.py --dataset "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized" --out results\replay_fidelity\tmc_estimate
+.venv\Scripts\python.exe scripts\leap\tmc_estimate_report.py --dataset "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set 2026-10-08 organized" --out results\replay_fidelity\tmc_estimate
 ```
 
 The report ends with `TMC ESTIMATE REPORT OK: transitions_used=42

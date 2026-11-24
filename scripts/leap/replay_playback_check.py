@@ -21,7 +21,7 @@ or PLAYBACK FAIL: ... (exit 1) when a trial's first run shows fewer than
 --min-frames-per-s distinct frames per second, or has no play run. Writes
 OUT/trial<k>.json (the viewer's timing logs) and OUT/summary.json.
 
-  .venv\Scripts\python.exe scripts\leap\replay_playback_check.py --dataset "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized" --grasp p3_circular_power --take 1 --trials 3 --duration 6 --min-frames-per-s 30 --out results\replay_fidelity\codex_corrections_20261024\timing\after
+  .venv\Scripts\python.exe scripts\leap\replay_playback_check.py --dataset "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set 2026-10-08 organized" --grasp p3_circular_power --take 1 --trials 3 --duration 6 --min-frames-per-s 30 --out results\replay_fidelity\codex_corrections_20261024\timing\after
 """
 import argparse
 import json

@@ -27,7 +27,7 @@ are measured rather than absorbed into the fit. --fit all solves on every
 landmark, which flatters both sides equally.
 
 Usage:
-  python scripts/compare_to_tracker.py "..\\xr trainer\\xr trainer poses"
+  python scripts/compare_to_tracker.py "xr trainer\\xr trainer poses"
   python scripts/compare_to_tracker.py <folder> --csv out.csv --fit all
   python scripts/compare_to_tracker.py <folder> --annotate out_dir   # save overlays
 """

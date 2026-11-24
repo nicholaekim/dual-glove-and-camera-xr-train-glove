@@ -19,6 +19,12 @@ Glove-side scripts live in `scripts/glove/`, Ultraleap scripts in
 `scripts/leap/`, webcam scripts in `scripts/`. Everything runs from this
 folder with this venv.
 
+On 22 Nov 2026 the Desktop folder `xr trainer` moved into this checkout as
+`xr trainer\`, which git ignores; the ledgers `GATES_*.md` and `archive\` still
+show the earlier location. `protocols\grasps.json` still names the earlier
+picture folder, because a recorded session stores that file's SHA-256 and the
+file was left unchanged.
+
 **Why a camera at all.** The glove measures finger *flexion* directly and
 keeps working when fingers hide behind the palm. It has no sensor for finger
 *spread* or *thumb opposition* — which is exactly why `pinch` classified as
@@ -229,7 +235,7 @@ python scripts/analyze_poses_cam.py                 # camera separability report
 **Score the camera against the professor's tracker** — his dataset has both
 the photo and his device's keypoints for the same instant:
 ```powershell
-python scripts/compare_to_tracker.py "..\xr trainer\xr trainer poses" --csv results/tracker_comparison.csv
+python scripts/compare_to_tracker.py "xr trainer\xr trainer poses" --csv results/tracker_comparison.csv
 ```
 
 ## Daily use — Ultraleap (Stereo IR 170)
@@ -305,7 +311,7 @@ end-to-end example; the live procedure is `docs/validation_capture_protocol.md`.
 No reference capture exists yet; handoff: `docs/validation_handoff_codex.md`.
 
 ```powershell
-.venv\Scripts\python.exe scripts\leap\replay_view.py --dataset "..\xr trainer\grasp set 2026-10-08 organized" --grasp p3_circular_power --take 1
+.venv\Scripts\python.exe scripts\leap\replay_view.py --dataset "xr trainer\grasp set 2026-10-08 organized" --grasp p3_circular_power --take 1
 ```
 
 Full plan, phases and acceptance: `docs/ultraleap_ir170_plan.md`. This section
@@ -332,7 +338,7 @@ machine, so `pip install` cannot do it and the `leap` extra in
    python scripts\leap\check_setup.py
    ```
    `setup_bindings.ps1` clones the bindings into the Ultraleap archive folder
-   (`..\xr trainer\reference\ultraleap\`, created if missing), compiles
+   (`xr trainer\reference\ultraleap\`, created if missing), compiles
    `leapc_cffi` against the SDK, installs both packages into `.venv` and ends
    by running the checker. It reuses an archived wheel built for the running
    interpreter when there is one, so a repeat setup takes seconds instead of
@@ -345,7 +351,7 @@ machine, so `pip install` cannot do it and the `leap` extra in
    exits 2. Set `LEAPSDK_INSTALL_LOCATION` first if the SDK is not at the
    default path.
 5. Archive the installer and the `LeapSDK` folder into
-   `..\xr trainer\reference\ultraleap\` the day they are downloaded —
+   `xr trainer\reference\ultraleap\` the day they are downloaded —
    Ultraleap releases have disappeared before. The bindings clone already
    lives there and `leap` is installed **editable from it**, so that folder
    is not a copy of the working install, it *is* the working install: do not
@@ -943,9 +949,9 @@ project, so run them with the **old project's** interpreter, which already has
 ultralytics and `yolo11n-pose.pt`:
 
 ```powershell
-& "..\xr trainer\summer-xr-trainer\.venv\Scripts\python.exe" scripts/train_glove_model.py --smoke
-& "..\xr trainer\summer-xr-trainer\.venv\Scripts\python.exe" scripts/train_glove_model.py --epochs 30 --imgsz 512
-& "..\xr trainer\summer-xr-trainer\.venv\Scripts\python.exe" scripts/predict_glove.py --source cam
+& "xr trainer\summer-xr-trainer\.venv\Scripts\python.exe" scripts/train_glove_model.py --smoke
+& "xr trainer\summer-xr-trainer\.venv\Scripts\python.exe" scripts/train_glove_model.py --epochs 30 --imgsz 512
+& "xr trainer\summer-xr-trainer\.venv\Scripts\python.exe" scripts/predict_glove.py --source cam
 ```
 
 That torch install is **CPU-only**, so a real run is hours, not minutes —
@@ -1833,4 +1839,4 @@ glove's time lag" for what they are for.
 - `selftest_sync.py` numbers are a plumbing and logic check, not evidence
   about real hardware.
 
-**The professor's 21 frames in one batch.** `scripts/leap/record_prof_frames.py --reference "..\xr trainer\xr trainer poses"` runs `record_frame.py` for every `frame_<id>_NA` folder in order, skipping frames whose `frame_<id>_keypoints.txt` already exists (`--redo` to repeat, `--only 153624,156023` for a subset, `--all` for every frame, `--dry-run` to list the commands). No hand filter is applied by default: the left/right label is the tracker's opinion and is unreliable for these poses on both sides, so each file keeps the label with the most frames in the take (`--hand left|right` forces one). `--rewrite` records nothing and regenerates every keypoint file from its newest take. `scripts/leap/compare_prof_frames.py recordings/leap/prof_frames --reference "..\xr trainer\xr trainer poses"` then compares each file with his, after a palm fit and a mirrored palm fit.
+**The professor's 21 frames in one batch.** `scripts/leap/record_prof_frames.py --reference "xr trainer\xr trainer poses"` runs `record_frame.py` for every `frame_<id>_NA` folder in order, skipping frames whose `frame_<id>_keypoints.txt` already exists (`--redo` to repeat, `--only 153624,156023` for a subset, `--all` for every frame, `--dry-run` to list the commands). No hand filter is applied by default: the left/right label is the tracker's opinion and is unreliable for these poses on both sides, so each file keeps the label with the most frames in the take (`--hand left|right` forces one). `--rewrite` records nothing and regenerates every keypoint file from its newest take. `scripts/leap/compare_prof_frames.py recordings/leap/prof_frames --reference "xr trainer\xr trainer poses"` then compares each file with his, after a palm fit and a mirrored palm fit.

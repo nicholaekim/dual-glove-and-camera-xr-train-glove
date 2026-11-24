@@ -8,7 +8,7 @@ them before trusting any of it.
 Repository: `C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer`
 (run everything from this folder with `.venv\Scripts\python.exe`; there is no
 `python` on PATH).
-Dataset (read-only): `C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized`.
+Dataset (read-only): `C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set 2026-10-08 organized`.
 Paper 3: `C:\Users\nkim2\OneDrive\Desktop\paper3 (3).pdf` (the Downloads copies
 `paper1 (3).pdf`, `paper2 (3).pdf`, `paper3 (3).pdf` are byte-identical to the
 earlier copies; the text extraction used is
@@ -61,7 +61,7 @@ Batch fidelity run over all 115 static takes and 52 transitions, plus the four
 scenario reports (writes `results\replay_fidelity\`):
 
 ```bash
-.venv\Scripts\python.exe scripts\leap\replay_verify.py --dataset "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized" --out results\replay_fidelity --all --scenarios
+.venv\Scripts\python.exe scripts\leap\replay_verify.py --dataset "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set 2026-10-08 organized" --out results\replay_fidelity --all --scenarios
 ```
 
 Check the scenario reports against the known facts:
@@ -73,13 +73,13 @@ Check the scenario reports against the known facts:
 Check that the dataset is unchanged against the forensic SHA-256 baseline:
 
 ```bash
-.venv\Scripts\python.exe scripts\leap\replay_verify.py --check-dataset-unchanged "C:\Users\nkim2\AppData\Local\Temp\hand-forensic-20261023-iqxo3s8o\baseline_sha256.json" "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized"
+.venv\Scripts\python.exe scripts\leap\replay_verify.py --check-dataset-unchanged "C:\Users\nkim2\AppData\Local\Temp\hand-forensic-20261023-iqxo3s8o\baseline_sha256.json" "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set 2026-10-08 organized"
 ```
 
 Headless screenshots of the viewer for the four scenarios (no window):
 
 ```bash
-.venv\Scripts\python.exe scripts\leap\replay_view.py --dataset "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized" --scenario-screenshots results\replay_fidelity\screens
+.venv\Scripts\python.exe scripts\leap\replay_view.py --dataset "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set 2026-10-08 organized" --scenario-screenshots results\replay_fidelity\screens
 ```
 
 The interactive viewer (opens a window; keys: space play/pause, left/right
@@ -87,7 +87,7 @@ step a frame, + and - speed, n/p next/previous event, r reference frame,
 i hold/interpolate, o recorded overlay, a joint axes, s screenshot, q quit):
 
 ```bash
-.venv\Scripts\python.exe scripts\leap\replay_view.py --dataset "C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized" --grasp p3_circular_power --take 1
+.venv\Scripts\python.exe scripts\leap\replay_view.py --dataset "C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set 2026-10-08 organized" --grasp p3_circular_power --take 1
 ```
 
 The acceptance ledger, re-executing every runnable gate:
@@ -340,7 +340,7 @@ The acceptance ledger with its evidence lines: `GATES_replay.md`.
 ## 9. A reproducible example for each real-data scenario
 
 `DATASET` below stands for
-`"C:\Users\nkim2\OneDrive\Desktop\xr trainer\grasp set 2026-10-08 organized"`.
+`"C:\Users\nkim2\OneDrive\Desktop\non glove xr trainer\xr trainer\grasp set 2026-10-08 organized"`.
 Each scenario's JSON is written by the `--scenarios` run of section 2 and
 checked by `--check-scenarios`; a single recording's fidelity can also be
 rerun on its own with `replay_verify.py --dataset DATASET --static <grasp> <take> --out <dir>`.

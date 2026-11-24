@@ -257,7 +257,7 @@ Coordinate policy
 1. Download Hyperion 6.2.0 for Windows from
    https://www.ultraleap.com/downloads/sir170/ . Copy the installer and,
    after install, `C:\Program Files\Ultraleap\LeapSDK` into
-   `OneDrive\Desktop\xr trainer\reference\ultraleap\`.
+   `OneDrive\Desktop\non glove xr trainer\xr trainer\reference\ultraleap\`.
 2. Install, plug the camera into a direct USB 2.0/3.0 port, open the
    Ultraleap Control Panel, confirm the device is listed and the visualiser
    shows hands. Set tracking mode to Desktop. Note the firmware/software
@@ -414,7 +414,7 @@ Phase 0 outcome, same day (evening of 2026-09-16)
   service key `UltraleapTracking`, display name "Ultraleap Tracking
   Service", running. SDK at the default path with `LeapC.h`, `LeapC.dll`,
   `LeapC.lib`. Installer, SDK copy, the bindings clone and the built wheel
-  are archived in `..\xr trainer\reference\ultraleap\`.
+  are archived in `xr trainer\reference\ultraleap\`.
 - `leapc_cffi` builds on Python 3.14 with the VS 2022 Build Tools
   (`leapc_cffi-0.0.1-cp314-cp314-win_amd64.whl`). The 3.11 fallback is not
   needed. Two of the five open items are therefore closed.
@@ -841,7 +841,7 @@ PlayerPrefs and strings in `StretchSense.CompanionApp.Runtime.dll`)
 - PlayerPrefs hold only sensitivities, paired gloves and window state: no
   per-hand smoothing or filter setting exists for the user to check.
 - Batch runner for the 21 professor frames: `scripts/leap/record_prof_frames.py
-  --reference "..\xr trainer\xr trainer poses"` (hand taken from each
+  --reference "xr trainer\xr trainer poses"` (hand taken from each
   frame's file, resumable, `--dry-run`).
 
 ChatGPT review of improvements 1 to 3 (2026-09-22) and the follow-up
@@ -1052,7 +1052,7 @@ Rail-disagreement override, trust-based thumb vote, report changes (merged
   the hand.
 
 Right-glove recalibration check and pose-hold drift (2026-09-18, 19:01 to
-19:11; `recordings/right_recal_check`, `..\xr trainer\hold_drift_*.csv`)
+19:11; `recordings/right_recal_check`, `xr trainer\hold_drift_*.csv`)
 - Reseat + fresh Basic calibration, then fist / peace / thumbs up / index
   point x 3 (12 takes, none rejected, pose check 6 ok 6 warn). Right ring:
   fist 1.03 -> 0.82, peace 1.51 -> 1.00 (fixed). Right pinky: fist 1.28 ->
@@ -1140,7 +1140,7 @@ hands one at a time, 6 poses x 3 takes each; copy in
   plus tracker config. Device label "Reality Glove". No raw stretch-sensor
   channel is exposed. Open lead: the articulation calibration level is
   "Basic"; a higher level, if XR Trainer has one, may represent the pinch.
-  `..\xr trainer\probe_pinch_inputs.py --hand left` logs skeleton and
+  `xr trainer\probe_pinch_inputs.py --hand left` logs skeleton and
   controller values through open / pinch / open / fist to see whether
   anything XR Trainer sends carries the pinch.
 
@@ -1207,7 +1207,7 @@ Gated fusion (ChatGPT-reviewed design, merged, 159 tests at the time)
   that finger's curl from the camera only when the camera passes its gates
   and shows flexion beyond a margin for several frames, with hysteresis,
   index finger first. Before telling the professor, measure it:
-  `..\xr trainer\measure_dead_zone.py --hand left --finger index` sweeps one
+  `xr trainer\measure_dead_zone.py --hand left --finger index` sweeps one
   finger slowly and reports the dead-zone width, its hysteresis and the
   glove's lag against the camera (validated on a synthetic 30 % / 120 ms
   sweep: recovered 30 % and 115 ms).
